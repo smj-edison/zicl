@@ -14,10 +14,12 @@ pub fn build(b: *std.Build) void {
         "test-filter",
         "Filter for test. Only applies to Zig tests.",
     ) orelse &[0][]const u8{};
+    const token_debugging = b.option(bool, "token-debugging", "Whether to print tokens when they're parsed") orelse false;
 
     const options = b.addOptions();
     options.addOption(bool, "use_utf8", use_utf8);
     options.addOption(bool, "bracket_expr_sugar", bracket_expr_sugar);
+    options.addOption(bool, "token_debugging", token_debugging);
 
     const options_mod = options.createModule();
 

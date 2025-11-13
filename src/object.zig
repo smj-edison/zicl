@@ -130,6 +130,27 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
     return handle;
 }
 
+pub fn setStringFromEscaped(arena: std.mem.Allocator, handle: Handle, escaped: []const u8) !void {
+    // Unescaped must be equal or shorter than escaped version
+    const unescaped = try arena.allocSentinel(u8, escaped.len, 0);
+    errdefer arena.free(unescaped);
+    const written = stringutil.removeEscaping(escaped, unescaped);
+    unescaped[written] = 0; // null terminator
+
+    const did_set = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
+    if (did_set) {
+        arena.free(unescaped);
+    } else {
+        // Too large for normal string, so we'll try setting as a long string.
+        const did_take = try handle.getHeap().setLongString(
+            handle.index,
+            unescaped[0..written :0],
+            .{ .different_capacity = unescaped.len },
+        );
+        if (!did_take) arena.free(unescaped);
+    }
+}
+
 pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !bool {
     const pattern_str = try Heap.getString(pattern);
     const to_check_str = try Heap.getString(to_check);
@@ -147,31 +168,44 @@ pub fn compare(a: Handle, b: Handle, case_insensitive: bool) !std.math.Order {
 ///////////////////////////////
 //  Index related functions  //
 
-/// Due to Tcl convention, both `start` and `end` are inclusive.
+/// `start` is inclusive, `end` is exclusive. (Note, this is different from tcl's
+/// convention, where both are inclusive. `fromObjects` accounts for this when
+/// running the conversion).
 pub const Range = struct {
     start: usize,
     end: usize,
 
-    pub fn fromObjects(calling_heap: *Heap, det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !?Range {
+    pub fn fromObjects(calling_heap: *Heap, det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !Range {
         // Make sure we can distinguish between which input is the error.
         const start_idx = try getIndex(calling_heap, start, det);
         const end_idx = try getIndex(calling_heap, end, det);
 
-        return constrainRange(list_len, .{
+        return fromIndexes(list_len, .{
             .start = start_idx,
             .end = end_idx,
         });
     }
+
+    /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
+    pub fn fromIndexes(list_len: usize, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
+        var start = start_index.asAbsoluteIndex(list_len);
+        var end = end_index.asAbsoluteIndex(list_len);
+
+        if (start > end) return .{ .start = 0, .end = 0 };
+
+        // End is inclusive, so we'll switch it to exclusive. We had to do it here, however,
+        // otherwise `start > end` wouldn't catch a start of 0 and an end of -1.
+        end += 1;
+
+        if (start < 0) start = 0;
+        if (end > list_len) end = list_len;
+
+        return .{
+            .start = @intCast(start),
+            .end = @intCast(end),
+        };
+    }
 };
-
-pub fn constrainRange(list_len: usize, range: Range) ?Range {
-    // Make sure indexes are within the list.
-    if (range.start >= list_len) return null;
-    if (range.end >= list_len) return null;
-    if (range.start > range.end) return null;
-
-    return range;
-}
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
 fn badIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
@@ -712,15 +746,21 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         // a new object anyways.
 
         // Try to preserve information about filename / line number.
-        var sourceInfo: ?SourceInfo = null;
-        defer if (sourceInfo) |*info| info.deinit(calling_heap.gpa);
-        if (getSourceInfo(handle.*)) |info| {
-            // TODO PERF see if it's possible to not duplicate the filename here
-            sourceInfo = try info.duplicate(calling_heap.gpa);
+        const source_info: ?SourceInfo = getSourceInfo(handle.*);
+        var file_name: ?Handle = null;
+        var line_no: u32 = 1;
+        if (source_info) |info| {
+            line_no = info.line_no;
+
+            if (info.file_name) |unwrapped| {
+                file_name = unwrapped;
+                _ = unwrapped.reference(); // Increment ref count.
+            }
         }
+        defer if (file_name) |unwrapped| calling_heap.release(unwrapped);
 
         const str = try handle.getString();
-        var parser = Parser.init(str);
+        var parser = Parser.init(str, line_no);
 
         var arena_instance = std.heap.ArenaAllocator.init(calling_heap.gpa);
         defer arena_instance.deinit();
@@ -749,39 +789,25 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         errdefer calling_heap.release(new_list);
 
         for (tokens.items, 0..) |token, i| {
-            const item_idx: u32 = @intCast(new_list.index + 1 + i);
+            const item = listItemRaw(new_list, @intCast(i));
 
             if (token.tag == .simple_string) {
                 // Normal string, so no escaping needed.
-                const did_set = try calling_heap.setNormalString(item_idx, str[token.loc.start..token.loc.end]);
-                if (!did_set) {
-                    // Need to duplicate the string, because the heap may take ownership
-                    const token_str = try calling_heap.gpa.allocSentinel(u8, token.loc.end - token.loc.start, 0);
-                    errdefer calling_heap.gpa.free(token_str);
-                    @memcpy(token_str, str[token.loc.start..token.loc.end]);
-
-                    const did_take = try calling_heap.setLongString(item_idx, token_str, .{
-                        .different_capacity = str.len,
-                    });
-                    if (!did_take) calling_heap.gpa.free(token_str);
-                }
+                try item.setString(str[token.loc.start..token.loc.end]);
             } else {
                 // Needs escaping. We'll create another string to copy the escaped string into.
-                const escaped_str = try calling_heap.gpa.allocSentinel(u8, token.loc.end - token.loc.start, 0);
-                errdefer calling_heap.gpa.free(escaped_str);
-                const written = stringutil.removeEscaping(str[token.loc.start..token.loc.end], escaped_str);
-                escaped_str[written] = 0; // null terminator
+                try setStringFromEscaped(
+                    calling_heap.gpa,
+                    item,
+                    str[token.loc.start..token.loc.end],
+                );
+            }
 
-                const did_set = try calling_heap.setNormalString(item_idx, escaped_str[0..written]);
-                if (!did_set) {
-                    // Too large for normal string, so we'll try setting as a long string
-                    const did_take = try calling_heap.setLongString(
-                        item_idx,
-                        escaped_str[0..written :0],
-                        .{ .different_capacity = escaped_str.len },
-                    );
-                    if (!did_take) calling_heap.gpa.free(escaped_str);
-                }
+            if (source_info) |info| {
+                try setSourceInfo(calling_heap, item, .{
+                    .file_name = info.file_name,
+                    .line_no = token.loc.line_no,
+                });
             }
         }
 
@@ -793,11 +819,20 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
 
 /// Panics if provided handle is not a list.
 fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
-    const list = handle.*.peek();
+    const list = handle.peek();
     assert(list.tag == .list);
 
-    // No need to resize if there's enough space.
+    // No need to realloc if we're shrinking.
     if (new_len <= list.body.list.len) {
+        // Be sure to free the objects when we shrink though.
+        const freed_count = list.body.list.len - new_len;
+        for (0..freed_count) |to_free| {
+            const to_free_idx = handle.index + 1 + list.body.list.len - freed_count + to_free;
+            const to_free_handle = handle.getHeap().getHandle(@intCast(to_free_idx), false);
+            calling_heap.invalidateBody(to_free_handle);
+            calling_heap.invalidateString(to_free_handle);
+        }
+
         list.body.list.len = new_len;
         return;
     }
@@ -824,10 +859,10 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
         handle.* = new_list;
         calling_heap.release(old_handle);
     } else {
-        // If the list isn't shared, we can copy over the objects over without
+        // If the list isn't shared, we can move the objects over without
         // any duplication.
         const old_items = listItemsRaw(handle.*);
-        for (old_items, new_items) |old_item, *new_item| {
+        for (old_items, new_items[0..old_items.len]) |old_item, *new_item| {
             new_item.* = old_item;
         }
 
@@ -840,7 +875,7 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
 }
 
 /// Assumes provided handle is a list.
-fn listItemRaw(handle: Handle, index: u32) Handle {
+pub fn listItemRaw(handle: Handle, index: u32) Handle {
     const list = handle.peek();
     assert(list.tag == .list);
 
@@ -853,7 +888,7 @@ fn listItemRaw(handle: Handle, index: u32) Handle {
     } else @panic("List element out of bounds");
 }
 
-pub fn listItem(calling_heap: *Heap, det: *ErrorDetails, handle: *Handle, index: u32) !?Handle {
+pub fn listItem(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, index: u32) !?Handle {
     try shimmerToList(calling_heap, det, handle);
     const list = handle.peek().body.list;
 
@@ -863,14 +898,26 @@ pub fn listItem(calling_heap: *Heap, det: *ErrorDetails, handle: *Handle, index:
 }
 
 /// Assumes handle is a list.
-fn listItemsRaw(handle: Handle) []Heap.Object {
+pub fn listItemsRaw(handle: Handle) []Heap.Object {
     const list = handle.peek();
     assert(list.tag == .list);
 
     return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..list.body.list.len];
 }
 
-pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Handle) !void {
+pub fn listAppendObject(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Heap.Object) !u32 {
+    try shimmerToList(calling_heap, det, handle);
+    try listSetLength(calling_heap, handle, handle.peek().body.list.len + 1);
+
+    const list = handle.peek();
+    const index = list.body.list.len - 1;
+
+    listItemsRaw(handle.*)[index] = item;
+
+    return index;
+}
+
+pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Handle) !u32 {
     try shimmerToList(calling_heap, det, handle);
     try listSetLength(calling_heap, handle, handle.peek().body.list.len + 1);
 
@@ -878,6 +925,8 @@ pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, ite
     const index = list.body.list.len - 1;
 
     listItemsRaw(handle.*)[index] = try calling_heap.duplicateOrReference(item);
+
+    return index;
 }
 
 test "Lists" {
@@ -899,68 +948,65 @@ test "Lists" {
     try testing.expectEqualStrings("object 1", try listItemRaw(list1, 0).getString());
 
     const to_append = try newString(heap, "appended item");
-    try listAppend(heap, &det, &list1, to_append);
+    _ = try listAppend(heap, &det, &list1, to_append);
     try testing.expectEqualStrings("appended item", try listItemRaw(list1, 2).getString());
 
     var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
     );
-    // const old_string_list_handle = string_list;
+    const old_string_list_handle = string_list;
     try shimmerToList(heap, &det, &string_list);
-    // try testing.expect(old_string_list_handle != string_list);
-    // try testing.expectEqualStrings("item1", try listItemRaw(string_list, 0).getString());
-    // try testing.expectEqualStrings("item 2", try listItemRaw(string_list, 1).getString());
-    // try testing.expectEqualStrings("item 3", try listItemRaw(string_list, 2).getString());
+    try testing.expect(old_string_list_handle != string_list);
+    try testing.expectEqualStrings("item1", try listItemRaw(string_list, 0).getString());
+    try testing.expectEqualStrings("item 2", try listItemRaw(string_list, 1).getString());
+    try testing.expectEqualStrings("item 3", try listItemRaw(string_list, 2).getString());
 }
 
 pub const SourceInfo = struct {
-    filename_ref: [:0]const u8,
+    file_name: ?Handle,
     line_no: u32,
-
-    pub fn duplicate(self: *const SourceInfo, gpa: std.mem.Allocator) !SourceInfo {
-        return .{
-            .filename_ref = try gpa.dupeZ(u8, self.filename_ref),
-            .line_no = self.line_no,
-        };
-    }
-
-    pub fn deinit(self: *SourceInfo, gpa: std.mem.Allocator) void {
-        gpa.free(self.filename_ref);
-    }
 };
 
+/// .file_name will become invalid if the file name object's string becomes invalid.
 pub fn getSourceInfo(handle: Handle) ?SourceInfo {
     const ref = handle.peek();
-
     if (ref.tag != .source) return null;
 
+    const file_name_handle = handle.getHeap().normalHandle(ref.body.source.file_name_obj);
+    const file_name = if (file_name_handle.index != 0) file_name_handle else null;
+
     return .{
-        .filename_ref = handle.getHeap().getHeapStringZ(ref.body.source.file_name),
+        .file_name = file_name,
         .line_no = ref.body.source.line_no,
     };
 }
 
-/// Will return error.EmbeddedNull if `filename` has embedded nulls.
-pub fn setSourceInfo(calling_heap: *Heap, obj: Handle, file_name: [:0]const u8, line_no: u32) !void {
-    for (file_name) |byte| {
-        if (byte == 0) return error.EmbeddedNull;
-    }
+pub fn setSourceInfo(calling_heap: *Heap, source: Handle, source_info: SourceInfo) !void {
+    var source_handle = source;
+    try Heap.ensureShimmerable(calling_heap, &source_handle);
+    calling_heap.invalidateBody(source_handle);
 
-    Heap.invalidateBody(calling_heap, obj);
-
-    // Allocate space for the filename string (has to be in the heap, because
-    // the string handles are stored as a u32 in the source rep)
-    const len: u32 = @intCast(file_name.len);
-    const filename_in_heap = try calling_heap.createString(len);
-    errdefer calling_heap.freeString(filename_in_heap, len);
-
-    // Copy the filename
-    @memcpy(calling_heap.getHeapString(filename_in_heap, filename_in_heap + len), file_name);
-
-    const ref = obj.peek();
+    const ref = source_handle.peek();
     ref.tag = .source;
-    ref.body.source.file_name = filename_in_heap;
-    ref.body.source.line_no = line_no;
+    ref.body.source.line_no = source_info.line_no;
+
+    if (source_info.file_name) |unwrapped| {
+        var same_heap_file_name = unwrapped;
+
+        if (same_heap_file_name.heap != source_handle.heap) {
+            same_heap_file_name = try calling_heap.duplicate(same_heap_file_name);
+        } else {
+            // Make sure to increment the ref count.
+            _ = same_heap_file_name.reference();
+        }
+
+        // This should be true, as Heap.ensureShimmerable will make sure it's in our heap.
+        assert(source_handle.heap == same_heap_file_name.heap);
+
+        ref.body.source.file_name_obj = same_heap_file_name.index;
+    } else {
+        ref.body.source.file_name_obj = calling_heap.nullObject().index;
+    }
 }
 
 test "Source info" {
@@ -969,7 +1015,7 @@ test "Source info" {
     defer Heap.deinitAll();
 
     const obj = try heap.createObject();
-    try setSourceInfo(heap, obj, "test_file.tcl", 42);
+    try setSourceInfo(heap, obj, .{ .file_name = try newString(heap, "test_file.tcl"), .line_no = 42 });
 
     // Verify the object has the source tag
     const ref = obj.peek();
@@ -977,10 +1023,8 @@ test "Source info" {
     try testing.expectEqual(@as(u32, 42), ref.body.source.line_no);
 
     const info = getSourceInfo(obj);
-    if (info) |unwrapped| {
-        try testing.expectEqualSlices(u8, "test_file.tcl", unwrapped.filename_ref);
-        try testing.expectEqual(@as(u32, 42), unwrapped.line_no);
-    } else return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, "test_file.tcl", try info.?.file_name.?.getString());
+    try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
     const obj2 = try newString(heap, "hello");
     const empty_info = getSourceInfo(obj2);
@@ -993,59 +1037,41 @@ var next_script_id = 1;
 //  Script related functions  //
 
 /// Not threadsafe.
-pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
-    try Heap.ensureShimmerable(calling_heap, handle);
+pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
+    // Get source info, or use defaults.
+    const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else SourceInfo{
+        .file_name = null,
+        .line_no = 1,
+    };
+
+    // Parse all the tokens of the script, handling any errors that come up. //
 
     const bytes = try handle.getString();
-    var parser = Parser.init(bytes);
-
-    // Parse all the tokens of the script, handling any errors that come up.
+    var parser = Parser.init(bytes, source_info.line_no);
 
     // Set up tokens list.
-    var tokens = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, bytes.len / 8);
-    errdefer tokens.deinit(calling_heap.gpa);
+    var tokens = try std.ArrayList(Parser.Token).initCapacity(calling_heap.gpa, bytes.len / 8);
+    defer tokens.deinit(calling_heap.gpa);
 
-    // Track how many commands there are, so we can be sure to make a .start_of_line for
-    // each of them.
-    var command_count: usize = 1;
-    // Also track how many words there are that have multiple components (i.e. something like `foo$bar`)
-    // so we have enough space for all needed ".start_of_word"s.
-    var multi_word_count: usize = 0;
-    // Count how many sections are within this word ("foo", 1 section, "foo$bar", 2 sections, etc).
-    var word_section_count: usize = 0;
-    // How many separators were found (we'll subtract one from the total for each separator).
-    var separator_count: usize = 0;
-    // Used for trimming the first whitespace, if any.
-    var is_first_token: bool = true;
+    // Used to ignore the first token if it's .command_separator (effectively
+    // trimming any starting whitespace)
+    var is_trimming = true;
     // Add all tokens to the list, handling any errors that may come up.
     while (true) {
         const next_token = parser.parseScript();
         if (next_token) |token| {
-            tokens.append(calling_heap.gpa, token);
             switch (token.tag) {
-                .word_separator => {
-                    separator_count += 1;
-                    word_section_count = 0;
+                .command_separator, .word_separator => {
+                    if (!is_trimming) try tokens.append(calling_heap.gpa, token);
                 },
-                .command_separator => {
-                    separator_count += 1;
-                    // Make sure we don't double-count the first command.
-                    if (!is_first_token) command_count += 1;
+                .end_of_file => {
+                    try tokens.append(calling_heap.gpa, token);
+                    break;
                 },
-                .argument_expansion => {
-                    // Argument expansion is always considered a multi word, though
-                    // it inserts an .argument_expansion token instead of a .start_or_word
-                    // token.
-                    multi_word_count += 1;
-                    word_section_count = 0;
+                else => {
+                    is_trimming = false;
+                    try tokens.append(calling_heap.gpa, token);
                 },
-                .simple_string, .escaped_string, .variable_subst, .dict_sugar, .command_subst => {
-                    word_section_count += 1;
-                    // Why exactly 2? Because otherwise multi_word_count would increment for every
-                    // section of a multi word.
-                    if (word_section_count == 2) multi_word_count += 1;
-                },
-                .end_of_file => break,
             }
         } else |err| {
             if (det) |details| {
@@ -1057,33 +1083,202 @@ pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle)
             return err;
         }
 
-        is_first_token = false;
+        is_trimming = false;
     }
 
-    const new_token_count = tokens.len + command_count + multi_word_count - separator_count;
+    if (options.token_debugging) {
+        for (tokens.items, 0..) |token, i| {
+            std.debug.print("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"\n", .{
+                i,
+                token.loc.line_no,
+                @tagName(token.tag),
+                bytes[token.loc.start..token.loc.end],
+            });
+        }
+    }
 
-    // Initialize the Heap-stored list that will store all the corrisponding value for each token
-    const token_values = try newUninitializedList(calling_heap, new_token_count);
-    errdefer calling_heap.release(token_values);
-    const converted_tokens = try calling_heap.gpa.alloc(Parser.Token.Tag, new_token_count);
-    errdefer calling_heap.gpa.free(converted_tokens);
-    // const elements = listElements(calling_heap, null, token_values) catch unreachable;
+    // +1 for the first ".script_command".
+    const new_token_capacity: u32 = @intCast(tokens.items.len + 1);
 
-    // // The initial command separator was trimmed, if it existed in the first place,
-    // // so we'll start off with it.
-    // var token: Parser.Token.Tag = .command_separator;
-    // // Where the command started (the start_of_line token), so we can edit its information
-    // // when we reach the end of the command.
-    // var command_start: usize = 0;
-    // var i: usize = 0;
+    // Initialize the Heap-stored list that will contain the corrisponding value for each token.
+    var new_token_values = try newUninitializedList(calling_heap, new_token_capacity);
+    // Set length to 0 so we can just call listAppend().
+    try listSetLength(calling_heap, &new_token_values, 0);
+    errdefer calling_heap.release(new_token_values);
 
-    // while (i < )
-    // for (tokens.items, 0..) |token, i| {
-    //     if (token[i] == .command_separator) {
-    //         converted_tokens[i] = .start_of_line;
-    //         elements[i].tag = .script_line;
-    //     }
-    // }
+    var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, new_token_capacity);
+    errdefer new_token_tags.deinit(calling_heap.gpa);
+
+    // Be sure to append the first .script_command token.
+    try new_token_tags.append(calling_heap.gpa, .start_of_command);
+    _ = try listAppendObject(calling_heap, det, &new_token_values, .{
+        .str = Heap.Object.null_string,
+        .tag = .script_command,
+        .body = .{
+            .script_command = .{
+                .line = source_info.line_no,
+                .arg_count = 0, // Set later.
+            },
+        },
+    });
+
+    // The current script line's token index.
+    var script_command_idx: usize = 0;
+    // The number of arguments for this command.
+    var command_arg_count: u32 = 0;
+    var i: usize = 0;
+    var last_i: usize = 0;
+    while (i < tokens.items.len) {
+        // Skip any leading separators.
+        while (tokens.items[i].tag == .word_separator) i += 1;
+
+        // Look ahead to see when the next separator is.
+        var arg_token_count: usize = 0;
+        var found_expansion: bool = false;
+        while (i + arg_token_count < tokens.items.len) : (arg_token_count += 1) {
+            switch (tokens.items[i + arg_token_count].tag) {
+                .argument_expansion => found_expansion = true,
+                .command_separator, .word_separator, .end_of_file => break,
+                else => {},
+            }
+        }
+
+        // We'll only reach here if the current token is .command_separator or .end_of_file, because
+        // word_token_count counts all tokens except those (well, and it doesn't count .word_separator,
+        // but that's ruled out at the beginning when we skipped leading separators).
+        if (arg_token_count == 0) {
+            listItemsRaw(new_token_values)[script_command_idx].body.script_command.arg_count = command_arg_count;
+
+            if (tokens.items[i].tag == .end_of_file) {
+                break; // Don't append a .script_command for EOF
+            }
+
+            i += 1; // Skip command separator.
+
+            // Start a new command.
+            command_arg_count = 0;
+            try new_token_tags.append(calling_heap.gpa, .start_of_command);
+            script_command_idx = try listAppendObject(calling_heap, det, &new_token_values, .{
+                .str = Heap.Object.null_string,
+                .tag = .script_command,
+                .body = .{ .script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
+            });
+
+            continue;
+        }
+
+        // Append the start of the word (only if necessary).
+        if (found_expansion or arg_token_count > 1) {
+            if (found_expansion) {
+                try new_token_tags.append(calling_heap.gpa, .argument_expansion);
+            } else {
+                try new_token_tags.append(calling_heap.gpa, .start_of_word);
+            }
+
+            _ = try listAppendObject(calling_heap, det, &new_token_values, .{
+                .str = Heap.Object.null_string,
+                .tag = .number,
+                .body = .{
+                    .number = @intCast(arg_token_count),
+                },
+            });
+        }
+
+        command_arg_count += 1;
+
+        // Now append the tokens to the new list, escaping as necessary.
+        for (i..(i + arg_token_count)) |token_idx| {
+            const token = tokens.items[token_idx];
+
+            var str_handle: Handle = undefined;
+            switch (token.tag) {
+                .argument_expansion => {},
+                .escaped_string => {
+                    try new_token_tags.append(calling_heap.gpa, .simple_string);
+                    const str_idx = try listAppendObject(
+                        calling_heap,
+                        det,
+                        &new_token_values,
+                        .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
+                    );
+                    str_handle = listItemRaw(new_token_values, str_idx);
+
+                    try setStringFromEscaped(calling_heap.gpa, str_handle, bytes[token.loc.start..token.loc.end]);
+                },
+                else => {
+                    try new_token_tags.append(calling_heap.gpa, token.tag);
+                    const str_idx = try listAppendObject(
+                        calling_heap,
+                        det,
+                        &new_token_values,
+                        .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
+                    );
+                    str_handle = listItemRaw(new_token_values, str_idx);
+
+                    try str_handle.setString(bytes[token.loc.start..token.loc.end]);
+                },
+            }
+
+            try setSourceInfo(calling_heap, str_handle, .{
+                .file_name = source_info.file_name,
+                .line_no = token.loc.line_no,
+            });
+        }
+
+        // Be sure to advance our index to the next word.
+        i += arg_token_count;
+
+        last_i = i;
+    }
+
+    // Increment reference count to file name, if not null.
+    if (source_info.file_name) |file_name| _ = file_name.reference();
+    const parsed_script: Heap.ParsedScript = .{
+        .tags = new_token_tags,
+        .values = new_token_values,
+        .first_line = source_info.line_no,
+        .file_name_obj = source_info.file_name,
+    };
+    if (options.token_debugging) parsed_script.printTokens();
+
+    return parsed_script;
+}
+
+test "Script parsing" {
+    const ta = testing.allocator;
+    const heap = try Heap.createHeap(ta);
+    defer Heap.deinitAll();
+
+    const script1 = try newString(heap,
+        \\ set x 5
+        \\ set y $x[set x]
+    );
+    var parsed = try parseScript(heap, null, script1);
+    defer parsed.tags.deinit(ta);
+    const tokens = parsed.tags.items;
+    const values = listItemsRaw(parsed.values);
+
+    // set x 5
+    try testing.expectEqual(.start_of_command, tokens[0]);
+    try testing.expectEqual(1, values[0].body.script_command.line);
+    try testing.expectEqual(3, values[0].body.script_command.arg_count);
+    try expectEqualToken(&parsed, 1, .simple_string, "set");
+    try expectEqualToken(&parsed, 2, .simple_string, "x");
+    try expectEqualToken(&parsed, 3, .simple_string, "5");
+
+    try testing.expectEqual(.start_of_command, tokens[4]);
+    try testing.expectEqual(2, values[4].body.script_command.line);
+    try testing.expectEqual(3, values[4].body.script_command.arg_count);
+    try expectEqualToken(&parsed, 5, .simple_string, "set");
+    try expectEqualToken(&parsed, 6, .simple_string, "y");
+    try testing.expectEqual(.start_of_word, tokens[7]);
+    try testing.expectEqual(2, values[4].body.number);
+    try expectEqualToken(&parsed, 3, .simple_string, "5");
+}
+
+fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {
+    try testing.expectEqual(tag, script.tags.items[index]);
+    try testing.expectEqualStrings(value, try listItemRaw(script.values, index).getString());
 }
 
 pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {

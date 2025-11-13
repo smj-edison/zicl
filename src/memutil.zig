@@ -271,10 +271,10 @@ pub fn vmemMapItems(comptime T: type, count: usize) ![]align(heap.page_size_min)
     return @alignCast(items[0..count]);
 }
 
-pub fn vmemUnmapItems(comptime T: type, items: []T) void {
+pub fn vmemUnmapItems(comptime T: type, items: []align(heap.page_size_min) T) void {
     const byte_count = items.len * @sizeOf(T);
-    const bytes: [*]u8 = @ptrCast(items.ptr);
-    heap.PageAllocator.unmap(@alignCast(bytes[0..byte_count]));
+    const bytes: [*]align(heap.page_size_min) u8 = @ptrCast(items.ptr);
+    heap.PageAllocator.unmap(bytes[0..byte_count]);
 }
 
 test "Virtual memory" {
@@ -357,7 +357,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
 
         pub fn deinit(self: *Self, gpa: Allocator) void {
             if (use_vmem) {
-                vmemUnmapItems(Item, self.items);
+                vmemUnmapItems(Item, @alignCast(self.items));
             } else {
                 gpa.free(self.items);
             }

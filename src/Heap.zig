@@ -9,6 +9,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Parser = @import("Parser.zig");
+const object = @import("object.zig");
 
 // These numbers are final, and can be depended on to be their current values
 const null_string = 0;
@@ -106,10 +107,10 @@ pub const CustomTypeInstance = struct {
 ///
 /// will produce a ParsedScript with the following token/object pairs:
 ///
-/// | .start_of_line  | 2     |
+/// | .start_of_command  | 2     |
 /// | .simple_string  | puts  |
 /// | .simple_string  | hello |
-/// | .start_of_line  | 4     |
+/// | .start_of_command  | 4     |
 /// | .simple_string  | set   |
 /// | .variable_subst | i     |
 /// | .start_of_word  | 2     |
@@ -119,11 +120,11 @@ pub const CustomTypeInstance = struct {
 /// | .command_subst  | foo   |
 /// | .simple_string  | BAR   |
 ///
-/// "puts hello" has two args (.start_of_line 2), composed of single tokens.
-/// (Note that the .start_of_line token is omitted for the common case of a
+/// "puts hello" has two args (.start_of_command 2), composed of single tokens.
+/// (Note that the .start_of_command token is omitted for the common case of a
 /// single token.)
 ///
-/// "set $i $x$y [foo]BAR" has four (.start_of_line 4) args, the first word
+/// "set $i $x$y [foo]BAR" has four (.start_of_command 4) args, the first word
 /// has 1 token (.simple_string set), and the last has two tokens
 /// (.start_of_word 2 .command_subst foo .simple_string BAR)
 ///
@@ -142,12 +143,12 @@ pub const CustomTypeInstance = struct {
 ///
 /// Will produce the following pairs:
 ///
-/// | .start_of_line | 2     |
+/// | .start_of_command | 2     |
 /// | .simple_string | list  |
 /// | .start_of_word | .none |
 /// | .braced_string | a b   |
 ///
-/// Note that the '.start_of_line' token also contains the source information
+/// Note that the '.start_of_command' token also contains the source information
 /// for the first word of the line for error reporting purposes
 ///
 /// -- the substFlags field of the structure --
@@ -166,19 +167,36 @@ pub const CustomTypeInstance = struct {
 /// Will (re)create the internal representation of the $string object
 /// two times.
 ///
-const ParsedScript = struct {
+pub const ParsedScript = struct {
     /// A handle pointing to a tcl list that has the same length as `tokens`,
     /// that stores the state of the evaluated script. Note, this is not
     /// the same as the stack.
-    objects: Handle,
+    values: Handle,
     /// Tokens array.
-    tokens: []Parser.Token.Tag,
+    tags: std.ArrayList(Parser.Token.Tag),
     /// File name.
-    filename: [:0]u8,
+    file_name_obj: ?Handle,
     /// Line number of the first line.
     first_line: u32,
-    /// Ref count (starts at 1 when created).
-    ref_count: u32,
+
+    pub fn printTokens(script: *const ParsedScript) void {
+        const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
+
+        var line: u64 = 0;
+        for (script.tags.items, object.listItemsRaw(script.values), 0..) |token, value, i| {
+            switch (token) {
+                .start_of_command => {
+                    line = value.body.script_command.line;
+                    std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.script_command });
+                },
+                .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.number }),
+                else => {
+                    const item = object.listItemRaw(script.values, @intCast(i));
+                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), item.getString() catch "<oom string>" });
+                },
+            }
+        }
+    }
 };
 
 pub const Object = packed struct(u128) {
@@ -230,12 +248,13 @@ pub const Tag = enum(u5) {
     source,
     list,
     dict,
-    script_line,
+    script_command,
     script,
     reference,
     custom_type,
 };
 
+pub const IndexError = error{BadIndex};
 /// Tcl list index. Indexes are inclusive both for start and end in tcl. Additionally,
 /// an index may be relative, such as "end" or "end-1".
 pub const ListIndex = packed struct {
@@ -243,17 +262,14 @@ pub const ListIndex = packed struct {
         index: u32,
         end_offset: i33,
     },
-    /// Whether this is the index "end", or "end-1", etc
+    /// Whether this is a relative index, such as "end", or "end-1", etc
     is_relative: bool,
 
     pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
 
-    pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) !usize {
+    pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) i33 {
         if (self.is_relative) {
-            const idx = std.math.add(i33, self.u.end_offset, list_len -| 1) catch return error.BadIndex;
-            if (idx < 0) return error.BadIndex;
-            if (idx > list_len) return error.BadIndex;
-            return @intCast(idx);
+            return self.u.end_offset + (list_len -| 1);
         } else {
             return self.u.index;
         }
@@ -306,10 +322,8 @@ pub const Body = packed union {
         utf8_length: u33,
     },
     source: packed struct {
-        /// Pointer to a nul-terminated string in the heap (we don't have
-        /// space to store the string length, and file names can't have
-        /// embedded nulls anyways)
-        file_name: u32,
+        /// Pointer to an object in the same heap that contains the file name.
+        file_name_obj: u32,
         line_no: u32,
     },
     list: packed struct {
@@ -320,7 +334,8 @@ pub const Body = packed union {
     /// from a list, but duplicates will be removed when any writing operation
     /// happens.
     dict: DictIndex,
-    script_line: packed struct {
+    /// Information about a command.
+    script_command: packed struct {
         line: u32,
         arg_count: u32,
     },
@@ -405,12 +420,12 @@ pub const Handle = packed struct(u64) {
     }
 
     /// Guaranteed to be valid, barring OOM.
-    pub fn getString(handle: Handle) ![:0]const u8 {
+    pub fn getString(handle: Handle) Allocator.Error![:0]const u8 {
         return try handle.getHeap().getLocalString(handle.index);
     }
 
     /// Copies provided string.
-    pub fn setString(handle: Handle, bytes: []const u8) !void {
+    pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
         const heap = handle.getHeap();
 
         // Try setting as a normal string first
@@ -535,8 +550,9 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 }
 
 pub fn deinit(self: *Heap) void {
-    for (0..self.objects.len) |i| {
-        if (self.objects.get(i).metadata.in_use) {
+    for (1..self.objects.len) |i| {
+        const metadata = self.objects.get(i).metadata;
+        if (metadata.in_use) {
             // We don't use free object here, as it may cause a double-free when
             // freeing recursive structures. For example, if there was a list with
             // two items, we'll free the list (first free of items), then free
@@ -564,27 +580,40 @@ pub fn deinit(self: *Heap) void {
     self.parsed_scripts.deinit(self.gpa);
 }
 
+pub fn nullObject(self: *Heap) Handle {
+    return .{
+        .index = 0,
+        .heap = self.heap_id,
+        .ref_counted = false,
+    };
+}
+
 pub fn createObject(self: *Heap) !Handle {
     const index = try self.createObjects(1);
-    return self.normalHandle(index);
+    return .{
+        .index = index,
+        .heap = self.heap_id,
+        .ref_counted = true,
+    };
 }
 
 /// create_objects does not initialize objects, but does initialize
 /// reference counts.
 pub fn createObjects(self: *Heap, count: u32) !u32 {
     const order: u5 = @intCast(memutil.getOrder(count));
+    const aligned_count = memutil.getOrderSize(order);
 
     self.mem_mgmt_mutex.lock();
     errdefer self.mem_mgmt_mutex.unlock();
     const index: u32 = @intCast(try self.object_tracking.alloc(self.gpa, order));
     self.mem_mgmt_mutex.unlock();
 
-    const end = index + count;
+    const end = index + aligned_count;
 
     // Make object list has space for new objects
-    if (self.objects.len < index + count) {
+    if (self.objects.len < index + aligned_count) {
         const start_of_new = self.objects.len;
-        try self.objects.resize(self.heapAlloc(), index + count);
+        try self.objects.resize(self.heapAlloc(), index + aligned_count);
         @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
             .order = 31,
             .is_alloc_head = false,
@@ -630,7 +659,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         .in_use = true,
     };
 
-    if (count > 1) @memset(
+    if (aligned_count > 1) @memset(
         self.objects.items(.metadata)[(index + 1)..end],
         .{
             .order = order,
@@ -786,10 +815,9 @@ pub fn invalidateBody(calling_heap: *Heap, handle: Handle) void {
         },
         .source => {
             const source = obj.body.source;
-            const file_name = obj_heap.getHeapStringZ(source.file_name);
-            obj_heap.freeString(source.file_name, @intCast(file_name.len));
+            if (source.file_name_obj != 0) calling_heap.release(obj_heap.normalHandle(source.file_name_obj));
         },
-        .none, .index, .number, .float, .bool, .script_line => {},
+        .none, .index, .number, .float, .bool, .script_command => {},
     }
 
     obj.tag = .none;
@@ -923,7 +951,7 @@ pub fn duplicateOrReference(self: *Heap, handle: Handle) !Object {
 pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
-        .none, .index, .number, .float, .string, .bool, .script, .script_line => {
+        .none, .index, .number, .float, .string, .bool, .script, .script_command => {
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
@@ -931,22 +959,28 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
             };
         },
         .source => {
-            // Duplicate the source info, including the filename string
             const source = src.body.source;
-            const file_name = self.getHeapStringZ(source.file_name);
-            const len: u26 = @intCast(file_name.len);
 
-            const new_file_name = try self.createString(len);
-            errdefer self.freeString(new_file_name, len);
-
-            @memcpy(self.getHeapString(new_file_name, new_file_name + len), file_name);
+            var new_handle: Handle = undefined;
+            if (source.file_name_obj == 0) {
+                // Null object, so just use the current heap id.
+                new_handle = self.getHandle(0, false);
+            } else {
+                // Better make sure it's in the correct heap.
+                if (handle.heap != self.heap_id) {
+                    new_handle = try self.duplicate(self.normalHandle(source.file_name_obj));
+                } else {
+                    new_handle = self.normalHandle(source.file_name_obj);
+                    _ = new_handle.reference(); // Increase ref count
+                }
+            }
 
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = .source,
                 .body = .{
                     .source = .{
-                        .file_name = new_file_name,
+                        .file_name_obj = new_handle.index,
                         .line_no = source.line_no,
                     },
                 },
@@ -1091,14 +1125,12 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
 }
 
 pub fn normalHandle(self: *Heap, index: u32) Handle {
-    return .{
-        .heap = self.heap_id,
-        .index = index,
-        .ref_counted = true,
-    };
+    return self.getHandle(index, true);
 }
 
 pub fn getHandle(self: *Heap, index: u32, ref_counted: bool) Handle {
+    assert(index != 0); // Null objects should never exist in a handle.
+
     return .{
         .heap = self.heap_id,
         .index = index,
@@ -1227,7 +1259,7 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
 /// Returns whether the object heap took ownership of the string.
 /// The only case where this would fail is OOM or if someone else
 /// exchanged the string right before us.
-pub fn setLongString(self: *Heap, index: u32, bytes: [:0]u8, details: LongString.Details) !bool {
+pub fn setLongString(self: *Heap, index: u32, bytes: [:0]u8, details: LongString.Details) Allocator.Error!bool {
     assert(bytes.len > 0);
 
     const long_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
@@ -1300,7 +1332,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             // the reference's string, not our own
             return obj.body.reference.getString();
         },
-        .script_line => {
+        .script_command => {
             @panic("Script line is an internal object only");
         },
         .source, .script => {
@@ -1530,10 +1562,12 @@ pub fn createCustomTypeInstance(self: *Heap) !u32 {
     return @intCast(new_id);
 }
 
+var next_parsed_script: usize = 1;
 /// `tokens` must be allocated by the allocator provided to heap. Takes ownership.
 pub fn createParsedScript(self: *Heap, script: ParsedScript) !void {
-    const index = try self.parsed_scripts.create(self.gpa);
-    self.parsed_scripts.items[index] = script;
+    const slot_index = atomicIncr(usize, &next_parsed_script);
+    try self.parsed_scripts.put(self.gpa, ScriptId.fromInt(slot_index), script);
+    return slot_index;
 }
 
 // Heap instances //

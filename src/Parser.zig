@@ -75,7 +75,7 @@ pub const Token = struct {
 
         /// Special 'start-of-line' token. Corrisponding object contains the
         /// number of arguments for this command.
-        start_of_line,
+        start_of_command,
         /// Special 'start-of-word' token. Corrisponding object contains the
         /// number of tokens to combine for this word (of type .number)
         start_of_word,
@@ -84,11 +84,11 @@ pub const Token = struct {
     };
 };
 
-pub fn init(buffer: []const u8) Parser {
+pub fn init(buffer: []const u8, line_no: u32) Parser {
     return .{
         .buffer = buffer,
         .index = 0,
-        .line_no = 1,
+        .line_no = line_no,
         .in_quote = false,
         .comment_possible = true,
         .can_parse_arg_expansion = false,
@@ -503,7 +503,7 @@ pub fn parseCommand(self: *Parser) Error!Token {
                 // Advance to just past where the brace ends.
                 _ = try self.parseBrace();
 
-                //  ...and restore.
+                // ...and restore.
                 self.can_parse_arg_expansion = could_parse_arg_expansion;
                 start_of_word = false; // have to set because of the continue
                 continue;
@@ -848,7 +848,7 @@ test "Parser" {
         \\set $i $x$y [foo]BAR
     ;
 
-    var parser = Parser.init(script);
+    var parser = Parser.init(script, 1);
 
     try testNextToken(&parser, .simple_string, "set");
     try testNextToken(&parser, .word_separator, " ");
@@ -877,7 +877,7 @@ test "Parser" {
     try testNextToken(&parser, .end_of_file, "");
 
     const broken = "set x {good}bad";
-    parser = Parser.init(broken);
+    parser = Parser.init(broken, 1);
 
     try testNextToken(&parser, .simple_string, "set");
     try testNextToken(&parser, .word_separator, " ");
@@ -885,14 +885,14 @@ test "Parser" {
     try testNextToken(&parser, .word_separator, " ");
     try testing.expectError(error.CharactersAfterCloseBrace, parser.parseScript());
 
-    // const argument_expansion = "{*}$value";
-    // parser = Parser.init(argument_expansion);
+    const argument_expansion = "{*}$value";
+    parser = Parser.init(argument_expansion, 1);
 
-    // try testNextToken(&parser, .argument_expansion, "*");
-    // try testNextToken(&parser, .variable_subst, "value");
+    try testNextToken(&parser, .argument_expansion, "*");
+    try testNextToken(&parser, .variable_subst, "value");
 
     const double_asterisks = "{*}{*}";
-    parser = Parser.init(double_asterisks);
+    parser = Parser.init(double_asterisks, 1);
 
     try testNextToken(&parser, .argument_expansion, "*");
     try testNextToken(&parser, .simple_string, "*");
