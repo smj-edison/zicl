@@ -77,8 +77,12 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
                 .alloc_count = [_]usize{0} ** max_order,
             };
 
-            for (0..max_order) |i| {
-                new_alloc.free_lists[i] = try FreeList.initCapacity(allocator, initial_capacity);
+            var initialized: usize = 0;
+            errdefer for (0..initialized) |i| {
+                new_alloc.free_lists[i].deinit(allocator);
+            };
+            while (initialized < max_order) : (initialized += 1) {
+                new_alloc.free_lists[initialized] = try FreeList.initCapacity(allocator, initial_capacity);
             }
 
             try new_alloc.free_lists[max_order - 1].append(allocator, 0);
@@ -218,7 +222,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 
 const TestAlloc = BuddyUnmanaged(5);
 
-test "Buddy allocator" {
+test "buddy allocator" {
     const ta = std.testing.allocator;
 
     var alloc = try TestAlloc.init(ta, 16);
@@ -276,7 +280,7 @@ pub fn vmemUnmapItems(comptime T: type, items: []align(heap.page_size_min) T) vo
     heap.PageAllocator.unmap(bytes[0..byte_count]);
 }
 
-test "Virtual memory" {
+test "virtual memory" {
     var array = try vmemMap(5);
     array[0] = 5;
     array[1] = 10;
@@ -364,7 +368,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
     };
 }
 
-test "Indexed memory pool" {
+test "indexed memory pool" {
     const ta = testing.allocator;
 
     const TestStruct = struct {

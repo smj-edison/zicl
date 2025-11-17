@@ -176,7 +176,6 @@ pub const Range = struct {
     end: usize,
 
     pub fn fromObjects(calling_heap: *Heap, det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !Range {
-        // Make sure we can distinguish between which input is the error.
         const start_idx = try getIndex(calling_heap, start, det);
         const end_idx = try getIndex(calling_heap, end, det);
 
@@ -208,7 +207,7 @@ pub const Range = struct {
 };
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
-fn badIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
+fn badIndexError(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
     if (det) |details| details.* = .{
         .message = try newStringFmt(calling_heap, "bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
@@ -226,10 +225,10 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, handle: Handle) !void {
     // Does it start with "end"? If so, it might be end+5, or end-2, etc
     if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
         if (bytes.len >= 4) {
-            if (bytes[3] != '+' or bytes[3] != '-') return badIndex(det, handle);
+            if (bytes[3] != '+' or bytes[3] != '-') return badIndexError(det, handle);
 
             const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch {
-                return badIndex(det, handle);
+                return badIndexError(det, handle);
             };
             obj.body.index = .{ .u = .{ .end_offset = index_offset }, .is_end = true };
         }
@@ -237,7 +236,7 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, handle: Handle) !void {
         obj.body.index = Heap.ListIndex.end;
     } else {
         const index = std.fmt.parseInt(u32, bytes, 10) catch {
-            return badIndex(det, handle);
+            return badIndexError(det, handle);
         };
         obj.body.index = index;
     }
@@ -256,18 +255,18 @@ pub fn getIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap
     const obj = handle.peek();
 
     // Fast case: if it's an integer or float, we can quickly cast it (don't
-    // shimmer though, as it'll probably used for its original purpose still)
+    // shimmer though, as it'll probably still be used for its original purpose)
     if (obj.tag == .number) {
-        if (obj.body.number < 0) return badIndex(det, handle);
-        if (obj.body.number > std.math.maxInt(u32)) return badIndex(det, handle);
+        if (obj.body.number < 0) return badIndexError(det, handle);
+        if (obj.body.number > std.math.maxInt(u32)) return badIndexError(det, handle);
 
         return .{ .u = .{ .index = @intCast(obj.body.number) }, .is_end = false };
     } else if (obj.tag == .float) {
         const value = obj.body.float;
 
-        if (std.math.isNan(value)) return badIndex(det, handle);
-        if (value < 0) return badIndex(det, handle);
-        if (value > std.math.maxInt(u32)) return badIndex(det, handle);
+        if (std.math.isNan(value)) return badIndexError(det, handle);
+        if (value < 0) return badIndexError(det, handle);
+        if (value > std.math.maxInt(u32)) return badIndexError(det, handle);
 
         return .{ .u = .{ .index = @intFromFloat(obj.body.number) }, .is_end = false };
     }
@@ -560,6 +559,9 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
         pub const names = enumNames(T);
 
         pub fn get(calling_heap: *Heap, det: ?*ErrorDetails, value: *Handle) !T {
+            // TODO PERF we can optimize this by shimmering the value to an "enum" type,
+            // where the enum type has a u48 storing the hash of enum_name and a u16 for
+            // which variant it is, by index.
             const bytes = try value.getString();
             const variant = map.get(bytes);
             if (variant) |unwrapped| {
@@ -579,7 +581,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
     };
 }
 
-test "Tcl enum" {
+test "tcl enum" {
     const Things = enum { foo, bar, baz };
     const map = (EnumMapping(Things){}).map;
     const names = enumNames(Things);
@@ -642,15 +644,19 @@ pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to
     }
 }
 
-test "String is" {
+test "string is" {
     const ta = testing.allocator;
     const heap = try Heap.createHeap(ta);
-    defer Heap.deinitAll();
+    defer Heap.testFinish();
 
     var str = try newString(heap, "abcdefg");
+    defer str.release();
     var str2 = try newString(heap, "abcdefg123");
+    defer str2.release();
     var class = try newString(heap, "alpha");
+    defer class.release();
     var bad_class = try newString(heap, "bad_class");
+    defer bad_class.release();
     var details: ErrorDetails = undefined;
 
     try testing.expectEqual(true, try stringIs(heap, &details, &str, &class, false));
@@ -661,6 +667,7 @@ test "String is" {
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
         try details.message.getString(),
     );
+    details.message.release();
 }
 
 pub fn convertParserError(heap: *Heap, err: Parser.Error) error{OutOfMemory}!ErrorDetails {
@@ -762,13 +769,11 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         const str = try handle.getString();
         var parser = Parser.init(str, line_no);
 
-        var arena_instance = std.heap.ArenaAllocator.init(calling_heap.gpa);
-        defer arena_instance.deinit();
-        const arena = arena_instance.allocator();
-
         // Figure out how many tokens there are, so we can create the correct list size
         // in the heap.
-        var tokens: std.ArrayList(Parser.Token) = .{};
+        var tokens: std.ArrayList(Parser.Token) = .empty;
+        defer tokens.deinit(calling_heap.gpa);
+
         while (true) {
             const next_token = parser.parseList() catch |e| {
                 if (det) |details| details.* = try convertParserError(calling_heap, e);
@@ -776,7 +781,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
             };
             switch (next_token.tag) {
                 .simple_string, .escaped_string => {
-                    try tokens.append(arena, next_token);
+                    try tokens.append(calling_heap.gpa, next_token);
                 },
                 .end_of_file => break,
                 else => {
@@ -929,16 +934,19 @@ pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, ite
     return index;
 }
 
-test "Lists" {
-    const ta = testing.allocator;
+fn testLists(ta: std.mem.Allocator) !void {
     const heap = try Heap.createHeap(ta);
-    defer Heap.deinitAll();
+    defer Heap.testFinish();
+
     var det: ErrorDetails = undefined;
 
     // Simple case: two objects in a list
     const obj1 = try newString(heap, "object 1");
+    defer obj1.release();
     const obj2 = try newString(heap, "object 2");
+    defer obj2.release();
     var list1 = try newList(heap, &.{ obj1, obj2 });
+    defer list1.release();
 
     const items = listItemsRaw(list1);
     try testing.expectEqual(2, items.len);
@@ -948,18 +956,26 @@ test "Lists" {
     try testing.expectEqualStrings("object 1", try listItemRaw(list1, 0).getString());
 
     const to_append = try newString(heap, "appended item");
+    defer to_append.release();
+
     _ = try listAppend(heap, &det, &list1, to_append);
     try testing.expectEqualStrings("appended item", try listItemRaw(list1, 2).getString());
 
     var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
     );
+    defer string_list.release();
+
     const old_string_list_handle = string_list;
     try shimmerToList(heap, &det, &string_list);
     try testing.expect(old_string_list_handle != string_list);
     try testing.expectEqualStrings("item1", try listItemRaw(string_list, 0).getString());
     try testing.expectEqualStrings("item 2", try listItemRaw(string_list, 1).getString());
     try testing.expectEqualStrings("item 3", try listItemRaw(string_list, 2).getString());
+}
+
+test "lists" {
+    try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
 }
 
 pub const SourceInfo = struct {
@@ -1009,13 +1025,17 @@ pub fn setSourceInfo(calling_heap: *Heap, source: Handle, source_info: SourceInf
     }
 }
 
-test "Source info" {
-    const ta = testing.allocator;
+fn testSourceInfo(ta: std.mem.Allocator) !void {
     const heap = try Heap.createHeap(ta);
-    defer Heap.deinitAll();
+    defer Heap.testFinish();
 
     const obj = try heap.createObject();
-    try setSourceInfo(heap, obj, .{ .file_name = try newString(heap, "test_file.tcl"), .line_no = 42 });
+    defer obj.release();
+
+    const file_name = try newString(heap, "test_file.tcl");
+    defer file_name.release();
+
+    try setSourceInfo(heap, obj, .{ .file_name = file_name, .line_no = 42 });
 
     // Verify the object has the source tag
     const ref = obj.peek();
@@ -1027,8 +1047,14 @@ test "Source info" {
     try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
     const obj2 = try newString(heap, "hello");
+    defer obj2.release();
+
     const empty_info = getSourceInfo(obj2);
     try testing.expect(empty_info == null);
+}
+
+test "source info" {
+    try testing.checkAllAllocationFailures(testing.allocator, testSourceInfo, .{});
 }
 
 var next_script_id = 1;
@@ -1244,10 +1270,10 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     return parsed_script;
 }
 
-test "Script parsing" {
+test "script parsing" {
     const ta = testing.allocator;
     const heap = try Heap.createHeap(ta);
-    defer Heap.deinitAll();
+    defer Heap.testFinish();
 
     const script1 = try newString(heap,
         \\ set x 5
@@ -1278,33 +1304,75 @@ test "Script parsing" {
 }
 
 pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+    if (handle.peek().tag == .script) return;
     try Heap.ensureShimmerable(calling_heap, handle);
 
     const script_id = try Heap.ScriptId.next();
     errdefer script_id.retire();
     var parsed = try parseScript(calling_heap, det, handle.*);
     errdefer parsed.deinit(calling_heap);
-    try calling_heap.parsed_scripts.put(calling_heap.gpa, script_id, parsed);
+
+    // Check if this script index already exists in the calling heap.
+    if (calling_heap.parsed_scripts.get(script_id.index)) |existing_script| {
+        // Already exists in the heap, so we'll deinit it before we overwrite it.
+        var script_as_mut = existing_script.script;
+        script_as_mut.deinit(calling_heap);
+    }
+    try calling_heap.parsed_scripts.put(calling_heap.gpa, script_id.index, .{
+        .script = parsed,
+        .generation = script_id.generation,
+    });
 
     const obj = handle.peek();
     obj.body.script = .{ .id = script_id };
     obj.tag = .script;
 }
 
+pub fn getScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap.ParsedScript {
+    try shimmerToScript(calling_heap, det, handle);
+    assert(handle.peek().tag == .script);
+
+    const script_id = handle.peek().body.script.id;
+    const script_and_generation = calling_heap.parsed_scripts.get(script_id.index).?;
+    assert(script_and_generation.generation == script_id.generation);
+
+    return script_and_generation.script;
+}
+
 test "script shimmering" {
     const ta = testing.allocator;
     const heap = try Heap.createHeap(ta);
+    defer Heap.testFinish();
 
     var script1 = try newString(heap,
         \\ set x 5
         \\ set y $x[set x]
     );
-    std.debug.print("script1: {any}, ref count: {}\n", .{ script1, script1.debugRefCount() });
-    try shimmerToScript(heap, null, &script1);
-    std.debug.print("script1: {any}, ref count: {}\n", .{ script1, script1.debugRefCount() });
+
+    const parsed_script = try getScript(heap, null, &script1);
+    const script1_id = script1.peek().body.script.id;
+    try testing.expectEqualSlices(Parser.Token.Tag, &[_]Parser.Token.Tag{
+        .start_of_command,
+        .simple_string,
+        .simple_string,
+        .simple_string,
+        .start_of_command,
+        .simple_string,
+        .simple_string,
+        .start_of_word,
+        .variable_subst,
+        .command_subst,
+    }, parsed_script.tags.items);
     script1.release();
 
-    Heap.testFinish();
+    var script2 = try newString(heap, "set x 5");
+    try shimmerToScript(heap, null, &script2);
+    const script2_id = script2.peek().body.script.id;
+
+    try testing.expectEqual(script1_id.index, script2_id.index);
+    try testing.expect(script1_id.generation != script2_id.generation);
+
+    script2.release();
 }
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {

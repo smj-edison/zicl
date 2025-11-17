@@ -65,8 +65,6 @@ heap_id: HeapId,
 
 /// Used whenever an allocation or free is happening
 mem_mgmt_mutex: Mutex = .{},
-mailbox_mutex: Mutex = .{},
-mailbox: Mailbox = .{},
 
 object_tracking: ObjectTracker,
 objects: ObjectList,
@@ -88,12 +86,7 @@ const StringList = std.ArrayList(u8);
 const DictionaryPool = memutil.IndexedMemoryPool(Dictionary, cfg.use_vmem);
 const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
 const ScriptMetadataPool = memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem);
-const ParsedScripts = std.AutoHashMapUnmanaged(ScriptId, ParsedScript);
-
-pub const Mailbox = std.ArrayList(HeapMessage);
-pub const HeapMessage = union(enum) {
-    free_script: ScriptId,
-};
+const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
 
 pub const DictIndex = u32;
 pub const Dictionary = struct {
@@ -124,44 +117,72 @@ pub const CustomTypeInstance = struct {
 };
 
 /// Each script is assigned a unique id when created. Each interpreter
-/// has a hashmap that associates a script with its local parsed
+/// has a hashmap that associates a script id with its local parsed
 /// representation. This way, when a script is sent between threads,
 /// the script doesn't need to be parsed twice. The script parsing
 /// is not guaranteed to be idempotent.
-pub const ScriptId = enum(u64) {
-    _,
-
-    pub fn toInt(id: ScriptId) u64 {
-        return @intFromEnum(id);
-    }
-
-    pub fn fromInt(id: u64) ScriptId {
-        return @enumFromInt(id);
-    }
+pub const ScriptId = packed struct(u64) {
+    index: u32,
+    generation: u32,
 
     pub fn next() !ScriptId {
         state.mutex.lock();
         defer state.mutex.unlock();
 
         const index = try script_metadata.create(state.gpa);
-        @atomicStore(usize, &script_metadata.items[index].ref_count, 1, .release);
-        return fromInt(index);
+        const generation = @atomicLoad(u32, &script_metadata.items[index].generation, .monotonic);
+        @atomicStore(u32, &script_metadata.items[index].ref_count, 1, .monotonic);
+
+        return .{
+            .index = @intCast(index),
+            .generation = generation,
+        };
     }
 
     pub fn retire(id: ScriptId) void {
         state.mutex.lock();
         defer state.mutex.unlock();
 
-        script_metadata.destroy(id.toInt());
+        std.debug.print("Retire {}\n", .{id});
+
+        script_metadata.destroy(id.index);
+        // Increment generation.
+        _ = @atomicRmw(u32, &script_metadata.items[id.index].generation, .Add, 1, .monotonic);
     }
 };
 
-/// This can get a little confusing, as script objects are ref counted, but
-/// their metadata is also ref counted. The reason is so that a parsed script
+/// This can get a little confusing, as objects are ref counted, but their
+/// script metadata is also ref counted. The reason is so that a parsed script
 /// isn't freed, even if the script object gets freed, until _all_ script objects
 /// for a certain ID are freed.
-pub const ScriptMetadata = struct {
-    ref_count: usize,
+pub const ScriptMetadata = packed struct(ScriptMetadata.get_full_size()) {
+    // This must be backed by a packed u64 (32-bit) or u96 (64-bit),
+    // and ref_count must be the first field, as ScriptMetadata is stored
+    // in an IndexedMemoryPool, which uses the first usize bits of
+    // ScriptMetadata to store a next pointer.
+
+    inline fn get_needed_padding() type {
+        const needed_padding = @as(u16, @bitSizeOf(usize)) -| 32;
+        return @Type(.{
+            .int = .{
+                .bits = needed_padding,
+                .signedness = .unsigned,
+            },
+        });
+    }
+
+    inline fn get_full_size() type {
+        return @Type(.{
+            .int = .{
+                .bits = @bitSizeOf(usize) + 32,
+                .signedness = .unsigned,
+            },
+        });
+    }
+
+    ref_count: u32,
+    _padding: get_needed_padding() = 0,
+    generation: u32,
 };
 
 /// This is the script object internal representation. It is an array
@@ -605,12 +626,18 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     return heap;
 }
 
-pub fn deinit(self: *Heap) void {
-    // Parsed scripts have references to objects, so we'll deinit them first.
+fn clearParsedScripts(self: *Heap) void {
     var parsed_script_iter = self.parsed_scripts.valueIterator();
     while (parsed_script_iter.next()) |parsed_script| {
-        parsed_script.deinit(self);
+        parsed_script.script.deinit(self);
     }
+
+    self.parsed_scripts.clearRetainingCapacity();
+}
+
+pub fn deinit(self: *Heap) void {
+    // Parsed scripts have references to objects, so we'll deinit scripts before objects.
+    self.clearParsedScripts();
     self.parsed_scripts.deinit(self.gpa);
 
     for (1..self.objects.len) |i| {
@@ -863,11 +890,8 @@ fn invalidateBodyImpl(handle: Handle) void {
         },
         .script => {
             const script = obj.body.script; // copy
-            if (decrRefCountOf(usize, &script_metadata.items[script.id.toInt()].ref_count)) {
-                broadcastMessage(.{ .free_script = script.id }) catch {
-                    // TODO should we let the script leak, should we block until there's
-                    // room in the queue, or should we panic?
-                };
+            if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count)) {
+                script.id.retire();
             }
         },
         .source => {
@@ -1475,12 +1499,16 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     return finished_str[0..(written - 1) :0];
 }
 
-pub fn leakCheck(self: *Heap) !bool {
+pub fn leakCheck(heap: *Heap) !bool {
+    // Make sure to free any parsed scripts, as they're allowed to leak (they
+    // have references to heap objects, so it will cause a false positive).
+    heap.clearParsedScripts();
+
     var leaked = false;
 
-    for (self.objects.items(.metadata)[1..], 1..) |metadata, i| {
+    for (heap.objects.items(.metadata)[1..], 1..) |metadata, i| {
         if (metadata.in_use) {
-            const handle = self.getHandle(@intCast(i), false);
+            const handle = heap.getHandle(@intCast(i), false);
             std.debug.print("Leaked {s}\n", .{try handle.getString()});
             leaked = true;
         }
@@ -1648,21 +1676,6 @@ pub fn createCustomTypeInstance(self: *Heap) !u32 {
     return @intCast(new_id);
 }
 
-pub fn sendMessage(dest: *Heap, message: HeapMessage) !void {
-    dest.mailbox_mutex.lock();
-    defer dest.mailbox_mutex.unlock();
-
-    try dest.mailbox.append(dest.gpa, message);
-}
-
-/// Message must be copyable.
-pub fn broadcastMessage(message: HeapMessage) !void {
-    const heap_count = @atomicLoad(usize, &state.next_open_heap, .monotonic);
-    for (0..heap_count) |heap_id| {
-        heaps[heap_id].sendMessage(message);
-    }
-}
-
 // Heap instances //
 
 /// Caller is responsible for locking the global mutex.
@@ -1750,10 +1763,10 @@ pub fn createCustomType(custom_type: CustomType) ?*CustomType {
     }
 }
 
-test "Object duplication" {
+test "object duplication" {
     const ta = std.testing.allocator;
     var heap = try createHeap(ta);
-    defer deinitAll();
+    defer Heap.testFinish();
 
     // Number object
     const obj = try heap.createObject();
@@ -1778,10 +1791,10 @@ test "Object duplication" {
     try expectEqual(1, heap.objects.get(new_obj.index).ref_count);
 }
 
-test "Get string" {
+test "get string" {
     const ta = std.testing.allocator;
     var heap = try createHeap(ta);
-    defer deinitAll();
+    defer Heap.testFinish();
 
     const obj = try heap.createObject();
     defer obj.release();
