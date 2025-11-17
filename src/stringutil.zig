@@ -806,13 +806,13 @@ pub fn quoteSize(quoting_type: QuotingType, str_len: usize) usize {
 pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escape_first_pound: bool) usize {
     switch (quoting_type) {
         .bare => {
-            @memmove(dest, src);
+            @memmove(dest[0..src.len], src);
             return src.len;
         },
         .brace => {
             dest[0] = '{';
-            dest[dest.len - 1] = '}';
-            @memmove(dest[1..(dest.len - 1)], src);
+            dest[1 + src.len] = '}';
+            @memmove(dest[1..][0..src.len], src);
             return src.len + 2;
         },
         .escape => {

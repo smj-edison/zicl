@@ -23,7 +23,7 @@ pub fn shimmerToString(calling_heap: *Heap, handle: *Handle) !void {
     _ = try handle.getString(); // Ensure string representation
 
     if (obj.tag != .string) {
-        calling_heap.invalidateBody(handle.*);
+        handle.invalidateBody();
         obj.tag = .string;
         obj.body.string = .{
             // Don't know the utf-8 length yet
@@ -704,7 +704,7 @@ pub fn newUninitializedList(heap: *Heap, len: u32) !Handle {
 
 pub fn newList(heap: *Heap, handles: []const Handle) !Handle {
     const list = try newUninitializedList(heap, @intCast(handles.len));
-    errdefer heap.release(list);
+    errdefer list.release();
 
     const new_items = listItemsRaw(list);
 
@@ -757,7 +757,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
                 _ = unwrapped.reference(); // Increment ref count.
             }
         }
-        defer if (file_name) |unwrapped| calling_heap.release(unwrapped);
+        defer if (file_name) |unwrapped| unwrapped.release();
 
         const str = try handle.getString();
         var parser = Parser.init(str, line_no);
@@ -786,7 +786,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         }
 
         const new_list = try newUninitializedList(calling_heap, @intCast(tokens.items.len));
-        errdefer calling_heap.release(new_list);
+        errdefer new_list.release();
 
         for (tokens.items, 0..) |token, i| {
             const item = listItemRaw(new_list, @intCast(i));
@@ -813,7 +813,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
 
         const old_handle = handle.*;
         handle.* = new_list;
-        calling_heap.release(old_handle);
+        old_handle.release();
     }
 }
 
@@ -829,8 +829,8 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
         for (0..freed_count) |to_free| {
             const to_free_idx = handle.index + 1 + list.body.list.len - freed_count + to_free;
             const to_free_handle = handle.getHeap().getHandle(@intCast(to_free_idx), false);
-            calling_heap.invalidateBody(to_free_handle);
-            calling_heap.invalidateString(to_free_handle);
+            to_free_handle.invalidateBody();
+            to_free_handle.invalidateString();
         }
 
         list.body.list.len = new_len;
@@ -846,7 +846,7 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
 
     // We've exhausted all other options, so we'll need to make a new list.
     const new_list = try newUninitializedList(calling_heap, new_len);
-    errdefer calling_heap.freeObject(new_list);
+    errdefer Heap.freeObject(new_list);
     const new_items = listItemsRaw(new_list);
 
     if (handle.isShared()) {
@@ -857,7 +857,7 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
 
         const old_handle = handle.*;
         handle.* = new_list;
-        calling_heap.release(old_handle);
+        old_handle.release();
     } else {
         // If the list isn't shared, we can move the objects over without
         // any duplication.
@@ -868,7 +868,7 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
 
         // Free the old list without running destructors (because the objects are
         // still in use).
-        handle.getHeap().freeObjectBacking(handle.*);
+        Heap.freeObjectBacking(handle.*);
 
         handle.* = new_list;
     }
@@ -984,7 +984,7 @@ pub fn getSourceInfo(handle: Handle) ?SourceInfo {
 pub fn setSourceInfo(calling_heap: *Heap, source: Handle, source_info: SourceInfo) !void {
     var source_handle = source;
     try Heap.ensureShimmerable(calling_heap, &source_handle);
-    calling_heap.invalidateBody(source_handle);
+    source_handle.invalidateBody();
 
     const ref = source_handle.peek();
     ref.tag = .source;
@@ -1104,7 +1104,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     var new_token_values = try newUninitializedList(calling_heap, new_token_capacity);
     // Set length to 0 so we can just call listAppend().
     try listSetLength(calling_heap, &new_token_values, 0);
-    errdefer calling_heap.release(new_token_values);
+    errdefer new_token_values.release();
 
     var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, new_token_capacity);
     errdefer new_token_tags.deinit(calling_heap.gpa);
@@ -1272,8 +1272,39 @@ test "Script parsing" {
     try expectEqualToken(&parsed, 5, .simple_string, "set");
     try expectEqualToken(&parsed, 6, .simple_string, "y");
     try testing.expectEqual(.start_of_word, tokens[7]);
-    try testing.expectEqual(2, values[4].body.number);
-    try expectEqualToken(&parsed, 3, .simple_string, "5");
+    try testing.expectEqual(2, values[7].body.number);
+    try expectEqualToken(&parsed, 8, .variable_subst, "x");
+    try expectEqualToken(&parsed, 9, .command_subst, "set x");
+}
+
+pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+    try Heap.ensureShimmerable(calling_heap, handle);
+
+    const script_id = try Heap.ScriptId.next();
+    errdefer script_id.retire();
+    var parsed = try parseScript(calling_heap, det, handle.*);
+    errdefer parsed.deinit(calling_heap);
+    try calling_heap.parsed_scripts.put(calling_heap.gpa, script_id, parsed);
+
+    const obj = handle.peek();
+    obj.body.script = .{ .id = script_id };
+    obj.tag = .script;
+}
+
+test "script shimmering" {
+    const ta = testing.allocator;
+    const heap = try Heap.createHeap(ta);
+
+    var script1 = try newString(heap,
+        \\ set x 5
+        \\ set y $x[set x]
+    );
+    std.debug.print("script1: {any}, ref count: {}\n", .{ script1, script1.debugRefCount() });
+    try shimmerToScript(heap, null, &script1);
+    std.debug.print("script1: {any}, ref count: {}\n", .{ script1, script1.debugRefCount() });
+    script1.release();
+
+    Heap.testFinish();
 }
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {

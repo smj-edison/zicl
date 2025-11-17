@@ -19,7 +19,7 @@ fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[
     _ = n;
     _ = alignment;
     _ = ra;
-    @panic("Alloc called on null allocator");
+    return null;
 }
 fn null_resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_size: usize, return_address: usize) bool {
     _ = ctx;
@@ -27,7 +27,7 @@ fn null_resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_size: u
     _ = alignment;
     _ = new_size;
     _ = return_address;
-    @panic("Resize called on null allocator");
+    return false;
 }
 fn null_remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
     _ = context;
@@ -35,14 +35,13 @@ fn null_remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_l
     _ = alignment;
     _ = new_len;
     _ = return_address;
-    @panic("Remap called on null allocator");
+    return null;
 }
 fn null_free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_address: usize) void {
     _ = ctx;
     _ = buf;
     _ = alignment;
     _ = return_address;
-    @panic("Free called on null allocator");
 }
 var null_ctx: usize = 0;
 pub const null_allocator: Allocator = .{
