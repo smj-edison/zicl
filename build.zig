@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // options
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
+    const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse false;
     const bracket_expr_sugar = b.option(bool, "bracket-expr-sugar",
         \\Expression sugar with brackets instead of with parenthesis (e.g. $[5 + 5] instead of $(5 + 5))
     ) orelse false;
@@ -52,6 +53,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "zigtcl",
         .root_module = root,
+        .use_llvm = use_llvm,
     });
 
     b.installArtifact(exe);

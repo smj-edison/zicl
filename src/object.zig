@@ -65,6 +65,8 @@ pub fn getCodepointLength(calling_heap: *Heap, handle: *Handle) !usize {
 /// Copies provided string.
 pub fn newString(calling_heap: *Heap, bytes: []const u8) !Handle {
     var str = try calling_heap.createObject();
+    errdefer str.release();
+
     try str.setString(bytes);
     try shimmerToString(calling_heap, &str);
     return str;
@@ -644,8 +646,7 @@ pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to
     }
 }
 
-test "string is" {
-    const ta = testing.allocator;
+fn testStringIs(ta: std.mem.Allocator) !void {
     const heap = try Heap.createHeap(ta);
     defer Heap.testFinish();
 
@@ -661,13 +662,19 @@ test "string is" {
 
     try testing.expectEqual(true, try stringIs(heap, &details, &str, &class, false));
     try testing.expectEqual(false, try stringIs(heap, &details, &str2, &class, false));
-    try testing.expectError(error.BadEnumVariant, stringIs(heap, &details, &str, &bad_class, false));
+    const err = stringIs(heap, &details, &str, &bad_class, false);
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    try testing.expectError(error.BadEnumVariant, err);
     try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
         try details.message.getString(),
     );
     details.message.release();
+}
+
+test "string is" {
+    try testing.checkAllAllocationFailures(testing.allocator, testStringIs, .{});
 }
 
 pub fn convertParserError(heap: *Heap, err: Parser.Error) error{OutOfMemory}!ErrorDetails {
@@ -935,8 +942,8 @@ pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, ite
 }
 
 fn testLists(ta: std.mem.Allocator) !void {
-    const heap = try Heap.createHeap(ta);
     defer Heap.testFinish();
+    const heap = try Heap.createHeap(ta);
 
     var det: ErrorDetails = undefined;
 
@@ -1270,8 +1277,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     return parsed_script;
 }
 
-test "script parsing" {
-    const ta = testing.allocator;
+fn testScriptParsing(ta: std.mem.Allocator) !void {
     const heap = try Heap.createHeap(ta);
     defer Heap.testFinish();
 
@@ -1279,8 +1285,10 @@ test "script parsing" {
         \\ set x 5
         \\ set y $x[set x]
     );
+    defer script1.release();
     var parsed = try parseScript(heap, null, script1);
-    defer parsed.tags.deinit(ta);
+    defer parsed.deinit(heap);
+
     const tokens = parsed.tags.items;
     const values = listItemsRaw(parsed.values);
 
@@ -1301,6 +1309,10 @@ test "script parsing" {
     try testing.expectEqual(2, values[7].body.number);
     try expectEqualToken(&parsed, 8, .variable_subst, "x");
     try expectEqualToken(&parsed, 9, .command_subst, "set x");
+}
+
+test "script parsing" {
+    try testing.checkAllAllocationFailures(testing.allocator, testScriptParsing, .{});
 }
 
 pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
@@ -1339,40 +1351,48 @@ pub fn getScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Hea
     return script_and_generation.script;
 }
 
-test "script shimmering" {
-    const ta = testing.allocator;
+fn testScriptShimmering(ta: std.mem.Allocator) !void {
     const heap = try Heap.createHeap(ta);
     defer Heap.testFinish();
 
-    var script1 = try newString(heap,
-        \\ set x 5
-        \\ set y $x[set x]
-    );
+    const old_script_id = blk: {
+        var old_script = try newString(heap,
+            \\ set x 5
+            \\ set y $x[set x]
+        );
+        defer old_script.release();
 
-    const parsed_script = try getScript(heap, null, &script1);
-    const script1_id = script1.peek().body.script.id;
-    try testing.expectEqualSlices(Parser.Token.Tag, &[_]Parser.Token.Tag{
-        .start_of_command,
-        .simple_string,
-        .simple_string,
-        .simple_string,
-        .start_of_command,
-        .simple_string,
-        .simple_string,
-        .start_of_word,
-        .variable_subst,
-        .command_subst,
-    }, parsed_script.tags.items);
-    script1.release();
+        const parsed_script = try getScript(heap, null, &old_script);
+        const script1_id = old_script.peek().body.script.id;
+        try testing.expectEqualSlices(Parser.Token.Tag, &[_]Parser.Token.Tag{
+            .start_of_command,
+            .simple_string,
+            .simple_string,
+            .simple_string,
+            .start_of_command,
+            .simple_string,
+            .simple_string,
+            .start_of_word,
+            .variable_subst,
+            .command_subst,
+        }, parsed_script.tags.items);
 
-    var script2 = try newString(heap, "set x 5");
-    try shimmerToScript(heap, null, &script2);
-    const script2_id = script2.peek().body.script.id;
+        break :blk script1_id;
+    };
 
-    try testing.expectEqual(script1_id.index, script2_id.index);
-    try testing.expect(script1_id.generation != script2_id.generation);
+    var new_script = try newString(heap, "set x 5");
+    defer new_script.release();
 
-    script2.release();
+    try shimmerToScript(heap, null, &new_script);
+    const new_script_id = new_script.peek().body.script.id;
+
+    // Make sure the new script recycles the old script's index
+    try testing.expectEqual(old_script_id.index, new_script_id.index);
+    try testing.expect(old_script_id.generation != new_script_id.generation);
+}
+
+test "script shimmering" {
+    try testing.checkAllAllocationFailures(testing.allocator, testScriptShimmering, .{});
 }
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {

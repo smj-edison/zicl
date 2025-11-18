@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const math = std.math;
 
 const Allocator = std.mem.Allocator;
@@ -35,9 +36,14 @@ pub const HeapSettings = struct {
     max_heaps: usize = 128,
     /// Whether to enable memory tracing (for debugging only, as
     /// it leaks the strings it allocates)
-    trace_mem: bool = false,
+    trace_mem: bool = true,
 };
 const cfg: HeapSettings = .{};
+
+// Use these for debugging objects (traces, etc) that can afford
+// to leak.
+var debugging_gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{}){} else undefined;
+var debug_gpa = if (builtin.mode == .Debug) debugging_gpa.allocator() else undefined;
 
 pub const GlobalHeapState = struct {
     initialized: bool = false,
@@ -47,7 +53,7 @@ pub const GlobalHeapState = struct {
     /// Used for all global data structures (currently custom_types and script_metadata)
     gpa: std.mem.Allocator = undefined,
     next_open_heap: usize = 0,
-    running_leak_check: bool = false,
+    running_leak_check: bool = true,
 };
 pub var state: GlobalHeapState = .{};
 pub var heaps: [cfg.max_heaps]Heap = undefined;
@@ -142,8 +148,6 @@ pub const ScriptId = packed struct(u64) {
     pub fn retire(id: ScriptId) void {
         state.mutex.lock();
         defer state.mutex.unlock();
-
-        std.debug.print("Retire {}\n", .{id});
 
         script_metadata.destroy(id.index);
         // Increment generation.
@@ -716,7 +720,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         self.objects.items(.trace)[index].addAddr(
             @returnAddress(),
             try std.fmt.allocPrint(
-                self.gpa,
+                debug_gpa,
                 "Alloc {} of order {}",
                 .{ index, order },
             ),
@@ -771,7 +775,7 @@ pub fn freeObjectBacking(handle: Handle) void {
     if (cfg.trace_mem) {
         const trace = &obj_heap.objects.items(.trace)[handle.index];
         trace.addAddr(@returnAddress(), std.fmt.allocPrint(
-            state.gpa,
+            debug_gpa,
             "Free {} of order {}",
             .{ handle.index, metadata.order },
         ) catch "OOM");
@@ -1509,7 +1513,12 @@ pub fn leakCheck(heap: *Heap) !bool {
     for (heap.objects.items(.metadata)[1..], 1..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i), false);
-            std.debug.print("Leaked {s}\n", .{try handle.getString()});
+            std.debug.print("Leaked \"{s}\"\n", .{try handle.getString()});
+            if (cfg.trace_mem) {
+                heap.objects.get(i).trace.dump();
+                std.debug.print("\n\n", .{});
+            }
+
             leaked = true;
         }
     }
@@ -1702,6 +1711,12 @@ pub fn createHeap(gpa: Allocator) !*Heap {
 
         break :blk heap_index;
     };
+    errdefer {
+        // Roll back heap index if it failed to initialize correctly.
+        state.mutex.lock();
+        state.next_open_heap -= 1;
+        state.mutex.unlock();
+    }
 
     if (slot_index < cfg.max_heaps) {
         const new_heap = try init(gpa, @intCast(slot_index));
@@ -1729,10 +1744,6 @@ pub fn leakCheckAll() void {
     state.mutex.lock();
     state.running_leak_check = false;
     state.mutex.unlock();
-
-    if (leaked == true) {
-        @panic("Leaks found");
-    }
 }
 
 pub fn deinitAll() void {
@@ -1740,9 +1751,8 @@ pub fn deinitAll() void {
     for (heaps[0..state.next_open_heap]) |*heap| {
         heap.deinit();
     }
+    state.next_open_heap = 0;
     state.mutex.unlock();
-
-    @atomicStore(usize, &state.next_open_heap, 0, .seq_cst);
 }
 
 pub fn testFinish() void {
