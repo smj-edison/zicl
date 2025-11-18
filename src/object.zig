@@ -829,31 +829,34 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
     }
 }
 
-/// Panics if provided handle is not a list.
+/// Panics if provided handle is not a list, or if it can't shimmer.
 fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
     const list = handle.peek();
     assert(list.tag == .list);
 
-    // No need to realloc if we're shrinking.
-    if (new_len <= list.body.list.len) {
-        // Be sure to free the objects when we shrink though.
-        const freed_count = list.body.list.len - new_len;
-        for (0..freed_count) |to_free| {
-            const to_free_idx = handle.index + 1 + list.body.list.len - freed_count + to_free;
-            const to_free_handle = handle.getHeap().getHandle(@intCast(to_free_idx), false);
-            to_free_handle.invalidateBody();
-            to_free_handle.invalidateString();
+    // We can only do these quick changes if the list is not shared.
+    if (!handle.isShared()) {
+        // No need to realloc if we're shrinking.
+        if (new_len <= list.body.list.len) {
+            // Be sure to free the objects when we shrink though.
+            const freed_count = list.body.list.len - new_len;
+            for (0..freed_count) |to_free| {
+                const to_free_handle = listItemRaw(handle.*, @intCast(list.body.list.len - freed_count + to_free));
+                to_free_handle.invalidateBody();
+                to_free_handle.invalidateString();
+            }
+
+            list.body.list.len = new_len;
+            return;
         }
 
-        list.body.list.len = new_len;
-        return;
-    }
-
-    // Even if there's not enough length, there may be enough capacity.
-    const order = handle.getHeap().objects.items(.metadata)[handle.index].order;
-    const capacity = memutil.getOrderSize(order) - 1; // -1 for list head
-    if (new_len <= capacity) {
-        list.body.list.len = new_len;
+        // Even if there's not enough length, there may be enough capacity.
+        const order = handle.getHeap().objects.items(.metadata)[handle.index].order;
+        const capacity = memutil.getOrderSize(order) - 1; // -1 for list head
+        if (new_len <= capacity) {
+            list.body.list.len = new_len;
+            return;
+        }
     }
 
     // We've exhausted all other options, so we'll need to make a new list.
@@ -1316,20 +1319,38 @@ test "script parsing" {
 }
 
 pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
-    if (handle.peek().tag == .script) return;
+    var using_new_id: bool = undefined;
+    var script_id: Heap.ScriptId = undefined;
+
+    if (handle.peek().tag == .script) {
+        const script = handle.peek().body.script;
+        script_id = script.id;
+        using_new_id = false;
+
+        if (calling_heap.parsed_scripts.get(handle.*.index)) |existing_script| {
+            if (existing_script.generation == script.id.generation) {
+                // Object is already a script, it exists as parsed in our heap,
+                // and it's the correct generation. No need to reparse!
+                return;
+            } else {
+                // Wrong generation, so free the old one before overwriting (later in code).
+                var script_as_mut = existing_script.script;
+                script_as_mut.deinit(calling_heap);
+            }
+        } else {
+            // We don't have this script in our heap, so keep going to generate it.
+        }
+    } else {
+        using_new_id = true;
+        script_id = try Heap.ScriptId.next();
+    }
+    errdefer if (using_new_id) script_id.retire();
+
     try Heap.ensureShimmerable(calling_heap, handle);
 
-    const script_id = try Heap.ScriptId.next();
-    errdefer script_id.retire();
     var parsed = try parseScript(calling_heap, det, handle.*);
     errdefer parsed.deinit(calling_heap);
 
-    // Check if this script index already exists in the calling heap.
-    if (calling_heap.parsed_scripts.get(script_id.index)) |existing_script| {
-        // Already exists in the heap, so we'll deinit it before we overwrite it.
-        var script_as_mut = existing_script.script;
-        script_as_mut.deinit(calling_heap);
-    }
     try calling_heap.parsed_scripts.put(calling_heap.gpa, script_id.index, .{
         .script = parsed,
         .generation = script_id.generation,
@@ -1386,7 +1407,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     try shimmerToScript(heap, null, &new_script);
     const new_script_id = new_script.peek().body.script.id;
 
-    // Make sure the new script recycles the old script's index
+    // Make sure the new script recycles the old script's index.
     try testing.expectEqual(old_script_id.index, new_script_id.index);
     try testing.expect(old_script_id.generation != new_script_id.generation);
 }

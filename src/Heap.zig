@@ -13,8 +13,8 @@ const Parser = @import("Parser.zig");
 const object = @import("object.zig");
 
 // These numbers are final, and can be depended on to be their current values
-const null_string = 0;
-const empty_string = 1;
+pub const null_string = 0;
+pub const empty_string = 1;
 
 const global_heap_id = 0;
 // --- //
@@ -36,7 +36,7 @@ pub const HeapSettings = struct {
     max_heaps: usize = 128,
     /// Whether to enable memory tracing (for debugging only, as
     /// it leaks the strings it allocates)
-    trace_mem: bool = true,
+    trace_mem: bool = false,
 };
 const cfg: HeapSettings = .{};
 
@@ -321,15 +321,6 @@ pub const Object = packed struct(u128) {
     str: StrOrPtr,
     tag: Tag,
     body: Body,
-
-    fn hasNullString(self: Object) bool {
-        if (self.str.is_ptr) {
-            return false;
-        } else {
-            // Must check length too, as tiny strings use a null index but non-zero length
-            return self.str.u.str.index == 0 and self.str.u.str.len == 0;
-        }
-    }
 };
 
 comptime {
@@ -467,6 +458,10 @@ pub const Handle = packed struct(u64) {
     pub fn isShared(handle: Handle) bool {
         const objects = handle.getHeap().objects.slice();
         return objects.items(.metadata)[handle.index].cross_thread or objects.items(.ref_count)[handle.index] > 1;
+    }
+
+    pub fn hasString(handle: Handle) bool {
+        return handle.peek().str != Object.null_string;
     }
 
     /// This should not be used for checking if an object is shared, use `isShared` instead.
@@ -615,17 +610,20 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         .parsed_scripts = parsed_scripts,
     };
 
-    // Specialty objects
-    // null object is guaranteed to have index 0
-    const null_object = try heap.createObject();
-    assert(null_object.index == 0);
-
     // null string is guaranteed to have index 0
     const null_string_idx = try heap.string_tracking.alloc(gpa, 0);
     assert(null_string_idx == null_string);
     // empty string is guaranteed to have index 1
     const empty_string_idx = try heap.string_tracking.alloc(gpa, 0);
     assert(empty_string_idx == empty_string);
+
+    // Specialty objects
+    // null object is guaranteed to have index 0.
+    const null_object = try heap.createObject();
+    assert(null_object.index == 0);
+    // Empty object is guaranteed to have index 1.
+    const empty_object = try heap.createObject();
+    assert(empty_object.index == 1);
 
     return heap;
 }
@@ -676,6 +674,14 @@ pub fn deinit(self: *Heap) void {
 pub fn nullObject(self: *Heap) Handle {
     return .{
         .index = 0,
+        .heap = self.heap_id,
+        .ref_counted = false,
+    };
+}
+
+pub fn emptyObject(self: *Heap) Handle {
+    return .{
+        .index = 1,
         .heap = self.heap_id,
         .ref_counted = false,
     };
