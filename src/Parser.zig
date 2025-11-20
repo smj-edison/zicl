@@ -77,7 +77,7 @@ pub const Token = struct {
         /// number of arguments for this command.
         start_of_command,
         /// Special 'start-of-word' token. Corrisponding object contains the
-        /// number of tokens to combine for this word (of type .number)
+        /// number of tokens to combine for this word (of type .integer)
         start_of_word,
 
         // Used for expr parsing

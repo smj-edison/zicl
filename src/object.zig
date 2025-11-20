@@ -10,6 +10,14 @@ const Heap = @import("./Heap.zig");
 const Parser = @import("./Parser.zig");
 const Handle = Heap.Handle;
 
+pub const Error = std.mem.Allocator.Error || error{
+    WrongArgumentCount,
+    BadIndex,
+    NotMutable,
+    BadEnumVariant,
+    BadBoolean,
+};
+
 pub const ErrorDetails = struct {
     message: Handle,
     index: ?u32 = null,
@@ -214,7 +222,7 @@ fn badIndexError(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void
         .message = try newStringFmt(calling_heap, "bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
-    return error.BadIndex;
+    return Error.BadIndex;
 }
 
 /// Shimmers to an index representation.
@@ -258,11 +266,11 @@ pub fn getIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap
 
     // Fast case: if it's an integer or float, we can quickly cast it (don't
     // shimmer though, as it'll probably still be used for its original purpose)
-    if (obj.tag == .number) {
-        if (obj.body.number < 0) return badIndexError(det, handle);
-        if (obj.body.number > std.math.maxInt(u32)) return badIndexError(det, handle);
+    if (obj.tag == .integer) {
+        if (obj.body.integer < 0) return badIndexError(det, handle);
+        if (obj.body.integer > std.math.maxInt(u32)) return badIndexError(det, handle);
 
-        return .{ .u = .{ .index = @intCast(obj.body.number) }, .is_end = false };
+        return .{ .u = .{ .index = @intCast(obj.body.integer) }, .is_end = false };
     } else if (obj.tag == .float) {
         const value = obj.body.float;
 
@@ -270,7 +278,7 @@ pub fn getIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap
         if (value < 0) return badIndexError(det, handle);
         if (value > std.math.maxInt(u32)) return badIndexError(det, handle);
 
-        return .{ .u = .{ .index = @intFromFloat(obj.body.number) }, .is_end = false };
+        return .{ .u = .{ .index = @intFromFloat(obj.body.integer) }, .is_end = false };
     }
 
     if (obj.tag != .index) {
@@ -329,8 +337,8 @@ pub fn stringReplace(calling_heap: *Heap, str: *Handle, start: *Handle, end: *Ha
             const new_bytes = Heap.getStringMut(new_str) catch |err| {
                 switch (err) {
                     // empty strings aren't mutable, so we'll just return the empty string
-                    error.NotMutable => return new_str,
-                    error.OutOfMemory => return err,
+                    Error.NotMutable => return new_str,
+                    Error.OutOfMemory => return err,
                 }
             };
 
@@ -349,8 +357,8 @@ pub fn stringReplace(calling_heap: *Heap, str: *Handle, start: *Handle, end: *Ha
             const new_bytes = Heap.getStringMut(new_str) catch |err| {
                 switch (err) {
                     // empty strings aren't mutable, so we'll just return the empty string
-                    error.NotMutable => return new_str,
-                    error.OutOfMemory => return err,
+                    Error.NotMutable => return new_str,
+                    Error.OutOfMemory => return err,
                 }
             };
 
@@ -395,8 +403,8 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
         const new_bytes = try Heap.getStringMut(new_str) catch |err| {
             switch (err) {
                 // empty strings aren't mutable, so we'll just return the empty string
-                error.NotMutable => return new_str,
-                error.OutOfMemory => return err,
+                Error.NotMutable => return new_str,
+                Error.OutOfMemory => return err,
             }
         };
 
@@ -427,8 +435,8 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
         const new_bytes = try Heap.getStringMut(new_str) catch |err| {
             switch (err) {
                 // Empty strings aren't mutable, so we'll just return the empty string.
-                error.NotMutable => return new_str,
-                error.OutOfMemory => return err,
+                Error.NotMutable => return new_str,
+                Error.OutOfMemory => return err,
             }
         };
 
@@ -577,7 +585,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
                     ),
                 };
 
-                return error.BadEnumVariant;
+                return Error.BadEnumVariant;
             }
         }
     };
@@ -663,8 +671,8 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     try testing.expectEqual(true, try stringIs(heap, &details, &str, &class, false));
     try testing.expectEqual(false, try stringIs(heap, &details, &str2, &class, false));
     const err = stringIs(heap, &details, &str, &bad_class, false);
-    if (err == error.OutOfMemory) return error.OutOfMemory;
-    try testing.expectError(error.BadEnumVariant, err);
+    if (err == Error.OutOfMemory) return Error.OutOfMemory;
+    try testing.expectError(Error.BadEnumVariant, err);
     try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
@@ -698,12 +706,12 @@ pub fn convertParserError(heap: *Heap, err: Parser.Error) error{OutOfMemory}!Err
     }
 }
 
-pub fn newUninitializedList(heap: *Heap, len: u32) !Handle {
+pub fn listUninitializedNew(heap: *Heap, len: u32) !Handle {
     // `1 +` to make space for the list's head
     const list_index = try heap.createObjects(1 + len);
-    const list: []Heap.Object = heap.objects.items(.object)[list_index..][0..(len + 1)];
+    const list_head: *Heap.Object = &heap.objects.items(.object)[list_index];
 
-    list[0] = .{
+    list_head.* = .{
         .str = Heap.Object.null_string,
         .tag = .list,
         .body = .{
@@ -716,8 +724,8 @@ pub fn newUninitializedList(heap: *Heap, len: u32) !Handle {
     return heap.normalHandle(list_index);
 }
 
-pub fn newList(heap: *Heap, handles: []const Handle) !Handle {
-    const list = try newUninitializedList(heap, @intCast(handles.len));
+pub fn listNew(heap: *Heap, handles: []const Handle) !Handle {
+    const list = try listUninitializedNew(heap, @intCast(handles.len));
     errdefer list.release();
 
     const new_items = listItemsRaw(list);
@@ -797,7 +805,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
             }
         }
 
-        const new_list = try newUninitializedList(calling_heap, @intCast(tokens.items.len));
+        const new_list = try listUninitializedNew(calling_heap, @intCast(tokens.items.len));
         errdefer new_list.release();
 
         for (tokens.items, 0..) |token, i| {
@@ -860,7 +868,7 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
     }
 
     // We've exhausted all other options, so we'll need to make a new list.
-    const new_list = try newUninitializedList(calling_heap, new_len);
+    const new_list = try listUninitializedNew(calling_heap, new_len);
     errdefer Heap.freeObject(new_list);
     const new_items = listItemsRaw(new_list);
 
@@ -955,7 +963,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     defer obj1.release();
     const obj2 = try newString(heap, "object 2");
     defer obj2.release();
-    var list1 = try newList(heap, &.{ obj1, obj2 });
+    var list1 = try listNew(heap, &.{ obj1, obj2 });
     defer list1.release();
 
     const items = listItemsRaw(list1);
@@ -986,6 +994,138 @@ fn testLists(ta: std.mem.Allocator) !void {
 
 test "lists" {
     try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
+}
+
+pub fn dictItemsRaw(handle: Handle) []Heap.Object {
+    const obj = handle.peek();
+    const obj_heap = handle.getHeap();
+
+    assert(obj.tag == .dict);
+
+    const len = obj_heap.dicts.items[obj.body.dict].len;
+    return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..len];
+}
+
+pub fn dictItemRaw(handle: Handle, index: u32) Handle {
+    const dict = handle.peek();
+    assert(dict.tag == .dict);
+    const metadata = handle.getHeap().dicts.items[dict.body.dict];
+
+    if (index < metadata.len) {
+        return .{
+            .index = handle.index + 1 + index,
+            .heap = handle.heap,
+            .ref_counted = false,
+        };
+    } else {
+        std.debug.panic("Index {} out of bounds (length {})", .{ index, metadata.len });
+    }
+}
+
+fn dictUninitializedNew(heap: *Heap, len: u32) !Handle {
+    assert(@mod(len, 2) == 0);
+
+    // `1 +` to make space for the dict's head.
+    const dict_index = try heap.createObjects(1 + len);
+    errdefer Heap.freeObjectBacking(heap.normalHandle(dict_index));
+    const dict_metadata = try heap.createDictMetadata();
+    errdefer heap.destroyDictMetadata(dict_metadata);
+
+    heap.dicts.items[dict_metadata] = .{
+        .dict = .empty,
+        .len = len,
+    };
+
+    const dict_head: *Heap.Object = &heap.objects.items(.object)[dict_index];
+    dict_head.* = .{
+        .str = Heap.Object.null_string,
+        .tag = .dict,
+        .body = .{
+            .dict = dict_metadata,
+        },
+    };
+
+    return heap.normalHandle(dict_index);
+}
+
+/// Caller is responsible that `handles` has handles.len % 2 == 0.
+pub fn dictNew(heap: *Heap, handles: []const Handle) !Handle {
+    const dict = try dictUninitializedNew(heap, @intCast(handles.len));
+    errdefer dict.release();
+
+    const new_items = dictItemsRaw(dict);
+
+    for (handles, new_items) |handle, *item| {
+        item.* = try heap.duplicateOrReference(handle);
+    }
+
+    try dictReindex(dict);
+
+    return dict;
+}
+
+/// Panics if not a dict, or if it can't shimmer.
+pub fn dictReindex(handle: Handle) !void {
+    assert(handle.canShimmer());
+    const obj = handle.peek();
+    assert(obj.tag == .dict);
+    const dict = &handle.getHeap().dicts.items[obj.body.dict];
+    assert(dict.len % 2 == 0);
+
+    dict.dict.clearRetainingCapacity();
+
+    // This properly accounts for duplicate dictionary entries,
+    // as it'll just overwrite it with the second `dict.put`.
+    var pair: u32 = 0;
+    while (pair < dict.len) : (pair += 2) {
+        const key: Handle = .{
+            .index = handle.index + 1 + pair,
+            .heap = handle.heap,
+            .ref_counted = false,
+        };
+        // Point to `pair + 1`, e.g. the value following the key
+        try dict.dict.put(handle.getHeap().gpa, key, pair + 1);
+    }
+}
+
+pub fn dictLookupRaw(dict: Handle, key: Handle) ?Handle {
+    assert(dict.peek().tag == .dict);
+
+    const dict_heap = dict.getHeap();
+    const metadata = &dict_heap.dicts.items[dict.peek().body.dict];
+
+    if (metadata.dict.get(key)) |value_offset| {
+        return dictItemRaw(dict, value_offset);
+    } else return null;
+}
+
+fn testDicts(ta: std.mem.Allocator) !void {
+    defer Heap.testFinish();
+    const heap = try Heap.createHeap(ta);
+
+    const key1 = try newString(heap, "foo");
+    defer key1.release();
+    const value1 = try newString(heap, "1");
+    defer value1.release();
+    const key2 = try newString(heap, "bar");
+    defer key2.release();
+    const value2 = try newString(heap, "2");
+    defer value2.release();
+
+    const dict1 = try dictNew(heap, &[_]Heap.Handle{ key1, value1, key2, value2 });
+    defer dict1.release();
+
+    const good_key = try newString(heap, "foo");
+    defer good_key.release();
+    const bad_key = try newString(heap, "bogus");
+    defer bad_key.release();
+
+    try testing.expectEqualStrings("1", try Heap.getString(dictLookupRaw(dict1, good_key).?));
+    try testing.expectEqual(null, dictLookupRaw(dict1, bad_key));
+}
+
+test "dicts" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDicts, .{});
 }
 
 pub const SourceInfo = struct {
@@ -1137,7 +1277,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     const new_token_capacity: u32 = @intCast(tokens.items.len + 1);
 
     // Initialize the Heap-stored list that will contain the corrisponding value for each token.
-    var new_token_values = try newUninitializedList(calling_heap, new_token_capacity);
+    var new_token_values = try listUninitializedNew(calling_heap, new_token_capacity);
     errdefer new_token_values.release();
     // Set length to 0 so we can just call listAppend().
     try listSetLength(calling_heap, &new_token_values, 0);
@@ -1213,9 +1353,9 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
 
             _ = try listAppendObject(calling_heap, det, &new_token_values, .{
                 .str = Heap.Object.null_string,
-                .tag = .number,
+                .tag = .integer,
                 .body = .{
-                    .number = @intCast(arg_token_count),
+                    .integer = @intCast(arg_token_count),
                 },
             });
         }
@@ -1309,7 +1449,7 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
     try expectEqualToken(&parsed, 5, .simple_string, "set");
     try expectEqualToken(&parsed, 6, .simple_string, "y");
     try testing.expectEqual(.start_of_word, tokens[7]);
-    try testing.expectEqual(2, values[7].body.number);
+    try testing.expectEqual(2, values[7].body.integer);
     try expectEqualToken(&parsed, 8, .variable_subst, "x");
     try expectEqualToken(&parsed, 9, .command_subst, "set x");
 }
@@ -1443,7 +1583,7 @@ pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
                 .{handle},
             ),
         };
-        return error.BadBoolean;
+        return Error.BadBoolean;
     };
 
     const ref = handle.peek();

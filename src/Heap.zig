@@ -85,7 +85,7 @@ dicts: DictionaryPool,
 type_instances: CustomTypeInstancePool,
 parsed_scripts: ParsedScripts,
 
-pub const HeapId = u30;
+pub const HeapId = u16;
 const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
 
 const ObjectTracker = memutil.BuddyUnmanaged(cfg.object_heap_order);
@@ -285,7 +285,7 @@ pub const ParsedScript = struct {
                     line = value.body.script_command.line;
                     std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.script_command });
                 },
-                .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.number }),
+                .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
                     const item = object.listItemRaw(script.values, @intCast(i));
                     std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), getString(item) catch "<oom string>" });
@@ -331,16 +331,18 @@ pub const Object = packed struct(u128) {
 pub const Tag = enum(u5) {
     none,
     index,
-    number,
+    integer,
     float,
     bool,
     string,
     source,
     list,
     dict,
+    dict_subst,
     script_command,
     script,
     reference,
+    variable,
     custom_type,
 };
 
@@ -370,7 +372,7 @@ pub const Body = packed union {
     none: void,
     /// List index
     index: ListIndex,
-    number: i64,
+    integer: i64,
     float: f64,
     bool: bool,
     string: packed struct {
@@ -390,6 +392,10 @@ pub const Body = packed union {
     /// from a list, but duplicates will be removed when any writing operation
     /// happens.
     dict: DictIndex,
+    dict_subst: packed struct {
+        var_name_index: u32,
+        dict_value_index: u32,
+    },
     /// Information about a command.
     script_command: packed struct {
         line: u32,
@@ -399,6 +405,14 @@ pub const Body = packed union {
         id: ScriptId,
     },
     reference: Handle,
+    variable: packed struct {
+        index: u32,
+        /// Used to invalidate `index`'s cached value, if it doesn't match
+        /// the current evaluator's call frame.
+        call_frame_idx: u31,
+        /// Whether the variable is global, e.g. prefixed with ::
+        is_global: bool,
+    },
     custom_type: packed struct {
         type_id: u32,
         index: u32,
@@ -433,7 +447,7 @@ pub const Handle = packed struct(u64) {
     heap: HeapId,
     /// Whether this object can be ref counted (else it needs to be cloned)
     ref_counted: bool,
-    _padding: u1 = 0,
+    _padding: u15 = 0,
 
     pub fn format(
         self: Handle,
@@ -457,7 +471,7 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn isShared(handle: Handle) bool {
-        const objects = handle.getHeap().objects.slice();
+        const objects = handle.getHeap().objects;
         return objects.items(.metadata)[handle.index].cross_thread or objects.items(.ref_count)[handle.index] > 1;
     }
 
@@ -724,7 +738,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         .str = Object.null_string,
         .tag = .none,
         .body = .{
-            .number = 0,
+            .integer = 0,
         },
     });
 
@@ -756,6 +770,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 pub fn freeObjectBacking(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.objects.items(.metadata)[handle.index];
+    assert(metadata.is_alloc_head);
 
     obj_heap.mem_mgmt_mutex.lock();
     if (cfg.trace_mem) {
@@ -854,16 +869,19 @@ fn invalidateBodyImpl(handle: Handle) void {
             }
         },
         .dict => {
-            const dict = &obj_heap.dicts.items[obj.body.dict];
+            const dict_metadata = &obj_heap.dicts.items[obj.body.dict];
 
             // Don't free the head (e.g. self)
-            for (1..(dict.len + 1)) |i| {
+            for (1..(dict_metadata.len + 1)) |i| {
                 freeObject(.{
                     .index = @intCast(handle.index + i),
                     .heap = handle.heap,
                     .ref_counted = false,
                 });
             }
+
+            dict_metadata.dict.deinit(obj_heap.gpa);
+            obj_heap.destroyDictMetadata(obj.body.dict);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
@@ -890,7 +908,9 @@ fn invalidateBodyImpl(handle: Handle) void {
                 obj_heap.normalHandle(source.file_name_obj).release();
             }
         },
-        .none, .index, .number, .float, .bool, .script_command => {},
+        .none, .index, .integer, .dict_subst, .variable, .float, .bool, .script_command => {
+            obj.body = undefined;
+        },
     }
 
     obj.tag = .none;
@@ -1024,7 +1044,7 @@ pub fn duplicateOrReference(self: *Heap, handle: Handle) !Object {
 pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
-        .none, .index, .number, .float, .string, .bool, .script, .script_command => {
+        .none, .index, .integer, .float, .string, .bool, .script, .script_command => {
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
@@ -1079,6 +1099,14 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
             try custom_types.items[custom_type.type_id].duplicate(self, src, &new_object);
 
             return new_object;
+        },
+        .dict_subst, .variable => {
+            // Variable lookup is not stable between threads.
+            return .{
+                .str = try self.duplicateObjString(handle),
+                .tag = .none,
+                .body = undefined,
+            };
         },
         .list, .dict => {
             return error.MultiItemObject;
@@ -1161,7 +1189,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 .str = try calling_heap.duplicateObjString(handle),
                 .tag = .dict,
                 .body = .{
-                    .dict = try calling_heap.createDictionary(),
+                    .dict = try calling_heap.createDictMetadata(),
                 },
             };
             errdefer calling_heap.dicts.destroy(new_head.body.dict);
@@ -1181,7 +1209,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
 
             const dict = &calling_heap.dicts.items[new_head.body.dict];
             dict.len = old_head.len;
-            try reindexDict(calling_heap.gpa, calling_heap.normalHandle(new_dict_idx));
+            try object.dictReindex(calling_heap.normalHandle(new_dict_idx));
 
             return calling_heap.normalHandle(new_dict_idx);
         },
@@ -1400,8 +1428,8 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         .index => {
             new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.index}, 0);
         },
-        .number => {
-            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.number}, 0);
+        .integer => {
+            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.integer}, 0);
         },
         .float => {
             new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.float}, 0);
@@ -1442,11 +1470,8 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 new_str = try std.fmt.allocPrintSentinel(self.gpa, "<none>", .{}, 0);
             } else @panic("Tried to generate a string for .none");
         },
-        .string => {
-            @panic("Tried to generate a string for .string with no body");
-        },
-        .source, .script => {
-            @panic("Source and script objects should always have a string representation");
+        .string, .dict_subst, .source, .script, .variable => {
+            std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     }
 
@@ -1650,30 +1675,7 @@ pub const CustomTypes = struct {
     }
 };
 
-/// Panics if not a dict.
-pub fn reindexDict(gpa: Allocator, handle: Handle) !void {
-    const obj = handle.peek();
-    assert(obj.tag == .dict);
-    const dict = &handle.getHeap().dicts.items[obj.body.dict];
-    assert(dict.len % 2 == 0);
-
-    dict.dict.clearRetainingCapacity();
-
-    // This properly accounts for duplicate dictionary entries,
-    // as it'll just overwrite it the second `dict.put`
-    var pair: u32 = 0;
-    while (pair < dict.len) : (pair += 2) {
-        const key: Handle = .{
-            .index = handle.index + 1 + pair,
-            .heap = handle.heap,
-            .ref_counted = false,
-        };
-        // Point to `pair + 1`, e.g. the value following the key
-        try dict.dict.put(gpa, key, pair + 1);
-    }
-}
-
-pub fn createDictionary(self: *Heap) !DictIndex {
+pub fn createDictMetadata(self: *Heap) !DictIndex {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
@@ -1681,6 +1683,13 @@ pub fn createDictionary(self: *Heap) !DictIndex {
     if (new_id >= object_heap_max_count) return error.OutOfMemory;
 
     return @intCast(new_id);
+}
+
+pub fn destroyDictMetadata(self: *Heap, index: DictIndex) void {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    self.dicts.destroy(index);
 }
 
 pub fn createCustomTypeInstance(self: *Heap) !u32 {
@@ -1790,15 +1799,15 @@ test "object duplication" {
     const obj = try heap.createObject();
     defer obj.release();
     var ref = obj.peek();
-    ref.tag = .number;
-    ref.body.number = 10;
+    ref.tag = .integer;
+    ref.body.integer = 10;
 
     const new_obj = try heap.duplicate(obj);
     const new_ref = new_obj.peek();
     defer new_obj.release();
 
-    try expectEqual(.number, new_ref.tag);
-    try expectEqual(10, new_ref.body.number);
+    try expectEqual(.integer, new_ref.tag);
+    try expectEqual(10, new_ref.body.integer);
 
     // try borrowing
     const borrowed = try heap.borrow(new_obj);
@@ -1817,8 +1826,8 @@ test "get string" {
     const obj = try heap.createObject();
     defer obj.release();
     var ref = obj.peek();
-    ref.tag = .number;
-    ref.body.number = 10;
+    ref.tag = .integer;
+    ref.body.integer = 10;
 
     try expectEqualSlices(u8, "10", try getString(obj));
 }

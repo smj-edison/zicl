@@ -11,11 +11,20 @@ gpa: std.mem.Allocator,
 /// The result from a procedure or eval call
 result: ?Heap.Handle,
 error_details: object.ErrorDetails,
-eval_frame: ?EvalFrame,
-call_frame: ?CallFrame,
+/// Eval frames are separate from call frames, as eval calls can be
+/// nested while staying in the same scope. For example,
+/// `puts [+ 2 2]` has one call frame (the global scope), and two
+/// eval frames (one for puts, and while puts is running, another
+/// for +).
+eval_frames: std.ArrayList(EvalFrame),
+call_frames: std.ArrayList(CallFrame),
 commands: CommandHashTable,
 
+evaluating_safe_expr: bool,
+
 pub const CommandFn = fn (interp: *Interp, args: []const Heap.Handle) void;
+
+pub const Error = std.mem.Allocator.Error || error{ EvaluatingSafeExpression, IsDictSugar };
 
 const ProcedureSignature = struct {
     /// Handle to the argument list of the procedure.
@@ -99,12 +108,44 @@ pub fn setEmptyResult(interp: *Interp) void {
     interp.result = interp.heap.emptyObject();
 }
 
+fn shimmerToVariable(interp: *Interp, name: *Heap.Handle) !void {
+    try interp.heap.ensureShimmerable(name);
+    const name_obj = name.peek();
+
+    if (name_obj.tag == .variable) {
+        // Fast case: if we're in the same call frame as last time,
+        // we don't need to do anything.
+        if (name_obj.body.variable.call_frame_idx == interp.currentCallFrame()) return;
+
+        // Need to re-resolve the variable in the current call frame.
+    } else if (name_obj.tag == .dict_subst) {
+        return Error.IsDictSugar;
+    }
+
+    var var_name = try Heap.getString(name.*);
+
+    // Make sure it's not syntax to get/set a dict.
+    if (var_name.len >= 2 and var_name[0] == '(' and var_name[var_name.len - 1] == ')') {
+        return Error.IsDictSugar;
+    }
+
+    //  No need to check slice length since it's null terminated.
+    if (var_name[0] == ':' and var_name[1] == ':') {
+        // Skip as many colons as are present to match tcl behavior.
+        while (var_name[0] == ':') var_name = var_name[1..];
+    }
+}
+
+/// Resolves to the variables' value.
+pub fn getVariable(interp: *Interp, name: Heap.Handle) !Heap.Handle {
+    if (interp.evaluating_safe_expr) return Error.EvaluatingSafeExpression;
+
+    var new_name = name;
+    const result = interp.shimmerToVariable(&new_name);
+}
+
 /// Call frame.
 const CallFrame = struct {
-    /// Parent call frame.
-    parent: *CallFrame,
-    /// Level of this frame. 0 = global.
-    level: u32,
     /// Handle to a hash map containing the variables.
     variables: Heap.Handle,
     /// Handle to a hash map containing all the statics.
@@ -115,31 +156,18 @@ const CallFrame = struct {
     signature: ProcedureSignature,
 };
 
-/// Evaluation frame.
-const EvalFrame = struct {
-    /// Parent of this frame.
-    parent: ?*EvalFrame,
-    /// Pointer to the corrisponding call frame.
-    call_frame: *CallFrame,
-    /// Level of this frame. 0 = global.
-    level: u32,
-};
-
-fn initAndPushEvalFrame(interp: *Interp, frame: *EvalFrame) void {
-    const level = if (interp.eval_frame) |unwrapped| unwrapped.level else 0;
-    frame.* = .{
-        .call_frame = interp.call_frame.?,
-        .level = level + 1,
-        .parent = interp.eval_frame,
-    };
-
-    interp.eval_frame = frame;
+fn currentCallFrame(interp: *Interp) usize {
+    return interp.call_frames.items.len - 1;
 }
 
-fn popEvalFrame(interp: *Interp) void {
-    if (interp.eval_frame) |current_frame| {
-        interp.eval_frame = current_frame.parent;
-    }
+/// Evaluation frame.
+const EvalFrame = struct {
+    /// Pointer to the corrisponding call frame.
+    call_frame: usize,
+};
+
+fn currentEvalFrame(interp: *Interp) usize {
+    return interp.eval_frames.items.len - 1;
 }
 
 pub const ControlFlow = enum {
@@ -174,12 +202,13 @@ pub fn eval(interp: *Interp, script: *Heap.Handle) !ControlFlow {
 
     // FIXME do I need `script->inUse++;`?
 
-    var eval_frame: EvalFrame = undefined;
+    interp.eval_frames.append(interp.gpa, .{
+        .call_frame = interp.call_frames.items.len,
+    });
+    defer interp.eval_frames.pop();
+    const eval_frame = interp.currentEvalFrame();
 
-    // Eval frames become a linked list of frames on the stack.
-    interp.initAndPushEvalFrame(&eval_frame);
-    defer interp.popEvalFrame();
-
+    // Used for allocating the arguments passed into a command call.
     const args_alloc_backing = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
     const args_alloc = args_alloc_backing.get();
 
@@ -187,16 +216,38 @@ pub fn eval(interp: *Interp, script: *Heap.Handle) !ControlFlow {
     var command_token_i: usize = 0;
 
     const tags = parsed.tags.items;
+    const values = object.listItemsRaw(parsed.values);
+    // Loop through commands.
     while (command_token_i < tags.len) : (command_token_i += 1) {
         // First token of the line is always .script_command.
-        const command_info = object.listItemRaw(parsed.values, command_token_i).peek().body.script_command;
+        const command_info = values[command_token_i].body.script_command;
         command_token_i += 1; // Skip .script_command.
 
         const args = try args_alloc.alloc(Heap.Handle, command_info.arg_count);
         defer args_alloc.free(args);
 
-        // Populate the arguments objects.
-        var word_i = 0;
-        while (word_i < command_info.arg_count) {}
+        // Populate the arguments by looping through each word of the command and
+        // substituting.
+        var word_token_i: usize = command_token_i;
+        while (word_token_i < command_token_i + command_info.arg_count) : (word_token_i += 1) {
+            var word_parts: usize = 1;
+            const argument_expansion = tags[word_token_i] == .argument_expansion;
+            if (tags[word_token_i] == .start_of_word or argument_expansion) {
+                word_parts = values[word_token_i].body.integer;
+                word_token_i += 1;
+            }
+
+            const resultant_word: Heap.Handle = blk: {
+                // Simple one-to-one substitution, so a simple case.
+                if (word_parts == 1) {
+                    switch (tags[word_token_i]) {
+                        .simple_string => {
+                            break :blk object.listItemRaw(parsed.values, word_token_i);
+                        },
+                        .variable_subst => {},
+                    }
+                }
+            };
+        }
     }
 }
