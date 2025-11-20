@@ -20,7 +20,7 @@ pub fn shimmerToString(calling_heap: *Heap, handle: *Handle) !void {
     try Heap.ensureShimmerable(calling_heap, handle);
 
     const obj = handle.peek();
-    _ = try handle.getString(); // Ensure string representation
+    _ = try Heap.getString(handle.*); // Ensure string representation
 
     if (obj.tag != .string) {
         handle.invalidateBody();
@@ -67,7 +67,7 @@ pub fn newString(calling_heap: *Heap, bytes: []const u8) !Handle {
     var str = try calling_heap.createObject();
     errdefer str.release();
 
-    try str.setString(bytes);
+    try Heap.setString(str, bytes);
     try shimmerToString(calling_heap, &str);
     return str;
 }
@@ -77,7 +77,7 @@ pub fn newStringFmt(calling_heap: *Heap, comptime fmt: []const u8, args: anytype
     // TODO PERF no need to allocate the string, just to duplicate it
     const value = try std.fmt.allocPrint(calling_heap.gpa, fmt, args);
     defer calling_heap.gpa.free(value);
-    try str.setString(value);
+    try Heap.setString(str, value);
     return str;
 }
 
@@ -564,7 +564,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
             // TODO PERF we can optimize this by shimmering the value to an "enum" type,
             // where the enum type has a u48 storing the hash of enum_name and a u16 for
             // which variant it is, by index.
-            const bytes = try value.getString();
+            const bytes = try Heap.getString(value.*);
             const variant = map.get(bytes);
             if (variant) |unwrapped| {
                 return unwrapped;
@@ -613,7 +613,7 @@ pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to
 
     const class = try Class.get(calling_heap, det, class_to_check);
 
-    const bytes = try str.getString();
+    const bytes = try Heap.getString(str.*);
     if (bytes.len == 0) {
         return !strict;
     }
@@ -668,7 +668,7 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
-        try details.message.getString(),
+        try Heap.getString(details.message),
     );
     details.message.release();
 }
@@ -773,7 +773,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         }
         defer if (file_name) |unwrapped| unwrapped.release();
 
-        const str = try handle.getString();
+        const str = try Heap.getString(handle.*);
         var parser = Parser.init(str, line_no);
 
         // Figure out how many tokens there are, so we can create the correct list size
@@ -805,7 +805,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
 
             if (token.tag == .simple_string) {
                 // Normal string, so no escaping needed.
-                try item.setString(str[token.loc.start..token.loc.end]);
+                try Heap.setString(item, str[token.loc.start..token.loc.end]);
             } else {
                 // Needs escaping. We'll create another string to copy the escaped string into.
                 try setStringFromEscaped(
@@ -963,13 +963,13 @@ fn testLists(ta: std.mem.Allocator) !void {
     // The object should have been copied when being moved into the list
     try testing.expect(obj1.peek().str != items[0].str);
     // But it should have an identical string
-    try testing.expectEqualStrings("object 1", try listItemRaw(list1, 0).getString());
+    try testing.expectEqualStrings("object 1", try Heap.getString(listItemRaw(list1, 0)));
 
     const to_append = try newString(heap, "appended item");
     defer to_append.release();
 
     _ = try listAppend(heap, &det, &list1, to_append);
-    try testing.expectEqualStrings("appended item", try listItemRaw(list1, 2).getString());
+    try testing.expectEqualStrings("appended item", try Heap.getString(listItemRaw(list1, 2)));
 
     var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
@@ -979,9 +979,9 @@ fn testLists(ta: std.mem.Allocator) !void {
     const old_string_list_handle = string_list;
     try shimmerToList(heap, &det, &string_list);
     try testing.expect(old_string_list_handle != string_list);
-    try testing.expectEqualStrings("item1", try listItemRaw(string_list, 0).getString());
-    try testing.expectEqualStrings("item 2", try listItemRaw(string_list, 1).getString());
-    try testing.expectEqualStrings("item 3", try listItemRaw(string_list, 2).getString());
+    try testing.expectEqualStrings("item1", try Heap.getString(listItemRaw(string_list, 0)));
+    try testing.expectEqualStrings("item 2", try Heap.getString(listItemRaw(string_list, 1)));
+    try testing.expectEqualStrings("item 3", try Heap.getString(listItemRaw(string_list, 2)));
 }
 
 test "lists" {
@@ -1053,7 +1053,7 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     try testing.expectEqual(@as(u32, 42), ref.body.source.line_no);
 
     const info = getSourceInfo(obj);
-    try testing.expectEqualSlices(u8, "test_file.tcl", try info.?.file_name.?.getString());
+    try testing.expectEqualSlices(u8, "test_file.tcl", try Heap.getString(info.?.file_name.?));
     try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
     const obj2 = try newString(heap, "hello");
@@ -1082,10 +1082,10 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
 
     // Parse all the tokens of the script, handling any errors that come up. //
 
-    const bytes = try handle.getString();
+    const bytes = try Heap.getString(handle);
     var parser = Parser.init(bytes, source_info.line_no);
 
-    // Set up tokens list.
+    // Set up tokens list (to be added to).
     var tokens = try std.ArrayList(Parser.Token).initCapacity(calling_heap.gpa, bytes.len / 8);
     defer tokens.deinit(calling_heap.gpa);
 
@@ -1138,9 +1138,9 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
 
     // Initialize the Heap-stored list that will contain the corrisponding value for each token.
     var new_token_values = try newUninitializedList(calling_heap, new_token_capacity);
+    errdefer new_token_values.release();
     // Set length to 0 so we can just call listAppend().
     try listSetLength(calling_heap, &new_token_values, 0);
-    errdefer new_token_values.release();
 
     var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, new_token_capacity);
     errdefer new_token_tags.deinit(calling_heap.gpa);
@@ -1251,7 +1251,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
                     );
                     str_handle = listItemRaw(new_token_values, str_idx);
 
-                    try str_handle.setString(bytes[token.loc.start..token.loc.end]);
+                    try Heap.setString(str_handle, bytes[token.loc.start..token.loc.end]);
                 },
             }
 
@@ -1322,29 +1322,34 @@ pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle
     var using_new_id: bool = undefined;
     var script_id: Heap.ScriptId = undefined;
 
+    // Figure out whether the provided object already has a script id, or if we need to
+    // generate a new one.
     if (handle.peek().tag == .script) {
         const script = handle.peek().body.script;
         script_id = script.id;
         using_new_id = false;
-
-        if (calling_heap.parsed_scripts.get(handle.*.index)) |existing_script| {
-            if (existing_script.generation == script.id.generation) {
-                // Object is already a script, it exists as parsed in our heap,
-                // and it's the correct generation. No need to reparse!
-                return;
-            } else {
-                // Wrong generation, so free the old one before overwriting (later in code).
-                var script_as_mut = existing_script.script;
-                script_as_mut.deinit(calling_heap);
-            }
-        } else {
-            // We don't have this script in our heap, so keep going to generate it.
-        }
     } else {
         using_new_id = true;
         script_id = try Heap.ScriptId.next();
     }
     errdefer if (using_new_id) script_id.retire();
+
+    if (calling_heap.parsed_scripts.get(script_id.index)) |existing_script| {
+        if (existing_script.generation == script_id.generation) {
+            // Object is already a script, it exists as parsed in our heap,
+            // and it's the correct generation. No need to reparse!
+            return;
+        } else {
+            // Wrong generation, so free the old one before overwriting (later in code).
+            var script_as_mut = existing_script.script;
+            script_as_mut.deinit(calling_heap);
+            // Be sure to remove it, in case we hit an error before we have the chance
+            // to overwrite it.
+            _ = calling_heap.parsed_scripts.remove(script_id.index);
+        }
+    } else {
+        // We don't have this script in our heap, so keep going to generate it.
+    }
 
     try Heap.ensureShimmerable(calling_heap, handle);
 
@@ -1378,8 +1383,8 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
 
     const old_script_id = blk: {
         var old_script = try newString(heap,
-            \\ set x 5
-            \\ set y $x[set x]
+            \\ set foo 5
+            \\ set y $foo[set foo]
         );
         defer old_script.release();
 
@@ -1418,7 +1423,7 @@ test "script shimmering" {
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {
     try testing.expectEqual(tag, script.tags.items[index]);
-    try testing.expectEqualStrings(value, try listItemRaw(script.values, index).getString());
+    try testing.expectEqualStrings(value, try Heap.getString(listItemRaw(script.values, index)));
 }
 
 pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
@@ -1429,7 +1434,7 @@ pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
         .{ "0", false }, .{ "false", false }, .{ "no", false }, .{ "off", false },
     });
 
-    const bytes = try handle.getString();
+    const bytes = try Heap.getString(handle.*);
     const new_value = Mapping.get(bytes) orelse {
         if (det) |details| details.* = .{
             .message = try newStringFmt(

@@ -16,6 +16,10 @@ const object = @import("object.zig");
 pub const null_string = 0;
 pub const empty_string = 1;
 
+pub const special_object_count = 2;
+pub const null_object_idx = 0;
+pub const empty_object_idx = 1;
+
 const global_heap_id = 0;
 // --- //
 
@@ -36,7 +40,7 @@ pub const HeapSettings = struct {
     max_heaps: usize = 128,
     /// Whether to enable memory tracing (for debugging only, as
     /// it leaks the strings it allocates)
-    trace_mem: bool = false,
+    trace_mem: bool = true,
 };
 const cfg: HeapSettings = .{};
 
@@ -102,7 +106,7 @@ pub const Dictionary = struct {
         pub fn hash(ctx: @This(), key: Handle) u64 {
             _ = ctx;
 
-            const str = key.getString() catch return 0;
+            const str = getString(key) catch return 0;
             return std.hash_map.hashString(str);
         }
 
@@ -200,17 +204,17 @@ pub const ScriptMetadata = packed struct(ScriptMetadata.get_full_size()) {
 /// will produce a ParsedScript with the following token/object pairs:
 ///
 /// | .start_of_command  | 2     |
-/// | .simple_string  | puts  |
-/// | .simple_string  | hello |
+/// | .simple_string     | puts  |
+/// | .simple_string     | hello |
 /// | .start_of_command  | 4     |
-/// | .simple_string  | set   |
-/// | .variable_subst | i     |
-/// | .start_of_word  | 2     |
-/// | .variable_subst | x     |
-/// | .variable_subst | y     |
-/// | .start_of_word  | 2     |
-/// | .command_subst  | foo   |
-/// | .simple_string  | BAR   |
+/// | .simple_string     | set   |
+/// | .variable_subst    | i     |
+/// | .start_of_word     | 2     |
+/// | .variable_subst    | x     |
+/// | .variable_subst    | y     |
+/// | .start_of_word     | 2     |
+/// | .command_subst     | foo   |
+/// | .simple_string     | BAR   |
 ///
 /// "puts hello" has two args (.start_of_command 2), composed of single tokens.
 /// (Note that the .start_of_command token is omitted for the common case of a
@@ -284,7 +288,7 @@ pub const ParsedScript = struct {
                 .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.number }),
                 else => {
                     const item = object.listItemRaw(script.values, @intCast(i));
-                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), item.getString() catch "<oom string>" });
+                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), getString(item) catch "<oom string>" });
                 },
             }
         }
@@ -306,6 +310,7 @@ pub const Object = packed struct(u128) {
         .u = .{ .str = .{ .index = 1, .len = 0 } },
         .is_ptr = false,
     };
+
     pub const StrOrPtr = packed struct(u59) {
         u: packed union {
             str: packed struct {
@@ -322,10 +327,6 @@ pub const Object = packed struct(u128) {
     tag: Tag,
     body: Body,
 };
-
-comptime {
-    assert(@sizeOf(Object) == 16);
-}
 
 pub const Tag = enum(u5) {
     none,
@@ -351,7 +352,7 @@ pub const ListIndex = packed struct {
         index: u32,
         end_offset: i33,
     },
-    /// Whether this is a relative index, such as "end", or "end-1", etc
+    /// Whether this is a relative index, such as "end", "end-1", "end+5", etc
     is_relative: bool,
 
     pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
@@ -483,27 +484,6 @@ pub const Handle = packed struct(u64) {
         };
     }
 
-    /// Guaranteed to be valid, barring OOM.
-    pub fn getString(handle: Handle) Allocator.Error![:0]const u8 {
-        return try handle.getHeap().getLocalString(handle.index);
-    }
-
-    /// Copies provided string.
-    pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
-        const heap = handle.getHeap();
-
-        // Try setting as a normal string first
-        const did_set = try heap.setNormalString(handle.index, bytes);
-        if (!did_set) {
-            // Setting it as a long string will most likely take ownership,
-            // so we need to copy.
-            const new_str = try heap.gpa.dupeZ(u8, bytes);
-            errdefer heap.gpa.free(new_str);
-            const took_ownership = try heap.setLongString(handle.index, new_str, .normal);
-            if (!took_ownership) heap.gpa.free(new_str);
-        }
-    }
-
     pub fn invalidateString(handle: Handle) void {
         invalidateStringImpl(handle);
     }
@@ -532,7 +512,7 @@ const ObjectAndMetadata = struct {
         /// Whether this object is currently being used (used to track double frees)
         in_use: bool,
     },
-    trace: std.debug.ConfigurableTrace(8, 8, @import("builtin").mode == .Debug),
+    trace: std.debug.ConfigurableTrace(8, 8, cfg.trace_mem),
 };
 
 fn heapAlloc(self: *Heap) Allocator {
@@ -642,7 +622,7 @@ pub fn deinit(self: *Heap) void {
     self.clearParsedScripts();
     self.parsed_scripts.deinit(self.gpa);
 
-    for (1..self.objects.len) |i| {
+    for (special_object_count..self.objects.len) |i| {
         const metadata = self.objects.get(i).metadata;
         if (metadata.in_use) {
             // We don't use free object here, as it may cause a double-free when
@@ -950,8 +930,8 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
     if (a == b) return true;
 
     // Make sure they have a string rep before checking the details
-    const a_str = try a.getString();
-    const b_str = try b.getString();
+    const a_str = try getString(a);
+    const b_str = try getString(b);
     const a_details = getStringDetails(a);
     const b_details = getStringDetails(b);
 
@@ -1235,6 +1215,27 @@ pub fn getLocalObject(self: *Heap, index: u32) *Object {
     return &self.objects.items(.object)[index];
 }
 
+/// Guaranteed to be valid, barring OOM.
+pub fn getString(handle: Handle) Allocator.Error![:0]const u8 {
+    return try handle.getHeap().getLocalString(handle.index);
+}
+
+/// Copies provided string.
+pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
+    const heap = handle.getHeap();
+
+    // Try setting as a normal string first
+    const did_set = try heap.setNormalString(handle.index, bytes);
+    if (!did_set) {
+        // Setting it as a long string will most likely take ownership,
+        // so we need to copy.
+        const new_str = try heap.gpa.dupeZ(u8, bytes);
+        errdefer heap.gpa.free(new_str);
+        const took_ownership = try heap.setLongString(handle.index, new_str, .normal);
+        if (!took_ownership) heap.gpa.free(new_str);
+    }
+}
+
 /// Get the string to modify (must not write any longer than current len).
 /// Not threadsafe.
 pub fn getStringMut(handle: Handle) ![:0]u8 {
@@ -1258,7 +1259,7 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
 /// Returns whether the exchange was successful (if not, caller is responsible
 /// for cleaning up).
 pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set_to: Object.StrOrPtr) bool {
-    const obj: *Object = &self.objects.items(.object)[index];
+    const obj: *Object = self.getLocalObject(index);
     if (cfg.threading and self.objects.get(index).metadata.cross_thread) {
         // Atomically swap only the first half of the object
         if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
@@ -1376,7 +1377,7 @@ const empty_string_value = "";
 /// This returns a temporary string. Whenever the object is modified, it
 /// may become invalid.
 fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
-    const obj: *Object = &self.objects.items(.object)[index];
+    const obj: *Object = self.getLocalObject(index);
 
     switch (self.getLocalStringDetails(index)) {
         .long => |long_str| {
@@ -1422,8 +1423,8 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
         .reference => {
             // Intentionally return early, since we should always use
-            // the reference's string, not our own
-            return obj.body.reference.getString();
+            // the reference's string, not our own.
+            return getString(obj.body.reference);
         },
         .script_command => {
             if (state.running_leak_check) {
@@ -1516,13 +1517,14 @@ pub fn leakCheck(heap: *Heap) !bool {
 
     var leaked = false;
 
-    for (heap.objects.items(.metadata)[1..], 1..) |metadata, i| {
+    for (heap.objects.items(.metadata)[special_object_count..], special_object_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i), false);
-            std.debug.print("Leaked \"{s}\"\n", .{try handle.getString()});
+            std.debug.print("Leaked {} @ {} \"{s}\"\n", .{ handle.peek().tag, i, try getString(handle) });
             if (cfg.trace_mem) {
-                heap.objects.get(i).trace.dump();
-                std.debug.print("\n\n", .{});
+                const trace = heap.objects.get(i).trace;
+                trace.dump();
+                if (trace.index > 0) std.debug.print("\n\n", .{});
             }
 
             leaked = true;
@@ -1818,7 +1820,7 @@ test "get string" {
     ref.tag = .number;
     ref.body.number = 10;
 
-    try expectEqualSlices(u8, "10", try obj.getString());
+    try expectEqualSlices(u8, "10", try getString(obj));
 }
 
 const DummyMutex = struct {
