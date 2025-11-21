@@ -18,13 +18,21 @@ error_details: object.ErrorDetails,
 /// for +).
 eval_frames: std.ArrayList(EvalFrame),
 call_frames: std.ArrayList(CallFrame),
+/// Used to invalidate cached variable lookups. Will overflow, but
+/// when it overflows it'll scan through the heap and invalidate all
+/// variables.
+current_epoch: u31,
 commands: CommandHashTable,
 
 evaluating_safe_expr: bool,
 
 pub const CommandFn = fn (interp: *Interp, args: []const Heap.Handle) void;
 
-pub const Error = std.mem.Allocator.Error || error{ EvaluatingSafeExpression, IsDictSugar };
+pub const Error = std.mem.Allocator.Error || error{
+    EvaluatingSafeExpression,
+    IsDictSugar,
+    VariableNotFound,
+};
 
 const ProcedureSignature = struct {
     /// Handle to the argument list of the procedure.
@@ -109,13 +117,14 @@ pub fn setEmptyResult(interp: *Interp) void {
 }
 
 fn shimmerToVariable(interp: *Interp, name: *Heap.Handle) !void {
+    // This ensures that the name is local to this interpreters' heap.
     try interp.heap.ensureShimmerable(name);
     const name_obj = name.peek();
 
     if (name_obj.tag == .variable) {
-        // Fast case: if we're in the same call frame as last time,
+        // Fast case: if we're in the same epoch as last time,
         // we don't need to do anything.
-        if (name_obj.body.variable.call_frame_idx == interp.currentCallFrame()) return;
+        if (name_obj.body.variable.epoch == interp.current_epoch) return;
 
         // Need to re-resolve the variable in the current call frame.
     } else if (name_obj.tag == .dict_subst) {
@@ -129,11 +138,55 @@ fn shimmerToVariable(interp: *Interp, name: *Heap.Handle) !void {
         return Error.IsDictSugar;
     }
 
+    var call_frame_id: u32 = 0;
+    var is_global: bool = false;
+    var var_value: ?Heap.Handle = null;
+
     //  No need to check slice length since it's null terminated.
     if (var_name[0] == ':' and var_name[1] == ':') {
+        call_frame_id = 0; // global frame
+        is_global = true;
+
         // Skip as many colons as are present to match tcl behavior.
         while (var_name[0] == ':') var_name = var_name[1..];
+
+        const var_dict = interp.call_frames.items[call_frame_id].variables;
+        // TODO PERF would it be possible to make dict lookup take a slice
+        // instead of an object?
+        const key = try object.newString(interp.heap, var_name);
+        defer key.release();
+
+        var_value = object.dictLookupRaw(var_dict, key);
+    } else {
+        call_frame_id = interp.currentCallFrame();
+        is_global = false;
+
+        const var_dict = interp.call_frames.items[call_frame_id].variables;
+        const statics_dict = interp.call_frames.items[call_frame_id].statics;
+
+        // Check the variables dictionary.
+        var_value = object.dictLookupRaw(var_dict, name.*);
+
+        // Maybe it's in the statics dictionary instead?
+        if (var_value == null) {
+            if (statics_dict) |unwrapped| {
+                // Be sure to check the statics if we don't have a local
+                // variable with the same name.
+                var_value = object.dictLookupRaw(unwrapped, name.*);
+            }
+        }
     }
+
+    if (var_value) |unwrapped| {
+        // Free the old representation and set the new one.
+        name.invalidateBody();
+
+        name_obj.body.variable = .{
+            .epoch = interp.current_epoch,
+            .index = unwrapped.index,
+            .is_global = is_global,
+        };
+    } else return Error.VariableNotFound;
 }
 
 /// Resolves to the variables' value.
@@ -146,14 +199,17 @@ pub fn getVariable(interp: *Interp, name: Heap.Handle) !Heap.Handle {
 
 /// Call frame.
 const CallFrame = struct {
-    /// Handle to a hash map containing the variables.
+    /// Handle to a dictionary containing the variables.
     variables: Heap.Handle,
-    /// Handle to a hash map containing all the statics.
-    statics: Heap.Handle,
+    /// Handle to a dictionary containing all the statics.
+    statics: ?Heap.Handle,
     /// Arguments of the procedure call, a heap-stored list.
     args: Heap.Handle,
     /// Signature of the procedure that this is being called with.
     signature: ProcedureSignature,
+    /// Epoch id. Used to invalidate previous variable lookups. Will overflow,
+    /// but when it overflows it'll scan the heap and reset all cached lookups.
+    epoch_id: u32,
 };
 
 fn currentCallFrame(interp: *Interp) usize {

@@ -11,11 +11,11 @@ const Parser = @import("./Parser.zig");
 const Handle = Heap.Handle;
 
 pub const Error = std.mem.Allocator.Error || error{
-    WrongArgumentCount,
     BadIndex,
     NotMutable,
     BadEnumVariant,
     BadBoolean,
+    BadDict,
 };
 
 pub const ErrorDetails = struct {
@@ -746,13 +746,15 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
 
     // Optimise dict -> list for object with no string rep.
     if (obj.tag == .dict and Heap.getStringDetails(handle.*) == .null) {
+        // Only need to ensure it's shimmerable in this case, since
+        // in the other case we duplicate it anyways.
         try Heap.ensureShimmerable(calling_heap, handle);
 
-        const dict = &obj_heap.dicts.items[obj.body.dict];
-        const len = dict.len;
+        const metadata = obj_heap.getDictMetadata(obj.body.dict);
+        const len = metadata.len;
 
         // Discard the old hash map.
-        dict.dict.clearAndFree(obj_heap.gpa);
+        metadata.dict.clearAndFree(obj_heap.gpa);
 
         // Because both lists and dicts store their values directly after,
         // we can just swap out the head to convert to a list.
@@ -837,32 +839,38 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
     }
 }
 
+pub fn listLength(calling_heap: *Heap, det: ?*ErrorDetails, list: *Handle) !u32 {
+    try shimmerToList(calling_heap, det, list);
+
+    return list.peek().body.list.len;
+}
+
 /// Panics if provided handle is not a list, or if it can't shimmer.
-fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
-    const list = handle.peek();
-    assert(list.tag == .list);
+fn listSetLength(calling_heap: *Heap, list: *Handle, new_len: u32) !void {
+    const list_obj = list.peek();
+    assert(list_obj.tag == .list);
 
     // We can only do these quick changes if the list is not shared.
-    if (!handle.isShared()) {
+    if (!list.isShared()) {
         // No need to realloc if we're shrinking.
-        if (new_len <= list.body.list.len) {
+        if (new_len <= list_obj.body.list.len) {
             // Be sure to free the objects when we shrink though.
-            const freed_count = list.body.list.len - new_len;
+            const freed_count = list_obj.body.list.len - new_len;
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItemRaw(handle.*, @intCast(list.body.list.len - freed_count + to_free));
+                const to_free_handle = listItemRaw(list.*, @intCast(list_obj.body.list.len - freed_count + to_free));
                 to_free_handle.invalidateBody();
                 to_free_handle.invalidateString();
             }
 
-            list.body.list.len = new_len;
+            list_obj.body.list.len = new_len;
             return;
         }
 
         // Even if there's not enough length, there may be enough capacity.
-        const order = handle.getHeap().objects.items(.metadata)[handle.index].order;
+        const order = list.getHeap().objects.items(.metadata)[list.index].order;
         const capacity = memutil.getOrderSize(order) - 1; // -1 for list head
         if (new_len <= capacity) {
-            list.body.list.len = new_len;
+            list_obj.body.list.len = new_len;
             return;
         }
     }
@@ -872,28 +880,28 @@ fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
     errdefer Heap.freeObject(new_list);
     const new_items = listItemsRaw(new_list);
 
-    if (handle.isShared()) {
+    if (list.isShared()) {
         // If the list is shared, we need to duplicate all the items.
         for (0.., new_items) |i, *new_item| {
-            new_item.* = try Heap.duplicateOrReference(calling_heap, listItemRaw(handle.*, @intCast(i)));
+            new_item.* = try Heap.duplicateOrReference(calling_heap, listItemRaw(list.*, @intCast(i)));
         }
 
-        const old_handle = handle.*;
-        handle.* = new_list;
+        const old_handle = list.*;
+        list.* = new_list;
         old_handle.release();
     } else {
         // If the list isn't shared, we can move the objects over without
         // any duplication.
-        const old_items = listItemsRaw(handle.*);
+        const old_items = listItemsRaw(list.*);
         for (old_items, new_items[0..old_items.len]) |old_item, *new_item| {
             new_item.* = old_item;
         }
 
         // Free the old list without running destructors (because the objects are
         // still in use).
-        Heap.freeObjectBacking(handle.*);
+        Heap.freeObjectBacking(list.*);
 
-        handle.* = new_list;
+        list.* = new_list;
     }
 }
 
@@ -996,20 +1004,51 @@ test "lists" {
     try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
 }
 
+pub fn shimmerToDict(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+    if (handle.peek().tag == .dict) return;
+
+    // Getting the list length will also shimmer it to a list.
+    const len = try listLength(calling_heap, det, handle);
+    if (@mod(len, 2) == 1) {
+        // Unmatched key.
+        if (det) |details| details.* = .{
+            .message = try newString(calling_heap, "missing value to go with key"),
+        };
+        return Error.BadDict;
+    }
+
+    const handle_heap = handle.getHeap();
+
+    const metadata_index = try handle_heap.createDictMetadata();
+    handle_heap.getDictMetadata(metadata_index).len = len;
+
+    // Because both lists and dicts store their values directly after,
+    // we can just swap out the head to convert to a dict.
+    handle.peek().* = .{
+        .str = Heap.Object.null_string,
+        .tag = .dict,
+        .body = .{
+            .dict = metadata_index,
+        },
+    };
+
+    try dictReindex(handle.*);
+}
+
 pub fn dictItemsRaw(handle: Handle) []Heap.Object {
     const obj = handle.peek();
     const obj_heap = handle.getHeap();
 
     assert(obj.tag == .dict);
 
-    const len = obj_heap.dicts.items[obj.body.dict].len;
+    const len = obj_heap.getDictMetadata(obj.body.dict).len;
     return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..len];
 }
 
 pub fn dictItemRaw(handle: Handle, index: u32) Handle {
     const dict = handle.peek();
     assert(dict.tag == .dict);
-    const metadata = handle.getHeap().dicts.items[dict.body.dict];
+    const metadata = handle.getHeap().getDictMetadata(dict.body.dict);
 
     if (index < metadata.len) {
         return .{
@@ -1022,6 +1061,12 @@ pub fn dictItemRaw(handle: Handle, index: u32) Handle {
     }
 }
 
+pub fn dictPairLength(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !u32 {
+    try shimmerToDict(calling_heap, det, handle);
+
+    return handle.getHeap().getDictMetadata(handle.peek().body.dict).len / 2;
+}
+
 fn dictUninitializedNew(heap: *Heap, len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
@@ -1031,7 +1076,7 @@ fn dictUninitializedNew(heap: *Heap, len: u32) !Handle {
     const dict_metadata = try heap.createDictMetadata();
     errdefer heap.destroyDictMetadata(dict_metadata);
 
-    heap.dicts.items[dict_metadata] = .{
+    heap.getDictMetadata(dict_metadata).* = .{
         .dict = .empty,
         .len = len,
     };
@@ -1069,7 +1114,7 @@ pub fn dictReindex(handle: Handle) !void {
     assert(handle.canShimmer());
     const obj = handle.peek();
     assert(obj.tag == .dict);
-    const dict = &handle.getHeap().dicts.items[obj.body.dict];
+    const dict = handle.getHeap().getDictMetadata(obj.body.dict);
     assert(dict.len % 2 == 0);
 
     dict.dict.clearRetainingCapacity();
@@ -1092,11 +1137,84 @@ pub fn dictLookupRaw(dict: Handle, key: Handle) ?Handle {
     assert(dict.peek().tag == .dict);
 
     const dict_heap = dict.getHeap();
-    const metadata = &dict_heap.dicts.items[dict.peek().body.dict];
+    const metadata = dict_heap.getDictMetadata(dict.peek().body.dict);
 
     if (metadata.dict.get(key)) |value_offset| {
         return dictItemRaw(dict, value_offset);
     } else return null;
+}
+
+/// Removes duplicate entries when running. Assumes handle is a dict.
+fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
+    assert(handle.peek().tag == .dict);
+    try Heap.ensureModifiable(calling_heap, handle);
+
+    const dict_obj = handle.peek();
+    const dict_heap = handle.getHeap();
+    const metadata = dict_heap.getDictMetadata(dict_obj.body.dict);
+
+    if (metadata.dict.size * 2 != metadata.len) {
+        // Before modifying a dictionary, we need to remove any duplicate keys.
+
+        const items = dictItemsRaw(handle.*);
+        var pair_index: u32 = 0;
+
+        while (pair_index < metadata.len / 2) : (pair_index += 1) {
+            const key_index = pair_index * 2;
+            const value_index = key_index + 1;
+            const key_handle = dictItemRaw(handle.*, key_index);
+            const value_handle = dictItemRaw(handle.*, value_index);
+
+            if (metadata.dict.get(key_handle).? != value_index) {
+                key_handle.peek().tag = .marked;
+                value_handle.peek().tag = .marked;
+            }
+        }
+
+        // Why mark all the handles before later removing them? Because the hash map
+        // requires all the keys and values to not move, and we use the hash map
+        // to see what pairs need to be removed.
+        var removed: u32 = 0;
+        pair_index = 0;
+        while (pair_index < metadata.len / 2) : (pair_index += 1) {
+            const key_index = pair_index * 2;
+            const value_index = key_index + 1;
+            const key_handle = dictItemRaw(handle.*, key_index);
+            const value_handle = dictItemRaw(handle.*, value_index);
+
+            if (key_handle.peek().tag == .marked) {
+                removed += 1;
+
+                // We have to invalidate the string here, and not earlier, because
+                // the hash map `.get()` uses the string rep of the keys.
+                key_handle.invalidateString();
+                key_handle.invalidateBody();
+                value_handle.invalidateString();
+                value_handle.invalidateBody();
+            } else if (removed > 0) {
+                // There was a pair removed at some point, so we need to shift this pair backwards.
+                const new_key_index = (pair_index - removed) * 2;
+                const new_value_index = new_key_index + 1;
+
+                items[new_key_index] = items[key_index];
+                items[new_value_index] = items[value_index];
+            }
+        }
+
+        // "zero" out the removed items.
+        for ((metadata.len - removed * 2)..metadata.len) |to_zero| {
+            items[to_zero] = .{
+                .str = Heap.Object.null_string,
+                .tag = .none,
+                .body = undefined,
+            };
+        }
+
+        metadata.len -= removed * 2;
+
+        // Be sure to reindex, now that we've shuffled everything around.
+        try dictReindex(handle.*);
+    }
 }
 
 fn testDicts(ta: std.mem.Allocator) !void {
@@ -1122,6 +1240,19 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     try testing.expectEqualStrings("1", try Heap.getString(dictLookupRaw(dict1, good_key).?));
     try testing.expectEqual(null, dictLookupRaw(dict1, bad_key));
+
+    // Dict with duplicate entries
+    var dict_with_duplicates = try newString(heap, "foo 5 bar 10 foo 15");
+    defer dict_with_duplicates.release();
+    const dup_len = try dictPairLength(heap, null, &dict_with_duplicates);
+
+    try testing.expectEqual(3, dup_len);
+    // Should be last entry.
+    try testing.expectEqualStrings("15", try Heap.getString(dictLookupRaw(dict_with_duplicates, key1).?));
+
+    try dictEnsureMutable(heap, &dict_with_duplicates);
+    const dup_mut_len = try dictPairLength(heap, null, &dict_with_duplicates);
+    try testing.expectEqual(2, dup_mut_len);
 }
 
 test "dicts" {

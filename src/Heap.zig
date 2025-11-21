@@ -57,7 +57,7 @@ pub const GlobalHeapState = struct {
     /// Used for all global data structures (currently custom_types and script_metadata)
     gpa: std.mem.Allocator = undefined,
     next_open_heap: usize = 0,
-    running_leak_check: bool = true,
+    running_leak_check: bool = false,
 };
 pub var state: GlobalHeapState = .{};
 pub var heaps: [cfg.max_heaps]Heap = undefined;
@@ -344,6 +344,7 @@ pub const Tag = enum(u5) {
     reference,
     variable,
     custom_type,
+    marked,
 };
 
 pub const IndexError = error{BadIndex};
@@ -408,8 +409,8 @@ pub const Body = packed union {
     variable: packed struct {
         index: u32,
         /// Used to invalidate `index`'s cached value, if it doesn't match
-        /// the current evaluator's call frame.
-        call_frame_idx: u31,
+        /// the current evaluator's epoch.
+        epoch: u31,
         /// Whether the variable is global, e.g. prefixed with ::
         is_global: bool,
     },
@@ -417,6 +418,8 @@ pub const Body = packed union {
         type_id: u32,
         index: u32,
     },
+    /// Used internally in places where a value needs to be temporarily marked.
+    marked: void,
 };
 
 comptime {
@@ -815,8 +818,18 @@ pub fn freeObject(handle: Handle) void {
     }
 }
 
-/// If the object can't be shimmered, this will duplicate said object
-/// and release the original object.
+/// If the object can't be modified, this will duplicate and release
+/// the object.
+pub fn ensureModifiable(calling_heap: *Heap, handle: *Handle) !void {
+    if (handle.isShared()) {
+        const before_duplicating = handle.*;
+        handle.* = try calling_heap.duplicate(handle.*);
+        before_duplicating.release();
+    }
+}
+
+/// If the object can't be shimmered, this will duplicate and release
+/// the object.
 pub fn ensureShimmerable(calling_heap: *Heap, handle: *Handle) !void {
     if (!handle.canShimmer()) {
         const before_duplicating = handle.*;
@@ -869,7 +882,7 @@ fn invalidateBodyImpl(handle: Handle) void {
             }
         },
         .dict => {
-            const dict_metadata = &obj_heap.dicts.items[obj.body.dict];
+            const dict_metadata = obj_heap.getDictMetadata(obj.body.dict);
 
             // Don't free the head (e.g. self)
             for (1..(dict_metadata.len + 1)) |i| {
@@ -908,7 +921,7 @@ fn invalidateBodyImpl(handle: Handle) void {
                 obj_heap.normalHandle(source.file_name_obj).release();
             }
         },
-        .none, .index, .integer, .dict_subst, .variable, .float, .bool, .script_command => {
+        .none, .index, .integer, .dict_subst, .variable, .float, .bool, .script_command, .marked => {
             obj.body = undefined;
         },
     }
@@ -975,8 +988,6 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
             return std.mem.eql(u8, a_str, b_str);
         },
     }
-
-    return std.mem.eql(u8, a_str, b_str);
 }
 
 /// Increase ref count if possible, otherwise duplicate onto calling_heap.
@@ -1044,7 +1055,7 @@ pub fn duplicateOrReference(self: *Heap, handle: Handle) !Object {
 pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
-        .none, .index, .integer, .float, .string, .bool, .script, .script_command => {
+        .none, .index, .integer, .float, .string, .bool, .script, .script_command, .marked => {
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
@@ -1164,7 +1175,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
             return calling_heap.normalHandle(new_list_idx);
         },
         .dict => {
-            const old_head = &calling_heap.dicts.items[src.body.dict];
+            const old_head = calling_heap.getDictMetadata(src.body.dict);
             const old_start = handle.index + 1;
 
             const new_dict_idx = try calling_heap.createObjects(1 + old_head.len);
@@ -1207,7 +1218,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 };
             }
 
-            const dict = &calling_heap.dicts.items[new_head.body.dict];
+            const dict = calling_heap.getDictMetadata(new_head.body.dict);
             dict.len = old_head.len;
             try object.dictReindex(calling_heap.normalHandle(new_dict_idx));
 
@@ -1404,10 +1415,10 @@ pub fn setLongString(self: *Heap, index: u32, bytes: [:0]u8, details: LongString
 const empty_string_value = "";
 /// This returns a temporary string. Whenever the object is modified, it
 /// may become invalid.
-fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
-    const obj: *Object = self.getLocalObject(index);
+fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
+    const obj: *Object = heap.getLocalObject(index);
 
-    switch (self.getLocalStringDetails(index)) {
+    switch (heap.getLocalStringDetails(index)) {
         .long => |long_str| {
             return long_str.string;
         },
@@ -1426,28 +1437,28 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     var new_str: [:0]u8 = undefined;
     switch (obj.tag) {
         .index => {
-            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.index}, 0);
+            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.index}, 0);
         },
         .integer => {
-            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.integer}, 0);
+            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.integer}, 0);
         },
         .float => {
-            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.float}, 0);
+            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.float}, 0);
         },
         .bool => {
-            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
+            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
         },
         .list => {
             const list = obj.body.list;
-            new_str = try getListString(self, index + 1, list.len);
+            new_str = try getListString(heap, index + 1, list.len);
         },
         .dict => {
-            const dict = &self.dicts.items[obj.body.dict];
-            new_str = try getListString(self, index + 1, dict.len);
+            const dict = heap.getDictMetadata(obj.body.dict);
+            new_str = try getListString(heap, index + 1, dict.len);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
-            new_str = try custom_types.items[custom_type.type_id].get_string(self, obj);
+            new_str = try custom_types.items[custom_type.type_id].get_string(heap, obj);
         },
         .reference => {
             // Intentionally return early, since we should always use
@@ -1455,10 +1466,10 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             return getString(obj.body.reference);
         },
         .script_command => {
-            if (state.running_leak_check) {
+            if (builtin.mode == .Debug) {
                 const script_command = obj.body.script_command;
                 new_str = try std.fmt.allocPrintSentinel(
-                    self.gpa,
+                    heap.gpa,
                     "<script command: args: {}, line: {}>",
                     .{ script_command.arg_count, script_command.line },
                     0,
@@ -1466,20 +1477,25 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             } else @panic("Script line is an internal object only");
         },
         .none => {
-            if (state.running_leak_check) {
-                new_str = try std.fmt.allocPrintSentinel(self.gpa, "<none>", .{}, 0);
+            if (builtin.mode == .Debug) {
+                new_str = try std.fmt.allocPrintSentinel(heap.gpa, "<none>", .{}, 0);
             } else @panic("Tried to generate a string for .none");
+        },
+        .marked => {
+            if (builtin.mode == .Debug) {
+                new_str = try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
+            } else @panic("Tried to generate a string for .marked");
         },
         .string, .dict_subst, .source, .script, .variable => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     }
 
-    const took_ownership = try setStringOwning(self.normalHandle(index), new_str, null);
-    if (!took_ownership) self.gpa.free(new_str);
+    const took_ownership = try setStringOwning(heap.normalHandle(index), new_str, null);
+    if (!took_ownership) heap.gpa.free(new_str);
 
     // Rerun this function to figure out where the new string is
-    return self.getLocalString(index);
+    return heap.getLocalString(index);
 }
 
 fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
@@ -1683,6 +1699,10 @@ pub fn createDictMetadata(self: *Heap) !DictIndex {
     if (new_id >= object_heap_max_count) return error.OutOfMemory;
 
     return @intCast(new_id);
+}
+
+pub fn getDictMetadata(self: *Heap, index: DictIndex) *Dictionary {
+    return &self.dicts.items[index];
 }
 
 pub fn destroyDictMetadata(self: *Heap, index: DictIndex) void {
