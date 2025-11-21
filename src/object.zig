@@ -1188,9 +1188,9 @@ fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
                 // We have to invalidate the string here, and not earlier, because
                 // the hash map `.get()` uses the string rep of the keys.
                 key_handle.invalidateString();
-                key_handle.invalidateBody();
+                key_handle.invalidateBody(); // sets tag to .none
                 value_handle.invalidateString();
-                value_handle.invalidateBody();
+                value_handle.invalidateBody(); // sets tag to .none
             } else if (removed > 0) {
                 // There was a pair removed at some point, so we need to shift this pair backwards.
                 const new_key_index = (pair_index - removed) * 2;
@@ -1212,7 +1212,7 @@ fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
 
         metadata.len -= removed * 2;
 
-        // Be sure to reindex, now that we've shuffled everything around.
+        // Be sure to reindex now that we've shuffled everything around.
         try dictReindex(handle.*);
     }
 }

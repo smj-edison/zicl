@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 const Heap = @import("Heap.zig");
 const object = @import("object.zig");
@@ -116,77 +117,138 @@ pub fn setEmptyResult(interp: *Interp) void {
     interp.result = interp.heap.emptyObject();
 }
 
-fn shimmerToVariable(interp: *Interp, name: *Heap.Handle) !void {
-    // This ensures that the name is local to this interpreters' heap.
-    try interp.heap.ensureShimmerable(name);
-    const name_obj = name.peek();
+fn variableNotFoundError(interp: *Interp, var_name: []const u8) !void {
+    interp.error_details = .{
+        .message = try object.newStringFmt(interp.heap, "can't read \"{s}\": no such variable", .{var_name}),
+    };
 
-    if (name_obj.tag == .variable) {
-        // Fast case: if we're in the same epoch as last time,
-        // we don't need to do anything.
-        if (name_obj.body.variable.epoch == interp.current_epoch) return;
+    return error.VariableNotFound;
+}
 
-        // Need to re-resolve the variable in the current call frame.
-    } else if (name_obj.tag == .dict_subst) {
-        return Error.IsDictSugar;
-    }
+const VariableInfo = struct {
+    target_index: u32,
+    call_frame_idx: u32,
+};
 
-    var var_name = try Heap.getString(name.*);
+/// Resolves to the variables' value, if any. Accounts for :: for globals.
+fn resolveVariable(interp: *Interp, name: Heap.Handle, var_call_frame: u32) !?VariableInfo {
+    const var_name = try Heap.getString(name);
 
-    // Make sure it's not syntax to get/set a dict.
-    if (var_name.len >= 2 and var_name[0] == '(' and var_name[var_name.len - 1] == ')') {
-        return Error.IsDictSugar;
-    }
-
-    var call_frame_id: u32 = 0;
-    var is_global: bool = false;
+    var call_frame_idx: u32 = 0;
     var var_value: ?Heap.Handle = null;
 
     //  No need to check slice length since it's null terminated.
     if (var_name[0] == ':' and var_name[1] == ':') {
-        call_frame_id = 0; // global frame
-        is_global = true;
+        call_frame_idx = 0; // global frame
 
         // Skip as many colons as are present to match tcl behavior.
-        while (var_name[0] == ':') var_name = var_name[1..];
+        var trimmed_var_name = var_name;
+        while (trimmed_var_name[0] == ':') trimmed_var_name = trimmed_var_name[1..];
 
-        const var_dict = interp.call_frames.items[call_frame_id].variables;
+        const var_dict = interp.call_frames.items[call_frame_idx].variables;
         // TODO PERF would it be possible to make dict lookup take a slice
         // instead of an object?
-        const key = try object.newString(interp.heap, var_name);
+        const key = try object.newString(interp.heap, trimmed_var_name);
         defer key.release();
 
         var_value = object.dictLookupRaw(var_dict, key);
+        // Global scope doesn't have statics.
     } else {
-        call_frame_id = interp.currentCallFrame();
-        is_global = false;
+        call_frame_idx = var_call_frame;
 
-        const var_dict = interp.call_frames.items[call_frame_id].variables;
-        const statics_dict = interp.call_frames.items[call_frame_id].statics;
+        const var_dict = interp.call_frames.items[call_frame_idx].variables;
+        const statics_dict = interp.call_frames.items[call_frame_idx].statics;
 
         // Check the variables dictionary.
-        var_value = object.dictLookupRaw(var_dict, name.*);
+        var_value = object.dictLookupRaw(var_dict, name);
 
         // Maybe it's in the statics dictionary instead?
         if (var_value == null) {
             if (statics_dict) |unwrapped| {
-                // Be sure to check the statics if we don't have a local
-                // variable with the same name.
-                var_value = object.dictLookupRaw(unwrapped, name.*);
+                var_value = object.dictLookupRaw(unwrapped, name);
             }
         }
     }
 
     if (var_value) |unwrapped| {
+        assert(unwrapped.heap == interp.heap);
+
+        return .{
+            .target_index = unwrapped.index,
+            .call_frame_idx = call_frame_idx,
+        };
+    }
+}
+
+/// This always shimmers to .variable. You probably should be using `ensureVariableType`.
+fn reshimmerToVariable(interp: *Interp, name: *Heap.Handle) !void {
+    const var_name = try Heap.getString(name.*);
+
+    if (try interp.resolveVariable(name.*, interp.currentCallFrame())) |var_info| {
         // Free the old representation and set the new one.
         name.invalidateBody();
 
-        name_obj.body.variable = .{
+        name.peek().tag = .variable;
+        name.peek().body.variable = .{
             .epoch = interp.current_epoch,
-            .index = unwrapped.index,
-            .is_global = is_global,
+            .index = var_info.index,
+            .is_global = var_info.call_frame_idx == 0,
         };
-    } else return Error.VariableNotFound;
+    } else {
+        return interp.variableNotFoundError(var_name);
+    }
+}
+
+/// Ensures that this is a valid variable, dict sugar, or upvar.
+fn ensureVariableType(interp: *Interp, name: *Heap.Handle) !void {
+    // This ensures that the name is local to this interpreters' heap.
+    try interp.heap.ensureShimmerable(name);
+
+    const name_obj = name.peek();
+    const name_heap = name.getHeap();
+
+    if (name_obj.tag == .variable) {
+        // Fast case: if we're in the same epoch as last time,
+        // we don't need to do anything.
+        if (name_obj.body.variable.epoch == interp.current_epoch) {
+            return;
+        } else {
+            // Need to re-resolve the variable in the current call frame.
+            try reshimmerToVariable(interp, name);
+            return;
+        }
+    } else if (name_obj.tag == .upvar) {
+        const upvar = name_heap.getUpvar(name_obj.body.upvar);
+
+        // Fast case is same as for .variable.
+        if (upvar.epoch == interp.current_epoch) {
+            return;
+        } else {
+            // Need to look this back up.
+            if (upvar.dict_sugar) |_| {
+                @panic("Dict sugar not implemented yet");
+            } else {
+                // Be sure to look it up in the upvar's call frame.
+                if (try interp.resolveVariable(name.*, upvar.call_frame_idx)) |upvar_target| {
+                    upvar.index = upvar_target.target_index;
+                    return;
+                } else {
+                    return interp.variableNotFoundError(try Heap.getString(name.*));
+                }
+            }
+        }
+    } else if (name_obj.tag == .dict_subst) {
+        @panic("Dict sugar not implemented yet");
+    } else {
+        // We don't know whether this is a normal variable or dict sugar yet.
+        const var_name = try Heap.getString(name.*);
+        if (var_name.len >= 2 and var_name[0] == '(' and var_name[var_name.len - 1] == ')') {
+            @panic("Dict sugar not implemented yet");
+            // name_obj.tag = .dict_subst;
+        } else {
+            try reshimmerToVariable(interp, name);
+        }
+    }
 }
 
 /// Resolves to the variables' value.
@@ -194,7 +256,17 @@ pub fn getVariable(interp: *Interp, name: Heap.Handle) !Heap.Handle {
     if (interp.evaluating_safe_expr) return Error.EvaluatingSafeExpression;
 
     var new_name = name;
-    const result = interp.shimmerToVariable(&new_name);
+    try interp.ensureVariableType(&new_name);
+
+    switch (new_name.peek().tag) {
+        .variable => {
+            return new_name.getHeap().getLocalObject(new_name.peek().body.variable.index);
+        },
+        .upvar, .dict_subst => {
+            @panic("Unimplemented");
+        },
+        else => unreachable,
+    }
 }
 
 /// Call frame.

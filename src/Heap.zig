@@ -82,6 +82,7 @@ string_tracking: StringTracker,
 strings: StringList,
 
 dicts: DictionaryPool,
+upvars: UpvarPool,
 type_instances: CustomTypeInstancePool,
 parsed_scripts: ParsedScripts,
 
@@ -94,6 +95,7 @@ const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
 const StringList = std.ArrayList(u8);
 
 const DictionaryPool = memutil.IndexedMemoryPool(Dictionary, cfg.use_vmem);
+const UpvarPool = memutil.IndexedMemoryPool(Upvar, cfg.use_vmem);
 const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
 const ScriptMetadataPool = memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem);
 const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
@@ -119,6 +121,19 @@ pub const Dictionary = struct {
     /// Length of dictionaries' backing list, including potential duplicated
     /// keys when shimmering from list.
     len: u32,
+};
+
+pub const Upvar = struct {
+    call_frame_idx: u32,
+    epoch: u31,
+    /// Cached index of the target object.
+    index: u32,
+    dict_sugar: ?struct {
+        /// _Non_-cached index of the dictionary name ("foo" of `foo(bar)`).
+        dict_name_index: u32,
+        /// _Non_-cached index of the key ("bar" of `foo(bar)`).
+        dict_key_index: u32,
+    },
 };
 
 pub const CustomTypeInstance = struct {
@@ -343,6 +358,7 @@ pub const Tag = enum(u5) {
     script,
     reference,
     variable,
+    upvar,
     custom_type,
     marked,
 };
@@ -393,6 +409,7 @@ pub const Body = packed union {
     /// from a list, but duplicates will be removed when any writing operation
     /// happens.
     dict: DictIndex,
+    /// Both objects must be in the same heap.
     dict_subst: packed struct {
         var_name_index: u32,
         dict_value_index: u32,
@@ -414,6 +431,8 @@ pub const Body = packed union {
         /// Whether the variable is global, e.g. prefixed with ::
         is_global: bool,
     },
+    /// Index into Heap.upvars.
+    upvar: u32,
     custom_type: packed struct {
         type_id: u32,
         index: u32,
@@ -582,12 +601,15 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 
     const object_capacity = if (cfg.threading) object_heap_max_count else 32;
 
+    var dictionaries: DictionaryPool = try .initWithCapacity(gpa, object_capacity);
+    errdefer dictionaries.deinit(gpa);
+
+    var upvars: UpvarPool = try .initWithCapacity(gpa, object_capacity);
+    errdefer upvars.deinit(gpa);
+
     // Init type instances
     var type_instances: CustomTypeInstancePool = try .initWithCapacity(gpa, object_capacity);
     errdefer type_instances.deinit(gpa);
-
-    var dictionaries: DictionaryPool = try .initWithCapacity(gpa, object_capacity);
-    errdefer dictionaries.deinit(gpa);
 
     var parsed_scripts: ParsedScripts = .empty;
     errdefer parsed_scripts.deinit(gpa);
@@ -603,6 +625,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         .strings = strings,
 
         .dicts = dictionaries,
+        .upvars = upvars,
         .type_instances = type_instances,
         .parsed_scripts = parsed_scripts,
     };
@@ -665,6 +688,7 @@ pub fn deinit(self: *Heap) void {
     self.string_tracking.deinit(self.gpa);
 
     self.dicts.deinit(self.gpa);
+    self.upvars.deinit(self.gpa);
     self.type_instances.deinit(self.gpa);
 }
 
@@ -1690,6 +1714,27 @@ pub const CustomTypes = struct {
         }
     }
 };
+
+pub fn createUpvar(self: *Heap) !u32 {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    const new_index = try self.upvars.create(self.gpa);
+    if (new_index >= object_heap_max_count) return error.OutOfMemory;
+
+    return @intCast(new_index);
+}
+
+pub fn getUpvar(self: *Heap, index: u32) *Upvar {
+    return &self.upvars.items[index];
+}
+
+pub fn destroyUpvar(self: *Heap, index: u32) void {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    self.upvars.destroy(index);
+}
 
 pub fn createDictMetadata(self: *Heap) !DictIndex {
     self.mem_mgmt_mutex.lock();
