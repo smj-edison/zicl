@@ -44,10 +44,9 @@ pub const HeapSettings = struct {
 };
 const cfg: HeapSettings = .{};
 
-// Use these for debugging objects (traces, etc) that can afford
-// to leak.
 var debugging_gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{}){} else undefined;
-var debug_gpa = if (builtin.mode == .Debug) debugging_gpa.allocator() else undefined;
+/// Use this for debugging objects (traces, etc) that can afford to leak.
+var debug_gpa = if (builtin.mode == .Debug) debugging_gpa.allocator() else memutil.null_allocator;
 
 pub const GlobalHeapState = struct {
     initialized: bool = false,
@@ -55,7 +54,7 @@ pub const GlobalHeapState = struct {
     /// (no need to lock when using).
     mutex: Mutex = .{},
     /// Used for all global data structures (currently custom_types and script_metadata)
-    gpa: std.mem.Allocator = undefined,
+    gpa: std.mem.Allocator = memutil.null_allocator,
     next_open_heap: usize = 0,
     running_leak_check: bool = false,
 };
@@ -125,7 +124,7 @@ pub const Dictionary = struct {
 
 pub const Upvar = struct {
     call_frame_idx: u32,
-    epoch: u31,
+    call_frame_epoch: u31,
     /// Cached index of the target object.
     index: u32,
     dict_sugar: ?struct {
@@ -427,7 +426,7 @@ pub const Body = packed union {
         index: u32,
         /// Used to invalidate `index`'s cached value, if it doesn't match
         /// the current evaluator's epoch.
-        epoch: u31,
+        call_epoch: u31,
         /// Whether the variable is global, e.g. prefixed with ::
         is_global: bool,
     },
@@ -494,7 +493,11 @@ pub const Handle = packed struct(u64) {
 
     pub fn isShared(handle: Handle) bool {
         const objects = handle.getHeap().objects;
-        return objects.items(.metadata)[handle.index].cross_thread or objects.items(.ref_count)[handle.index] > 1;
+
+        const cross_thread = objects.items(.metadata)[handle.index].cross_thread;
+        const multiple_owners = objects.items(.ref_count)[handle.index] > 1;
+        const is_owned = !handle.ref_counted;
+        return cross_thread or multiple_owners or is_owned;
     }
 
     pub fn hasString(handle: Handle) bool {
@@ -506,9 +509,13 @@ pub const Handle = packed struct(u64) {
         return handle.getHeap().objects.items(.ref_count)[handle.index];
     }
 
-    pub fn reference(handle: Handle) Object {
+    pub fn incrRefCount(handle: Handle) void {
         assert(handle.ref_counted);
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index]);
+    }
+
+    pub fn reference(handle: Handle) Object {
+        handle.incrRefCount();
 
         return .{
             // References are guaranteed to always have a null representation.
@@ -520,13 +527,8 @@ pub const Handle = packed struct(u64) {
         };
     }
 
-    pub fn invalidateString(handle: Handle) void {
-        invalidateStringImpl(handle);
-    }
-
-    pub fn invalidateBody(handle: Handle) void {
-        invalidateBodyImpl(handle);
-    }
+    pub const invalidateString = invalidateStringImpl;
+    pub const invalidateBody = invalidateBodyImpl;
 
     pub fn release(handle: Handle) void {
         releaseImpl(handle);
@@ -756,9 +758,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
     // Make sure the items we're allocating are free (used to
     // ensure our allocator hasn't reached a broken state).
-    for (self.objects.items(.metadata)[index..end]) |metadata| {
-        assert(metadata.in_use == false);
-    }
+    for (self.objects.items(.metadata)[index..end]) |metadata| assert(metadata.in_use == false);
 
     // Initialize all as empty objects
     @memset(self.objects.items(.object)[index..end], .{
@@ -843,7 +843,7 @@ pub fn freeObject(handle: Handle) void {
 }
 
 /// If the object can't be modified, this will duplicate and release
-/// the object.
+/// the old object.
 pub fn ensureModifiable(calling_heap: *Heap, handle: *Handle) !void {
     if (handle.isShared()) {
         const before_duplicating = handle.*;
@@ -853,7 +853,7 @@ pub fn ensureModifiable(calling_heap: *Heap, handle: *Handle) !void {
 }
 
 /// If the object can't be shimmered, this will duplicate and release
-/// the object.
+/// the old object.
 pub fn ensureShimmerable(calling_heap: *Heap, handle: *Handle) !void {
     if (!handle.canShimmer()) {
         const before_duplicating = handle.*;
@@ -930,8 +930,8 @@ fn invalidateBodyImpl(handle: Handle) void {
             obj.body.reference.release();
         },
         .string => {
-            // How come string is a no-op? Because we could potentially
-            // double-free when freeStringRep is called.
+            // How come string is a no-op? Because the string is separate
+            // from its cached length.
         },
         .script => {
             const script = obj.body.script; // copy
@@ -945,11 +945,10 @@ fn invalidateBodyImpl(handle: Handle) void {
                 obj_heap.normalHandle(source.file_name_obj).release();
             }
         },
-        .none, .index, .integer, .dict_subst, .variable, .float, .bool, .script_command, .marked => {
-            obj.body = undefined;
-        },
+        .none, .index, .integer, .dict_subst, .variable, .float, .bool, .script_command, .marked => {},
     }
 
+    obj.body = undefined;
     obj.tag = .none;
 }
 
@@ -992,26 +991,27 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
     const a_details = getStringDetails(a);
     const b_details = getStringDetails(b);
 
-    switch (a_details) {
-        .long => |a_long_str| {
-            switch (b_details) {
-                .long => |b_long_str| {
-                    // If both strings are long strings, we can just
-                    // compare their hashes instead of the whole string
-                    return a_long_str.getHash() == b_long_str.getHash();
-                },
-                else => {
-                    return std.mem.eql(u8, a_str, b_str);
-                },
-            }
-        },
-        // We generated string reps when calling getString, so
-        // we know it's not null
-        .null => unreachable,
-        else => {
-            return std.mem.eql(u8, a_str, b_str);
-        },
+    blk: {
+        const a_long_str = switch (a_details) {
+            .long => |unwrapped| unwrapped,
+            // We generated string reps when calling getString, so
+            // we know it's not null.
+            .null => unreachable,
+            else => break :blk,
+        };
+
+        const b_long_str = switch (b_details) {
+            .long => |unwrapped| unwrapped,
+            .null => unreachable,
+            else => break :blk,
+        };
+
+        // If both strings are long strings, we can just
+        // compare their hashes instead of the whole string.
+        return a_long_str.getHash() == b_long_str.getHash();
     }
+
+    return std.mem.eql(u8, a_str, b_str);
 }
 
 /// Increase ref count if possible, otherwise duplicate onto calling_heap.
@@ -1089,19 +1089,20 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
         .source => {
             const source = src.body.source;
 
-            var new_handle: Handle = undefined;
-            if (source.file_name_obj == 0) {
-                // Null object, so just use the current heap id.
-                new_handle = self.getHandle(0, false);
-            } else {
-                // Better make sure it's in the correct heap.
-                if (handle.heap != self.heap_id) {
-                    new_handle = try self.duplicate(self.normalHandle(source.file_name_obj));
+            const new_handle = blk: {
+                if (source.file_name_obj == 0) {
+                    break :blk self.nullObject();
                 } else {
-                    new_handle = self.normalHandle(source.file_name_obj);
-                    _ = new_handle.reference(); // Increase ref count
+                    // Better make sure it's in our heap.
+                    if (handle.heap != self.heap_id) {
+                        break :blk try self.duplicate(self.normalHandle(source.file_name_obj));
+                    } else {
+                        const to_break = self.normalHandle(source.file_name_obj);
+                        to_break.incrRefCount();
+                        break :blk to_break;
+                    }
                 }
-            }
+            };
 
             return .{
                 .str = try self.duplicateObjString(handle),
@@ -1458,31 +1459,30 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     }
 
     // No representation, so we better generate it
-    var new_str: [:0]u8 = undefined;
-    switch (obj.tag) {
+    const new_str = blk: switch (obj.tag) {
         .index => {
-            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.index}, 0);
+            break :blk try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.index}, 0);
         },
         .integer => {
-            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.integer}, 0);
+            break :blk try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.integer}, 0);
         },
         .float => {
-            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.float}, 0);
+            break :blk try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{obj.body.float}, 0);
         },
         .bool => {
-            new_str = try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
+            break :blk try std.fmt.allocPrintSentinel(heap.gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
         },
         .list => {
             const list = obj.body.list;
-            new_str = try getListString(heap, index + 1, list.len);
+            break :blk try getListString(heap, index + 1, list.len);
         },
         .dict => {
             const dict = heap.getDictMetadata(obj.body.dict);
-            new_str = try getListString(heap, index + 1, dict.len);
+            break :blk try getListString(heap, index + 1, dict.len);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
-            new_str = try custom_types.items[custom_type.type_id].get_string(heap, obj);
+            break :blk try custom_types.items[custom_type.type_id].get_string(heap, obj);
         },
         .reference => {
             // Intentionally return early, since we should always use
@@ -1492,7 +1492,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         .script_command => {
             if (builtin.mode == .Debug) {
                 const script_command = obj.body.script_command;
-                new_str = try std.fmt.allocPrintSentinel(
+                break :blk try std.fmt.allocPrintSentinel(
                     heap.gpa,
                     "<script command: args: {}, line: {}>",
                     .{ script_command.arg_count, script_command.line },
@@ -1502,18 +1502,18 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
         .none => {
             if (builtin.mode == .Debug) {
-                new_str = try std.fmt.allocPrintSentinel(heap.gpa, "<none>", .{}, 0);
+                break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<none>", .{}, 0);
             } else @panic("Tried to generate a string for .none");
         },
         .marked => {
             if (builtin.mode == .Debug) {
-                new_str = try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
+                break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
         .string, .dict_subst, .source, .script, .variable => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
-    }
+    };
 
     const took_ownership = try setStringOwning(heap.normalHandle(index), new_str, null);
     if (!took_ownership) heap.gpa.free(new_str);
@@ -1697,21 +1697,6 @@ pub const LongString = struct {
         }
 
         gpa.destroy(self);
-    }
-};
-
-pub const CustomTypes = struct {
-    elem: [cfg.max_custom_types]CustomType = undefined,
-    next_open: usize = 0,
-
-    pub fn getAvailableSlot(self: *CustomTypes) ?usize {
-        const slot_index = atomicIncr(usize, &self.next_open);
-
-        if (slot_index < cfg.max_custom_types) {
-            return slot_index;
-        } else {
-            return null;
-        }
     }
 };
 

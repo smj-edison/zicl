@@ -383,18 +383,20 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
         var iter = stringutil.Iterator.init(bytes);
         var is_first_char = true;
         while (iter.next()) |cp| {
-            var converted: u21 = undefined;
-            switch (mode) {
-                .upper => converted = stringutil.toUpper(cp),
-                .lower => converted = stringutil.toLower(cp),
-                .title => {
-                    if (is_first_char) {
-                        converted = stringutil.toTitle(cp);
-                    } else {
-                        converted = stringutil.toLower(cp);
-                    }
-                },
-            }
+            const converted = blk: {
+                switch (mode) {
+                    .upper => break :blk stringutil.toUpper(cp),
+                    .lower => break :blk stringutil.toLower(cp),
+                    .title => {
+                        if (is_first_char) {
+                            break :blk stringutil.toTitle(cp);
+                        } else {
+                            break :blk stringutil.toLower(cp);
+                        }
+                    },
+                }
+            };
+
             new_len += std.unicode.utf8ByteSequenceLength(converted);
             is_first_char = false;
         }
@@ -413,18 +415,19 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
         var written: usize = 0;
         is_first_char = true;
         while (iter.next()) |cp| {
-            var converted: u21 = undefined;
-            switch (mode) {
-                .upper => converted = stringutil.toUpper(cp),
-                .lower => converted = stringutil.toLower(cp),
-                .title => {
-                    if (is_first_char) {
-                        converted = stringutil.toTitle(cp);
-                    } else {
-                        converted = stringutil.toLower(cp);
-                    }
-                },
-            }
+            const converted = blk: {
+                switch (mode) {
+                    .upper => break :blk stringutil.toUpper(cp),
+                    .lower => break :blk stringutil.toLower(cp),
+                    .title => {
+                        if (is_first_char) {
+                            break :blk stringutil.toTitle(cp);
+                        } else {
+                            break :blk stringutil.toLower(cp);
+                        }
+                    },
+                }
+            };
             written += std.unicode.utf8Encode(converted, new_bytes[written..]) catch unreachable;
 
             is_first_char = false;
@@ -498,66 +501,33 @@ pub fn stringTrim(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Handle 
 //////////////////////////////
 //  Enum related functions  //
 
-/// Byte count of enum names joined by ", "
-fn enumNamesCount(comptime T: type) usize {
-    comptime {
-        var result_size = 0;
-        for (std.meta.fields(T)) |field| {
-            result_size += field.name.len;
-        }
-        // Be sure to account for ", "
-        result_size += ((std.meta.fields(T).len) -| 1) * 2;
-
-        return result_size;
-    }
-}
-
 /// Enum names joined by ", "
-pub inline fn enumNames(comptime T: type) *const [enumNamesCount(T):0]u8 {
-    comptime {
-        // Fill the buffer
-        var buf: [enumNamesCount(T):0]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
-
-        var first_time = true;
-        for (std.meta.fields(T)) |field| {
-            if (!first_time) {
-                w.writeAll(", ") catch unreachable;
-            } else first_time = false;
-
-            w.writeAll(field.name) catch unreachable;
+pub fn enumNames(comptime T: type) []const u8 {
+    return comptime blk: {
+        var result: []const u8 = @tagName(std.enums.values(T)[0]);
+        for (std.enums.values(T)[1..]) |value| {
+            result = &(result[0..].* ++ ", ".* ++ @tagName(value).*);
         }
 
-        buf[buf.len] = 0;
-
-        const final = buf;
-        return &final;
-    }
+        break :blk result;
+    };
 }
 
 pub fn EnumMapping(comptime T: type) type {
     comptime {
-        const field_count = std.meta.fields(T).len;
+        const values = std.enums.values(T);
 
-        // Create an entry type (instantiated as .{ "foo", .foo })
-        const EntryType = std.meta.Tuple(&[_]type{ [:0]const u8, T });
-        // Repeat that type for how many fields there are
-        const entries = [1]type{EntryType} ** field_count;
-        // Create a map type with those repeated entries
-        const Mapping = std.meta.Tuple(&entries);
-
-        // Fill out the map
-        var mapping: Mapping = undefined;
-        for (std.meta.fields(T), 0..) |variant, i| {
-            const entry: EntryType = .{ variant.name, @enumFromInt(variant.value) };
-            @field(mapping, std.fmt.comptimePrint("{}", .{i})) = entry;
+        // Fill out the mapping
+        var entries: [values.len]struct { []const u8, T } = undefined;
+        for (values, &entries) |value, *entry| {
+            entry.* = .{ @tagName(value), value };
         }
 
         // Create the table
         return struct {
             pub const StaticStringMap = std.StaticStringMap(T);
 
-            map: StaticStringMap = StaticStringMap.initComptime(mapping),
+            map: StaticStringMap = StaticStringMap.initComptime(entries),
         };
     }
 }
@@ -1497,39 +1467,46 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
         for (i..(i + arg_token_count)) |token_idx| {
             const token = tokens.items[token_idx];
 
-            var str_handle: Handle = undefined;
-            switch (token.tag) {
-                .argument_expansion => {},
-                .escaped_string => {
-                    try new_token_tags.append(calling_heap.gpa, .simple_string);
-                    const str_idx = try listAppendObject(
-                        calling_heap,
-                        det,
-                        &new_token_values,
-                        .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
-                    );
-                    str_handle = listItemRaw(new_token_values, str_idx);
+            const str_handle = blk: {
+                switch (token.tag) {
+                    .argument_expansion => break :blk null,
+                    .escaped_string => {
+                        try new_token_tags.append(calling_heap.gpa, .simple_string);
+                        const str_idx = try listAppendObject(
+                            calling_heap,
+                            det,
+                            &new_token_values,
+                            .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
+                        );
 
-                    try setStringFromEscaped(calling_heap.gpa, str_handle, bytes[token.loc.start..token.loc.end]);
-                },
-                else => {
-                    try new_token_tags.append(calling_heap.gpa, token.tag);
-                    const str_idx = try listAppendObject(
-                        calling_heap,
-                        det,
-                        &new_token_values,
-                        .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
-                    );
-                    str_handle = listItemRaw(new_token_values, str_idx);
+                        const item_handle = listItemRaw(new_token_values, str_idx);
+                        try setStringFromEscaped(calling_heap.gpa, item_handle, bytes[token.loc.start..token.loc.end]);
 
-                    try Heap.setString(str_handle, bytes[token.loc.start..token.loc.end]);
-                },
+                        break :blk item_handle;
+                    },
+                    else => {
+                        try new_token_tags.append(calling_heap.gpa, token.tag);
+                        const str_idx = try listAppendObject(
+                            calling_heap,
+                            det,
+                            &new_token_values,
+                            .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
+                        );
+
+                        const item_handle = listItemRaw(new_token_values, str_idx);
+                        try Heap.setString(item_handle, bytes[token.loc.start..token.loc.end]);
+
+                        break :blk item_handle;
+                    },
+                }
+            };
+
+            if (str_handle) |unwrapped| {
+                try setSourceInfo(calling_heap, unwrapped, .{
+                    .file_name = source_info.file_name,
+                    .line_no = token.loc.line_no,
+                });
             }
-
-            try setSourceInfo(calling_heap, str_handle, .{
-                .file_name = source_info.file_name,
-                .line_no = token.loc.line_no,
-            });
         }
 
         // Be sure to advance our index to the next word.
@@ -1590,19 +1567,18 @@ test "script parsing" {
 }
 
 pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
-    var using_new_id: bool = undefined;
-    var script_id: Heap.ScriptId = undefined;
-
     // Figure out whether the provided object already has a script id, or if we need to
     // generate a new one.
-    if (handle.peek().tag == .script) {
-        const script = handle.peek().body.script;
-        script_id = script.id;
-        using_new_id = false;
-    } else {
-        using_new_id = true;
-        script_id = try Heap.ScriptId.next();
-    }
+    var script_id: Heap.ScriptId = undefined;
+    var using_new_id: bool = undefined;
+    script_id, using_new_id = blk: {
+        if (handle.peek().tag == .script) {
+            const script = handle.peek().body.script;
+            break :blk .{ script.id, false };
+        } else {
+            break :blk .{ try Heap.ScriptId.next(), true };
+        }
+    };
     errdefer if (using_new_id) script_id.retire();
 
     if (calling_heap.parsed_scripts.get(script_id.index)) |existing_script| {

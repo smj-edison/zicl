@@ -143,16 +143,17 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
             const freed_buddy = buddy_of(index, getOrderSize(order));
-            var buddy_free_list_index: usize = undefined;
-            for (self.free_lists[order].items, 0..) |block, i| {
-                if (block == freed_buddy) {
-                    buddy_free_list_index = i;
-                    break;
+            const buddy_free_list_index = blk: {
+                for (self.free_lists[order].items, 0..) |block, i| {
+                    if (block == freed_buddy) {
+                        break :blk i;
+                    }
+                } else {
+                    // Unreachable as we reserved enough space during alloc.
+                    self.free_lists[order].append(null_allocator, index) catch unreachable;
+                    return; // No buddy, return.
                 }
-            } else {
-                self.free_lists[order].append(null_allocator, index) catch unreachable;
-                return; // No buddy, return.
-            }
+            };
 
             // This block has a buddy, so do recursive merging.
             var order_being_merged = order;
