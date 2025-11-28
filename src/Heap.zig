@@ -80,9 +80,8 @@ objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
 
-dicts: DictionaryPool,
-upvars: UpvarPool,
-type_instances: CustomTypeInstancePool,
+/// If an object can't store all its information in 8 bytes, it can throw extra data on here.
+extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
 
 pub const HeapId = u16;
@@ -93,52 +92,8 @@ const ObjectList = std.MultiArrayList(ObjectAndMetadata);
 const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
 const StringList = std.ArrayList(u8);
 
-const DictionaryPool = memutil.IndexedMemoryPool(Dictionary, cfg.use_vmem);
-const UpvarPool = memutil.IndexedMemoryPool(Upvar, cfg.use_vmem);
-const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
-const ScriptMetadataPool = memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem);
+const ExtraDataPool = memutil.IndexedMemoryPool(ExtraData, cfg.use_vmem);
 const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
-
-pub const DictIndex = u32;
-pub const Dictionary = struct {
-    /// This does not store the key/value pairs directly, instead it
-    /// is an mapping of key to value index.
-    dict: std.HashMapUnmanaged(Handle, u32, struct {
-        pub fn hash(ctx: @This(), key: Handle) u64 {
-            _ = ctx;
-
-            const str = getString(key) catch return 0;
-            return std.hash_map.hashString(str);
-        }
-
-        pub fn eql(ctx: @This(), a: Handle, b: Handle) bool {
-            _ = ctx;
-
-            return checkIfEqual(a, b) catch return false;
-        }
-    }, 80),
-    /// Length of dictionaries' backing list, including potential duplicated
-    /// keys when shimmering from list.
-    len: u32,
-};
-
-pub const Upvar = struct {
-    call_frame_idx: u32,
-    call_frame_epoch: u31,
-    /// Cached index of the target object.
-    index: u32,
-    dict_sugar: ?struct {
-        /// _Non_-cached index of the dictionary name ("foo" of `foo(bar)`).
-        dict_name_index: u32,
-        /// _Non_-cached index of the key ("bar" of `foo(bar)`).
-        dict_key_index: u32,
-    },
-};
-
-pub const CustomTypeInstance = struct {
-    first_ptr: *anyopaque,
-    second_ptr: *anyopaque,
-};
 
 /// Each script is assigned a unique id when created. Each interpreter
 /// has a hashmap that associates a script id with its local parsed
@@ -178,8 +133,8 @@ pub const ScriptId = packed struct(u64) {
 /// isn't freed, even if the script object gets freed, until _all_ script objects
 /// for a certain ID are freed.
 pub const ScriptMetadata = packed struct(ScriptMetadata.get_full_size()) {
-    // This must be backed by a packed u64 (32-bit) or u96 (64-bit),
-    // and ref_count must be the first field, as ScriptMetadata is stored
+    // This must be backed by a packed u64 (32-bit systems) or u96 (64-bit systems),
+    // and ref_count must be the first field. Why? This struct is stored
     // in an IndexedMemoryPool, which uses the first usize bits of
     // ScriptMetadata to store a next pointer.
 
@@ -393,8 +348,8 @@ pub const Body = packed union {
     float: f64,
     bool: bool,
     string: packed struct {
-        /// If = utf8_length > maxInt(u32), it means the length has not been determined
-        utf8_length: u33,
+        utf8_length: u32,
+        length_determined: bool,
     },
     source: packed struct {
         /// Pointer to an object in the same heap that contains the file name.
@@ -408,7 +363,7 @@ pub const Body = packed union {
     /// Keys and values alternate. Allows for duplicate keys when shimmering
     /// from a list, but duplicates will be removed when any writing operation
     /// happens.
-    dict: DictIndex,
+    dict: ExtraDataIndex,
     /// Both objects must be in the same heap.
     dict_subst: packed struct {
         var_name_index: u32,
@@ -436,11 +391,10 @@ pub const Body = packed union {
         /// Whether the variable is global, e.g. prefixed with ::
         is_global: bool,
     },
-    /// Index into Heap.upvars.
-    upvar: u32,
+    upvar: ExtraDataIndex,
     custom_type: packed struct {
         type_id: u32,
-        index: u32,
+        index: ExtraDataIndex,
     },
     /// Used internally in places where a value needs to be temporarily marked.
     marked: void,
@@ -458,6 +412,48 @@ comptime {
         assert(std.mem.eql(u8, tag_field.name, body_field.name));
     }
 }
+
+pub const ExtraDataIndex = u32;
+/// Extra data, for when you can't store enough in the main object.
+pub const ExtraData = union {
+    /// This does not store the key/value pairs directly, instead it
+    /// is an mapping of key to value index.
+    dict: struct {
+        table: std.HashMapUnmanaged(Handle, u32, struct {
+            pub fn hash(ctx: @This(), key: Handle) u64 {
+                _ = ctx;
+
+                const str = getString(key) catch return 0;
+                return std.hash_map.hashString(str);
+            }
+
+            pub fn eql(ctx: @This(), a: Handle, b: Handle) bool {
+                _ = ctx;
+
+                return checkIfEqual(a, b) catch return false;
+            }
+        }, 80),
+        /// Length of dictionaries' backing list, including potential duplicated
+        /// keys when shimmering from list.
+        len: u32,
+    },
+    upvar: struct {
+        call_frame_idx: u32,
+        call_frame_epoch: u31,
+        /// Cached index of the target object.
+        index: u32,
+        dict_sugar: ?struct {
+            /// _Non_-cached index of the dictionary name ("foo" of `foo(bar)`).
+            dict_name_index: u32,
+            /// _Non_-cached index of the key ("bar" of `foo(bar)`).
+            dict_key_index: u32,
+        },
+    },
+    custom_type: struct {
+        first_ptr: *anyopaque,
+        second_ptr: *anyopaque,
+    },
+};
 
 pub const CustomType = struct {
     /// Type name.
@@ -500,7 +496,7 @@ pub const Handle = packed struct(u64) {
     pub fn isShared(handle: Handle) bool {
         const obj_heap = handle.getHeap();
 
-        const cross_thread = obj_heap.getLocalMetadata(handle.index);
+        const cross_thread = obj_heap.getLocalMetadata(handle.index).cross_thread;
         const multiple_owners = obj_heap.getLocalRefCount(handle.index) > 1;
         const is_owned = !handle.ref_counted;
         return cross_thread or multiple_owners or is_owned;
@@ -511,7 +507,7 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
-        handle.getHeap().getLocalMetadata(handle.index);
+        return handle.getHeap().getLocalMetadata(handle.index);
     }
 
     /// This should not be used for checking if an object is shared, use `isShared` instead.
@@ -617,15 +613,8 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 
     const object_capacity = if (cfg.threading) object_heap_max_count else 32;
 
-    var dictionaries: DictionaryPool = try .initWithCapacity(gpa, object_capacity);
-    errdefer dictionaries.deinit(gpa);
-
-    var upvars: UpvarPool = try .initWithCapacity(gpa, object_capacity);
-    errdefer upvars.deinit(gpa);
-
-    // Init type instances
-    var type_instances: CustomTypeInstancePool = try .initWithCapacity(gpa, object_capacity);
-    errdefer type_instances.deinit(gpa);
+    var extra: ExtraDataPool = try .initWithCapacity(gpa, object_capacity);
+    errdefer extra.deinit(gpa);
 
     var parsed_scripts: ParsedScripts = .empty;
     errdefer parsed_scripts.deinit(gpa);
@@ -640,9 +629,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         .string_tracking = string_tracking,
         .strings = strings,
 
-        .dicts = dictionaries,
-        .upvars = upvars,
-        .type_instances = type_instances,
+        .extra = extra,
         .parsed_scripts = parsed_scripts,
     };
 
@@ -703,9 +690,7 @@ pub fn deinit(self: *Heap) void {
     self.object_tracking.deinit(self.gpa);
     self.string_tracking.deinit(self.gpa);
 
-    self.dicts.deinit(self.gpa);
-    self.upvars.deinit(self.gpa);
-    self.type_instances.deinit(self.gpa);
+    self.extra.deinit(self.gpa);
 }
 
 pub fn nullObject(self: *Heap) Handle {
@@ -737,7 +722,7 @@ pub fn createObject(self: *Heap) !Handle {
 /// reference counts.
 pub fn createObjects(self: *Heap, count: u32) !u32 {
     const order: u5 = @intCast(memutil.getOrder(count));
-    const aligned_count = memutil.getOrderSize(order);
+    const aligned_count = @as(u32, 1) << order;
 
     const index: u32 = blk: {
         self.mem_mgmt_mutex.lock();
@@ -904,7 +889,7 @@ fn invalidateBodyImpl(handle: Handle) void {
     assert(handle.canShimmer());
 
     const obj_heap = handle.getHeap();
-    const obj: *Object = &obj_heap.getLocalObject(handle.index);
+    const obj = obj_heap.getLocalObject(handle.index);
 
     switch (obj.tag) {
         .list => {
@@ -920,7 +905,7 @@ fn invalidateBodyImpl(handle: Handle) void {
             }
         },
         .dict => {
-            const dict_metadata = obj_heap.getDictMetadata(obj.body.dict);
+            const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
 
             // Don't free the head (e.g. self)
             for (1..(dict_metadata.len + 1)) |i| {
@@ -931,8 +916,8 @@ fn invalidateBodyImpl(handle: Handle) void {
                 });
             }
 
-            dict_metadata.dict.deinit(obj_heap.gpa);
-            obj_heap.destroyDictMetadata(obj.body.dict);
+            dict_metadata.table.deinit(obj_heap.gpa);
+            obj_heap.destroyExtraData(obj.body.dict);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
@@ -959,7 +944,18 @@ fn invalidateBodyImpl(handle: Handle) void {
                 obj_heap.normalHandle(source.file_name_obj).release();
             }
         },
-        .none, .index, .integer, .dict_subst, .variable, .upvar, .float, .bool, .script_command, .marked => {},
+        .none,
+        .index,
+        .integer,
+        .dict_subst,
+        .variable,
+        .upvar,
+        .float,
+        .bool,
+        .script_command,
+        .marked,
+        .command,
+        => {},
     }
 
     obj.body = undefined;
@@ -1162,7 +1158,7 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = try self.createCustomTypeInstance(),
+                        .index = try self.createExtraData(),
                         .type_id = custom_type.type_id,
                     },
                 },
@@ -1171,7 +1167,7 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
 
             return new_object;
         },
-        .dict_subst, .variable, .upvar => {
+        .dict_subst, .variable, .upvar, .command => {
             // Variable lookup is not stable between threads.
             return .{
                 .str = try self.duplicateObjString(handle),
@@ -1235,7 +1231,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
             return calling_heap.normalHandle(new_list_idx);
         },
         .dict => {
-            const old_head = calling_heap.getDictMetadata(src.body.dict);
+            const old_head = calling_heap.getExtraData(src.body.dict).dict;
             const old_start = handle.index + 1;
 
             const new_dict_idx = try calling_heap.createObjects(1 + old_head.len);
@@ -1251,7 +1247,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 }
                 freeObject(.{ .index = new_dict_idx, .heap = handle.heap, .ref_counted = true });
             }
-            const new_head: *Object = &calling_heap.getLocalObject(new_dict_idx);
+            const new_head = calling_heap.getLocalObject(new_dict_idx);
             const new_start = new_dict_idx + 1;
             const new_items = calling_heap.objectSlice(new_start, new_start + old_head.len);
 
@@ -1260,10 +1256,10 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 .str = try calling_heap.duplicateObjString(handle),
                 .tag = .dict,
                 .body = .{
-                    .dict = try calling_heap.createDictMetadata(),
+                    .dict = try calling_heap.createExtraData(),
                 },
             };
-            errdefer calling_heap.dicts.destroy(new_head.body.dict);
+            errdefer calling_heap.destroyExtraData(new_head.body.dict);
 
             // Duplicate items of dict
             for (new_items, 0..) |*new_item, i| {
@@ -1278,7 +1274,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 };
             }
 
-            const dict = calling_heap.getDictMetadata(new_head.body.dict);
+            const dict = &calling_heap.getExtraData(new_head.body.dict).dict;
             dict.len = old_head.len;
             try object.dictReindex(calling_heap.normalHandle(new_dict_idx));
 
@@ -1319,7 +1315,7 @@ pub fn objectSlice(self: *Heap, start: u32, end: u32) []Object {
 }
 
 pub fn getLocalMetadata(self: *Heap, index: u32) *ObjectAndMetadata.Metadata {
-    return &self.heap.objects.items(.metadata)[index];
+    return &self.objects.items(.metadata)[index];
 }
 
 fn getLocalRefCount(self: *Heap, index: u32) u32 {
@@ -1530,7 +1526,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             break :blk try getListString(heap, index + 1, list.len);
         },
         .dict => {
-            const dict = heap.getDictMetadata(obj.body.dict);
+            const dict = &heap.getExtraData(obj.body.dict).dict;
             break :blk try getListString(heap, index + 1, dict.len);
         },
         .custom_type => {
@@ -1563,7 +1559,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
-        .string, .source, .script, .dict_subst, .variable, .upvar => {
+        .string, .source, .script, .dict_subst, .variable, .upvar, .command => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     };
@@ -1753,56 +1749,25 @@ pub const LongString = struct {
     }
 };
 
-pub fn createUpvar(self: *Heap) !u32 {
+pub fn createExtraData(self: *Heap) !ExtraDataIndex {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
-    const new_index = try self.upvars.create(self.gpa);
+    const new_index = try self.extra.create(self.heapAlloc());
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
 
     return @intCast(new_index);
 }
 
-pub fn getUpvar(self: *Heap, index: u32) *Upvar {
-    return &self.upvars.items[index];
+pub fn getExtraData(self: *Heap, index: ExtraDataIndex) *ExtraData {
+    return &self.extra.items[index];
 }
 
-pub fn destroyUpvar(self: *Heap, index: u32) void {
+pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
-    self.upvars.destroy(index);
-}
-
-pub fn createDictMetadata(self: *Heap) !DictIndex {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
-
-    const new_id = try self.dicts.create(self.gpa);
-    if (new_id >= object_heap_max_count) return error.OutOfMemory;
-
-    return @intCast(new_id);
-}
-
-pub fn getDictMetadata(self: *Heap, index: DictIndex) *Dictionary {
-    return &self.dicts.items[index];
-}
-
-pub fn destroyDictMetadata(self: *Heap, index: DictIndex) void {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
-
-    self.dicts.destroy(index);
-}
-
-pub fn createCustomTypeInstance(self: *Heap) !u32 {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
-
-    const new_id = try self.type_instances.create(self.gpa);
-    if (new_id >= object_heap_max_count) return error.OutOfMemory;
-
-    return @intCast(new_id);
+    self.extra.destroy(index);
 }
 
 // Heap instances //
