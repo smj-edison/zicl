@@ -143,7 +143,7 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
             const freed_buddy = buddy_of(index, getOrderSize(order));
-            const buddy_free_list_index = blk: {
+            var buddy_free_list_index = blk: {
                 for (self.free_lists[order].items, 0..) |block, i| {
                     if (block == freed_buddy) {
                         break :blk i;
@@ -299,6 +299,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
     return struct {
         const Self = @This();
         const no_next_free: usize = std.math.maxInt(usize);
+        pub const empty: Self = .{ .items = &.{} };
 
         // Make sure we have enough space for a usize.
         const node_align = std.mem.Alignment.of(usize).max(.of(Item));

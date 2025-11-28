@@ -841,7 +841,7 @@ pub fn atEnd(self: *Parser) bool {
     return self.index == self.buffer.len;
 }
 
-test "Parser" {
+test "parser" {
     const script =
         \\set x 5
         \\set y {a b c}

@@ -777,6 +777,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
             }
         }
 
+        // TODO PERF: reuse the object backing if it was allocated with more than one object.
         const new_list = try listUninitializedNew(calling_heap, @intCast(tokens.items.len));
         errdefer new_list.release();
 
@@ -850,7 +851,9 @@ fn listSetLength(calling_heap: *Heap, list: *Handle, new_len: u32) !void {
     errdefer Heap.freeObject(new_list);
     const new_items = listItemsRaw(new_list);
 
-    if (list.isShared()) {
+    // Why `calling_heap != list.heap`? Because we can't steal the old list's objects
+    // if they reference another heap's strings.
+    if (list.isShared() or calling_heap != list.heap) {
         // If the list is shared, we need to duplicate all the items.
         for (0.., new_items) |i, *new_item| {
             new_item.* = try Heap.duplicateOrReference(calling_heap, listItemRaw(list.*, @intCast(i)));

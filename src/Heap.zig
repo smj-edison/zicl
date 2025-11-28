@@ -353,6 +353,7 @@ pub const Tag = enum(u5) {
     list,
     dict,
     dict_subst,
+    command,
     script_command,
     script,
     reference,
@@ -412,6 +413,11 @@ pub const Body = packed union {
     dict_subst: packed struct {
         var_name_index: u32,
         dict_value_index: u32,
+    },
+    command: packed struct {
+        namespace_index: u32,
+        /// If std.math.maxInt(u32), this is the equivalent of null.
+        command_index: u32,
     },
     /// Information about a command.
     script_command: packed struct {
@@ -492,10 +498,10 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn isShared(handle: Handle) bool {
-        const objects = handle.getHeap().objects;
+        const obj_heap = handle.getHeap();
 
-        const cross_thread = objects.items(.metadata)[handle.index].cross_thread;
-        const multiple_owners = objects.items(.ref_count)[handle.index] > 1;
+        const cross_thread = obj_heap.getLocalMetadata(handle.index);
+        const multiple_owners = obj_heap.getLocalRefCount(handle.index) > 1;
         const is_owned = !handle.ref_counted;
         return cross_thread or multiple_owners or is_owned;
     }
@@ -504,14 +510,20 @@ pub const Handle = packed struct(u64) {
         return handle.peek().str != Object.null_string;
     }
 
+    pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
+        handle.getHeap().getLocalMetadata(handle.index);
+    }
+
     /// This should not be used for checking if an object is shared, use `isShared` instead.
     pub fn debugRefCount(handle: Handle) u32 {
-        return handle.getHeap().objects.items(.ref_count)[handle.index];
+        return getLocalRefCount(handle.getHeap(), handle.index);
     }
 
     pub fn incrRefCount(handle: Handle) void {
         assert(handle.ref_counted);
-        incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index]);
+
+        const is_cross_thread = handle.getMetadata().cross_thread;
+        incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], is_cross_thread);
     }
 
     pub fn reference(handle: Handle) Object {
@@ -536,9 +548,7 @@ pub const Handle = packed struct(u64) {
 };
 
 const ObjectAndMetadata = struct {
-    object: Object,
-    ref_count: u32,
-    metadata: packed struct {
+    pub const Metadata = packed struct {
         /// Order can be u5 instead of u6, because the heap size must be < 2^32
         order: u5,
         /// Whether this object is the front of the allocation
@@ -549,7 +559,11 @@ const ObjectAndMetadata = struct {
         cross_thread: bool,
         /// Whether this object is currently being used (used to track double frees)
         in_use: bool,
-    },
+    };
+
+    object: Object,
+    ref_count: u32,
+    metadata: Metadata,
     trace: std.debug.ConfigurableTrace(8, 8, cfg.trace_mem),
 };
 
@@ -761,7 +775,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     for (self.objects.items(.metadata)[index..end]) |metadata| assert(metadata.in_use == false);
 
     // Initialize all as empty objects
-    @memset(self.objects.items(.object)[index..end], .{
+    @memset(self.objectSlice(index, end), .{
         .str = Object.null_string,
         .tag = .none,
         .body = .{
@@ -796,7 +810,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 /// Does not run any destructors, frees the object directly.
 pub fn freeObjectBacking(handle: Handle) void {
     const obj_heap = handle.getHeap();
-    const metadata = obj_heap.objects.items(.metadata)[handle.index];
+    const metadata = obj_heap.getLocalMetadata(handle.index);
     assert(metadata.is_alloc_head);
 
     obj_heap.mem_mgmt_mutex.lock();
@@ -834,7 +848,7 @@ pub fn freeObject(handle: Handle) void {
     handle.invalidateBody();
     handle.invalidateString();
 
-    const metadata = obj_heap.objects.items(.metadata)[handle.index];
+    const metadata = obj_heap.getLocalMetadata(handle.index);
     if (metadata.is_alloc_head) {
         if (!metadata.in_use) @panic("Double free!");
 
@@ -890,7 +904,7 @@ fn invalidateBodyImpl(handle: Handle) void {
     assert(handle.canShimmer());
 
     const obj_heap = handle.getHeap();
-    const obj: *Object = &obj_heap.objects.items(.object)[handle.index];
+    const obj: *Object = &obj_heap.getLocalObject(handle.index);
 
     switch (obj.tag) {
         .list => {
@@ -935,7 +949,7 @@ fn invalidateBodyImpl(handle: Handle) void {
         },
         .script => {
             const script = obj.body.script; // copy
-            if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count)) {
+            if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, cfg.threading)) {
                 script.id.retire();
             }
         },
@@ -945,7 +959,7 @@ fn invalidateBodyImpl(handle: Handle) void {
                 obj_heap.normalHandle(source.file_name_obj).release();
             }
         },
-        .none, .index, .integer, .dict_subst, .variable, .float, .bool, .script_command, .marked => {},
+        .none, .index, .integer, .dict_subst, .variable, .upvar, .float, .bool, .script_command, .marked => {},
     }
 
     obj.body = undefined;
@@ -1014,6 +1028,25 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
     return std.mem.eql(u8, a_str, b_str);
 }
 
+/// Steal an object. This allocates a new object and sets its contents to the
+/// provided object's contents. Be very careful when using this.
+///
+/// Some things to keep in mind:
+///  * Caller is responsible for freeing the object's previous allocation,
+///    _without_ triggering `invalidateBody` or `invalidateString`. You'll
+///    want to use `freeObjectBacking` instead of `freeObject`.
+///  * This allocates a single object, not a range, so you can't use this to
+///    steal a list or dict.
+///  * This can't be used with a shared object.
+pub fn steal(calling_heap: *Heap, handle: Handle) !Handle {
+    assert(calling_heap.heap_id == handle.heap);
+    assert(handle.getMetadata().order == 0);
+    if (handle.ref_counted) assert(!handle.isShared());
+
+    const new_obj = try calling_heap.createObject();
+    new_obj.peek().* = handle.peek().*;
+}
+
 /// Increase ref count if possible, otherwise duplicate onto calling_heap.
 pub fn borrow(calling_heap: *Heap, handle: Handle) !Handle {
     // If the object isn't ref counted, then we'll need to clone it (i.e. a list item)
@@ -1024,7 +1057,8 @@ pub fn borrow(calling_heap: *Heap, handle: Handle) !Handle {
     // This object may have come from another heap
     const obj_heap = handle.getHeap();
 
-    incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index]);
+    const is_cross_thread = handle.getMetadata().cross_thread;
+    incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread);
 
     return handle;
 }
@@ -1033,7 +1067,8 @@ fn releaseImpl(handle: Handle) void {
     if (!handle.ref_counted) return;
 
     const obj_heap = handle.getHeap();
-    if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index])) {
+    const is_cross_thread = handle.getMetadata().cross_thread;
+    if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread)) {
         freeObject(handle);
     }
 }
@@ -1136,7 +1171,7 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
 
             return new_object;
         },
-        .dict_subst, .variable => {
+        .dict_subst, .variable, .upvar => {
             // Variable lookup is not stable between threads.
             return .{
                 .str = try self.duplicateObjString(handle),
@@ -1171,9 +1206,9 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 }
                 freeObject(.{ .index = new_list_idx, .heap = handle.heap, .ref_counted = true });
             }
-            const new_head: *Object = &calling_heap.objects.items(.object)[new_list_idx];
+            const new_head: *Object = calling_heap.getLocalObject(new_list_idx);
             const new_start = new_list_idx + 1;
-            const new_items = calling_heap.objects.items(.object)[new_start..][0..old_body.len];
+            const new_items = calling_heap.objectSlice(new_start, new_start + old_body.len);
 
             // Duplicate head of list
             new_head.* = .{
@@ -1216,9 +1251,9 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 }
                 freeObject(.{ .index = new_dict_idx, .heap = handle.heap, .ref_counted = true });
             }
-            const new_head: *Object = &calling_heap.objects.items(.object)[new_dict_idx];
+            const new_head: *Object = &calling_heap.getLocalObject(new_dict_idx);
             const new_start = new_dict_idx + 1;
-            const new_items = calling_heap.objects.items(.object)[new_start..][0..old_head.len];
+            const new_items = calling_heap.objectSlice(new_start, new_start + old_head.len);
 
             // Duplicate head of dict
             new_head.* = .{
@@ -1251,7 +1286,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
         },
         else => {
             const new_object = try calling_heap.createObject();
-            calling_heap.objects.items(.object)[new_object.index] = calling_heap.duplicateSingle(handle) catch |e| switch (e) {
+            new_object.peek().* = calling_heap.duplicateSingle(handle) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // We already checked if it was a multi-item object (i.e. a list)
                 error.MultiItemObject => unreachable,
@@ -1277,6 +1312,24 @@ pub fn getHandle(self: *Heap, index: u32, ref_counted: bool) Handle {
 
 pub fn getLocalObject(self: *Heap, index: u32) *Object {
     return &self.objects.items(.object)[index];
+}
+
+pub fn objectSlice(self: *Heap, start: u32, end: u32) []Object {
+    return self.objects.items(.object)[start..end];
+}
+
+pub fn getLocalMetadata(self: *Heap, index: u32) *ObjectAndMetadata.Metadata {
+    return &self.heap.objects.items(.metadata)[index];
+}
+
+fn getLocalRefCount(self: *Heap, index: u32) u32 {
+    const ptr = &self.objects.items(.ref_count)[index];
+
+    if (self.getLocalMetadata(index).cross_thread) {
+        return @atomicLoad(u32, ptr, .monotonic);
+    } else {
+        return ptr.*;
+    }
 }
 
 /// Guaranteed to be valid, barring OOM.
@@ -1510,7 +1563,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
-        .string, .dict_subst, .source, .script, .variable => {
+        .string, .source, .script, .dict_subst, .variable, .upvar => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     };
@@ -1679,11 +1732,11 @@ pub const LongString = struct {
     }
 
     pub fn incrRefCount(self: *align(align_amt) LongString) void {
-        incrRefCountOf(usize, &self.ref_count);
+        incrRefCountOf(usize, &self.ref_count, cfg.threading);
     }
 
     pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
-        if (decrRefCountOf(usize, &self.ref_count)) {
+        if (decrRefCountOf(usize, &self.ref_count, cfg.threading)) {
             self.freeUnchecked(gpa);
         }
     }
@@ -1905,8 +1958,8 @@ pub fn atomicIncr(comptime T: type, ptr: *T) T {
     }
 }
 
-pub fn incrRefCountOf(comptime T: type, ref: *T) void {
-    if (cfg.threading) {
+pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) void {
+    if (is_atomic) {
         _ = @atomicRmw(T, ref, .Add, 1, .monotonic);
     } else {
         ref.* += 1;
@@ -1914,9 +1967,9 @@ pub fn incrRefCountOf(comptime T: type, ref: *T) void {
 }
 
 /// Returns true if count has reached zero. Multithreaded safe.
-pub fn decrRefCountOf(comptime T: type, ref: *T) bool {
+pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
     var after_sub: T = undefined;
-    if (cfg.threading) {
+    if (is_atomic) {
         const before_sub = @atomicRmw(T, ref, .Sub, 1, .release);
         after_sub = before_sub - 1;
 

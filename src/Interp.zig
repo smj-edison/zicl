@@ -70,10 +70,8 @@ const VariableInfo = struct {
     call_frame_idx: u32,
 };
 
-/// Resolves to the variables' value, if any. Accounts for :: for globals.
-fn resolveVariable(interp: *Interp, name: Heap.Handle, var_call_frame: u32) !?VariableInfo {
-    const var_name = try Heap.getString(name);
-
+/// Resolves to the variable's value, if any. Accounts for :: for globals.
+fn resolveVariable(interp: *Interp, var_name: []const u8, var_call_frame: u32) ?VariableInfo {
     var call_frame_idx: u32 = 0;
     var var_value: ?Heap.Handle = null;
 
@@ -86,12 +84,8 @@ fn resolveVariable(interp: *Interp, name: Heap.Handle, var_call_frame: u32) !?Va
         while (trimmed_var_name[0] == ':') trimmed_var_name = trimmed_var_name[1..];
 
         const var_dict = interp.call_frames.items[call_frame_idx].variables;
-        // TODO PERF would it be possible to make dict lookup take a slice
-        // instead of an object?
-        const key = try object.newString(interp.heap, trimmed_var_name);
-        defer key.release();
+        var_value = var_dict.get(trimmed_var_name);
 
-        var_value = object.dictLookupRaw(var_dict, key);
         // Global scope doesn't have statics.
     } else {
         call_frame_idx = var_call_frame;
@@ -100,13 +94,11 @@ fn resolveVariable(interp: *Interp, name: Heap.Handle, var_call_frame: u32) !?Va
         const statics_dict = interp.call_frames.items[call_frame_idx].statics;
 
         // Check the variables dictionary.
-        var_value = object.dictLookupRaw(var_dict, name);
+        var_value = var_dict.get(var_name);
 
         // Maybe it's in the statics dictionary instead?
         if (var_value == null) {
-            if (statics_dict) |unwrapped| {
-                var_value = object.dictLookupRaw(unwrapped, name);
-            }
+            if (statics_dict) |unwrapped| var_value = unwrapped.get(var_name);
         }
     }
 
@@ -119,13 +111,15 @@ fn resolveVariable(interp: *Interp, name: Heap.Handle, var_call_frame: u32) !?Va
             .call_frame_idx = call_frame_idx,
         };
     }
+
+    return null;
 }
 
 /// This always shimmers to .variable. You probably should be using `ensureVariableType`.
 fn reshimmerToVariable(interp: *Interp, det: ?object.ErrorDetails, name: *Heap.Handle) !void {
     const var_name = try Heap.getString(name.*);
 
-    if (try interp.resolveVariable(name.*, interp.currentCallFrame())) |var_info| {
+    if (interp.resolveVariable(var_name, interp.currentCallFrame())) |var_info| {
         // Free the old representation and set the new one.
         name.invalidateBody();
 
@@ -142,7 +136,7 @@ fn reshimmerToVariable(interp: *Interp, det: ?object.ErrorDetails, name: *Heap.H
 
 /// Ensures that this is a valid variable, dict sugar, or upvar.
 fn ensureVariableType(interp: *Interp, det: ?object.ErrorDetails, name: *Heap.Handle) !void {
-    // This ensures that the name is local to this interpreters' heap.
+    // This ensures that the name is local to this interpreter's heap.
     try interp.heap.ensureShimmerable(name);
 
     const name_obj = name.peek();
@@ -192,7 +186,7 @@ fn ensureVariableType(interp: *Interp, det: ?object.ErrorDetails, name: *Heap.Ha
     }
 }
 
-/// Resolves to the variables' value.
+/// Resolves to the variable's value.
 pub fn getVariable(interp: *Interp, det: ?object.ErrorDetails, name: Heap.Handle) !Heap.Handle {
     if (interp.evaluating_safe_expr) return Error.EvaluatingSafeExpression;
 
@@ -241,7 +235,7 @@ pub const Command = struct {
     }
 };
 
-pub const CommandHashTable = std.HashMapUnmanaged(Heap.Handle, Command, struct {
+pub const CommandHashTable = std.ArrayHashMapUnmanaged(Heap.Handle, Command, struct {
     pub fn hash(ctx: @This(), key: Heap.Handle) u64 {
         _ = ctx;
 
@@ -254,7 +248,7 @@ pub const CommandHashTable = std.HashMapUnmanaged(Heap.Handle, Command, struct {
 
         return Heap.checkIfEqual(a, b) catch return false;
     }
-}, 80);
+}, true);
 
 fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
     const name_obj = try object.newString(interp.heap, name);
@@ -324,21 +318,21 @@ const CallFrame = struct {
     parent: u32,
     /// Level of the call frame. 0 = global.
     level: u32,
-    /// Handle to a dictionary containing the variables.
-    variables: Heap.Handle,
-    /// Handle to a dictionary containing all the statics.
-    statics: ?Heap.Handle,
+    /// Hash map containing the frame's variables.
+    variables: VariableMap,
+    /// Hash map containing the frame's statics.
+    statics: ?VariableMap,
     /// Arguments of the procedure call.
     args: []Heap.Handle,
     /// Signature of the procedure that this is being called with.
     signature: ProcedureSignature,
-    /// Call epoch. Used to invalidate previous variable lookups. Will overflow,
+    /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
     /// but when it overflows it'll scan the heap and reset all cached lookups.
     call_epoch: u31,
 };
 
-fn currentCallFrame(interp: *Interp) usize {
-    return interp.call_frames.items.len - 1;
+fn currentCallFrame(interp: *Interp) u32 {
+    return @intCast(interp.call_frames.items.len - 1);
 }
 
 /// Evaluation frame.
@@ -347,18 +341,31 @@ const EvalFrame = struct {
     call_frame: u32,
 };
 
-fn currentEvalFrame(interp: *Interp) usize {
-    return interp.eval_frames.items.len - 1;
+fn currentEvalFrame(interp: *Interp) u32 {
+    return @intCast(interp.eval_frames.items.len - 1);
 }
 
+fn pushEvalFrame(interp: *Interp) u32 {
+    interp.eval_frames.append(interp.gpa, .{
+        .call_frame = interp.currentCallFrame(),
+    });
+    return interp.currentEvalFrame();
+}
+
+fn popEvalFrame(interp: *Interp) void {
+    interp.eval_frames.pop() orelse unreachable;
+}
+
+/// Caller should release return value when they're done.
 fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle) !Heap.Handle {
     switch (tag) {
         .simple_string => {
-            return value;
+            return try interp.heap.borrow(value);
         },
         .variable_subst => {
             var det: object.ErrorDetails = undefined;
-            return try interp.wrapErrorDetails(&det, interp.getVariable(&det, value));
+            const var_target = try interp.wrapErrorDetails(&det, interp.getVariable(&det, value));
+            return try interp.heap.borrow(var_target);
         },
         .dict_sugar => {
             @panic("Dict sugar unimplemented");
@@ -474,10 +481,21 @@ fn interpolateTokens(
             error.NotMutable => unreachable,
         }
     }
+
+    return new_str;
 }
 
-pub fn eval(interp: *Interp, script: *Heap.Handle) !void {
-    // If the object is of type "list", with no string rep we can call a specialized version of eval()
+pub fn shimmerToCommand(interp: *Interp, det: ?object.ErrorDetails, handle: Heap.Handle) !void {
+    // In order to be valid, the proc epoch must match and the lookup must have occurred in the same namespace.
+    if (handle.peek().tag == .command and )
+}
+
+fn invokeCommand(interp: *Interp, args: []Heap.Handle) !void {
+
+}
+
+pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
+    // If the object is of type "list", with no string rep we can call a specialized version of eval().
     if (script.peek().tag == .list and script.hasString()) {
         return interp.evalList(script);
     }
@@ -486,19 +504,18 @@ pub fn eval(interp: *Interp, script: *Heap.Handle) !void {
     var det: object.ErrorDetails = undefined;
     const parsed = try interp.wrapErrorDetails(&det, object.getScript(interp.heap, &det, script));
 
-    // Reset the interpreter result. This is useful to
-    // return the empty result in the case of empty program.
+    // Reset the interpreter result. This is useful to return the empty result in the case of empty program.
     interp.setEmptyResult();
+
+    // TODO need to set stack frame on error, something like:
+    // errdefer interp.setErrorStack()
 
     // TODO implement JIM_OPTIMIZATION speedups
 
     // FIXME do I need `script->inUse++;`?
 
-    interp.eval_frames.append(interp.gpa, .{
-        .call_frame = interp.call_frames.items.len,
-    });
-    defer interp.eval_frames.pop();
-    const eval_frame = interp.currentEvalFrame();
+    _ = interp.pushEvalFrame();
+    defer interp.popEvalFrame();
 
     // Used for allocating the arguments passed into a command call.
     const args_alloc_backing = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
@@ -509,14 +526,18 @@ pub fn eval(interp: *Interp, script: *Heap.Handle) !void {
 
     const tags = parsed.tags.items;
     const values = object.listItemsRaw(parsed.values);
-    // Loop through commands.
+    // Loop through the script's commands.
     while (command_token_i < tags.len) : (command_token_i += 1) {
         // First token of the line is always .script_command.
         const command_info = values[command_token_i].body.script_command;
         command_token_i += 1; // Skip .script_command.
 
-        const args = try args_alloc.alloc(Heap.Handle, command_info.arg_count);
+        // This is not always the same as which word token we're on, as argument expansion
+        // may write multiple arguments from one word.
+        var args_written: usize = 0;
+        var args = try args_alloc.alloc(Heap.Handle, command_info.arg_count);
         defer args_alloc.free(args);
+        defer for (args) |arg| arg.release();
 
         // Populate the arguments by looping through each word of the command and
         // substituting.
@@ -527,19 +548,50 @@ pub fn eval(interp: *Interp, script: *Heap.Handle) !void {
             if (tags[word_token_i] == .start_of_word or argument_expansion) {
                 word_parts = values[word_token_i].body.integer;
                 word_token_i += 1;
-            }
+            } else unreachable;
 
-            const resultant_word: Heap.Handle = blk: {
-                // Simple one-to-one substitution, so a simple case.
+            var resultant_word: Heap.Handle = blk: {
                 if (word_parts == 1) {
+                    // Simple one-to-one substitution, so an easy case.
                     break :blk try interp.substituteOneToken(tags[word_token_i], object.listItemRaw(parsed.values, word_token_i));
                 } else {
+                    // Helper function that'll interpolate all the word parts and merge them into a string.
                     break :blk try interp.interpolateTokens(tags[word_token_i..][0..word_parts], parsed.values, word_token_i, word_parts);
                 }
             };
-            defer resultant_word.release();
 
-            if (argument_expansion) {}
+            if (argument_expansion) {
+                // Argument expansion, so we'll need to shimmer the result to a list.
+                det = undefined;
+                const len = try wrapErrorDetails(interp, &det, object.listLength(interp.heap, &det, &resultant_word));
+                // Free the list backing without running destructors, since we're going to steal the items
+                // directly from the list.
+                defer Heap.freeObjectBacking(resultant_word);
+
+                if (len > 1) {
+                    // Expanded into multiple tokens, so we'll need to resize args.
+                    args = try args_alloc.realloc(args, args.len - 1 + len);
+                }
+
+                assert(!resultant_word.isShared());
+                for (0..len) |list_idx| {
+                    // Steal each object from the list.
+                    args[args_written] = try interp.heap.steal(object.listItemRaw(resultant_word, list_idx));
+                    args_written += 1;
+                }
+            } else {
+                args[args_written] = try interp.heap.steal(object.listItemRaw(resultant_word, 0));
+                args_written += 1;
+            }
+        }
+
+        // Now that we've populated the arguments for this command, we'll go ahead and run it.
+        const result = interp.invokeCommand(args);
+        // TODO actually check for signals.
+        if (false) {
+            return Error.Signal;
+        } else {
+            if (result) |_| {} else |err| return err;
         }
     }
 }
