@@ -13,16 +13,13 @@ const Parser = @import("Parser.zig");
 const object = @import("object.zig");
 
 // These numbers are final, and can be depended on to be their current values
+pub const special_string_count = 2;
 pub const null_string = 0;
 pub const empty_string = 1;
-
 pub const special_object_count = 3;
 pub const null_object_idx: u32 = 0;
 pub const empty_object_idx: u32 = 1;
 pub const temp_object_idx: u32 = 2;
-
-const global_heap_id = 0;
-// --- //
 
 pub const HeapSettings = struct {
     /// threading only works on 64-bit machines, because
@@ -301,6 +298,95 @@ pub const Object = packed struct(u128) {
     str: StrOrPtr,
     tag: Tag,
     body: Body,
+
+    pub fn deinitSingle(obj: *Object, heap: *Heap) void {
+        obj.deinitBodySingle(heap);
+        obj.deinitString(heap);
+    }
+
+    pub fn deinitString(obj: *Object, heap: *Heap) void {
+        switch (heap.getLocalStringDetails(obj)) {
+            .long => |long_str| {
+                long_str.decrRefCount(heap.gpa);
+            },
+            .normal => {
+                heap.freeString(obj.str.u.str.index, obj.str.u.str.len);
+            },
+            .null, .empty => {},
+        }
+
+        // Be sure to set the null string afterwards (we can directly assign,
+        // as we've already checked that we can shimmer).
+        obj.str = Object.null_string;
+    }
+
+    /// Only deinitializes if this is a single object, panics otherwise. Can
+    /// be used to deinit a stack-allocated object. `heap` is used to reference
+    /// the strings/extra data this object contains.
+    pub fn deinitBodySingle(obj: *Object, heap: *Heap) void {
+        // Deinit body
+        switch (obj.tag) {
+            .custom_type => {
+                const custom_type = obj.body.custom_type;
+                const type_fns = custom_types.items[custom_type.type_id];
+
+                type_fns.invalidate_body(heap, obj);
+            },
+            .reference => {
+                obj.body.reference.release();
+            },
+            .string => {
+                // How come string is a no-op? Because the string is separate
+                // from its cached length.
+            },
+            .script => {
+                const script = obj.body.script; // copy
+                if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, cfg.threading)) {
+                    script.id.retire();
+                }
+            },
+            .source => {
+                const source = obj.body.source;
+                if (source.file_name_obj != 0) {
+                    heap.normalHandle(source.file_name_obj).release();
+                }
+            },
+            .command => {
+                const command = obj.body.command;
+                if (!command.in_global_namespace) {
+                    const extra_data = heap.getExtraData(command.u.other_namespace).command;
+                    heap.normalHandle(extra_data.namespace).release();
+                    heap.destroyExtraData(command.u.other_namespace);
+                }
+            },
+            .upvar => {
+                const upvar = &heap.getExtraData(obj.body.upvar).upvar;
+                switch (upvar.name) {
+                    .normal => |var_name| {
+                        heap.normalHandle(var_name).release();
+                    },
+                    .dict_sugar => |dict_names| {
+                        heap.normalHandle(dict_names.dict_name_index).release();
+                        heap.normalHandle(dict_names.dict_key_index).release();
+                    },
+                }
+            },
+            .none,
+            .index,
+            .integer,
+            .dict_subst,
+            .variable,
+            .float,
+            .bool,
+            .script_command,
+            .marked,
+            => {},
+            .dict, .list => unreachable,
+        }
+
+        obj.body = undefined;
+        obj.tag = .none;
+    }
 };
 
 pub const Tag = enum(u5) {
@@ -556,10 +642,62 @@ pub const Handle = packed struct(u64) {
         };
     }
 
-    pub const invalidateString = invalidateStringImpl;
-    pub const invalidateBody = invalidateBodyImpl;
+    pub fn invalidateString(handle: Handle) void {
+        assert(handle.canShimmer());
 
-    pub const release = releaseImpl;
+        handle.peek().deinitString(handle.getHeap());
+    }
+
+    pub fn invalidateBody(handle: Handle) void {
+        assert(handle.canShimmer());
+
+        const obj_heap = handle.getHeap();
+        const obj = obj_heap.getLocalObject(handle.index);
+
+        switch (obj.tag) {
+            .list => {
+                const list = obj.body.list;
+
+                // Don't free the head (e.g. self).
+                for (1..(list.len + 1)) |i| {
+                    freeObject(.{
+                        .index = @intCast(handle.index + i),
+                        .heap = handle.heap,
+                        .ref_counted = false,
+                    });
+                }
+            },
+            .dict => {
+                const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
+
+                // Don't free the head (e.g. self).
+                for (1..(dict_metadata.len + 1)) |i| {
+                    freeObject(.{
+                        .index = @intCast(handle.index + i),
+                        .heap = handle.heap,
+                        .ref_counted = false,
+                    });
+                }
+
+                dict_metadata.table.deinit(obj_heap.gpa);
+                obj_heap.destroyExtraData(obj.body.dict);
+            },
+            else => obj.deinitBodySingle(obj_heap),
+        }
+
+        obj.body = undefined;
+        obj.tag = .none;
+    }
+
+    pub fn release(handle: Handle) void {
+        if (!handle.ref_counted) return;
+
+        const obj_heap = handle.getHeap();
+        const is_cross_thread = handle.getMetadata().cross_thread;
+        if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread)) {
+            freeObject(handle);
+        }
+    }
 };
 
 const ObjectAndMetadata = struct {
@@ -674,6 +812,9 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     const temp_object = try heap.createObject();
     assert(temp_object.index == temp_object_idx);
 
+    // We need to init the temp object as well by setting its string to a long string.
+    assert(try heap.setLongString(temp_object_idx, .{ .temp = "" }));
+
     return heap;
 }
 
@@ -686,37 +827,38 @@ fn clearParsedScripts(self: *Heap) void {
     self.parsed_scripts.clearRetainingCapacity();
 }
 
-pub fn deinit(self: *Heap) void {
+pub fn deinit(heap: *Heap) void {
     // Parsed scripts have references to objects, so we'll deinit scripts before objects.
-    self.clearParsedScripts();
-    self.parsed_scripts.deinit(self.gpa);
+    heap.clearParsedScripts();
+    heap.parsed_scripts.deinit(heap.gpa);
 
-    for (special_object_count..self.objects.len) |i| {
-        const metadata = self.objects.get(i).metadata;
+    for (special_object_count..heap.objects.len) |i| {
+        const metadata = heap.objects.get(i).metadata;
         if (metadata.in_use) {
             // We don't use free object here, as it may cause a double-free when
             // freeing recursive structures. For example, if there was a list with
             // two items, we'll free the list (first free of items), then free
             // the items individually (second free)
-            const handle = self.getHandle(@intCast(i), false);
+            const handle = heap.getHandle(@intCast(i), false);
             handle.invalidateBody();
             handle.invalidateString();
         }
     }
+    Heap.getStringDetails(heap.tempObject()).long.freeUnchecked(heap.gpa);
 
     if (cfg.use_vmem) {
-        memutil.vmemUnmap(@alignCast(self.strings.items));
-        memutil.vmemUnmap(@alignCast(self.objects.bytes[0..object_heap_max_bytes]));
+        memutil.vmemUnmap(@alignCast(heap.strings.items));
+        memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
     } else {
         // Don't use self.heapAlloc() in this case, as that will error
         // with the null allocator
-        self.strings.deinit(self.gpa);
-        self.objects.deinit(self.gpa);
+        heap.strings.deinit(heap.gpa);
+        heap.objects.deinit(heap.gpa);
     }
-    self.object_tracking.deinit(self.gpa);
-    self.string_tracking.deinit(self.gpa);
+    heap.object_tracking.deinit(heap.gpa);
+    heap.string_tracking.deinit(heap.gpa);
 
-    self.extra.deinit(self.gpa);
+    heap.extra.deinit(heap.gpa);
 }
 
 pub fn nullObject(self: *Heap) Handle {
@@ -746,28 +888,26 @@ pub fn tempObject(self: *Heap) Handle {
 pub fn resetTempObject(heap: *Heap) void {
     if (heap.tempObject().hasString()) {
         const long_string = getStringDetails(heap.tempObject()).long;
-        long_string.string = undefined;
+        long_string.string_type.temp = undefined;
     }
 }
 
 pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) !void {
     const temp_handle = heap.tempObject();
-
-    if (!temp_handle.hasString()) {
-        // First time initializing the temp object.
-        try heap.setLongString(temp_handle.index, "", .temp);
-    }
-
+    assert(temp_handle.hasString());
     assert(temp_handle.getMetadata().cross_thread == false);
+
     const long_string = getStringDetails(temp_handle).long;
-    // Try to avoid churning the LongString allocation by making it
+    // Avoid churning the LongString allocation by making it
     // extremely unlikely for its ref_count to reach zero.
     long_string.ref_count = std.math.maxInt(usize) / 2;
     // Reset anything that may have previously been computed.
     long_string.utf8_length = null;
     long_string.hash = null;
 
-    long_string.string = bytes;
+    long_string.string_type = .{
+        .temp = bytes,
+    };
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -924,122 +1064,6 @@ pub fn prepareToShimmer(calling_heap: *Heap, handle: *Handle) !void {
     handle.invalidateBody();
 }
 
-fn invalidateStringImpl(handle: Handle) void {
-    assert(handle.canShimmer());
-
-    const obj = handle.peek();
-    const obj_heap = handle.getHeap();
-
-    switch (obj_heap.getLocalStringDetails(handle.index)) {
-        .long => |long_str| {
-            long_str.decrRefCount(obj_heap.gpa);
-        },
-        .normal => {
-            obj_heap.freeString(obj.str.u.str.index, obj.str.u.str.len);
-        },
-        .null, .empty => {},
-    }
-
-    // Be sure to set the null string afterwards (we can directly assign,
-    // as we've already checked that we can shimmer).
-    obj.str = Object.null_string;
-}
-
-fn invalidateBodyImpl(handle: Handle) void {
-    assert(handle.canShimmer());
-
-    const obj_heap = handle.getHeap();
-    const obj = obj_heap.getLocalObject(handle.index);
-
-    switch (obj.tag) {
-        .list => {
-            const list = obj.body.list;
-
-            // Don't free the head (e.g. self)
-            for (1..(list.len + 1)) |i| {
-                freeObject(.{
-                    .index = @intCast(handle.index + i),
-                    .heap = handle.heap,
-                    .ref_counted = false,
-                });
-            }
-        },
-        .dict => {
-            const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
-
-            // Don't free the head (e.g. self)
-            for (1..(dict_metadata.len + 1)) |i| {
-                freeObject(.{
-                    .index = @intCast(handle.index + i),
-                    .heap = handle.heap,
-                    .ref_counted = false,
-                });
-            }
-
-            dict_metadata.table.deinit(obj_heap.gpa);
-            obj_heap.destroyExtraData(obj.body.dict);
-        },
-        .custom_type => {
-            const custom_type = obj.body.custom_type;
-            const type_fns = custom_types.items[custom_type.type_id];
-
-            type_fns.invalidate_body(obj_heap, obj);
-        },
-        .reference => {
-            obj.body.reference.release();
-        },
-        .string => {
-            // How come string is a no-op? Because the string is separate
-            // from its cached length.
-        },
-        .script => {
-            const script = obj.body.script; // copy
-            if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, cfg.threading)) {
-                script.id.retire();
-            }
-        },
-        .source => {
-            const source = obj.body.source;
-            if (source.file_name_obj != 0) {
-                obj_heap.normalHandle(source.file_name_obj).release();
-            }
-        },
-        .command => {
-            const command = obj.body.command;
-            if (!command.in_global_namespace) {
-                const extra_data = obj_heap.getExtraData(command.u.other_namespace).command;
-                obj_heap.normalHandle(extra_data.namespace).release();
-                obj_heap.destroyExtraData(command.u.other_namespace);
-            }
-        },
-        .upvar => {
-            const upvar = &obj_heap.getExtraData(obj.body.upvar).upvar;
-            switch (upvar.name) {
-                .normal => |var_name| {
-                    obj_heap.normalHandle(var_name).release();
-                },
-                .dict_sugar => |dict_names| {
-                    obj_heap.normalHandle(dict_names.dict_name_index).release();
-                    obj_heap.normalHandle(dict_names.dict_key_index).release();
-                },
-            }
-        },
-        .none,
-        .index,
-        .integer,
-        .dict_subst,
-        .variable,
-        .float,
-        .bool,
-        .script_command,
-        .marked,
-        => {},
-    }
-
-    obj.body = undefined;
-    obj.tag = .none;
-}
-
 /// Get a string slice from heap string storage
 pub fn getHeapString(self: *Heap, start: u32, end: u32) [:0]u8 {
     return self.strings.items[start..end :0];
@@ -1064,6 +1088,8 @@ pub fn createString(self: *Heap, len: u32) !u32 {
 }
 
 pub fn freeString(self: *Heap, index: u32, len: u32) void {
+    assert(index >= special_string_count);
+
     const length_with_null = len + 1;
     self.mem_mgmt_mutex.lock();
     self.string_tracking.freeCount(index, length_with_null);
@@ -1141,16 +1167,6 @@ pub fn borrowOptional(calling_heap: *Heap, handle: ?Handle) !?Handle {
     if (handle) |unwrapped| {
         return calling_heap.borrow(unwrapped);
     } else return null;
-}
-
-fn releaseImpl(handle: Handle) void {
-    if (!handle.ref_counted) return;
-
-    const obj_heap = handle.getHeap();
-    const is_cross_thread = handle.getMetadata().cross_thread;
-    if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread)) {
-        freeObject(handle);
-    }
 }
 
 fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr {
@@ -1428,7 +1444,7 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
         // so we need to copy.
         const new_str = try heap.gpa.dupeZ(u8, bytes);
         errdefer heap.gpa.free(new_str);
-        const took_ownership = try heap.setLongString(handle.index, new_str, .normal);
+        const took_ownership = try heap.setLongString(handle.index, .{ .normal = new_str });
         if (!took_ownership) heap.gpa.free(new_str);
     }
 }
@@ -1440,9 +1456,13 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
     _ = try heap.getLocalString(handle.index); // generate rep
 
     const obj = heap.getLocalObject(handle.index);
-    switch (heap.getLocalStringDetails(handle.index)) {
+    switch (heap.getLocalStringDetails(handle.peek())) {
         .long => |long_str| {
-            return long_str.string;
+            switch (long_str.string_type) {
+                .normal => |normal| return normal,
+                .temp => @panic("Can't modify a temp object"),
+                .different_capacity => |info| return info.string,
+            }
         },
         .normal => {
             const str = obj.str.u.str;
@@ -1498,17 +1518,14 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
 
 /// Returns whether the heap took ownership. It may copy the bytes into
 /// the heap, so it can succeed while also not taking ownership.
-pub fn setStringOwning(handle: Handle, bytes: [:0]u8, details: ?LongString.Details) !bool {
+pub fn setStringOwning(handle: Handle, bytes: [:0]u8) !bool {
     const heap = handle.getHeap();
 
-    if (details) |unwrapped| {
-        // Details provided, so we must wrap it in a long string
-        return try heap.setLongString(handle.index, bytes, unwrapped);
-    } else if (try heap.setNormalString(handle.index, bytes)) {
+    if (try heap.setNormalString(handle.index, bytes)) {
         // Successfully set as normal string.
         return false;
     } else {
-        return try heap.setLongString(handle.index, bytes, .normal);
+        return try heap.setLongString(handle.index, .{ .normal = bytes });
     }
 }
 
@@ -1550,14 +1567,11 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
 /// Returns whether the object heap took ownership of the string.
 /// The only case where this would fail is OOM or if someone else
 /// exchanged the string right before us.
-pub fn setLongString(self: *Heap, index: u32, bytes: [:0]u8, details: LongString.Details) Allocator.Error!bool {
-    assert(bytes.len > 0);
-
+pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allocator.Error!bool {
     const long_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
     errdefer self.gpa.free(long_string);
     long_string.* = .{
-        .string = bytes,
-        .details = details,
+        .string_type = string_type,
         .ref_count = 1,
         .utf8_length = null,
     };
@@ -1567,7 +1581,8 @@ pub fn setLongString(self: *Heap, index: u32, bytes: [:0]u8, details: LongString
         .is_ptr = true,
     };
 
-    return self.exchangeString(index, Object.null_string, string_header);
+    const res = self.exchangeString(index, Object.null_string, string_header);
+    return res;
 }
 
 const empty_string_value = "";
@@ -1576,9 +1591,9 @@ const empty_string_value = "";
 fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     const obj: *Object = heap.getLocalObject(index);
 
-    switch (heap.getLocalStringDetails(index)) {
+    switch (heap.getLocalStringDetails(obj)) {
         .long => |long_str| {
-            return long_str.string;
+            return long_str.getString();
         },
         .normal => |str| {
             return str;
@@ -1648,7 +1663,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
     };
 
-    const took_ownership = try setStringOwning(heap.normalHandle(index), new_str, null);
+    const took_ownership = try setStringOwning(heap.normalHandle(index), new_str);
     if (!took_ownership) heap.gpa.free(new_str);
 
     // Rerun this function to figure out where the new string is
@@ -1740,12 +1755,10 @@ const StringDetails = union(enum) {
 };
 
 pub fn getStringDetails(handle: Handle) StringDetails {
-    return handle.getHeap().getLocalStringDetails(handle.index);
+    return handle.getHeap().getLocalStringDetails(handle.peek());
 }
 
-fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
-    const obj = self.getLocalObject(index);
-
+fn getLocalStringDetails(heap: *Heap, obj: *Object) StringDetails {
     // Normal string or long string?
     if (obj.str.is_ptr) {
         // Convert to LongString ptr (guaranteed to be non-null)
@@ -1760,7 +1773,7 @@ fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
             return .empty;
         } else {
             return .{
-                .normal = self.getHeapString(str.index, str.index + str.len),
+                .normal = heap.getHeapString(str.index, str.index + str.len),
             };
         }
     }
@@ -1773,25 +1786,27 @@ pub const LongString = struct {
     pub const align_amt = 128;
     pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
 
-    string: [:0]u8,
-    utf8_length: ?u64,
-    details: Details,
-    hash: ?u256 = null,
-    ref_count: usize,
-
     /// Long strings are special in that they can have
     /// extended properties (mmaping is in the plans,
     /// for example). Since it has special properties,
     /// we have to track them so it can be freed correctly.
-    pub const Details = union(enum) {
-        normal,
+    pub const Type = union(enum) {
+        normal: [:0]u8,
         /// A temporary string has its bytes managed by someone else,
         /// so when this LongString is freed, we won't free the string.
-        temp,
+        temp: [:0]const u8,
         /// If the string was allocated with a different capacity
         /// than its current reported length, set this field
-        different_capacity: u64,
+        different_capacity: struct {
+            string: [:0]u8,
+            original_capacity: u64,
+        },
     };
+
+    string_type: Type,
+    utf8_length: ?u64,
+    hash: ?u256 = null,
+    ref_count: usize,
 
     pub fn fromInt(int: u58) *align(align_amt) LongString {
         return @ptrFromInt(int << 6);
@@ -1806,11 +1821,19 @@ pub const LongString = struct {
             return hash;
         } else {
             var out: [32]u8 = [_]u8{0} ** 32;
-            std.crypto.hash.Blake3.hash(self.string, &out, .{});
+            std.crypto.hash.Blake3.hash(self.getString(), &out, .{});
 
             const hash: u256 = @bitCast(out);
             self.hash = hash;
             return hash;
+        }
+    }
+
+    pub fn getString(self: *align(align_amt) LongString) [:0]const u8 {
+        switch (self.string_type) {
+            .normal => |string| return string,
+            .temp => |temp| return temp,
+            .different_capacity => |info| return info.string,
         }
     }
 
@@ -1825,10 +1848,10 @@ pub const LongString = struct {
     }
 
     pub fn freeUnchecked(self: *align(align_amt) LongString, gpa: Allocator) void {
-        switch (self.details) {
-            .normal => gpa.free(self.string),
-            .different_capacity => |capacity| {
-                gpa.free(self.string.ptr[0..capacity :0]);
+        switch (self.string_type) {
+            .normal => |string| gpa.free(string),
+            .different_capacity => |info| {
+                gpa.free(info.string.ptr[0..info.original_capacity :0]);
             },
             .temp => {
                 // We don't want to free the string, as it's managed by someone else.
