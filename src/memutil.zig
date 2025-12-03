@@ -298,7 +298,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
 
     return struct {
         const Self = @This();
-        const no_next_free: usize = std.math.maxInt(usize);
+        pub const no_next_free: usize = std.math.maxInt(usize);
         pub const empty: Self = .{ .items = &.{} };
 
         // Make sure we have enough space for a usize.
@@ -307,9 +307,10 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
         items: []align(node_align.toByteUnits()) Item,
         /// If == no_next_free, it doesn't point to anything
         next_free: usize = no_next_free,
-        /// `items.len` is the capacity, while `len` is how many
-        /// items are being used.
+        /// `len` is the largest index used, while `items.len` is the capacity.
         len: usize = 0,
+        /// `count` is how many items are live.
+        count: usize = 0,
 
         /// Capacity must be > 0
         pub fn initWithCapacity(gpa: Allocator, capacity: usize) !Self {
@@ -327,6 +328,9 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
         }
 
         pub fn create(self: *Self, gpa: Allocator) !usize {
+            self.count += 1;
+            errdefer self.count -= 1;
+
             // Check if there's anything on the free list
             if (self.next_free != no_next_free) {
                 const next_free = self.next_free;
@@ -334,26 +338,33 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
                 const item_ptr: *Item = &self.items[next_free];
                 const int_ptr: *usize = @ptrCast(item_ptr);
                 self.next_free = int_ptr.*;
+                // We intentionally don't set the item as undefined here, since
+                // some use cases (generation tracking) reuse the previous memory.
                 return next_free;
             }
 
             // Resize/realloc if needed
+            const new_size = @max(self.items.len, 4) * 2;
             if (self.len >= self.items.len) {
                 if (use_vmem) {
                     return error.OutOfMemory;
-                } else if (gpa.resize(self.items, self.items.len * 2)) {
-                    self.items.len *= 2;
+                } else if (gpa.resize(self.items, new_size)) {
+                    self.items.len = new_size;
                 } else {
-                    self.items = try gpa.realloc(self.items, self.items.len * 2);
+                    self.items = try gpa.realloc(self.items, new_size);
                 }
             }
 
             const new_index = self.len;
             self.len += 1;
+            // We intentionally don't set the item as undefined here, since
+            // some use cases (generation tracking) reuse the previous memory.
             return new_index;
         }
 
         pub fn destroy(self: *Self, index: usize) void {
+            self.count -= 1;
+
             const item_ptr: *Item = &self.items[index];
             const int_ptr: *usize = @ptrCast(item_ptr);
             int_ptr.* = self.next_free;
@@ -365,6 +376,29 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
                 vmemUnmapItems(Item, @alignCast(self.items));
             } else {
                 gpa.free(self.items);
+            }
+        }
+
+        /// For debugging purposes only. Dumps everything that was leaked.
+        pub fn dumpLeaked(self: *Self, scratch: Allocator, comptime fmt: []const u8) !void {
+            // We'll go through the free list, adding each free item to the `not_leaked` set.
+            var not_leaked = std.AutoHashMap(usize, void).init(scratch);
+            defer not_leaked.deinit();
+
+            var next_free = self.next_free;
+            while (next_free != no_next_free) {
+                try not_leaked.put(next_free, undefined);
+
+                const item_ptr: *Item = &self.items[next_free];
+                const int_ptr: *usize = @ptrCast(item_ptr);
+
+                next_free = int_ptr.*;
+            }
+
+            for (0..self.items.len) |i| {
+                if (!not_leaked.contains(i)) {
+                    std.debug.print(fmt, .{ i, self.items[i] });
+                }
             }
         }
     };

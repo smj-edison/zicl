@@ -16,9 +16,10 @@ const object = @import("object.zig");
 pub const null_string = 0;
 pub const empty_string = 1;
 
-pub const special_object_count = 2;
-pub const null_object_idx = 0;
-pub const empty_object_idx = 1;
+pub const special_object_count = 3;
+pub const null_object_idx: u32 = 0;
+pub const empty_object_idx: u32 = 1;
+pub const temp_object_idx: u32 = 2;
 
 const global_heap_id = 0;
 // --- //
@@ -56,12 +57,14 @@ pub const GlobalHeapState = struct {
     /// Used for all global data structures (currently custom_types and script_metadata)
     gpa: std.mem.Allocator = memutil.null_allocator,
     next_open_heap: usize = 0,
+    /// Used to turn some panics into useful messages.
     running_leak_check: bool = false,
 };
 pub var state: GlobalHeapState = .{};
 pub var heaps: [cfg.max_heaps]Heap = undefined;
 pub var custom_types: memutil.IndexedMemoryPool(CustomType, cfg.use_vmem) = undefined;
-pub var script_metadata: memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem) = undefined;
+pub var script_metadata: ScriptMetadataPool = undefined;
+const ScriptMetadataPool = memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem);
 
 const Heap = @This();
 
@@ -121,6 +124,9 @@ pub const ScriptId = packed struct(u64) {
     pub fn retire(id: ScriptId) void {
         state.mutex.lock();
         defer state.mutex.unlock();
+
+        // Null script should never be retired.
+        assert(id.index != 0);
 
         script_metadata.destroy(id.index);
         // Increment generation.
@@ -370,9 +376,14 @@ pub const Body = packed union {
         dict_value_index: u32,
     },
     command: packed struct {
-        namespace_index: u32,
-        /// If std.math.maxInt(u32), this is the equivalent of null.
-        command_index: u32,
+        procedure_epoch: u31,
+        in_global_namespace: bool,
+        u: packed union {
+            global_namespace: packed struct {
+                command_index: u32,
+            },
+            other_namespace: ExtraDataIndex,
+        },
     },
     /// Information about a command.
     script_command: packed struct {
@@ -413,7 +424,7 @@ comptime {
     }
 }
 
-pub const ExtraDataIndex = u32;
+pub const ExtraDataIndex = enum(u32) { _ };
 /// Extra data, for when you can't store enough in the main object.
 pub const ExtraData = union {
     /// This does not store the key/value pairs directly, instead it
@@ -440,18 +451,28 @@ pub const ExtraData = union {
     upvar: struct {
         call_frame_idx: u32,
         call_frame_epoch: u31,
-        /// Cached index of the target object.
+        /// Cached index of the target object. Contains the null object if the variable
+        /// doesn't exist.
         index: u32,
-        dict_sugar: ?struct {
-            /// _Non_-cached index of the dictionary name ("foo" of `foo(bar)`).
-            dict_name_index: u32,
-            /// _Non_-cached index of the key ("bar" of `foo(bar)`).
-            dict_key_index: u32,
+        name: union(enum) {
+            /// An object containing the name of the variable in the variable's scope.
+            normal: u32,
+            dict_sugar: struct {
+                /// _Non_-cached index of the dictionary name ("foo" of `foo(bar)`).
+                dict_name_index: u32,
+                /// _Non_-cached index of the dictionary key ("bar" of `foo(bar)`).
+                dict_key_index: u32,
+            },
         },
     },
     custom_type: struct {
         first_ptr: *anyopaque,
         second_ptr: *anyopaque,
+    },
+    /// Spillover for when command isn't in the global namespace.
+    command: struct {
+        namespace: u32,
+        command_index: u32,
     },
 };
 
@@ -538,9 +559,7 @@ pub const Handle = packed struct(u64) {
     pub const invalidateString = invalidateStringImpl;
     pub const invalidateBody = invalidateBodyImpl;
 
-    pub fn release(handle: Handle) void {
-        releaseImpl(handle);
-    }
+    pub const release = releaseImpl;
 };
 
 const ObjectAndMetadata = struct {
@@ -640,13 +659,20 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     const empty_string_idx = try heap.string_tracking.alloc(gpa, 0);
     assert(empty_string_idx == empty_string);
 
+    // This is to remember to update this section whenever the special
+    // objects change.
+    comptime assert(special_object_count == 3);
+
     // Specialty objects
     // null object is guaranteed to have index 0.
     const null_object = try heap.createObject();
-    assert(null_object.index == 0);
+    assert(null_object.index == null_object_idx);
     // Empty object is guaranteed to have index 1.
     const empty_object = try heap.createObject();
-    assert(empty_object.index == 1);
+    assert(empty_object.index == empty_object_idx);
+    // Temp object is guaranteed to have index 2.
+    const temp_object = try heap.createObject();
+    assert(temp_object.index == temp_object_idx);
 
     return heap;
 }
@@ -695,7 +721,7 @@ pub fn deinit(self: *Heap) void {
 
 pub fn nullObject(self: *Heap) Handle {
     return .{
-        .index = 0,
+        .index = null_object_idx,
         .heap = self.heap_id,
         .ref_counted = false,
     };
@@ -703,10 +729,45 @@ pub fn nullObject(self: *Heap) Handle {
 
 pub fn emptyObject(self: *Heap) Handle {
     return .{
-        .index = 1,
+        .index = empty_object_idx,
         .heap = self.heap_id,
         .ref_counted = false,
     };
+}
+
+pub fn tempObject(self: *Heap) Handle {
+    return .{
+        .index = temp_object_idx,
+        .heap = self.heap_id,
+        .ref_counted = false,
+    };
+}
+
+pub fn resetTempObject(heap: *Heap) void {
+    if (heap.tempObject().hasString()) {
+        const long_string = getStringDetails(heap.tempObject()).long;
+        long_string.string = undefined;
+    }
+}
+
+pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) !void {
+    const temp_handle = heap.tempObject();
+
+    if (!temp_handle.hasString()) {
+        // First time initializing the temp object.
+        try heap.setLongString(temp_handle.index, "", .temp);
+    }
+
+    assert(temp_handle.getMetadata().cross_thread == false);
+    const long_string = getStringDetails(temp_handle).long;
+    // Try to avoid churning the LongString allocation by making it
+    // extremely unlikely for its ref_count to reach zero.
+    long_string.ref_count = std.math.maxInt(usize) / 2;
+    // Reset anything that may have previously been computed.
+    long_string.utf8_length = null;
+    long_string.hash = null;
+
+    long_string.string = bytes;
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -852,13 +913,15 @@ pub fn ensureModifiable(calling_heap: *Heap, handle: *Handle) !void {
 }
 
 /// If the object can't be shimmered, this will duplicate and release
-/// the old object.
-pub fn ensureShimmerable(calling_heap: *Heap, handle: *Handle) !void {
+/// the old object. This also invalidates the object's body.
+pub fn prepareToShimmer(calling_heap: *Heap, handle: *Handle) !void {
     if (!handle.canShimmer()) {
         const before_duplicating = handle.*;
         handle.* = try calling_heap.duplicate(handle.*);
         before_duplicating.release();
     }
+
+    handle.invalidateBody();
 }
 
 fn invalidateStringImpl(handle: Handle) void {
@@ -877,12 +940,9 @@ fn invalidateStringImpl(handle: Handle) void {
         .null, .empty => {},
     }
 
-    // Be sure to mark as having no string
-    obj.str.is_ptr = false;
-    obj.str.u.str = .{
-        .index = 0,
-        .len = 0,
-    };
+    // Be sure to set the null string afterwards (we can directly assign,
+    // as we've already checked that we can shimmer).
+    obj.str = Object.null_string;
 }
 
 fn invalidateBodyImpl(handle: Handle) void {
@@ -944,17 +1004,35 @@ fn invalidateBodyImpl(handle: Handle) void {
                 obj_heap.normalHandle(source.file_name_obj).release();
             }
         },
+        .command => {
+            const command = obj.body.command;
+            if (!command.in_global_namespace) {
+                const extra_data = obj_heap.getExtraData(command.u.other_namespace).command;
+                obj_heap.normalHandle(extra_data.namespace).release();
+                obj_heap.destroyExtraData(command.u.other_namespace);
+            }
+        },
+        .upvar => {
+            const upvar = &obj_heap.getExtraData(obj.body.upvar).upvar;
+            switch (upvar.name) {
+                .normal => |var_name| {
+                    obj_heap.normalHandle(var_name).release();
+                },
+                .dict_sugar => |dict_names| {
+                    obj_heap.normalHandle(dict_names.dict_name_index).release();
+                    obj_heap.normalHandle(dict_names.dict_key_index).release();
+                },
+            }
+        },
         .none,
         .index,
         .integer,
         .dict_subst,
         .variable,
-        .upvar,
         .float,
         .bool,
         .script_command,
         .marked,
-        .command,
         => {},
     }
 
@@ -1057,6 +1135,12 @@ pub fn borrow(calling_heap: *Heap, handle: Handle) !Handle {
     incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread);
 
     return handle;
+}
+
+pub fn borrowOptional(calling_heap: *Heap, handle: ?Handle) !?Handle {
+    if (handle) |unwrapped| {
+        return calling_heap.borrow(unwrapped);
+    } else return null;
 }
 
 fn releaseImpl(handle: Handle) void {
@@ -1353,12 +1437,12 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
 /// Not threadsafe.
 pub fn getStringMut(handle: Handle) ![:0]u8 {
     const heap = handle.getHeap();
-    try heap.getLocalString(handle.index); // generate rep
+    _ = try heap.getLocalString(handle.index); // generate rep
 
     const obj = heap.getLocalObject(handle.index);
     switch (heap.getLocalStringDetails(handle.index)) {
         .long => |long_str| {
-            return &long_str.string;
+            return long_str.string;
         },
         .normal => {
             const str = obj.str.u.str;
@@ -1701,6 +1785,9 @@ pub const LongString = struct {
     /// we have to track them so it can be freed correctly.
     pub const Details = union(enum) {
         normal,
+        /// A temporary string has its bytes managed by someone else,
+        /// so when this LongString is freed, we won't free the string.
+        temp,
         /// If the string was allocated with a different capacity
         /// than its current reported length, set this field
         different_capacity: u64,
@@ -1743,6 +1830,9 @@ pub const LongString = struct {
             .different_capacity => |capacity| {
                 gpa.free(self.string.ptr[0..capacity :0]);
             },
+            .temp => {
+                // We don't want to free the string, as it's managed by someone else.
+            },
         }
 
         gpa.destroy(self);
@@ -1756,18 +1846,18 @@ pub fn createExtraData(self: *Heap) !ExtraDataIndex {
     const new_index = try self.extra.create(self.heapAlloc());
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
 
-    return @intCast(new_index);
+    return @enumFromInt(new_index);
 }
 
 pub fn getExtraData(self: *Heap, index: ExtraDataIndex) *ExtraData {
-    return &self.extra.items[index];
+    return &self.extra.items[@intFromEnum(index)];
 }
 
 pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
-    self.extra.destroy(index);
+    self.extra.destroy(@intFromEnum(index));
 }
 
 // Heap instances //
@@ -1776,7 +1866,11 @@ pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
 fn initGlobals(gpa: Allocator) !void {
     state.gpa = gpa;
     custom_types = try .initWithCapacity(gpa, if (cfg.threading) cfg.max_custom_types else 32);
+    errdefer custom_types.deinit(gpa);
+
     script_metadata = try .initWithCapacity(gpa, if (cfg.threading) cfg.max_scripts else 32);
+    errdefer script_metadata.deinit(gpa);
+
     // Create null script. TODO do we need a null script?
     assert(try script_metadata.create(gpa) == 0);
     state.initialized = true;
@@ -1827,16 +1921,35 @@ pub fn leakCheckAll() void {
     }
 
     state.mutex.lock();
+    // Make sure that all the global script ids were freed.
+    if (script_metadata.count > 1) {
+        leaked = true;
+        std.debug.print("Script IDs leaked!\n", .{});
+        script_metadata.dumpLeaked(state.gpa, "ID: {}, contents: {}\n") catch unreachable;
+    }
+
     state.running_leak_check = false;
     state.mutex.unlock();
 }
 
 pub fn deinitAll() void {
     state.mutex.lock();
-    for (heaps[0..state.next_open_heap]) |*heap| {
+    const heap_count = state.next_open_heap;
+    state.next_open_heap = 0;
+    state.mutex.unlock();
+
+    // Deinit heaps without holding the mutex, as they may lock.
+    for (heaps[0..heap_count]) |*heap| {
         heap.deinit();
     }
-    state.next_open_heap = 0;
+
+    // Deinit global state.
+    state.mutex.lock();
+    if (state.initialized) {
+        script_metadata.deinit(state.gpa);
+        custom_types.deinit(state.gpa);
+        state.initialized = false;
+    }
     state.mutex.unlock();
 }
 
