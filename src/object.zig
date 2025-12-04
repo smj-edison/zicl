@@ -838,7 +838,6 @@ pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
     return handle.getHeap().objectSlice(handle.index + 1, handle.index + 1 + len);
 }
 
-/// Don't forget to reindex if calling this with a dict!
 fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
     const obj = handle.peek();
 
@@ -858,6 +857,11 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
                 const to_free_handle = listItemRaw(handle.*, @intCast(current_len - freed_count + to_free));
+                if (obj.tag == .dict and @mod(to_free, 2) == 0) {
+                    // If a dict, be sure to remove the keys from the table.
+                    _ = handle.getHeap().getExtraData(obj.body.dict).dict.table.remove(to_free_handle);
+                }
+
                 to_free_handle.invalidateBody();
                 to_free_handle.invalidateString();
             }
@@ -893,9 +897,9 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
     errdefer Heap.freeObject(new_handle);
     const new_items = collectionItems(new_handle, new_len);
 
-    // Why `calling_heap.heap_id != handle.heap`? Because we can't steal the old collection's objects
+    // Why `calling_heap.heapId() != handle.heap`? Because we can't steal the old collection's objects
     // if they reference another heap's strings.
-    if (handle.isShared() or calling_heap.heap_id != handle.heap) {
+    if (handle.isShared() or calling_heap.heapId() != handle.heap) {
         // If the collection is shared, we need to duplicate all the items.
         for (0.., new_items) |i, *new_item| {
             new_item.* = try Heap.duplicateOrReference(
@@ -907,6 +911,8 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
         const old_handle = handle.*;
         handle.* = new_handle;
         old_handle.release();
+
+        if (handle.peek().tag == .dict) try dictReindex(handle.*, @min(current_len, new_len));
     } else {
         // If the collection isn't shared, we can move the objects over without
         // any duplication.
@@ -919,6 +925,8 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
         // still in use, as we just transferred them).
         Heap.freeObjectBacking(handle.*);
         handle.* = new_handle;
+
+        if (handle.peek().tag == .dict) try dictReindex(handle.*, @min(current_len, new_len));
     }
 }
 
@@ -1098,6 +1106,11 @@ pub fn dictItemRaw(handle: Handle, index: u32) Handle {
     }
 }
 
+pub fn dictItemLengthRaw(handle: Handle) u32 {
+    assert(handle.peek().tag == .dict);
+    return handle.getHeap().getExtraData(handle.peek().body.dict).dict.len;
+}
+
 pub fn dictPairLengthRaw(handle: Handle) u32 {
     assert(handle.peek().tag == .dict);
     return handle.getHeap().getExtraData(handle.peek().body.dict).dict.len / 2;
@@ -1146,13 +1159,14 @@ pub fn dictNew(heap: *Heap, handles: []const Handle) !Handle {
         item.* = try heap.duplicateOrReference(handle);
     }
 
-    try dictReindex(dict);
+    std.debug.print("Reindexing new dict\n", .{});
+    try dictReindex(dict, null);
 
     return dict;
 }
 
 /// Panics if not a dict, or if it can't shimmer.
-pub fn dictReindex(handle: Handle) !void {
+pub fn dictReindex(handle: Handle, up_to: ?usize) !void {
     assert(handle.canShimmer());
     const obj = handle.peek();
     assert(obj.tag == .dict);
@@ -1160,23 +1174,31 @@ pub fn dictReindex(handle: Handle) !void {
     assert(dict.len % 2 == 0);
 
     dict.table.clearRetainingCapacity();
+    // Reset the table if we run into an error. Better than leaving
+    // it in a bad state.
+    errdefer dict.table.clearAndFree(handle.getHeap().gpa);
 
     // This properly accounts for duplicate dictionary entries,
     // as it'll just overwrite it with the second `dict.put`.
     var pair: u32 = 0;
-    while (pair < dict.len) : (pair += 2) {
+    while (pair < up_to orelse dict.len) : (pair += 2) {
         const key: Handle = .{
             .index = handle.index + 1 + pair,
             .heap = handle.heap,
             .ref_counted = false,
         };
+        // Make sure key has a string rep.
+        _ = try Heap.getString(key);
+        std.debug.print("Attempting to insert\n", .{});
         // Point to `pair + 1`, e.g. the value following the key
         try dict.table.put(handle.getHeap().gpa, key, pair + 1);
     }
 }
 
-pub fn dictLookupRaw(dict: Handle, key: Handle) ?Handle {
+pub fn dictLookupRaw(dict: Handle, key: Handle) !?Handle {
     assert(dict.peek().tag == .dict);
+    // Make sure key has a string representation, as table.get isn't allowed to fail.
+    _ = try Heap.getString(key);
 
     const dict_heap = dict.getHeap();
     const metadata = &dict_heap.getExtraData(dict.peek().body.dict).dict;
@@ -1186,16 +1208,29 @@ pub fn dictLookupRaw(dict: Handle, key: Handle) ?Handle {
     } else return null;
 }
 
-/// Removes duplicate entries when running. Assumes handle is a dict. Caller
-/// needs to reindex.
-fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
-    assert(handle.peek().tag == .dict);
-    try Heap.ensureModifiable(calling_heap, handle);
-    handle.invalidateString();
-
+fn dictHasDuplicatesRaw(handle: Handle) bool {
     const dict_obj = handle.peek();
     const dict_heap = handle.getHeap();
     const metadata = &dict_heap.getExtraData(dict_obj.body.dict).dict;
+
+    assert(metadata.table.size * 2 <= metadata.len);
+    return metadata.table.size * 2 != metadata.len;
+}
+
+/// Removes duplicate entries. Assumes handle is a dict. If the caller needs to track
+/// a key/value as it gets rearranged, set `to_track`. The result will be its new index,
+/// unless it was removed.
+fn dictRemoveDuplicates(calling_heap: *Heap, handle: *Handle, to_track: ?u32) !?u32 {
+    var metadata = &handle.getHeap().getExtraData(handle.peek().body.dict).dict;
+
+    assert(handle.peek().tag == .dict);
+    try Heap.prepareForModification(calling_heap, handle);
+
+    const dict_obj = handle.peek();
+    const dict_heap = handle.getHeap();
+    metadata = &dict_heap.getExtraData(dict_obj.body.dict).dict;
+
+    var to_track_new_location: ?u32 = null;
 
     if (metadata.table.size * 2 != metadata.len) {
         // Before modifying a dictionary, we need to remove any duplicate keys.
@@ -1209,6 +1244,8 @@ fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
             const key_handle = dictItemRaw(handle.*, key_index);
             const value_handle = dictItemRaw(handle.*, value_index);
 
+            // Make sure key has a string representation, as table.get isn't allowed to fail.
+            _ = try Heap.getString(key_handle);
             if (metadata.table.get(key_handle).? != value_index) {
                 key_handle.peek().tag = .marked;
                 value_handle.peek().tag = .marked;
@@ -1240,8 +1277,14 @@ fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
                 const new_key_index = (pair_index - removed) * 2;
                 const new_value_index = new_key_index + 1;
 
+                if (key_index == to_track) to_track_new_location = new_key_index;
+                if (value_index == to_track) to_track_new_location = new_value_index;
+
                 items[new_key_index] = items[key_index];
                 items[new_value_index] = items[value_index];
+            } else {
+                if (key_index == to_track) to_track_new_location = key_index;
+                if (value_index == to_track) to_track_new_location = value_index;
             }
         }
 
@@ -1255,63 +1298,90 @@ fn dictEnsureMutable(calling_heap: *Heap, handle: *Handle) !void {
         }
 
         metadata.len -= removed * 2;
+    } else {
+        to_track_new_location = to_track;
     }
+
+    try dictReindex(handle.*, null);
+
+    return to_track_new_location;
 }
 
-pub fn dictPutRaw(calling_heap: *Heap, handle: *Handle, key: [:0]const u8, value: Handle) !void {
+/// Returns a handle to the new value.
+pub fn dictPutRaw(calling_heap: *Heap, handle: *Handle, original_key: Handle, value: Handle) !Heap.Handle {
     assert(handle.peek().tag == .dict);
-    try dictEnsureMutable(calling_heap, handle);
 
-    const dict_obj = handle.peek();
-    const dict_heap = handle.getHeap();
-    const metadata = &dict_heap.getExtraData(dict_obj.body.dict).dict;
+    // Copy on write logic.
+    const old_dict: ?Heap.Handle = blk: {
+        if (handle.isShared()) {
+            const old = handle.*;
+            handle.* = try calling_heap.duplicate(handle.*);
+            break :blk old;
+        } else break :blk null;
+    };
+    // The old dict needs to be released at the very end, because `key` may come from the old dict.
+    defer if (old_dict) |val| val.release();
 
-    // Use the temp object to create a key handle for lookup.
-    try dict_heap.setTempObjectString(key);
-    const temp_key = dict_heap.tempObject();
-    const maybe_existing_value = dictLookupRaw(handle.*, temp_key);
-    dict_heap.resetTempObject();
+    handle.invalidateString();
 
-    var new_value = try calling_heap.duplicateOrReference(value);
+    assert(handle.heap == calling_heap.heapId());
+    var metadata = &calling_heap.getExtraData(handle.peek().body.dict).dict;
 
-    const value_handle = blk: {
+    // Need to duplicate, since we're moving it to the dict.
+    var duped_value = try calling_heap.duplicateOrReference(value);
+
+    const value_index: u32 = blk: {
+        // If we get OOM at some point, we need to be sure to roll back the new value.
+        errdefer duped_value.deinitBodySingle(calling_heap);
+
+        // Ensure `original_key` has a string rep.
+        _ = try Heap.getString(original_key);
         // Does the key already exist?
-        if (maybe_existing_value) |existing_value| {
+        if (metadata.table.get(original_key)) |existing_value| {
             // Key exists, so replace the value in place.
-            existing_value.invalidateBody();
-            existing_value.invalidateString();
-            existing_value.peek().* = new_value;
+            const value_handle = dictItemRaw(handle.*, existing_value);
+            value_handle.invalidateBody();
+            value_handle.invalidateString();
+            value_handle.peek().* = duped_value;
 
             break :blk existing_value;
         } else {
-            // If we get OOM at some point, we need to be sure to roll back the new value.
-            errdefer new_value.deinitBodySingle(calling_heap);
+            // Need to copy the key string here, because it may become invalidated when
+            // calling `ensureTotalCapacity`.
+            const key_dup_str = try calling_heap.duplicateObjString(original_key);
+            errdefer key_dup_str.deinit(calling_heap);
 
             const new_length = metadata.len + 2;
-            try metadata.table.ensureTotalCapacity(dict_heap.gpa, new_length / 2);
+            try metadata.table.ensureTotalCapacity(calling_heap.gpa, new_length / 2);
 
             // Key doesn't exist, so append both key and value.
             const new_key_index = metadata.len;
             const new_value_index = metadata.len + 1;
             try setCollectionLength(calling_heap, handle, new_length);
+            // `handle` may change after updating the length, so we better reload
+            // the metadata pointer.
+            metadata = &calling_heap.getExtraData(handle.peek().body.dict).dict;
 
             const new_key_handle = dictItemRaw(handle.*, new_key_index);
             const new_value_handle = dictItemRaw(handle.*, new_value_index);
 
-            try Heap.setString(new_key_handle, key);
-            new_value_handle.peek().* = new_value;
+            assert(new_key_handle.heap == calling_heap.heapId());
+            assert(calling_heap.exchangeString(new_key_handle.index, Heap.Object.null_string, key_dup_str));
+            new_value_handle.peek().* = duped_value;
 
-            break :blk new_value_handle;
+            break :blk new_value_index;
         }
     };
-    const key_handle: Heap.Handle = .{
-        .index = value_handle.index - 1,
-        .heap = value_handle.heap,
-        .ref_counted = value_handle.ref_counted,
-    };
 
-    // Either we're replacing, or we reserved enough space, so we can assume.
-    metadata.table.putAssumeCapacity(key_handle, value_handle.index - handle.index - 1);
+    metadata.table.putAssumeCapacity(dictItemRaw(handle.*, value_index - 1), value_index);
+
+    // Because we mutated the dictionary, we need to remove any duplicates.
+    if (dictHasDuplicatesRaw(handle.*)) {
+        const new_value_index = (try dictRemoveDuplicates(calling_heap, handle, value_index)).?;
+        return dictItemRaw(handle.*, new_value_index);
+    }
+
+    return dictItemRaw(handle.*, value_index);
 }
 
 fn testDicts(ta: std.mem.Allocator) !void {
@@ -1335,8 +1405,8 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const bad_key = try newString(heap, "bogus");
     defer bad_key.release();
 
-    try testing.expectEqualStrings("1", try Heap.getString(dictLookupRaw(dict1, good_key).?));
-    try testing.expectEqual(null, dictLookupRaw(dict1, bad_key));
+    try testing.expectEqualStrings("1", try Heap.getString((try dictLookupRaw(dict1, good_key)).?));
+    try testing.expectEqual(null, try dictLookupRaw(dict1, bad_key));
 
     // Dict with duplicate entries testing.
     var dict_with_duplicates = try newString(heap, "foo 5 bar 10 foo 15");
@@ -1345,9 +1415,9 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     try testing.expectEqual(3, dup_len);
     // When a duplicate key is queried, it should point to the last corrisponding value.
-    try testing.expectEqualStrings("15", try Heap.getString(dictLookupRaw(dict_with_duplicates, key1).?));
+    try testing.expectEqualStrings("15", try Heap.getString((try dictLookupRaw(dict_with_duplicates, key1)).?));
 
-    try dictEnsureMutable(heap, &dict_with_duplicates);
+    _ = try dictRemoveDuplicates(heap, &dict_with_duplicates, null);
     try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
 
     // Dict put testing.
@@ -1359,12 +1429,27 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer value3.release();
 
     try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
-    try dictPutRaw(heap, &dict_for_put, try Heap.getString(key2), value3);
+    _ = try dictPutRaw(heap, &dict_for_put, key2, value3);
     try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
 
-    try dictPutRaw(heap, &dict_for_put, try Heap.getString(key3), value3);
+    _ = try dictPutRaw(heap, &dict_for_put, key3, value3);
     try testing.expectEqual(3, dictPairLengthRaw(dict_for_put));
-    try testing.expectEqualStrings("3", try Heap.getString(dictLookupRaw(dict_for_put, key3).?));
+    try testing.expectEqualStrings("3", try Heap.getString((try dictLookupRaw(dict_for_put, key3)).?));
+
+    // Test dict edge cases.
+    var dict_edge_cases = try dictNew(heap, &.{ key1, value1, key2, value2 });
+    defer dict_edge_cases.release();
+    // Try using a value as a key, and a key as the value while not shared (this is to check
+    // that this handles using internal objects correctly).
+    assert(!dict_edge_cases.isShared());
+    _ = try dictPutRaw(heap, &dict_edge_cases, dictItemRaw(dict_edge_cases, 1), dictItemRaw(dict_edge_cases, 2));
+    try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupRaw(dict_edge_cases, value1)).?));
+    // Try aliasing a key by using it as key and value.
+    _ = try dictPutRaw(heap, &dict_edge_cases, dictItemRaw(dict_edge_cases, 0), dictItemRaw(dict_edge_cases, 0));
+    try testing.expectEqualStrings("foo", try Heap.getString((try dictLookupRaw(dict_edge_cases, key1)).?));
+    // Try aliasing a value by using it as key and value.
+    _ = try dictPutRaw(heap, &dict_edge_cases, dictItemRaw(dict_edge_cases, 3), dictItemRaw(dict_edge_cases, 3));
+    try testing.expectEqualStrings("2", try Heap.getString((try dictLookupRaw(dict_edge_cases, value2)).?));
 }
 
 test "dicts" {

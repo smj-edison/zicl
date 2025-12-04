@@ -70,7 +70,6 @@ const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_
 const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
 gpa: Allocator,
-heap_id: HeapId,
 
 /// Used whenever an allocation or free is happening
 mem_mgmt_mutex: Mutex = .{},
@@ -293,6 +292,18 @@ pub const Object = packed struct(u128) {
             ptr: u58,
         },
         is_ptr: bool,
+
+        pub fn deinit(str: StrOrPtr, heap: *Heap) void {
+            switch (heap.getLocalStringDetails(str)) {
+                .long => |long_str| {
+                    long_str.decrRefCount(heap.gpa);
+                },
+                .normal => {
+                    heap.freeString(str.u.str.index, str.u.str.len);
+                },
+                .null, .empty => {},
+            }
+        }
     };
 
     str: StrOrPtr,
@@ -305,15 +316,7 @@ pub const Object = packed struct(u128) {
     }
 
     pub fn deinitString(obj: *Object, heap: *Heap) void {
-        switch (heap.getLocalStringDetails(obj)) {
-            .long => |long_str| {
-                long_str.decrRefCount(heap.gpa);
-            },
-            .normal => {
-                heap.freeString(obj.str.u.str.index, obj.str.u.str.len);
-            },
-            .null, .empty => {},
-        }
+        obj.str.deinit(heap);
 
         // Be sure to set the null string afterwards (we can directly assign,
         // as we've already checked that we can shimmer).
@@ -516,18 +519,20 @@ pub const ExtraData = union {
     /// This does not store the key/value pairs directly, instead it
     /// is an mapping of key to value index.
     dict: struct {
+        /// Caller needs to ensure that any string this is called with
+        /// is valid, as hash map methods don't return errors.
         table: std.HashMapUnmanaged(Handle, u32, struct {
             pub fn hash(ctx: @This(), key: Handle) u64 {
                 _ = ctx;
 
-                const str = getString(key) catch return 0;
+                const str = getString(key) catch unreachable;
                 return std.hash_map.hashString(str);
             }
 
             pub fn eql(ctx: @This(), a: Handle, b: Handle) bool {
                 _ = ctx;
 
-                return checkIfEqual(a, b) catch return false;
+                return checkIfEqual(a, b) catch unreachable;
             }
         }, 80),
         /// Length of dictionaries' backing list, including potential duplicated
@@ -728,7 +733,7 @@ fn heapAlloc(self: *Heap) Allocator {
     }
 }
 
-pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
+pub fn init(heap: *Heap, gpa: Allocator) !void {
     // Init objects
     var object_tracking = try ObjectTracker.init(gpa, cfg.object_heap_order);
     errdefer object_tracking.deinit(gpa);
@@ -777,9 +782,8 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     errdefer parsed_scripts.deinit(gpa);
 
     // Create heap
-    var heap = Heap{
+    heap.* = .{
         .gpa = gpa,
-        .heap_id = heap_id,
 
         .object_tracking = object_tracking,
         .objects = objects,
@@ -814,8 +818,6 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 
     // We need to init the temp object as well by setting its string to a long string.
     assert(try heap.setLongString(temp_object_idx, .{ .temp = "" }));
-
-    return heap;
 }
 
 fn clearParsedScripts(self: *Heap) void {
@@ -861,10 +863,14 @@ pub fn deinit(heap: *Heap) void {
     heap.extra.deinit(heap.gpa);
 }
 
+pub inline fn heapId(self: *Heap) HeapId {
+    return @intCast(self - &heaps);
+}
+
 pub fn nullObject(self: *Heap) Handle {
     return .{
         .index = null_object_idx,
-        .heap = self.heap_id,
+        .heap = self.heapId(),
         .ref_counted = false,
     };
 }
@@ -872,7 +878,7 @@ pub fn nullObject(self: *Heap) Handle {
 pub fn emptyObject(self: *Heap) Handle {
     return .{
         .index = empty_object_idx,
-        .heap = self.heap_id,
+        .heap = self.heapId(),
         .ref_counted = false,
     };
 }
@@ -880,7 +886,7 @@ pub fn emptyObject(self: *Heap) Handle {
 pub fn tempObject(self: *Heap) Handle {
     return .{
         .index = temp_object_idx,
-        .heap = self.heap_id,
+        .heap = self.heapId(),
         .ref_counted = false,
     };
 }
@@ -892,7 +898,7 @@ pub fn resetTempObject(heap: *Heap) void {
     }
 }
 
-pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) !void {
+pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
     const temp_handle = heap.tempObject();
     assert(temp_handle.hasString());
     assert(temp_handle.getMetadata().cross_thread == false);
@@ -914,7 +920,7 @@ pub fn createObject(self: *Heap) !Handle {
     const index = try self.createObjects(1);
     return .{
         .index = index,
-        .heap = self.heap_id,
+        .heap = self.heapId(),
         .ref_counted = true,
     };
 }
@@ -1044,12 +1050,14 @@ pub fn freeObject(handle: Handle) void {
 
 /// If the object can't be modified, this will duplicate and release
 /// the old object.
-pub fn ensureModifiable(calling_heap: *Heap, handle: *Handle) !void {
+pub fn prepareForModification(calling_heap: *Heap, handle: *Handle) !void {
     if (handle.isShared()) {
         const before_duplicating = handle.*;
         handle.* = try calling_heap.duplicate(handle.*);
         before_duplicating.release();
     }
+
+    handle.invalidateString();
 }
 
 /// If the object can't be shimmered, this will duplicate and release
@@ -1139,7 +1147,7 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
 ///    steal a list or dict.
 ///  * This can't be used with a shared object.
 pub fn steal(calling_heap: *Heap, handle: Handle) !Handle {
-    assert(calling_heap.heap_id == handle.heap);
+    assert(calling_heap.heapId() == handle.heap);
     assert(handle.getMetadata().order == 0);
     if (handle.ref_counted) assert(!handle.isShared());
 
@@ -1169,7 +1177,7 @@ pub fn borrowOptional(calling_heap: *Heap, handle: ?Handle) !?Handle {
     } else return null;
 }
 
-fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr {
+pub fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     switch (getStringDetails(handle)) {
         .long => |long_str| {
             long_str.incrRefCount();
@@ -1225,7 +1233,7 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
                     break :blk self.nullObject();
                 } else {
                     // Better make sure it's in our heap.
-                    if (handle.heap != self.heap_id) {
+                    if (handle.heap != self.heapId()) {
                         break :blk try self.duplicate(self.normalHandle(source.file_name_obj));
                     } else {
                         const to_break = self.normalHandle(source.file_name_obj);
@@ -1376,7 +1384,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
 
             const dict = &calling_heap.getExtraData(new_head.body.dict).dict;
             dict.len = old_head.len;
-            try object.dictReindex(calling_heap.normalHandle(new_dict_idx));
+            try object.dictReindex(calling_heap.normalHandle(new_dict_idx), null);
 
             return calling_heap.normalHandle(new_dict_idx);
         },
@@ -1400,7 +1408,7 @@ pub fn getHandle(self: *Heap, index: u32, ref_counted: bool) Handle {
     assert(index != 0); // Null objects should never exist in a handle.
 
     return .{
-        .heap = self.heap_id,
+        .heap = self.heapId(),
         .index = index,
         .ref_counted = ref_counted,
     };
@@ -1535,7 +1543,7 @@ pub fn setStringOwning(handle: Handle, bytes: [:0]u8) !bool {
 pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
     if (bytes.len == 0) {
         // No need to check the result of the exchange, as there's nothing to clean up
-        _ = self.exchangeString(index, Object.null_string, Object.empty_string);
+        assert(self.exchangeString(index, Object.null_string, Object.empty_string));
         return true;
     } else if (bytes.len < LongString.split_point) {
         const string = try self.createString(@intCast(bytes.len));
@@ -1591,7 +1599,7 @@ const empty_string_value = "";
 fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     const obj: *Object = heap.getLocalObject(index);
 
-    switch (heap.getLocalStringDetails(obj)) {
+    switch (heap.getLocalStringDetails(obj.str)) {
         .long => |long_str| {
             return long_str.getString();
         },
@@ -1638,7 +1646,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             return getString(obj.body.reference);
         },
         .script_command => {
-            if (builtin.mode == .Debug) {
+            if (builtin.mode == .Debug and state.running_leak_check) {
                 const script_command = obj.body.script_command;
                 break :blk try std.fmt.allocPrintSentinel(
                     heap.gpa,
@@ -1649,12 +1657,12 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             } else @panic("Script line is an internal object only");
         },
         .none => {
-            if (builtin.mode == .Debug) {
+            if (builtin.mode == .Debug and state.running_leak_check) {
                 break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<none>", .{}, 0);
             } else @panic("Tried to generate a string for .none");
         },
         .marked => {
-            if (builtin.mode == .Debug) {
+            if (builtin.mode == .Debug and state.running_leak_check) {
                 break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
@@ -1755,18 +1763,18 @@ const StringDetails = union(enum) {
 };
 
 pub fn getStringDetails(handle: Handle) StringDetails {
-    return handle.getHeap().getLocalStringDetails(handle.peek());
+    return handle.getHeap().getLocalStringDetails(handle.peek().str);
 }
 
-fn getLocalStringDetails(heap: *Heap, obj: *Object) StringDetails {
+fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
     // Normal string or long string?
-    if (obj.str.is_ptr) {
-        // Convert to LongString ptr (guaranteed to be non-null)
+    if (str_or_ptr.is_ptr) {
+        // Convert to LongString ptr (guaranteed to be non-null).
         return .{
-            .long = LongString.fromInt(obj.str.u.ptr),
+            .long = LongString.fromInt(str_or_ptr.u.ptr),
         };
     } else {
-        const str = obj.str.u.str;
+        const str = str_or_ptr.u.str;
         if (str.index == null_string) {
             return .null;
         } else if (str.index == empty_string) {
@@ -1921,10 +1929,9 @@ pub fn createHeap(gpa: Allocator) !*Heap {
     }
 
     if (slot_index < cfg.max_heaps) {
-        const new_heap = try init(gpa, @intCast(slot_index));
-
-        heaps[slot_index] = new_heap;
-        return &heaps[slot_index];
+        const new_heap = &heaps[slot_index];
+        try init(new_heap, gpa);
+        return new_heap;
     } else {
         return error.OutOfMemory;
     }

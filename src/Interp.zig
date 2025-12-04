@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const testing = std.testing;
 
 const Parser = @import("Parser.zig");
 const Heap = @import("Heap.zig");
@@ -252,6 +253,9 @@ fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value
         value.* = new_value;
         old_value.release();
     }
+
+    // We can increment the ref count directly, as we just ensure that it is
+    // ref counted.
     value.incrRefCount();
     defer value.release();
 
@@ -260,15 +264,17 @@ fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value
             .dict_subst => @panic("Dict sugar not implemented"),
             .variable => {
                 const variable = &name.peek().body.variable;
-                // Release last value.
-                interp.heap.normalHandle(variable.index).release();
+                const var_name = try Heap.getString(name.*);
+
+                // Make sure the variable "set" is saved.
+                const value_index = try object.dictPutRaw(interp.heap, &call_frame.variables, var_name, value.*);
+
                 // Borrow new value.
                 value.incrRefCount();
                 variable.* = .{
-                    .call_epoch = interp.current_call_epoch,
+                    .call_epoch = call_frame.call_epoch,
                     .index = value.index,
                 };
-                call_frame.variables.
             },
             .upvar => {
                 const upvar = &interp.heap.getExtraData(name.peek().body.upvar).upvar;
@@ -338,6 +344,13 @@ pub fn getVariable(interp: *Interp, det: ?object.ErrorDetails, name: Heap.Handle
         },
         else => unreachable,
     }
+}
+
+test "variables" {
+    defer Heap.testFinish();
+    const interp = try createInterp(try Heap.createHeap(testing.allocator));
+
+    testing.expectEqual(null, interp.resolveVariable(0, "foo"));
 }
 
 const ProcedureSignature = struct {
@@ -606,18 +619,19 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames[interp.currentCallFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: u32, args: []Heap.Handle, signature: ProcedureSignature) !u32 {
+fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: ProcedureSignature) !u32 {
     const namespace = try interp.heap.borrowOptional(interp.namespace);
     errdefer if (namespace) |ns| ns.release();
     const borrowed_signature = try signature.borrow(interp.heap);
     errdefer borrowed_signature.release();
 
+    const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
     try interp.call_frames.append(interp.gpa, .{
         .parent = parent,
         .args = args,
         .call_epoch = interp.current_call_epoch,
-        .level = interp.call_frames.items[parent].level + 1,
+        .level = level,
         .namespace = namespace,
         .signature = borrowed_signature,
     });
@@ -663,8 +677,8 @@ fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle
             // converted it from a string to a script. If so, we want to copy that script id
             // back to the token list so we'll use the cached script for future invocations.
             if (new_value != value) {
-                assert(value.heap == interp.heap.heap_id);
-                assert(new_value.heap == interp.heap.heap_id);
+                assert(value.heap == interp.heap.heapId());
+                assert(new_value.heap == interp.heap.heapId());
                 assert(new_value.peek().tag == .script);
 
                 // Copy over the new script id.
@@ -784,7 +798,7 @@ fn qualifyName(arena: std.mem.Allocator, namespace: Heap.Handle, name: []const u
 pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Handle) !*Command {
     early_exit: {
         // Can't use a command's cached value if it's from another heap.
-        if (handle.heap != interp.heap.heap_id) break :early_exit;
+        if (handle.heap != interp.heap.heapId()) break :early_exit;
 
         const obj = handle.peek();
 
@@ -848,7 +862,7 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
         handle.peek().tag = .command;
 
         if (current_namespace) |namespace| {
-            assert(handle.heap == interp.heap.heap_id);
+            assert(handle.heap == interp.heap.heapId());
 
             const borrowed_namespace = try interp.heap.borrow(namespace);
             errdefer borrowed_namespace.release();
@@ -1014,4 +1028,33 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
             if (result) |_| {} else |err| return err;
         }
     }
+}
+
+fn createInterp(heap: *Heap) !Interp {
+    var new_interp: Interp = .{
+        .heap = heap,
+        .gpa = testing.allocator,
+        .result = heap.emptyObject(),
+        .eval_frames = .empty,
+        .call_frames = .empty,
+        .current_call_epoch = 0,
+        .current_procedure_epoch = 0,
+        .commands = .empty,
+        .namespace = null,
+        .evaluating_safe_expr = false,
+        .eval_depth = 0,
+        .max_eval_depth = 100_000,
+        .max_call_depth = 100_000,
+    };
+
+    try new_interp.pushCallFrame(null, &.{}, .{
+        .args = try object.listNew(heap, &.{}),
+        .body = try object.newString(heap, ""),
+        .has_args_parameter = false,
+        .optional_arity = 0,
+        .required_arity = 0,
+        .statics = null,
+    });
+
+    return new_interp;
 }
