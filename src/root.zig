@@ -20,5 +20,5 @@ test {
     _ = @import("Parser.zig");
     _ = @import("object.zig");
     _ = @import("Heap.zig");
-    // _ = @import("Interp.zig");
+    _ = @import("Interp.zig");
 }

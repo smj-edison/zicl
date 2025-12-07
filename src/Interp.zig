@@ -35,6 +35,8 @@ evaluating_safe_expr: bool,
 eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
+/// Stack trace from a function error.
+stack_trace: ?Heap.Handle,
 
 pub const CommandFn = fn (interp: *Interp, args: []const Heap.Handle) void;
 
@@ -66,12 +68,12 @@ fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype)
     }
 }
 
-fn variableNotFoundError(heap: *Heap, det: ?object.ErrorDetails, var_name: []const u8) !void {
+fn variableNotFoundError(heap: *Heap, det: ?*object.ErrorDetails, var_name: []const u8) !void {
     if (det) |details| details.* = .{
         .message = try object.newStringFmt(heap, "can't read \"{s}\": no such variable", .{var_name}),
     };
 
-    return Error.VariableNotFound;
+    return error.VariableNotFound;
 }
 
 const VariableInfo = struct {
@@ -93,17 +95,24 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         while (trimmed_var_name[0] == ':') trimmed_var_name = trimmed_var_name[1..];
 
         const var_dict = interp.call_frames.items[call_frame_idx].variables;
-        var_value = var_dict.get(trimmed_var_name);
+
+        interp.heap.setTempObjectString(trimmed_var_name);
+        defer interp.heap.resetTempObject();
+        // Can't fail since we know a string exists for it.
+        var_value = (object.dictLookupRaw(var_dict, interp.heap.tempObject()) catch unreachable);
 
         // Global scope doesn't have statics.
     } else {
         call_frame_idx = var_call_frame;
 
-        const var_hash_map = interp.call_frames.items[call_frame_idx].variables;
+        const var_dict = interp.call_frames.items[call_frame_idx].variables;
         const statics_dict = interp.call_frames.items[call_frame_idx].signature.statics;
 
         // Check the variables dictionary.
-        var_value = var_hash_map.get(var_name);
+        interp.heap.setTempObjectString(var_name);
+        // Can't fail since we know a string exists for it.
+        var_value = (object.dictLookupRaw(var_dict, interp.heap.tempObject()) catch unreachable);
+        interp.heap.resetTempObject();
 
         // Maybe it's in the statics dictionary instead?
         if (var_value == null) {
@@ -111,16 +120,16 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
                 // The temp object is an object with a long string. What we can do is
                 // swap out that long string's `string` value to the var name. This avoids
                 // allocating a heap object, just to immediately drop it.
-                try interp.heap.setTempObjectString(var_name);
-                var_value = object.dictLookupRaw(dict, interp.heap.tempObject());
+                interp.heap.setTempObjectString(var_name);
+                // Can't fail since we know a string exists for it.
+                var_value = object.dictLookupRaw(dict, interp.heap.tempObject()) catch unreachable;
                 interp.heap.resetTempObject();
             }
         }
     }
 
     if (var_value) |unwrapped| {
-        assert(unwrapped.heap == interp.heap);
-        assert(!unwrapped.ref_counted);
+        assert(unwrapped.heap == interp.heap.heapId());
 
         return .{
             .target_index = unwrapped.index,
@@ -132,8 +141,9 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
 }
 
 /// This always shimmers to .variable. You probably should be using `ensureValidVariableType`.
-fn reshimmerToVariable(interp: *Interp, call_frame_idx: u32, det: ?object.ErrorDetails, name: *Heap.Handle) !void {
+fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: *Heap.Handle) !void {
     const var_name = try Heap.getString(name.*);
+    const call_frame = interp.call_frames.items[call_frame_idx];
 
     if (interp.resolveVariable(call_frame_idx, var_name)) |var_info| {
         // Free the old representation and set the new one.
@@ -141,19 +151,21 @@ fn reshimmerToVariable(interp: *Interp, call_frame_idx: u32, det: ?object.ErrorD
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
-            .epoch = interp.current_call_epoch,
-            .index = var_info.index,
+            .call_epoch = call_frame.call_epoch,
+            .index = var_info.target_index,
             .is_global = var_info.call_frame_idx == 0,
         };
     } else {
-        return variableNotFoundError(interp.heap, var_name, det);
+        return variableNotFoundError(interp.heap, det, var_name);
     }
 }
 
 /// Ensures that this is a valid variable, dict sugar, or upvar.
-fn ensureValidVariableType(interp: *Interp, det: ?object.ErrorDetails, call_frame_idx: u32, name: *Heap.Handle) !void {
+fn ensureValidVariableType(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: *Heap.Handle) !void {
+    const call_frame = interp.call_frames.items[call_frame_idx];
+
     // This ensures that the name is local to this interpreter's heap.
-    try interp.heap.ensureShimmerable(name);
+    try interp.heap.prepareToShimmer(name);
 
     const name_obj = name.peek();
     const name_heap = name.getHeap();
@@ -162,31 +174,38 @@ fn ensureValidVariableType(interp: *Interp, det: ?object.ErrorDetails, call_fram
     if (name_obj.tag == .variable) {
         // Fast case: if we're in the same epoch as last time,
         // we don't need to do anything.
-        if (name_obj.body.variable.call_epoch == interp.currentCallFrame().call_epoch) {
+        if (name_obj.body.variable.call_epoch == call_frame.call_epoch) {
             return;
         } else {
             // Need to re-resolve the variable in the current call frame.
-            try interp.reshimmerToVariable(call_frame_idx, name);
+            try interp.reshimmerToVariable(det, call_frame_idx, name);
             return;
         }
     } else if (name_obj.tag == .upvar) {
-        const upvar = name_heap.getExtraData(name_obj.body.upvar).upvar;
+        const upvar = &name_heap.getExtraData(name_obj.body.upvar).upvar;
 
         // Fast case is same as for .variable.
-        if (upvar.epoch == interp.currentCallFrame().call_epoch) {
+        if (upvar.call_frame_epoch == call_frame.call_epoch) {
             return;
         } else {
             // Need to look this back up.
-            if (upvar.dict_sugar) |_| {
-                @panic("Dict sugar not implemented yet");
-            } else {
-                // Be sure to look it up in the upvar's call frame.
-                if (try interp.resolveVariable(bytes, upvar.call_frame_idx)) |upvar_target| {
-                    upvar.index = upvar_target.target_index;
-                    return;
-                } else {
-                    return variableNotFoundError(interp.heap, det, bytes);
-                }
+            switch (upvar.name) {
+                .dict_sugar => {
+                    @panic("Dict sugar not implemented yet");
+                },
+                .normal => |name_index| {
+                    // `bytes` is the name of the variable in the upvar's scope, but we want the name
+                    // of the variable in the original scope. Case in point: if we ran `upvar upper here`,
+                    // `bytes` would contain "here", while `original_name` would contain "upper".
+                    const original_name = try Heap.getString(interp.heap.getHandle(name_index));
+                    // Be sure to look it up in the upvar's call frame.
+                    if (interp.resolveVariable(upvar.call_frame_idx, original_name)) |upvar_target| {
+                        upvar.index = upvar_target.target_index;
+                        return;
+                    } else {
+                        return variableNotFoundError(interp.heap, det, bytes);
+                    }
+                },
             }
         }
     } else if (name_obj.tag == .dict_subst) {
@@ -198,18 +217,14 @@ fn ensureValidVariableType(interp: *Interp, det: ?object.ErrorDetails, call_fram
             @panic("Dict sugar not implemented yet");
             // name_obj.tag = .dict_subst;
         } else {
-            try reshimmerToVariable(interp, name);
+            try interp.reshimmerToVariable(det, call_frame_idx, name);
         }
     }
 }
 
-fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value: *Heap.Handle) !void {
+fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value: Heap.Handle) !void {
     const call_frame = &interp.call_frames.items[call_frame_idx];
     const name_bytes = try Heap.getString(name.*);
-
-    assert(!value.getMetadata().cross_thread);
-    assert(value.ref_counted);
-    value.incrRefCount();
 
     if (name_bytes.len >= 2 and name_bytes[0] == ':' and name_bytes[1] == ':') {
         var trimmed = name_bytes;
@@ -217,63 +232,45 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, valu
         while (trimmed[0] == ':') trimmed = trimmed[1..];
 
         // Add variable.
-        try interp.call_frames.items[0].variables.putNoClobber(trimmed, value.*);
+        interp.heap.setTempObjectString(trimmed);
+        defer interp.heap.resetTempObject();
+        const new_value = try object.dictPut(interp.heap, &interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
 
-        assert(name.canShimmer());
+        try interp.heap.prepareToShimmer(name);
         name.peek().tag = .variable;
         name.peek().body.variable = .{
             .call_epoch = call_frame.call_epoch,
-            .index = value.*.index,
+            .index = new_value.index,
             .is_global = true,
         };
     } else {
         // Add variable.
-        try call_frame.variables.putNoClobber(name_bytes, value.*);
+        const new_value = try object.dictPut(interp.heap, &call_frame.variables, name.*, value);
 
-        assert(name.canShimmer());
+        try interp.heap.prepareToShimmer(name);
         name.peek().tag = .variable;
         name.peek().body.variable = .{
             .call_epoch = call_frame.call_epoch,
-            .index = value.*.index,
+            .index = new_value.index,
             .is_global = false,
         };
     }
 }
 
-fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value: *Heap.Handle) !void {
-    const call_frame = &interp.call_frames.items[call_frame_idx];
-
-    if (value.getMetadata().cross_thread or !value.ref_counted) {
-        // We can only create a variable reference to something in our heap, so
-        // we'll need to duplicate the value before we can reference it. We also
-        // can't reference something that's not reference counted, since part of
-        // pointing to something is incrementing its reference.
-        const old_value = value.*;
-        const new_value = try interp.heap.duplicate(old_value);
-        value.* = new_value;
-        old_value.release();
-    }
-
-    // We can increment the ref count directly, as we just ensure that it is
-    // ref counted.
-    value.incrRefCount();
-    defer value.release();
-
+fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value: Heap.Handle) !void {
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
         switch (name.peek().tag) {
             .dict_subst => @panic("Dict sugar not implemented"),
             .variable => {
                 const variable = &name.peek().body.variable;
-                const var_name = try Heap.getString(name.*);
+                const var_call_frame_idx = if (variable.is_global) 0 else call_frame_idx;
+                const var_call_frame = &interp.call_frames.items[var_call_frame_idx];
 
-                // Make sure the variable "set" is saved.
-                const value_index = try object.dictPutRaw(interp.heap, &call_frame.variables, var_name, value.*);
-
-                // Borrow new value.
-                value.incrRefCount();
+                const value_handle = try object.dictPut(interp.heap, &var_call_frame.variables, name.*, value);
                 variable.* = .{
-                    .call_epoch = call_frame.call_epoch,
-                    .index = value.index,
+                    .call_epoch = var_call_frame.call_epoch,
+                    .index = value_handle.index,
+                    .is_global = variable.is_global,
                 };
             },
             .upvar => {
@@ -282,7 +279,7 @@ fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value
                 switch (upvar.name) {
                     .dict_sugar => @panic("Dict sugar not implemented"),
                     .normal => |upvar_name| {
-                        var name_handle = interp.heap.normalHandle(upvar_name);
+                        var name_handle = interp.heap.getHandle(upvar_name);
 
                         if (upvar.index == Heap.null_object_idx) {
                             // The upvar doesn't target anything, which means we need to create a variable
@@ -313,16 +310,17 @@ fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value
                     },
                 }
             },
+            else => unreachable,
         }
     } else |err| switch (err) {
-        Error.OutOfMemory => return Error.OutOfMemory,
-        Error.VariableNotFound => try createVariable(interp, call_frame_idx, name, value),
+        error.OutOfMemory => return error.OutOfMemory,
+        error.VariableNotFound => try createVariable(interp, call_frame_idx, name, value),
     }
 }
 
 /// Resolves to the variable's value.
 pub fn getVariable(interp: *Interp, det: ?object.ErrorDetails, name: Heap.Handle) !Heap.Handle {
-    if (interp.evaluating_safe_expr) return Error.EvaluatingSafeExpression;
+    if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
     var new_name = name;
     try interp.ensureValidVariableType(det, &new_name);
@@ -346,11 +344,26 @@ pub fn getVariable(interp: *Interp, det: ?object.ErrorDetails, name: Heap.Handle
     }
 }
 
-test "variables" {
+fn testVariables(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const interp = try createInterp(try Heap.createHeap(testing.allocator));
+    var interp = try init(try Heap.createHeap(ta));
+    defer interp.deinit();
 
-    testing.expectEqual(null, interp.resolveVariable(0, "foo"));
+    try testing.expectEqual(null, interp.resolveVariable(0, "foo"));
+    var foo = try object.newString(interp.heap, "foo");
+    defer foo.release();
+    const value = try object.newString(interp.heap, "value");
+    defer value.release();
+    try interp.setVariableTo(0, &foo, value);
+
+    const lookup_value = interp.resolveVariable(0, "foo").?.target_index;
+    try testing.expectEqualStrings("value", try Heap.getString(interp.heap.getHandle(lookup_value)));
+    // Should be copied.
+    try testing.expect(lookup_value != value.index);
+}
+
+test "variables" {
+    try testing.checkAllAllocationFailures(testing.allocator, testVariables, .{});
 }
 
 const ProcedureSignature = struct {
@@ -368,14 +381,14 @@ const ProcedureSignature = struct {
     /// the last argument name.
     has_args_parameter: bool,
 
-    pub fn borrow(signature: ProcedureSignature, heap: Heap) !ProcedureSignature {
+    pub fn borrow(signature: ProcedureSignature, heap: *Heap) !ProcedureSignature {
         return .{
             .args = try heap.borrow(signature.args),
             .body = try heap.borrow(signature.body),
             .statics = try heap.borrowOptional(signature.statics),
             .required_arity = signature.required_arity,
             .optional_arity = signature.optional_arity,
-            .args_parameter = signature.args_parameter,
+            .has_args_parameter = signature.has_args_parameter,
         };
     }
 
@@ -401,10 +414,6 @@ pub const Command = struct {
 
     pub fn deinit(gpa: std.mem.Allocator) void {
         _ = gpa;
-    }
-
-    pub fn call(command: *Command, interp: *Interp, args: []Heap.Handle) !void {
-        // Dispatch to native or procedure call.
     }
 
     /// Returns a string containing all the usage information. Allocates the string
@@ -484,7 +493,10 @@ pub fn registerCommand(interp: *Interp, name: []const u8, to_call: *const Comman
     });
 }
 
-fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void {
+const Tailcall = struct {
+    args: []Heap.Handle,
+};
+fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !?Tailcall {
     const signature = command.call_info.tcl.signature;
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
@@ -523,6 +535,10 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void 
             // Assign remaining arguments to `args`.
             const list = try object.listNew(interp.heap, args[called_idx..]);
             errdefer list.release();
+            try setVariableTo(interp, interp.currentCallFrameIndex(), var_name, list);
+        } else {
+            try setVariableTo(interp, interp.currentCallFrameIndex(), var_name, args[called_idx]);
+            called_idx += 1;
         }
     }
 }
@@ -574,7 +590,7 @@ const VariableMap = std.StringHashMap(Heap.Handle);
 /// Call frame.
 const CallFrame = struct {
     /// Parent index.
-    parent: u32,
+    parent: ?u32,
     /// Level of the call frame. 0 = global.
     level: u32,
     /// Dictionary containing the frame's variables.
@@ -622,8 +638,8 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: ProcedureSignature) !u32 {
     const namespace = try interp.heap.borrowOptional(interp.namespace);
     errdefer if (namespace) |ns| ns.release();
-    const borrowed_signature = try signature.borrow(interp.heap);
-    errdefer borrowed_signature.release();
+    const vars_handle = try object.dictNew(interp.heap, &.{});
+    errdefer vars_handle.release();
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
@@ -633,7 +649,10 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: 
         .call_epoch = interp.current_call_epoch,
         .level = level,
         .namespace = namespace,
-        .signature = borrowed_signature,
+        // Take ownership.
+        .signature = signature,
+        // TODO PERF recycle variable hash table if possible.
+        .variables = vars_handle,
     });
 
     interp.incrementCallEpoch();
@@ -788,7 +807,7 @@ fn qualifyName(arena: std.mem.Allocator, namespace: Heap.Handle, name: []const u
     // beginning of the name, if the name isn't globally scoped (e.g. by not
     // having :: at the beginning).
     if (name.len < 2 or name[0] != ':' or name[1] != ':') {
-        const namespace_name = try Heap.getString(unwrapped);
+        const namespace_name = try Heap.getString(namespace);
         return try std.fmt.allocPrint(arena, "{}::{}", .{ namespace_name, name });
     }
 }
@@ -896,7 +915,7 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
     }
 }
 
-fn invokeCommand(interp: *Interp, args: []Heap.Handle) !void {
+fn invokeCommand(interp: *Interp, args: []Heap.Handle) !?Tailcall {
     var det: object.ErrorDetails = undefined;
     const command = interp.wrapErrorDetails(&det, getCommand(interp, &det, &args[0])) catch |err| switch (err) {
         Error.OutOfMemory => Error.OutOfMemory,
@@ -915,16 +934,48 @@ fn invokeCommand(interp: *Interp, args: []Heap.Handle) !void {
 
     // Loop the calling section, as there may be a tailcall.
     var current_args = args;
+    var tailcall_info: ?Tailcall = null;
     while (true) {
         interp.currentEvalFrame().args = current_args;
         // TODO implement tracing.
 
         // Be sure to clear the previous result.
         interp.setEmptyResult();
+
+        switch (command.call_info) {
+            .native => |info| {
+                _ = info;
+                // TODO native procedure call
+            },
+            .tcl => |info| {
+                _ = info;
+
+                const result = interp.callProcedure(command, current_args);
+
+                if (result) |possible_tailcall| {
+                    if (possible_tailcall) |tailcall| {
+                        // Be sure to release the previous tailcall args.
+                        if (tailcall_info) |previous_tailcall| {
+                            for (previous_tailcall.args) |handle| handle.release();
+                            interp.gpa.free(previous_tailcall.args);
+                        }
+
+                        tailcall_info = tailcall;
+                        current_args = tailcall.args;
+                    }
+                } else |err| {
+                    switch (err) {
+                        Error.OutOfMemory => return Error.OutOfMemory,
+                        Error.EvalError => {
+                            // TO
+                        },
+                    }
+                }
+            },
+        }
         command.call(interp, current_args);
 
-        //command.
-        break;
+        if (tailcall_info == null) break;
     }
 }
 
@@ -1030,7 +1081,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
     }
 }
 
-fn createInterp(heap: *Heap) !Interp {
+pub fn init(heap: *Heap) !Interp {
     var new_interp: Interp = .{
         .heap = heap,
         .gpa = testing.allocator,
@@ -1045,9 +1096,10 @@ fn createInterp(heap: *Heap) !Interp {
         .eval_depth = 0,
         .max_eval_depth = 100_000,
         .max_call_depth = 100_000,
+        .stack_trace = null,
     };
 
-    try new_interp.pushCallFrame(null, &.{}, .{
+    _ = try new_interp.pushCallFrame(null, &.{}, .{
         .args = try object.listNew(heap, &.{}),
         .body = try object.newString(heap, ""),
         .has_args_parameter = false,
@@ -1057,4 +1109,18 @@ fn createInterp(heap: *Heap) !Interp {
     });
 
     return new_interp;
+}
+
+pub fn deinit(interp: *Interp) void {
+    // Deinit all frames.
+    for (interp.call_frames.items) |frame| {
+        // deinit args.
+        for (frame.args) |arg| arg.release();
+        interp.gpa.free(frame.args);
+
+        if (frame.namespace) |namespace| namespace.release();
+        frame.variables.release();
+        frame.signature.release();
+    }
+    interp.call_frames.deinit(interp.gpa);
 }
