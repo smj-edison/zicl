@@ -38,7 +38,7 @@ max_call_depth: usize,
 /// Stack trace from a function error.
 stack_trace: ?Heap.Handle,
 
-pub const CommandFn = fn (interp: *Interp, args: []const Heap.Handle) void;
+pub const CommandFn = fn (interp: *Interp, args: []const Heap.Handle) Error!void;
 
 pub const Error = std.mem.Allocator.Error || error{
     EvaluatingSafeExpression,
@@ -52,6 +52,10 @@ pub const Error = std.mem.Allocator.Error || error{
     WrongArgumentCount,
 };
 
+const Tailcall = struct {
+    args: []Heap.Handle,
+};
+
 /// Used to convert from an object error to an interpreter error (e.g. putting
 /// it in the interpreter result, instead of det)
 fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype) @TypeOf(result) {
@@ -59,10 +63,11 @@ fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype)
         return unwrapped;
     } else |err| {
         switch (err) {
-            Error.OutOfMemory => return Error.OutOfMemory,
+            error.OutOfMemory => return error.OutOfMemory,
             else => {
                 // This error should have error details, if it's not OOM.
                 interp.setResultOwning(det.message);
+                return err;
             },
         }
     }
@@ -319,26 +324,24 @@ fn setVariableTo(interp: *Interp, call_frame_idx: u32, name: *Heap.Handle, value
 }
 
 /// Resolves to the variable's value.
-pub fn getVariable(interp: *Interp, det: ?object.ErrorDetails, name: Heap.Handle) !Heap.Handle {
+pub fn getVariable(interp: *Interp, det: ?*object.ErrorDetails, name: Heap.Handle) !Heap.Handle {
     if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
     var new_name = name;
-    try interp.ensureValidVariableType(det, &new_name);
+    try interp.ensureValidVariableType(det, interp.currentCallFrameIndex(), &new_name);
 
     const new_name_obj = new_name.peek();
     const new_name_heap = new_name.getHeap();
 
     switch (new_name_obj.tag) {
         .variable => {
-            // Variable contents are stored in a dict, so it's not a ref-counted handle.
-            return new_name_heap.getHandle(new_name_obj.body.variable.index, false);
+            return new_name_heap.getHandle(new_name_obj.body.variable.index);
         },
         .upvar => {
-            // Variable contents are stored in a dict, so it's not a ref-counted handle.
-            return new_name_heap.getHandle(new_name_heap.getUpvar(new_name_obj.body.upvar).index, false);
+            return new_name_heap.getHandle(new_name_heap.getExtraData(new_name_obj.body.upvar).upvar.index);
         },
         .dict_subst => {
-            @panic("Unimplemented");
+            @panic("Dict sugar unimplemented");
         },
         else => unreachable,
     }
@@ -374,20 +377,32 @@ const ProcedureSignature = struct {
     /// Handle to the statics dictionary.
     statics: ?Heap.Handle,
     /// Required number of arguments.
-    required_arity: usize,
+    required_arity: u32,
     /// Optional number of arguments.
-    optional_arity: usize,
+    optional_arity: u32,
+    /// Values of optional arguments, if any.
+    optional_values: ?Heap.Handle,
     /// Whether `args` is provided as an argument name. `args`, if present, is always
     /// the last argument name.
     has_args_parameter: bool,
 
     pub fn borrow(signature: ProcedureSignature, heap: *Heap) !ProcedureSignature {
+        const args = try heap.borrow(signature.args);
+        errdefer args.release();
+        const body = try heap.borrow(signature.body);
+        errdefer body.release();
+        const statics = try heap.borrowOptional(signature.statics);
+        errdefer if (statics) |val| val.release();
+        const optional_values = try heap.borrowOptional(signature.optional_values);
+        errdefer if (optional_values) |val| val.release();
+
         return .{
-            .args = try heap.borrow(signature.args),
-            .body = try heap.borrow(signature.body),
-            .statics = try heap.borrowOptional(signature.statics),
+            .args = args,
+            .body = body,
+            .statics = statics,
             .required_arity = signature.required_arity,
             .optional_arity = signature.optional_arity,
+            .optional_values = optional_values,
             .has_args_parameter = signature.has_args_parameter,
         };
     }
@@ -396,24 +411,37 @@ const ProcedureSignature = struct {
         signature.args.release();
         signature.body.release();
         if (signature.statics) |statics| statics.release();
+        if (signature.optional_values) |values| values.release();
     }
 };
 
 pub const Command = struct {
-    ref_count: u32,
+    pub const NativeCommand = struct {
+        to_call: *const CommandFn,
+        description: ?[]const u8,
+        min_arity: usize,
+        max_arity: ?usize,
+        /// If the command argument length needs to be a multiple of some
+        /// amount, set this. A good example is `dict create`, as it needs
+        /// an even number of arguments.
+        multiple_of: ?usize,
+    };
+
     namespace: ?Heap.Handle,
     call_info: union(enum) {
-        native: struct {
-            to_call: *const CommandFn,
-            description: ?[]const u8,
-        },
+        native: NativeCommand,
         tcl: struct {
             signature: ProcedureSignature,
         },
     },
 
-    pub fn deinit(gpa: std.mem.Allocator) void {
-        _ = gpa;
+    pub fn deinit(command: *Command) void {
+        if (command.namespace) |namespace| namespace.release();
+
+        switch (command.call_info) {
+            .tcl => |val| val.signature.release(),
+            .native => {},
+        }
     }
 
     /// Returns a string containing all the usage information. Allocates the string
@@ -431,11 +459,11 @@ pub const Command = struct {
                 const args_len = object.listLengthRaw(args_list);
 
                 for (0..args_len) |i| {
-                    const arg = object.listItemRaw(args_list, i);
+                    const arg = object.listItem(args_list, @intCast(i));
 
-                    try aw.writer.writeAll(" ") catch return error.OutOfMemory;
+                    aw.writer.writeAll(" ") catch return error.OutOfMemory;
 
-                    if (i == call_info.signature.args_parameter) {
+                    if (i == args_len - 1 and call_info.signature.has_args_parameter) {
                         // Handle `args` paramater.
                         aw.writer.writeAll("?arg ...?") catch return error.OutOfMemory;
                     } else {
@@ -443,7 +471,7 @@ pub const Command = struct {
                         if (arg.peek().tag == .list) {
                             assert(object.listLengthRaw(arg) == 2);
 
-                            aw.writer.print("?{}?", .{try Heap.getString(arg)}) catch return error.OutOfMemory;
+                            aw.writer.print("?{s}?", .{try Heap.getString(arg)}) catch return error.OutOfMemory;
                         } else {
                             aw.writer.writeAll(try Heap.getString(arg)) catch return error.OutOfMemory;
                         }
@@ -454,7 +482,7 @@ pub const Command = struct {
             },
             .native => |call_info| {
                 if (call_info.description) |description| {
-                    aw.writer.print(" {}", .{description}) catch return error.OutOfMemory;
+                    aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
                 } else {
                     aw.writer.writeAll(" ...") catch return error.OutOfMemory;
                 }
@@ -467,7 +495,7 @@ pub const Command = struct {
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(Command);
 
-fn wrongArgumentCountError(heap: *Heap, det: ?object.ErrorDetails, command_usage: []const u8) !void {
+fn wrongArgumentCountError(heap: *Heap, det: ?*object.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
         .message = try object.newStringFmt(heap, "wrong # args: should be \"{s}\"", .{command_usage}),
     };
@@ -484,20 +512,12 @@ fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
     if (old_command) |unwrapped| unwrapped.value.deinit(interp.gpa);
 }
 
-pub fn registerCommand(interp: *Interp, name: []const u8, to_call: *const CommandFn) !void {
-    try interp.createCommand(name, .{
-        .ref_count = 1,
-        .call = .{
-            .native = to_call,
-        },
-    });
+pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.NativeCommand) !void {
+    try interp.commands.put(interp.gpa, name, .{ .namespace = null, .call_info = .{ .native = details } });
 }
 
-const Tailcall = struct {
-    args: []Heap.Handle,
-};
-fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !?Tailcall {
-    const signature = command.call_info.tcl.signature;
+fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void {
+    const signature = &command.call_info.tcl.signature;
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -505,59 +525,100 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !?Tail
         (!signature.has_args_parameter and arg_count > signature.required_arity + signature.optional_arity))
     {
         // Wrong argument count, error accordingly.
-        const scratch = std.heap.stackFallback(64, interp.gpa).get();
+        var sf = std.heap.stackFallback(64, interp.gpa);
+        const scratch = sf.get();
         const command_name = try Heap.getString(args[0]);
-        const command_usage = command.getUsageInfo(scratch, command_name);
+        const command_usage = try command.getUsageInfo(scratch, command_name);
         defer scratch.free(command_usage);
         var det: object.ErrorDetails = undefined;
-        return interp.wrapErrorDetails(&det, wrongArgumentCountError(&det, command_usage));
+        return interp.wrapErrorDetails(&det, wrongArgumentCountError(interp.heap, &det, command_usage));
     }
 
     // Check for infinite recursion.
     if (interp.currentCallFrame().level >= interp.max_call_depth) {
-        interp.setResultString("Too many nested calls. Infinite recursion?");
+        try interp.setResultString("Too many nested calls. Infinite recursion?");
         return Error.InfiniteRecursion;
     }
 
-    try interp.pushCallFrame(interp.currentCallFrameIndex(), args, signature);
+    const parent_idx = interp.currentCallFrameIndex();
+    const call_frame_idx = try interp.pushCallFrame(parent_idx, args, signature.*);
+
+    // Populate call frame.
 
     // Where we are in the arguments that this was called with.
     var called_idx: usize = 1;
     // Where we are in the signature.
-    var signature_idx: usize = 0;
+    var signature_idx: u32 = 0;
     const signature_len = object.listLengthRaw(signature.args);
 
     while (signature_idx < signature_len) : (signature_idx += 1) {
-        const var_name = object.listItemRaw(signature.args, signature_idx);
+        const var_name = object.listItem(signature.args, signature_idx);
+        var var_name_should_not_change = var_name;
 
         // Are we at the last argument? If so, is it `args`?
         if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
             // Assign remaining arguments to `args`.
             const list = try object.listNew(interp.heap, args[called_idx..]);
             errdefer list.release();
-            try setVariableTo(interp, interp.currentCallFrameIndex(), var_name, list);
+            try interp.setVariableTo(call_frame_idx, &var_name_should_not_change, list);
+        } else if (signature_idx > signature.required_arity) {
+            // This is an optional argument.
+
+            // Are there any remaining unassigned arguments?
+            if (called_idx < args.len) {
+                try interp.setVariableTo(call_frame_idx, &var_name_should_not_change, args[called_idx]);
+                called_idx += 1;
+            } else {
+                // Else populate it with its default value.
+                const default_value = object.listItem(signature.optional_values.?, signature_idx - signature.required_arity);
+                try interp.setVariableTo(call_frame_idx, &var_name_should_not_change, default_value);
+            }
         } else {
-            try setVariableTo(interp, interp.currentCallFrameIndex(), var_name, args[called_idx]);
+            try interp.setVariableTo(call_frame_idx, &var_name_should_not_change, args[called_idx]);
             called_idx += 1;
         }
+
+        // This shouldn't change, as the signature is local to this heap, so it can shimmer.
+        assert(var_name == var_name_should_not_change);
     }
+
+    // TODO implement trace
+
+    return interp.evalObject(&signature.body);
 }
 
-pub fn evalList(interp: *Interp, list: Heap.Handle) !void {
+fn callNative(interp: *Interp, command: *Command, args: []Heap.Handle) !void {
+    const signature = command.call_info.native;
+
+    early_exit: {
+        // Check arg count.
+        if (args.len < signature.min_arity) break :early_exit;
+        if (signature.max_arity) |max_arity| {
+            if (args.len > max_arity) break :early_exit;
+        }
+        if (signature.multiple_of) |multiple_of| {
+            if (@mod(args.len, multiple_of) != 0) break :early_exit;
+        }
+
+        try command.call_info.native.to_call(interp, args);
+        return;
+    }
+
+    var sf = std.heap.stackFallback(64, interp.gpa);
+    const scratch = sf.get();
+    const command_name = try Heap.getString(args[0]);
+    const command_usage = try command.getUsageInfo(scratch, command_name);
+    defer scratch.free(command_usage);
+    var det: object.ErrorDetails = undefined;
+    return interp.wrapErrorDetails(&det, wrongArgumentCountError(interp.heap, &det, command_usage));
+}
+
+pub fn evalList(interp: *Interp, list: *Heap.Handle) !void {
     _ = interp;
     _ = list;
 
     @panic("unimplemented");
 }
-
-pub fn getResult(interp: *Interp) Heap.Handle {
-    if (interp.result) |result| {
-        return result;
-    } else {
-        return interp.heap.emptyObject();
-    }
-}
-
 fn freeLastResult(interp: *Interp) void {
     interp.result.release();
     interp.result = interp.heap.emptyObject();
@@ -576,9 +637,15 @@ pub fn setResultOwning(interp: *Interp, handle: Heap.Handle) void {
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.freeLastResult();
     const bytes_handle = try object.newString(interp.heap, bytes);
-    defer bytes_handle.release();
 
-    setResult(interp, bytes_handle);
+    try setResult(interp, bytes_handle);
+}
+
+pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
+    interp.freeLastResult();
+    const fmt_handle = try object.newStringFmt(interp.heap, fmt, args);
+
+    try setResult(interp, fmt_handle);
 }
 
 pub fn setEmptyResult(interp: *Interp) void {
@@ -605,6 +672,8 @@ const CallFrame = struct {
     /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
     /// but when it overflows it'll scan the heap and reset all cached lookups.
     call_epoch: u31,
+    /// Set this during evaluation to trigger a tailcall.
+    tailcall: ?Tailcall,
 };
 
 fn currentCallFrameIndex(interp: *Interp) u32 {
@@ -624,7 +693,7 @@ const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
     /// Arguments of this eval frame.
-    args: []Heap.Handle,
+    args: ?[]Heap.Handle,
 };
 
 fn currentEvalFrameIndex(interp: *Interp) u32 {
@@ -632,7 +701,7 @@ fn currentEvalFrameIndex(interp: *Interp) u32 {
 }
 
 fn currentEvalFrame(interp: *Interp) *EvalFrame {
-    return &interp.eval_frames[interp.currentCallFrameIndex()];
+    return &interp.eval_frames.items[interp.currentCallFrameIndex()];
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: ProcedureSignature) !u32 {
@@ -653,6 +722,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: 
         .signature = signature,
         // TODO PERF recycle variable hash table if possible.
         .variables = vars_handle,
+        .tailcall = null,
     });
 
     interp.incrementCallEpoch();
@@ -660,15 +730,16 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: 
     return @intCast(new_call_frame_idx);
 }
 
-fn pushEvalFrame(interp: *Interp) u32 {
-    interp.eval_frames.append(interp.gpa, .{
+fn pushEvalFrame(interp: *Interp) !u32 {
+    try interp.eval_frames.append(interp.gpa, .{
         .call_frame = interp.currentCallFrameIndex(),
+        .args = null,
     });
     return interp.currentEvalFrameIndex();
 }
 
 fn popEvalFrame(interp: *Interp) void {
-    interp.eval_frames.pop() orelse unreachable;
+    _ = interp.eval_frames.pop() orelse unreachable;
 }
 
 /// Caller should release return value when they're done.
@@ -690,7 +761,7 @@ fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle
         },
         .command_subst => {
             var new_value = value;
-            const result = interp.eval(&new_value);
+            const result = interp.evalObject(&new_value);
 
             // The only case where the new value is not the same as the last value is if `eval`
             // converted it from a string to a script. If so, we want to copy that script id
@@ -708,7 +779,7 @@ fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle
 
             // Be sure to propagate any error that eval returned.
             if (result) {
-                return interp.getResult();
+                return interp.result;
             } else |err| {
                 return err;
             }
@@ -727,15 +798,15 @@ fn interpolateTokens(
     value_len: u32,
     substitution_only: bool,
 ) !Heap.Handle {
-    const args_alloc_backing = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
-    const tokens_alloc = args_alloc_backing.get();
+    var sf = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
+    const tokens_alloc = sf.get();
 
     const new_values = try tokens_alloc.alloc(Heap.Handle, value_len);
     defer tokens_alloc.free(new_values);
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len), 0..) |tag, value_index, i| {
-        if (interp.substituteOneToken(tag, object.dictItemRaw(value_list, value_index))) |new_value| {
+        if (interp.substituteOneToken(tag, object.dictItemRaw(value_list, @intCast(value_index)))) |new_value| {
             new_values[i] = new_value;
         } else |err| {
             // Due to the error, we're actually going to return early, after we take care
@@ -757,11 +828,11 @@ fn interpolateTokens(
             } else {
                 switch (err) {
                     Error.Break => {
-                        interp.setResultString("invoked \"break\" outside of a loop");
+                        try interp.setResultString("invoked \"break\" outside of a loop");
                         new_err = Error.EvalError;
                     },
                     Error.Continue => {
-                        interp.setResultString("invoked \"continue\" outside of a loop");
+                        try interp.setResultString("invoked \"continue\" outside of a loop");
                         new_err = Error.EvalError;
                     },
                     else => {},
@@ -782,7 +853,8 @@ fn interpolateTokens(
         new_str_len += (try Heap.getString(new_value)).len;
     }
 
-    const new_str = object.newStringToFill(interp.heap, new_str_len);
+    const new_str = try object.newStringToFill(interp.heap, new_str_len);
+    errdefer new_str.release();
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
         for (new_values) |new_value| {
@@ -802,19 +874,21 @@ fn interpolateTokens(
 
 /// Qualifies a name to its canonical version. For example, a name of "bar", and a namespace
 /// of "foo" would return "foo::bar", allocated on the arena.
-fn qualifyName(arena: std.mem.Allocator, namespace: Heap.Handle, name: []const u8) ![]const u8 {
+fn qualifyName(arena: std.mem.Allocator, namespace: Heap.Handle, name: []const u8) !?[]const u8 {
     // We're in a non-global namespace, so we'll need to append the namespace to the
     // beginning of the name, if the name isn't globally scoped (e.g. by not
     // having :: at the beginning).
     if (name.len < 2 or name[0] != ':' or name[1] != ':') {
         const namespace_name = try Heap.getString(namespace);
-        return try std.fmt.allocPrint(arena, "{}::{}", .{ namespace_name, name });
+        return try std.fmt.allocPrint(arena, "{s}::{s}", .{ namespace_name, name });
     }
+
+    return null;
 }
 
 /// This function returns the command that's found based on the string contents of `handle`.
 /// This also specializes the object to contain a cached lookup for the command.
-pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Handle) !*Command {
+pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Heap.Handle) !*Command {
     early_exit: {
         // Can't use a command's cached value if it's from another heap.
         if (handle.heap != interp.heap.heapId()) break :early_exit;
@@ -833,7 +907,7 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
                 // call frame's namespace.
                 if (obj.body.command.in_global_namespace) break :early_exit;
                 const obj_namespace = interp.heap.getExtraData(obj.body.command.u.other_namespace).command;
-                if (!try Heap.checkIfEqual(namespace, handle.getHeap().getLocalObject(obj_namespace.namespace))) {
+                if (!try Heap.checkIfEqual(namespace, handle.getHeap().getHandle(obj_namespace.namespace))) {
                     break :early_exit;
                 }
             } else if (!obj.body.command.in_global_namespace) {
@@ -846,7 +920,7 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
 
             // All checks passed, so now we can return the cached command's pointer.
             if (obj.body.command.in_global_namespace) {
-                return obj.body.command.u.global_namespace.command_index;
+                return &interp.commands.values()[obj.body.command.u.global_namespace.command_index];
             } else {
                 const extra_data = interp.heap.getExtraData(obj.body.command.u.other_namespace);
                 return &interp.commands.values()[extra_data.command.command_index];
@@ -858,17 +932,18 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
 
     // There wasn't a cached version, or it was invalid, so we'll need to look up this command.
     const current_namespace = interp.currentCallFrame().namespace;
-    const fallback_allocator = std.heap.StackFallbackAllocator(64).get();
+    var sf = std.heap.stackFallback(64, interp.gpa);
+    const scratch = sf.get();
     const qualified = blk: {
         // Only qualify if we're in a namespace.
         if (current_namespace) |namespace| {
-            break :blk qualifyName(fallback_allocator, namespace, command_name);
+            break :blk try qualifyName(scratch, namespace, command_name);
         }
         break :blk null;
     };
-    defer if (qualified) |unwrapped| fallback_allocator.free(unwrapped);
+    defer if (qualified) |unwrapped| scratch.free(unwrapped);
 
-    var command_index = interp.commands.getIndex(qualified orelse command_name);
+    var command_index: ?usize = interp.commands.getIndex(qualified orelse command_name);
     if (qualified != null and command_index == null) {
         // If we couldn't find the command in the namespace, we should check if it's in the global
         // namespace (by not qualifying the name, and instead using it raw).
@@ -889,9 +964,11 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
 
             const extra_data = try interp.heap.createExtraData();
             errdefer interp.heap.destroyExtraData(extra_data);
-            interp.heap.extra.items[extra_data].command = .{
-                .command_index = index,
-                .namespace = borrowed_namespace.index,
+            interp.heap.getExtraData(extra_data).* = .{
+                .command = .{
+                    .command_index = @intCast(index),
+                    .namespace = borrowed_namespace.index,
+                },
             };
 
             handle.peek().body.command = .{
@@ -903,31 +980,33 @@ pub fn getCommand(interp: *Interp, det: ?object.ErrorDetails, handle: *Heap.Hand
             handle.peek().body.command = .{
                 .procedure_epoch = interp.current_procedure_epoch,
                 .in_global_namespace = true,
-                .u = .{ .global_namespace = index },
+                .u = .{ .global_namespace = .{ .command_index = @intCast(index) } },
             };
         }
+
+        return &interp.commands.values()[index];
     } else {
         // If it was null, we better error.
         if (det) |details| details.* = .{
-            .message = object.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
+            .message = try object.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
         };
-        return Error.CommandNotFound;
+        return error.CommandNotFound;
     }
 }
 
-fn invokeCommand(interp: *Interp, args: []Heap.Handle) !?Tailcall {
+fn invokeCommand(interp: *Interp, args: []Heap.Handle) !void {
     var det: object.ErrorDetails = undefined;
     const command = interp.wrapErrorDetails(&det, getCommand(interp, &det, &args[0])) catch |err| switch (err) {
-        Error.OutOfMemory => Error.OutOfMemory,
-        Error.CommandNotFound => {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.CommandNotFound => {
             // TODO invoke jim unknown
             @panic("unimplemented");
         },
     };
 
     if (interp.eval_depth >= interp.max_eval_depth) {
-        interp.setResultString("Infinite eval recursion");
-        return Error.InfiniteRecursion;
+        try interp.setResultString("Infinite eval recursion");
+        return error.InfiniteRecursion;
     }
 
     interp.eval_depth += 1;
@@ -942,44 +1021,50 @@ fn invokeCommand(interp: *Interp, args: []Heap.Handle) !?Tailcall {
         // Be sure to clear the previous result.
         interp.setEmptyResult();
 
-        switch (command.call_info) {
-            .native => |info| {
-                _ = info;
-                // TODO native procedure call
-            },
-            .tcl => |info| {
-                _ = info;
+        const result = blk: {
+            switch (command.call_info) {
+                .native => |info| {
+                    _ = info;
 
-                const result = interp.callProcedure(command, current_args);
+                    break :blk interp.callNative(command, current_args);
+                },
+                .tcl => |info| {
+                    _ = info;
 
-                if (result) |possible_tailcall| {
-                    if (possible_tailcall) |tailcall| {
-                        // Be sure to release the previous tailcall args.
-                        if (tailcall_info) |previous_tailcall| {
-                            for (previous_tailcall.args) |handle| handle.release();
-                            interp.gpa.free(previous_tailcall.args);
-                        }
+                    break :blk interp.callProcedure(command, current_args);
+                },
+            }
+        };
 
-                        tailcall_info = tailcall;
-                        current_args = tailcall.args;
-                    }
-                } else |err| {
-                    switch (err) {
-                        Error.OutOfMemory => return Error.OutOfMemory,
-                        Error.EvalError => {
-                            // TO
-                        },
-                    }
+        if (result) {
+            if (interp.currentCallFrame().tailcall) |tailcall| {
+                // Be sure to free the previous tailcall.
+                if (tailcall_info) |prev_tailcall| {
+                    for (prev_tailcall.args) |arg| arg.release();
+                    interp.gpa.free(prev_tailcall.args);
                 }
-            },
+
+                tailcall_info = tailcall;
+                current_args = tailcall.args;
+                interp.currentCallFrame().tailcall = null;
+            } else {
+                tailcall_info = null;
+            }
+        } else |err| {
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    // TODO set stack trace
+                    return err;
+                },
+            }
         }
-        command.call(interp, current_args);
 
         if (tailcall_info == null) break;
     }
 }
 
-pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
+pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)!void {
     // If the object is of type "list", with no string rep we can call a specialized version of eval().
     if (script.peek().tag == .list and script.hasString()) {
         return interp.evalList(script);
@@ -999,12 +1084,12 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
 
     // FIXME do I need `script->inUse++;`?
 
-    _ = interp.pushEvalFrame();
+    _ = try interp.pushEvalFrame();
     defer interp.popEvalFrame();
 
     // Used for allocating the arguments passed into a command call.
-    const args_alloc_backing = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
-    const args_alloc = args_alloc_backing.get();
+    var sf = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
+    var args_alloc = sf.get();
 
     // Execute every command sequentially until the end of the script or an error occurs.
     var command_token_i: u32 = 0;
@@ -1021,6 +1106,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
         // may write multiple arguments from one word.
         var args_written: usize = 0;
         var args = try args_alloc.alloc(Heap.Handle, command_info.arg_count);
+        @memset(args, interp.heap.nullObject());
         defer args_alloc.free(args);
         defer for (args) |arg| arg.release();
 
@@ -1031,17 +1117,17 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
             var word_parts: u32 = 1;
             const argument_expansion = tags[word_token_i] == .argument_expansion;
             if (tags[word_token_i] == .start_of_word or argument_expansion) {
-                word_parts = values[word_token_i].body.integer;
+                word_parts = @intCast(values[word_token_i].body.integer);
                 word_token_i += 1;
-            } else unreachable;
+            }
 
             var resultant_word: Heap.Handle = blk: {
                 if (word_parts == 1) {
                     // Simple one-to-one substitution, so an easy case.
-                    break :blk try interp.substituteOneToken(tags[word_token_i], object.listItemRaw(parsed.values, word_token_i));
+                    break :blk try interp.substituteOneToken(tags[word_token_i], object.listItem(parsed.values, word_token_i));
                 } else {
                     // Helper function that'll interpolate all the word parts and merge them into a string.
-                    break :blk try interp.interpolateTokens(tags[word_token_i..][0..word_parts], parsed.values, word_token_i, word_parts);
+                    break :blk try interp.interpolateTokens(tags[word_token_i..][0..word_parts], parsed.values, word_token_i, word_parts, false);
                 }
             };
 
@@ -1061,14 +1147,16 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) !void {
                 assert(!resultant_word.isShared());
                 for (0..len) |list_idx| {
                     // Steal each object from the list.
-                    args[args_written] = try interp.heap.steal(object.listItemRaw(resultant_word, list_idx));
+                    args[args_written] = try interp.heap.steal(object.listItem(resultant_word, @intCast(list_idx)));
                     args_written += 1;
                 }
             } else {
-                args[args_written] = try interp.heap.steal(object.listItemRaw(resultant_word, 0));
+                args[args_written] = resultant_word;
                 args_written += 1;
             }
         }
+
+        command_token_i = word_token_i;
 
         // Now that we've populated the arguments for this command, we'll go ahead and run it.
         const result = interp.invokeCommand(args);
@@ -1104,6 +1192,7 @@ pub fn init(heap: *Heap) !Interp {
         .body = try object.newString(heap, ""),
         .has_args_parameter = false,
         .optional_arity = 0,
+        .optional_values = null,
         .required_arity = 0,
         .statics = null,
     });
@@ -1112,6 +1201,22 @@ pub fn init(heap: *Heap) !Interp {
 }
 
 pub fn deinit(interp: *Interp) void {
+    interp.result.release();
+    var iter = interp.commands.iterator();
+    while (iter.next()) |*entry| {
+        switch (entry.value_ptr.call_info) {
+            .native => {
+                // Don't free the string, as it's in .data
+            },
+            .tcl => {
+                interp.gpa.free(entry.key_ptr.*);
+            },
+        }
+
+        entry.value_ptr.deinit();
+    }
+    interp.commands.deinit(interp.gpa);
+
     // Deinit all frames.
     for (interp.call_frames.items) |frame| {
         // deinit args.
@@ -1123,4 +1228,6 @@ pub fn deinit(interp: *Interp) void {
         frame.signature.release();
     }
     interp.call_frames.deinit(interp.gpa);
+
+    interp.eval_frames.deinit(interp.gpa);
 }

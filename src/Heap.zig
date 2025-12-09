@@ -259,7 +259,7 @@ pub const ParsedScript = struct {
                 },
                 .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
-                    const item = object.listItemRaw(script.values, @intCast(i));
+                    const item = object.listItem(script.values, @intCast(i));
                     std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), getString(item) catch "<oom string>" });
                 },
             }
@@ -1152,6 +1152,8 @@ pub fn steal(calling_heap: *Heap, handle: Handle) !Handle {
 
     const new_obj = try calling_heap.createObject();
     new_obj.peek().* = handle.peek().*;
+
+    return new_obj;
 }
 
 /// Increase ref count if possible, otherwise duplicate onto calling_heap.

@@ -776,7 +776,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         errdefer new_list.release();
 
         for (tokens.items, 0..) |token, i| {
-            const item = listItemRaw(new_list, @intCast(i));
+            const item = listItem(new_list, @intCast(i));
 
             if (token.tag == .simple_string) {
                 // Normal string, so no escaping needed.
@@ -837,7 +837,8 @@ pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
     return handle.getHeap().objectSlice(handle.index + 1, handle.index + 1 + len);
 }
 
-fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
+/// Returns whether a reindex is needed.
+fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !bool {
     const obj = handle.peek();
 
     const current_len = blk: {
@@ -855,7 +856,7 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
             // Be sure to free the abandoned objects when we shrink.
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItemRaw(handle.*, @intCast(current_len - freed_count + to_free));
+                const to_free_handle = listItem(handle.*, @intCast(current_len - freed_count + to_free));
                 if (obj.tag == .dict and @mod(to_free, 2) == 0) {
                     // If a dict, be sure to remove the keys from the table.
                     _ = handle.getHeap().getExtraData(obj.body.dict).dict.table.remove(to_free_handle);
@@ -871,7 +872,7 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
                 else => unreachable,
             }
 
-            return;
+            return false;
         }
 
         // Even if there's not enough length, there may be enough capacity.
@@ -883,7 +884,7 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
                 else => unreachable,
             }
 
-            return;
+            return false;
         }
     }
 
@@ -929,28 +930,28 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void
         Heap.freeObjectBacking(handle.*);
         handle.* = new_handle;
     }
+
+    if (handle.peek().tag == .dict) return true;
+    return false;
 }
 
 /// Assumes provided handle is a list.
-pub fn listItemRaw(handle: Handle, index: u32) Handle {
+pub fn listItem(handle: Handle, index: u32) Handle {
     const list = handle.peek();
     assert(list.tag == .list);
 
     if (index < list.body.list.len) {
-        return .{
+        const list_elem: Heap.Handle = .{
             .index = handle.index + 1 + index,
             .heap = handle.heap,
         };
+
+        if (list_elem.peek().tag == .reference) {
+            return list_elem.peek().body.reference;
+        } else {
+            return list_elem;
+        }
     } else @panic("List element out of bounds");
-}
-
-pub fn listItem(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, index: u32) !?Handle {
-    try shimmerToList(calling_heap, det, handle);
-    const list = handle.peek().body.list;
-
-    if (index < list.len) {
-        return listItemRaw(handle.*, index);
-    } else return null;
 }
 
 /// Assumes handle is a list.
@@ -963,7 +964,7 @@ pub fn listItemsRaw(handle: Handle) []Heap.Object {
 
 pub fn listAppendObject(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Heap.Object) !u32 {
     try shimmerToList(calling_heap, det, handle);
-    try setCollectionLength(calling_heap, handle, handle.peek().body.list.len + 1);
+    _ = try setCollectionLength(calling_heap, handle, handle.peek().body.list.len + 1);
 
     const list = handle.peek();
     const index = list.body.list.len - 1;
@@ -975,7 +976,7 @@ pub fn listAppendObject(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
 
 pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Handle) !u32 {
     try shimmerToList(calling_heap, det, handle);
-    try setCollectionLength(calling_heap, handle, handle.peek().body.list.len + 1);
+    _ = try setCollectionLength(calling_heap, handle, handle.peek().body.list.len + 1);
 
     const list = handle.peek();
     const index = list.body.list.len - 1;
@@ -1004,13 +1005,13 @@ fn testLists(ta: std.mem.Allocator) !void {
     // The object should have been copied when being moved into the list
     try testing.expect(obj1.peek().str != items[0].str);
     // But it should have an identical string
-    try testing.expectEqualStrings("object 1", try Heap.getString(listItemRaw(list1, 0)));
+    try testing.expectEqualStrings("object 1", try Heap.getString(listItem(list1, 0)));
 
     const to_append = try newString(heap, "appended item");
     defer to_append.release();
 
     _ = try listAppend(heap, &det, &list1, to_append);
-    try testing.expectEqualStrings("appended item", try Heap.getString(listItemRaw(list1, 2)));
+    try testing.expectEqualStrings("appended item", try Heap.getString(listItem(list1, 2)));
 
     var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
@@ -1020,9 +1021,9 @@ fn testLists(ta: std.mem.Allocator) !void {
     const old_string_list_handle = string_list;
     try shimmerToList(heap, &det, &string_list);
     try testing.expect(old_string_list_handle != string_list);
-    try testing.expectEqualStrings("item1", try Heap.getString(listItemRaw(string_list, 0)));
-    try testing.expectEqualStrings("item 2", try Heap.getString(listItemRaw(string_list, 1)));
-    try testing.expectEqualStrings("item 3", try Heap.getString(listItemRaw(string_list, 2)));
+    try testing.expectEqualStrings("item1", try Heap.getString(listItem(string_list, 0)));
+    try testing.expectEqualStrings("item 2", try Heap.getString(listItem(string_list, 1)));
+    try testing.expectEqualStrings("item 3", try Heap.getString(listItem(string_list, 2)));
 }
 
 test "lists" {
@@ -1178,14 +1179,11 @@ pub fn dictReindex(handle: Handle, up_to: ?usize) !void {
     // This properly accounts for duplicate dictionary entries,
     // as it'll just overwrite it with the second `dict.put`.
     var pair: u32 = 0;
-    while (pair < up_to orelse dict.len) : (pair += 2) {
-        const key: Handle = .{
-            .index = handle.index + 1 + pair,
-            .heap = handle.heap,
-        };
+    while (pair < (up_to orelse dict.len)) : (pair += 2) {
+        const key: Handle = dictItemRaw(handle, pair);
         // Make sure key has a string rep.
         _ = try Heap.getString(key);
-        // Point to `pair + 1`, e.g. the value following the key
+        // Point to `pair + 1`, e.g. the value following the key.
         try dict.table.put(handle.getHeap().gpa, key, pair + 1);
     }
 }
@@ -1228,8 +1226,6 @@ fn dictRemoveDuplicates(calling_heap: *Heap, handle: *Handle, to_track: ?u32) !?
     var to_track_new_location: ?u32 = null;
 
     if (metadata.table.size * 2 != metadata.len) {
-        // Before modifying a dictionary, we need to remove any duplicate keys.
-
         const items = dictItemsRaw(handle.*);
         var pair_index: u32 = 0;
 
@@ -1326,7 +1322,7 @@ pub fn dictPut(calling_heap: *Heap, handle: *Handle, key: Handle, value: Handle)
     var duped_value = try calling_heap.duplicateOrReference(value);
 
     const value_index: u32 = blk: {
-        // If we get OOM at some point, we need to be sure to roll back the new value.
+        // If we hit OOM at some point, we need to be sure to roll back the new value.
         errdefer duped_value.deinitBodySingle(calling_heap);
 
         // Ensure `original_key` has a string rep.
@@ -1351,7 +1347,7 @@ pub fn dictPut(calling_heap: *Heap, handle: *Handle, key: Handle, value: Handle)
             // Key doesn't exist, so append both key and value.
             const new_key_index = metadata.len;
             const new_value_index = metadata.len + 1;
-            try setCollectionLength(calling_heap, handle, new_length);
+            const reindex_needed = try setCollectionLength(calling_heap, handle, new_length);
             // `handle` may change after updating the length, so we better reload
             // the metadata pointer.
             metadata = &calling_heap.getExtraData(handle.peek().body.dict).dict;
@@ -1364,11 +1360,17 @@ pub fn dictPut(calling_heap: *Heap, handle: *Handle, key: Handle, value: Handle)
             assert(calling_heap.exchangeString(new_key_handle.index, Heap.Object.null_string, key_dup_str));
             new_value_handle.peek().* = duped_value;
 
+            // Reindex after we've added the new value.
+            if (reindex_needed) {
+                // dictReindex could still fail if one of the objects doesn't have a string rep.
+                try dictReindex(handle.*, null);
+            } else {
+                metadata.table.putAssumeCapacity(new_key_handle, new_value_index);
+            }
+
             break :blk new_value_index;
         }
     };
-
-    metadata.table.putAssumeCapacity(dictItemRaw(handle.*, value_index - 1), value_index);
 
     // Because we mutated the dictionary, we need to remove any duplicates.
     if (dictHasDuplicatesRaw(handle.*)) {
@@ -1439,9 +1441,11 @@ fn testDicts(ta: std.mem.Allocator) !void {
     assert(!dict_edge_cases.isShared());
     _ = try dictPut(heap, &dict_edge_cases, dictItemRaw(dict_edge_cases, 1), dictItemRaw(dict_edge_cases, 2));
     try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupRaw(dict_edge_cases, value1)).?));
+
     // Try aliasing a key by using it as key and value.
     _ = try dictPut(heap, &dict_edge_cases, dictItemRaw(dict_edge_cases, 0), dictItemRaw(dict_edge_cases, 0));
     try testing.expectEqualStrings("foo", try Heap.getString((try dictLookupRaw(dict_edge_cases, key1)).?));
+
     // Try aliasing a value by using it as key and value.
     _ = try dictPut(heap, &dict_edge_cases, dictItemRaw(dict_edge_cases, 3), dictItemRaw(dict_edge_cases, 3));
     try testing.expectEqualStrings("2", try Heap.getString((try dictLookupRaw(dict_edge_cases, value2)).?));
@@ -1541,7 +1545,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
         .line_no = 1,
     };
 
-    // Parse all the tokens of the script, handling any errors that come up. //
+    // Parse all the tokens of the script, handling any errors that come up.
 
     const bytes = try Heap.getString(handle);
     var parser = Parser.init(bytes, source_info.line_no);
@@ -1601,7 +1605,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     var new_token_values = try listUninitializedNew(calling_heap, new_token_capacity);
     errdefer new_token_values.release();
     // Set length to 0 so we can just call listAppend().
-    try setCollectionLength(calling_heap, &new_token_values, 0);
+    _ = try setCollectionLength(calling_heap, &new_token_values, 0);
 
     var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, new_token_capacity);
     errdefer new_token_tags.deinit(calling_heap.gpa);
@@ -1699,7 +1703,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
                             .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
                         );
 
-                        const item_handle = listItemRaw(new_token_values, str_idx);
+                        const item_handle = listItem(new_token_values, str_idx);
                         try setStringFromEscaped(calling_heap.gpa, item_handle, bytes[token.loc.start..token.loc.end]);
 
                         break :blk item_handle;
@@ -1713,7 +1717,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
                             .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
                         );
 
-                        const item_handle = listItemRaw(new_token_values, str_idx);
+                        const item_handle = listItem(new_token_values, str_idx);
                         try Heap.setString(item_handle, bytes[token.loc.start..token.loc.end]);
 
                         break :blk item_handle;
@@ -1892,7 +1896,7 @@ test "script shimmering" {
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {
     try testing.expectEqual(tag, script.tags.items[index]);
-    try testing.expectEqualStrings(value, try Heap.getString(listItemRaw(script.values, index)));
+    try testing.expectEqualStrings(value, try Heap.getString(listItem(script.values, index)));
 }
 
 pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
