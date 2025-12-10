@@ -64,6 +64,8 @@ pub var custom_types: memutil.IndexedMemoryPool(CustomType, cfg.use_vmem) = unde
 pub var script_metadata: ScriptMetadataPool = undefined;
 const ScriptMetadataPool = memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem);
 
+pub threadlocal var local_heap: *Heap = undefined;
+
 const Heap = @This();
 
 const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
@@ -707,6 +709,28 @@ pub const Handle = packed struct(u64) {
         obj.tag = .none;
     }
 
+    /// Increase ref count if possible, otherwise duplicate onto local_heap.
+    pub fn borrow(handle: Handle) !Handle {
+        // If the object is in a collection, then we'll need to clone it (i.e. a list item)
+        if (handle.getMetadata().in_collection) {
+            return try local_heap.duplicate(handle);
+        }
+
+        // This object may have come from another heap
+        const obj_heap = handle.getHeap();
+
+        const is_cross_thread = handle.getMetadata().cross_thread;
+        incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread);
+
+        return handle;
+    }
+
+    pub fn borrowOptional(handle: ?Handle) !?Handle {
+        if (handle) |unwrapped| {
+            return try unwrapped.borrow();
+        } else return null;
+    }
+
     pub fn release(handle: Handle) void {
         const metadata = handle.getMetadata();
         if (metadata.in_collection) return;
@@ -1077,10 +1101,10 @@ pub fn freeObject(handle: Handle) void {
 
 /// If the object can't be modified, this will duplicate and release
 /// the old object.
-pub fn prepareForModification(calling_heap: *Heap, handle: *Handle) !void {
+pub fn prepareForModification(handle: *Handle) !void {
     if (!handle.canModify()) {
         const before_duplicating = handle.*;
-        handle.* = try calling_heap.duplicate(handle.*);
+        handle.* = try local_heap.duplicate(handle.*);
         before_duplicating.release();
     }
 
@@ -1089,10 +1113,10 @@ pub fn prepareForModification(calling_heap: *Heap, handle: *Handle) !void {
 
 /// If the object can't be shimmered, this will duplicate and release
 /// the old object. This also invalidates the object's body.
-pub fn prepareToShimmer(calling_heap: *Heap, handle: *Handle) !void {
+pub fn prepareToShimmer(handle: *Handle) !void {
     if (!handle.canShimmer()) {
         const before_duplicating = handle.*;
-        handle.* = try calling_heap.duplicate(handle.*);
+        handle.* = try local_heap.duplicate(handle.*);
         before_duplicating.release();
     }
 
@@ -1173,38 +1197,16 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
 ///  * This allocates a single object, not a range, so you can't use this to
 ///    steal a list or dict.
 ///  * This can't be used with a shared object.
-pub fn steal(calling_heap: *Heap, handle: Handle) !Handle {
-    assert(calling_heap.heapId() == handle.heap);
+pub fn steal(handle: Handle) !Handle {
+    assert(local_heap.heapId() == handle.heap);
 
-    const new_obj = try calling_heap.createObject();
+    const new_obj = try local_heap.createObject();
     new_obj.peek().* = handle.peek().*;
 
     return new_obj;
 }
 
-/// Increase ref count if possible, otherwise duplicate onto calling_heap.
-pub fn borrow(calling_heap: *Heap, handle: Handle) !Handle {
-    // If the object is in a collection, then we'll need to clone it (i.e. a list item)
-    if (handle.getMetadata().in_collection) {
-        return try calling_heap.duplicate(handle);
-    }
-
-    // This object may have come from another heap
-    const obj_heap = handle.getHeap();
-
-    const is_cross_thread = handle.getMetadata().cross_thread;
-    incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread);
-
-    return handle;
-}
-
-pub fn borrowOptional(calling_heap: *Heap, handle: ?Handle) !?Handle {
-    if (handle) |unwrapped| {
-        return try calling_heap.borrow(unwrapped);
-    } else return null;
-}
-
-pub fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr {
+pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     switch (getStringDetails(handle)) {
         .long => |long_str| {
             long_str.incrRefCount();
@@ -1214,9 +1216,9 @@ pub fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr 
             };
         },
         .normal => |bytes| {
-            const new_string = try calling_heap.createString(@intCast(bytes.len));
+            const new_string = try dest_heap.createString(@intCast(bytes.len));
             const len: u26 = @intCast(bytes.len);
-            @memcpy(calling_heap.getHeapString(new_string, new_string + len), bytes);
+            @memcpy(dest_heap.getHeapString(new_string, new_string + len), bytes);
 
             return .{
                 .u = .{ .str = .{ .index = new_string, .len = len } },
@@ -1230,8 +1232,8 @@ pub fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr 
 }
 
 /// Duplicates the object if it's a single item, otherwise create a reference to it.
-pub fn duplicateOrReference(self: *Heap, handle: Handle) !Object {
-    return Heap.duplicateSingle(self, handle) catch |e| switch (e) {
+pub fn duplicateOrReference(dest_heap: *Heap, handle: Handle) !Object {
+    return Heap.duplicateSingle(dest_heap, handle) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MultiItemObject => {
             // This item can't be duplicated, as it contains multiple objects.
@@ -1256,12 +1258,12 @@ pub fn referenceOrDuplicate(heap: *Heap, handle: Handle) !Object {
 }
 
 /// If called with a multi-item object, will return error.MultiItemObject
-pub fn duplicateSingle(heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
+pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
         .none, .index, .integer, .float, .string, .bool, .script, .script_command, .marked => {
             return .{
-                .str = try heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(handle),
                 .tag = src.tag,
                 .body = src.body,
             };
@@ -1271,13 +1273,13 @@ pub fn duplicateSingle(heap: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
 
             const file_name_handle = blk: {
                 if (source.file_name_obj == 0) {
-                    break :blk heap.nullObject();
+                    break :blk dest_heap.nullObject();
                 } else {
                     // Better make sure it's in our heap.
-                    if (handle.heap != heap.heapId()) {
-                        break :blk try heap.duplicate(heap.getHandle(source.file_name_obj));
+                    if (handle.heap != dest_heap.heapId()) {
+                        break :blk try dest_heap.duplicate(dest_heap.getHandle(source.file_name_obj));
                     } else {
-                        const to_break = heap.getHandle(source.file_name_obj);
+                        const to_break = dest_heap.getHandle(source.file_name_obj);
                         to_break.incrRefCount();
                         break :blk to_break;
                     }
@@ -1285,7 +1287,7 @@ pub fn duplicateSingle(heap: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
             };
 
             return .{
-                .str = try heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(handle),
                 .tag = .source,
                 .body = .{
                     .source = .{
@@ -1303,23 +1305,23 @@ pub fn duplicateSingle(heap: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
 
             var new_object: Object = .{
                 // TODO make sure this doesn't leak
-                .str = try heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(handle),
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = try heap.createExtraData(),
+                        .index = try dest_heap.createExtraData(),
                         .type_id = custom_type.type_id,
                     },
                 },
             };
-            try custom_types.items[custom_type.type_id].duplicate(heap, src, &new_object);
+            try custom_types.items[custom_type.type_id].duplicate(dest_heap, src, &new_object);
 
             return new_object;
         },
         .dict_subst, .variable, .upvar, .command => {
             // Variable lookup is not stable between threads.
             return .{
-                .str = try heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(handle),
                 .tag = .none,
                 .body = undefined,
             };
@@ -1330,7 +1332,7 @@ pub fn duplicateSingle(heap: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
     }
 }
 
-pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
+pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
     const src = handle.peek();
 
     switch (src.tag) {
@@ -1338,7 +1340,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
             const old_body = src.body.list;
             const old_start = handle.index + 1;
 
-            const new_list_idx = try calling_heap.createObjects(1 + old_body.len);
+            const new_list_idx = try dest_heap.createObjects(1 + old_body.len);
             errdefer {
                 // Free elements before freeing the head, as the head could
                 // be swapped out if freed too early
@@ -1350,13 +1352,13 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 }
                 freeObject(.{ .index = new_list_idx, .heap = handle.heap });
             }
-            const new_head: *Object = calling_heap.getLocalObject(new_list_idx);
+            const new_head: *Object = dest_heap.getLocalObject(new_list_idx);
             const new_start = new_list_idx + 1;
-            const new_items = calling_heap.objectSlice(new_start, new_start + old_body.len);
+            const new_items = dest_heap.objectSlice(new_start, new_start + old_body.len);
 
             // Duplicate head of list
             new_head.* = .{
-                .str = try calling_heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(handle),
                 .tag = .list,
                 .body = .{
                     .list = .{ .len = old_body.len },
@@ -1365,7 +1367,7 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
 
             // Duplicate items of list
             for (new_items, 0..) |*new_item, i| {
-                new_item.* = calling_heap.duplicateSingle(.{
+                new_item.* = dest_heap.duplicateSingle(.{
                     .heap = handle.heap,
                     .index = @intCast(old_start + i),
                 }) catch |e| switch (e) {
@@ -1375,13 +1377,13 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 };
             }
 
-            return calling_heap.getHandle(new_list_idx);
+            return dest_heap.getHandle(new_list_idx);
         },
         .dict => {
-            const old_head = calling_heap.getExtraData(src.body.dict).dict;
+            const old_head = dest_heap.getExtraData(src.body.dict).dict;
             const old_start = handle.index + 1;
 
-            const new_dict_idx = try calling_heap.createObjects(1 + old_head.len);
+            const new_dict_idx = try dest_heap.createObjects(1 + old_head.len);
             errdefer {
                 // Free elements before freeing the head, as the head could
                 // be realloced before finishing if freed too early
@@ -1393,23 +1395,23 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 }
                 freeObject(.{ .index = new_dict_idx, .heap = handle.heap });
             }
-            const new_head = calling_heap.getLocalObject(new_dict_idx);
+            const new_head = dest_heap.getLocalObject(new_dict_idx);
             const new_start = new_dict_idx + 1;
-            const new_items = calling_heap.objectSlice(new_start, new_start + old_head.len);
+            const new_items = dest_heap.objectSlice(new_start, new_start + old_head.len);
 
             // Duplicate head of dict
             new_head.* = .{
-                .str = try calling_heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(handle),
                 .tag = .dict,
                 .body = .{
-                    .dict = try calling_heap.createExtraData(),
+                    .dict = try dest_heap.createExtraData(),
                 },
             };
-            errdefer calling_heap.destroyExtraData(new_head.body.dict);
+            errdefer dest_heap.destroyExtraData(new_head.body.dict);
 
             // Duplicate items of dict
             for (new_items, 0..) |*new_item, i| {
-                new_item.* = calling_heap.duplicateSingle(.{
+                new_item.* = dest_heap.duplicateSingle(.{
                     .heap = handle.heap,
                     .index = @intCast(old_start + i),
                 }) catch |e| switch (e) {
@@ -1419,15 +1421,15 @@ pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle 
                 };
             }
 
-            const dict = &calling_heap.getExtraData(new_head.body.dict).dict;
+            const dict = &dest_heap.getExtraData(new_head.body.dict).dict;
             dict.len = old_head.len;
-            try object.dictReindex(calling_heap.getHandle(new_dict_idx), null);
+            try object.dictReindex(dest_heap.getHandle(new_dict_idx), null);
 
-            return calling_heap.getHandle(new_dict_idx);
+            return dest_heap.getHandle(new_dict_idx);
         },
         else => {
-            const new_object = try calling_heap.createObject();
-            new_object.peek().* = calling_heap.duplicateSingle(handle) catch |e| switch (e) {
+            const new_object = try dest_heap.createObject();
+            new_object.peek().* = dest_heap.duplicateSingle(handle) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // We already checked if it was a multi-item object (i.e. a list)
                 error.MultiItemObject => unreachable,
@@ -1926,10 +1928,10 @@ pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
     self.extra.destroy(@intFromEnum(index));
 }
 
-// Heap instances //
+pub fn initGlobals(gpa: Allocator) !void {
+    state.mutex.lock();
+    defer state.mutex.unlock();
 
-/// Caller is responsible for locking the global mutex.
-fn initGlobals(gpa: Allocator) !void {
     state.gpa = gpa;
     custom_types = try .initWithCapacity(gpa, if (cfg.threading) cfg.max_custom_types else 32);
     errdefer custom_types.deinit(gpa);
@@ -1942,14 +1944,12 @@ fn initGlobals(gpa: Allocator) !void {
     state.initialized = true;
 }
 
-pub fn createHeap(gpa: Allocator) !*Heap {
+pub fn initHeap(gpa: Allocator) !void {
     const slot_index = blk: {
         state.mutex.lock();
         defer state.mutex.unlock();
 
-        if (!state.initialized) {
-            try initGlobals(gpa);
-        }
+        assert(state.initialized);
 
         const heap_index = state.next_open_heap;
         state.next_open_heap += 1;
@@ -1965,8 +1965,8 @@ pub fn createHeap(gpa: Allocator) !*Heap {
 
     if (slot_index < cfg.max_heaps) {
         const new_heap = &heaps[slot_index];
-        try init(new_heap, gpa);
-        return new_heap;
+        try new_heap.init(gpa);
+        local_heap = new_heap;
     } else {
         return error.OutOfMemory;
     }
@@ -2018,6 +2018,13 @@ pub fn deinitAll() void {
     state.mutex.unlock();
 }
 
+pub fn testStart(gpa: Allocator) !*Heap {
+    try initGlobals(gpa);
+    try initHeap(gpa);
+
+    return local_heap;
+}
+
 pub fn testFinish() void {
     Heap.leakCheckAll();
     Heap.deinitAll();
@@ -2038,8 +2045,8 @@ pub fn createCustomType(custom_type: CustomType) ?*CustomType {
 
 test "object duplication" {
     const ta = std.testing.allocator;
-    var heap = try createHeap(ta);
     defer Heap.testFinish();
+    var heap = try Heap.testStart(ta);
 
     // Number object
     const obj = try heap.createObject();
@@ -2056,7 +2063,7 @@ test "object duplication" {
     try expectEqual(10, new_ref.body.integer);
 
     // try borrowing
-    const borrowed = try heap.borrow(new_obj);
+    const borrowed = try new_obj.borrow();
     try expectEqual(borrowed, new_obj);
     try expectEqual(2, heap.objects.get(new_obj.index).ref_count);
 
@@ -2066,8 +2073,8 @@ test "object duplication" {
 
 test "get string" {
     const ta = std.testing.allocator;
-    var heap = try createHeap(ta);
     defer Heap.testFinish();
+    var heap = try Heap.testStart(ta);
 
     const obj = try heap.createObject();
     defer obj.release();

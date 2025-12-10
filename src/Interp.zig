@@ -4,6 +4,7 @@ const testing = std.testing;
 
 const Parser = @import("Parser.zig");
 const Heap = @import("Heap.zig");
+const Handle = Heap.Handle;
 const object = @import("object.zig");
 
 const Interp = @This();
@@ -12,7 +13,7 @@ heap: *Heap,
 gpa: std.mem.Allocator,
 
 /// The result from a procedure or eval call
-result: Heap.Handle,
+result: Handle,
 /// Eval frames are separate from call frames, as eval calls can be
 /// nested while staying in the same scope. For example,
 /// `puts [+ 2 2]` has one call frame (the global scope), and two
@@ -29,16 +30,16 @@ call_frames: std.ArrayList(CallFrame),
 current_call_epoch: u31,
 current_procedure_epoch: u31,
 commands: CommandHashTable,
-namespace: ?Heap.Handle,
+namespace: ?Handle,
 
 evaluating_safe_expr: bool,
 eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
 /// Stack trace from a function error.
-stack_trace: ?Heap.Handle,
+stack_trace: ?Handle,
 
-pub const CommandFn = fn (interp: *Interp, args: []Heap.Handle) Error!void;
+pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
 
 pub const Error = std.mem.Allocator.Error || object.Error || error{
     EvaluatingSafeExpression,
@@ -53,7 +54,7 @@ pub const Error = std.mem.Allocator.Error || object.Error || error{
 };
 
 const Tailcall = struct {
-    args: []Heap.Handle,
+    args: []Handle,
 };
 
 /// Used to convert from an object error to an interpreter error (e.g. putting
@@ -73,9 +74,9 @@ fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype)
     }
 }
 
-fn variableNotFoundError(heap: *Heap, det: ?*object.ErrorDetails, var_name: []const u8) !void {
+fn variableNotFoundError(det: ?*object.ErrorDetails, var_name: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try object.newStringFmt(heap, "can't read \"{s}\": no such variable", .{var_name}),
+        .message = try object.newStringFmt("can't read \"{s}\": no such variable", .{var_name}),
     };
 
     return error.VariableNotFound;
@@ -89,7 +90,7 @@ const VariableInfo = struct {
 /// Resolves to the variable's value, if any. Accounts for :: for globals.
 fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8) ?VariableInfo {
     var call_frame_idx: u32 = 0;
-    var var_value: ?Heap.Handle = null;
+    var var_value: ?Handle = null;
 
     //  No need to check slice length since it's null terminated.
     if (var_name[0] == ':' and var_name[1] == ':') {
@@ -147,7 +148,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
 
 /// This always shimmers to .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name.
-fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Heap.Handle) !void {
+fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
     assert(name.canShimmer());
 
     const var_name = try Heap.getString(name);
@@ -164,13 +165,13 @@ fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_i
             .is_global = var_info.call_frame_idx == 0,
         };
     } else {
-        return variableNotFoundError(interp.heap, det, var_name);
+        return variableNotFoundError(det, var_name);
     }
 }
 
 /// Ensures that this is a valid variable, dict sugar, or upvar.
 /// Must be called with a heap-native variable name.
-fn ensureValidVariableType(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Heap.Handle) !void {
+fn ensureValidVariableType(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
     const call_frame = interp.call_frames.items[call_frame_idx];
 
     const name_obj = name.peek();
@@ -209,7 +210,7 @@ fn ensureValidVariableType(interp: *Interp, det: ?*object.ErrorDetails, call_fra
                         upvar.index = upvar_target.target_index;
                         return;
                     } else {
-                        return variableNotFoundError(interp.heap, det, bytes);
+                        return variableNotFoundError(det, bytes);
                     }
                 },
             }
@@ -229,7 +230,7 @@ fn ensureValidVariableType(interp: *Interp, det: ?*object.ErrorDetails, call_fra
 }
 
 // Must be called with a heap-native variable name.
-fn createVariable(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, value: Heap.Object) !void {
+fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
     assert(name.canShimmer());
 
     const call_frame = &interp.call_frames.items[call_frame_idx];
@@ -243,7 +244,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, value
         // Add variable.
         interp.heap.setTempObjectString(trimmed);
         defer interp.heap.resetTempObject();
-        const new_value = try object.dictPutObject(interp.heap, &interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
+        const new_value = try object.dictPutObject(&interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
@@ -253,7 +254,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, value
         };
     } else {
         // Add variable.
-        const new_value = try object.dictPutObject(interp.heap, &call_frame.variables, name, value);
+        const new_value = try object.dictPutObject(&call_frame.variables, name, value);
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
@@ -265,7 +266,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, value
 }
 
 /// Must be called with a heap-native name.
-fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, value: Heap.Object) !void {
+fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
         switch (name.peek().tag) {
             .dict_subst => @panic("Dict sugar not implemented"),
@@ -274,7 +275,7 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, valu
                 const var_call_frame_idx = if (variable.is_global) 0 else call_frame_idx;
                 const var_call_frame = &interp.call_frames.items[var_call_frame_idx];
 
-                const value_handle = try object.dictPutObject(interp.heap, &var_call_frame.variables, name, value);
+                const value_handle = try object.dictPutObject(&var_call_frame.variables, name, value);
                 variable.* = .{
                     .call_epoch = var_call_frame.call_epoch,
                     .index = value_handle.index,
@@ -327,7 +328,7 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Heap.Handle, valu
 }
 
 /// Resolves to the variable's value. Must be called with a heap-native name.
-fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Heap.Handle) !Heap.Handle {
+fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Handle) !Handle {
     if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
     try interp.ensureValidVariableType(det, interp.currentCallFrameIndex(), name);
@@ -351,18 +352,19 @@ fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Heap.Handl
 
 fn testVariables(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    var interp = try init(try Heap.createHeap(ta));
+    _ = try Heap.testStart(ta);
+    var interp = try Interp.init();
     defer interp.deinit();
 
     try testing.expectEqual(null, interp.resolveVariable(0, "foo"));
-    var foo = try object.newString(interp.heap, "foo");
+    var foo = try object.newString("foo");
     defer foo.release();
-    const value = try object.newString(interp.heap, "value");
+    const value = try object.newString("value");
     defer value.release();
     try interp.setVariableTo(&foo, value);
 
     const lookup_value = interp.resolveVariable(0, "foo").?.target_index;
-    try testing.expectEqualStrings("value", try Heap.getString(interp.heap.getHandle(lookup_value)));
+    try testing.expectEqualStrings("value", try Heap.getString(Heap.local_heap.getHandle(lookup_value)));
     // Should be copied.
     try testing.expect(lookup_value != value.index);
 }
@@ -373,17 +375,17 @@ test "variables" {
 
 const ProcedureSignature = struct {
     /// Handle to the argument list of the procedure.
-    args: Heap.Handle,
+    args: Handle,
     /// Handle to the ScriptId object.
-    body: Heap.Handle,
+    body: Handle,
     /// Handle to the statics dictionary.
-    statics: ?Heap.Handle,
+    statics: ?Handle,
     /// Required number of arguments.
     required_arity: u32,
     /// Optional number of arguments.
     optional_arity: u32,
     /// Values of optional arguments, if any.
-    optional_values: ?Heap.Handle,
+    optional_values: ?Handle,
     /// Whether `args` is provided as an argument name. `args`, if present, is always
     /// the last argument name.
     has_args_parameter: bool,
@@ -429,7 +431,7 @@ pub const Command = struct {
         multiple_of: ?usize,
     };
 
-    namespace: ?Heap.Handle,
+    namespace: ?Handle,
     call_info: union(enum) {
         native: NativeCommand,
         tcl: struct {
@@ -497,16 +499,16 @@ pub const Command = struct {
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(Command);
 
-fn wrongArgumentCountError(heap: *Heap, det: ?*object.ErrorDetails, command_usage: []const u8) !void {
+fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try object.newStringFmt(heap, "wrong # args: should be \"{s}\"", .{command_usage}),
+        .message = try object.newStringFmt("wrong # args: should be \"{s}\"", .{command_usage}),
     };
 
     return Error.CommandNotFound;
 }
 
 fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
-    const name_obj = try object.newString(interp.heap, name);
+    const name_obj = try object.newString(name);
     errdefer name_obj.release();
 
     // TODO make sure to check interp->local if we end up needing it in our impl
@@ -518,7 +520,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.Nativ
     try interp.commands.put(interp.gpa, name, .{ .namespace = null, .call_info = .{ .native = details } });
 }
 
-fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void {
+fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
     const signature = &command.call_info.tcl.signature;
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
@@ -533,7 +535,7 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void 
         const command_usage = try command.getUsageInfo(scratch, command_name);
         defer scratch.free(command_usage);
         var det: object.ErrorDetails = undefined;
-        return interp.wrapErrorDetails(&det, wrongArgumentCountError(interp.heap, &det, command_usage));
+        return interp.wrapErrorDetails(&det, wrongArgumentCountError(&det, command_usage));
     }
 
     // Check for infinite recursion.
@@ -559,7 +561,7 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void 
         // Are we at the last argument? If so, is it `args`?
         if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
             // Assign remaining arguments to `args`.
-            const list = try object.listNew(interp.heap, args[called_idx..]);
+            const list = try object.listNew(args[called_idx..]);
             defer list.release();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
         } else if (signature_idx > signature.required_arity) {
@@ -585,7 +587,7 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Heap.Handle) !void 
     return interp.evalObject(&signature.body);
 }
 
-fn callNative(interp: *Interp, command: *Command, args: []Heap.Handle) !void {
+fn callNative(interp: *Interp, command: *Command, args: []Handle) !void {
     const signature = command.call_info.native;
 
     early_exit: {
@@ -608,10 +610,10 @@ fn callNative(interp: *Interp, command: *Command, args: []Heap.Handle) !void {
     const command_usage = try command.getUsageInfo(scratch, command_name);
     defer scratch.free(command_usage);
     var det: object.ErrorDetails = undefined;
-    return interp.wrapErrorDetails(&det, wrongArgumentCountError(interp.heap, &det, command_usage));
+    return interp.wrapErrorDetails(&det, wrongArgumentCountError(&det, command_usage));
 }
 
-pub fn evalList(interp: *Interp, list: *Heap.Handle) !void {
+pub fn evalList(interp: *Interp, list: *Handle) !void {
     _ = interp;
     _ = list;
 
@@ -622,30 +624,30 @@ fn freeLastResult(interp: *Interp) void {
     interp.result = interp.heap.emptyObject();
 }
 
-pub fn setResult(interp: *Interp, handle: Heap.Handle) !void {
+pub fn setResult(interp: *Interp, handle: Handle) !void {
     interp.freeLastResult();
-    interp.result = try interp.heap.borrow(handle);
+    interp.result = try handle.borrow();
 }
 
-pub fn setResultOwning(interp: *Interp, handle: Heap.Handle) void {
+pub fn setResultOwning(interp: *Interp, handle: Handle) void {
     interp.freeLastResult();
     interp.result = handle;
 }
 
 pub fn setResultInteger(interp: *Interp, value: i64) !void {
-    interp.setResultOwning(try object.integerNew(interp.heap, value));
+    interp.setResultOwning(try object.integerNew(value));
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.freeLastResult();
-    const bytes_handle = try object.newString(interp.heap, bytes);
+    const bytes_handle = try object.newString(bytes);
 
     try setResult(interp, bytes_handle);
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
     interp.freeLastResult();
-    const fmt_handle = try object.newStringFmt(interp.heap, fmt, args);
+    const fmt_handle = try object.newStringFmt(fmt, args);
 
     try setResult(interp, fmt_handle);
 }
@@ -655,7 +657,7 @@ pub fn setEmptyResult(interp: *Interp) void {
     interp.result = interp.heap.emptyObject();
 }
 
-const VariableMap = std.StringHashMap(Heap.Handle);
+const VariableMap = std.StringHashMap(Handle);
 /// Call frame.
 const CallFrame = struct {
     /// Parent index.
@@ -663,14 +665,14 @@ const CallFrame = struct {
     /// Level of the call frame. 0 = global.
     level: u32,
     /// Dictionary containing the frame's variables.
-    variables: Heap.Handle,
+    variables: Handle,
     /// Arguments of the procedure call.
-    args: []Heap.Handle,
+    args: []Handle,
     /// Signature of the procedure that this is being called with.
     signature: ProcedureSignature,
     /// An object that contains a string with the current namespace. For example,
     /// it might contain "foo::bar", with that being the current namespace.
-    namespace: ?Heap.Handle,
+    namespace: ?Handle,
     /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
     /// but when it overflows it'll scan the heap and reset all cached lookups.
     call_epoch: u31,
@@ -695,7 +697,7 @@ const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
     /// Arguments of this eval frame.
-    args: ?[]Heap.Handle,
+    args: ?[]Handle,
 };
 
 fn currentEvalFrameIndex(interp: *Interp) u32 {
@@ -706,10 +708,10 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentCallFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Heap.Handle, signature: ProcedureSignature) !u32 {
-    const namespace = try interp.heap.borrowOptional(interp.namespace);
+fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: ProcedureSignature) !u32 {
+    const namespace = try Handle.borrowOptional(interp.namespace);
     errdefer if (namespace) |ns| ns.release();
-    const vars_handle = try object.dictNew(interp.heap, &.{});
+    const vars_handle = try object.dictNew(&.{});
     errdefer vars_handle.release();
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
@@ -745,15 +747,15 @@ fn popEvalFrame(interp: *Interp) void {
 }
 
 /// Caller should release return value when they're done.
-fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle) !Heap.Handle {
+fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Handle) !Handle {
     switch (tag) {
         .simple_string => {
-            return try interp.heap.borrow(value);
+            return try value.borrow();
         },
         .variable_subst => {
             var det: object.ErrorDetails = undefined;
             const var_target = try interp.wrapErrorDetails(&det, interp.getVariableImpl(&det, value));
-            return try interp.heap.borrow(var_target);
+            return try var_target.borrow();
         },
         .dict_sugar => {
             @panic("Dict sugar unimplemented");
@@ -781,7 +783,7 @@ fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle
 
             // Be sure to propagate any error that eval returned.
             if (result) {
-                return interp.heap.borrow(interp.result);
+                return try interp.result.borrow();
             } else |err| {
                 return err;
             }
@@ -795,15 +797,15 @@ fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Heap.Handle
 fn interpolateTokens(
     interp: *Interp,
     tags: []const Parser.Token.Tag,
-    value_list: Heap.Handle,
+    value_list: Handle,
     value_start: u32,
     value_len: u32,
     substitution_only: bool,
-) !Heap.Handle {
-    var sf = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
+) !Handle {
+    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, interp.gpa);
     const tokens_alloc = sf.get();
 
-    const new_values = try tokens_alloc.alloc(Heap.Handle, value_len);
+    const new_values = try tokens_alloc.alloc(Handle, value_len);
     defer tokens_alloc.free(new_values);
 
     // Substitute all the tokens, placing them in `new_values`.
@@ -855,7 +857,7 @@ fn interpolateTokens(
         new_str_len += (try Heap.getString(new_value)).len;
     }
 
-    const new_str = try object.newStringToFill(interp.heap, new_str_len);
+    const new_str = try object.newStringToFill(new_str_len);
     errdefer new_str.release();
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
@@ -876,7 +878,7 @@ fn interpolateTokens(
 
 /// Qualifies a name to its canonical version. For example, a name of "bar", and a namespace
 /// of "foo" would return "foo::bar", allocated on the arena.
-fn qualifyName(arena: std.mem.Allocator, namespace: Heap.Handle, name: []const u8) !?[]const u8 {
+fn qualifyName(arena: std.mem.Allocator, namespace: Handle, name: []const u8) !?[]const u8 {
     // We're in a non-global namespace, so we'll need to append the namespace to the
     // beginning of the name, if the name isn't globally scoped (e.g. by not
     // having :: at the beginning).
@@ -890,7 +892,7 @@ fn qualifyName(arena: std.mem.Allocator, namespace: Heap.Handle, name: []const u
 
 /// This function returns the command that's found based on the string contents of `handle`.
 /// This also specializes the object to contain a cached lookup for the command.
-pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Heap.Handle) !*Command {
+pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Handle) !*Command {
     early_exit: {
         // Can't use a command's cached value if it's from another heap.
         if (handle.heap != interp.heap.heapId()) break :early_exit;
@@ -954,13 +956,13 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Heap.Han
 
     // Cache the command.
     if (command_index) |index| {
-        try interp.heap.prepareToShimmer(handle);
+        try Heap.prepareToShimmer(handle);
         handle.peek().tag = .command;
 
         if (current_namespace) |namespace| {
             assert(handle.heap == interp.heap.heapId());
 
-            const borrowed_namespace = try interp.heap.borrow(namespace);
+            const borrowed_namespace = try namespace.borrow();
             errdefer borrowed_namespace.release();
             assert(borrowed_namespace.heap == handle.heap);
 
@@ -990,13 +992,13 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Heap.Han
     } else {
         // If it was null, we better error.
         if (det) |details| details.* = .{
-            .message = try object.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
+            .message = try object.newStringFmt("invalid command name \"{s}\"", .{command_name}),
         };
         return error.CommandNotFound;
     }
 }
 
-fn invokeCommand(interp: *Interp, args: []Heap.Handle) !void {
+fn invokeCommand(interp: *Interp, args: []Handle) !void {
     var det: object.ErrorDetails = undefined;
     const command = interp.wrapErrorDetails(&det, getCommand(interp, &det, &args[0])) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1066,7 +1068,7 @@ fn invokeCommand(interp: *Interp, args: []Heap.Handle) !void {
     }
 }
 
-pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)!void {
+pub fn evalObject(interp: *Interp, script: *Handle) (Error || Parser.Error)!void {
     // If the object is of type "list", with no string rep we can call a specialized version of eval().
     if (script.peek().tag == .list and script.hasString()) {
         return interp.evalList(script);
@@ -1074,7 +1076,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
 
     // Try to get the script, parsing if necessary.
     var det: object.ErrorDetails = undefined;
-    const parsed = try interp.wrapErrorDetails(&det, object.getScript(interp.heap, &det, script));
+    const parsed = try interp.wrapErrorDetails(&det, object.getScript(&det, script));
 
     // Reset the interpreter result. This is useful to return the empty result in the case of empty program.
     interp.setEmptyResult();
@@ -1090,7 +1092,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
     defer interp.popEvalFrame();
 
     // Used for allocating the arguments passed into a command call.
-    var sf = std.heap.stackFallback(@sizeOf(Heap.Handle) * 8, interp.gpa);
+    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, interp.gpa);
     var args_alloc = sf.get();
 
     // Execute every command sequentially until the end of the script or an error occurs.
@@ -1109,7 +1111,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
         // This is not always the same as which word token we're on, as argument expansion
         // may write multiple arguments from one word.
         var args_written: usize = 0;
-        var args = try args_alloc.alloc(Heap.Handle, command_info.arg_count);
+        var args = try args_alloc.alloc(Handle, command_info.arg_count);
         @memset(args, interp.heap.nullObject());
         defer args_alloc.free(args);
         defer for (args) |arg| arg.release();
@@ -1129,7 +1131,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
                 word_token_i += 1;
             }
 
-            var resultant_word: Heap.Handle = blk: {
+            var resultant_word: Handle = blk: {
                 if (word_parts == 1) {
                     // Simple one-to-one substitution, so an easy case.
                     break :blk try interp.substituteOneToken(tags[word_token_i], object.listItem(parsed.values, word_token_i));
@@ -1142,7 +1144,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
             if (argument_expansion) {
                 // Argument expansion, so we'll need to shimmer the result to a list.
                 det = undefined;
-                const len = try wrapErrorDetails(interp, &det, object.listLength(interp.heap, &det, &resultant_word));
+                const len = try wrapErrorDetails(interp, &det, object.listLength(&det, &resultant_word));
                 // Free the list backing without running destructors, since we're going to steal the items
                 // directly from the list.
                 defer Heap.freeObjectBacking(resultant_word);
@@ -1155,7 +1157,7 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
                 assert(resultant_word.canModify());
                 for (0..len) |list_idx| {
                     // Steal each object from the list.
-                    args[args_written] = try interp.heap.steal(object.listItem(resultant_word, @intCast(list_idx)));
+                    args[args_written] = try Heap.steal(object.listItem(resultant_word, @intCast(list_idx)));
                     args_written += 1;
                 }
             } else {
@@ -1181,11 +1183,11 @@ pub fn evalObject(interp: *Interp, script: *Heap.Handle) (Error || Parser.Error)
     }
 }
 
-pub fn init(heap: *Heap) !Interp {
+pub fn init() !Interp {
     var new_interp: Interp = .{
-        .heap = heap,
+        .heap = Heap.local_heap,
         .gpa = testing.allocator,
-        .result = heap.emptyObject(),
+        .result = Heap.local_heap.emptyObject(),
         .eval_frames = .empty,
         .call_frames = .empty,
         .current_call_epoch = 0,
@@ -1200,8 +1202,8 @@ pub fn init(heap: *Heap) !Interp {
     };
 
     _ = try new_interp.pushCallFrame(null, &.{}, .{
-        .args = try object.listNew(heap, &.{}),
-        .body = try object.newString(heap, ""),
+        .args = try object.listNew(&.{}),
+        .body = Heap.local_heap.emptyObject(),
         .has_args_parameter = false,
         .optional_arity = 0,
         .optional_values = null,
@@ -1245,40 +1247,40 @@ pub fn deinit(interp: *Interp) void {
 }
 
 // Export various utility functions with a nicer interface.
-pub fn getInteger(interp: *Interp, handle: *Heap.Handle) !i64 {
+pub fn getInteger(interp: *Interp, handle: *Handle) !i64 {
     var det: object.ErrorDetails = undefined;
-    try wrapErrorDetails(interp, &det, object.shimmerToInteger(interp.heap, &det, handle));
+    try wrapErrorDetails(interp, &det, object.shimmerToInteger(&det, handle));
     return handle.peek().body.integer;
 }
 
-pub fn getIntegerNoShimmer(interp: *Interp, handle: Heap.Handle) !i64 {
+pub fn getIntegerNoShimmer(interp: *Interp, handle: Handle) !i64 {
     var det: object.ErrorDetails = undefined;
-    return interp.wrapErrorDetails(&det, object.integerGetNoShimmer(interp.heap, &det, handle));
+    return interp.wrapErrorDetails(&det, object.integerGetNoShimmer(&det, handle));
 }
 
-pub fn getFloat(interp: *Interp, handle: *Heap.Handle) !f64 {
+pub fn getFloat(interp: *Interp, handle: *Handle) !f64 {
     var det: object.ErrorDetails = undefined;
-    try wrapErrorDetails(interp, &det, object.shimmerToFloat(interp.heap, &det, handle));
+    try wrapErrorDetails(interp, &det, object.shimmerToFloat(&det, handle));
     return handle.peek().body.float;
 }
 
-pub fn setVariableToObject(interp: *Interp, name: *Heap.Handle, obj: Heap.Object) !void {
-    try interp.heap.prepareToShimmer(name);
+pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) !void {
+    try Heap.prepareToShimmer(name);
     return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, obj);
 }
 
-pub fn setVariableTo(interp: *Interp, name: *Heap.Handle, handle: Heap.Handle) !void {
-    try interp.heap.prepareToShimmer(name);
-    return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, try interp.heap.duplicateOrReference(handle));
+pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) !void {
+    try Heap.prepareToShimmer(name);
+    return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, try Heap.local_heap.duplicateOrReference(handle));
 }
 
-pub fn getVariableNoDetails(interp: *Interp, name: *Heap.Handle) !Heap.Handle {
-    try interp.heap.prepareToShimmer(name);
+pub fn getVariableNoDetails(interp: *Interp, name: *Handle) !Handle {
+    try Heap.prepareToShimmer(name);
     return interp.getVariableImpl(null, name.*);
 }
 
-pub fn getVariable(interp: *Interp, name: *Heap.Handle) !Heap.Handle {
-    try interp.heap.prepareToShimmer(name);
+pub fn getVariable(interp: *Interp, name: *Handle) !Handle {
+    try Heap.prepareToShimmer(name);
     var det: object.ErrorDetails = undefined;
     return interp.wrapErrorDetails(&det, interp.getVariableImpl(&det, name.*));
 }

@@ -26,13 +26,13 @@ pub const ErrorDetails = struct {
     index: ?u32 = null,
 };
 
-pub fn shimmerToString(calling_heap: *Heap, handle: *Handle) !void {
+pub fn shimmerToString(handle: *Handle) !void {
     if (handle.peek().tag == .string) return;
 
     const obj = handle.peek();
     _ = try Heap.getString(handle.*); // Ensure string representation
 
-    try calling_heap.prepareToShimmer(handle);
+    try Heap.prepareToShimmer(handle);
     obj.tag = .string;
     obj.body.string = .{
         .utf8_length = 0,
@@ -41,8 +41,8 @@ pub fn shimmerToString(calling_heap: *Heap, handle: *Handle) !void {
     };
 }
 
-pub fn getCodepointLength(calling_heap: *Heap, handle: *Handle) !usize {
-    shimmerToString(calling_heap, handle);
+pub fn getCodepointLength(handle: *Handle) !usize {
+    shimmerToString(handle);
 
     const obj = handle.peek();
     const bytes = try Heap.getString(handle);
@@ -73,32 +73,32 @@ pub fn getCodepointLength(calling_heap: *Heap, handle: *Handle) !usize {
 }
 
 /// Copies provided string.
-pub fn newString(calling_heap: *Heap, bytes: []const u8) !Handle {
-    var str = try calling_heap.createObject();
-    errdefer str.release();
+pub fn newString(bytes: []const u8) !Handle {
+    var handle = try Heap.local_heap.createObject();
+    errdefer handle.release();
 
-    try Heap.setString(str, bytes);
-    try shimmerToString(calling_heap, &str);
-    return str;
+    try Heap.setString(handle, bytes);
+    try shimmerToString(&handle);
+    return handle;
 }
 
-pub fn newStringFmt(calling_heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
+pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
     const new_count = std.fmt.count(fmt, args);
-    const str = try newStringToFill(calling_heap, new_count);
+    const str = try newStringToFill(new_count);
     const written = std.fmt.bufPrint(Heap.getStringMut(str) catch unreachable, fmt, args) catch return error.OutOfMemory;
     assert(written.len == new_count);
 
     return str;
 }
 
-pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
-    const handle = try heap.createObject();
+pub fn newStringToFill(len: usize) !Handle {
+    const handle = try Heap.local_heap.createObject();
     errdefer handle.release();
 
     if (len < Heap.LongString.split_point) {
-        const new_str = try heap.createString(@intCast(len));
+        const new_str = try Heap.local_heap.createString(@intCast(len));
         const new_str_end = new_str + @as(u32, @intCast(len));
-        @memset(heap.getHeapString(new_str, new_str_end), 0);
+        @memset(Heap.local_heap.getHeapString(new_str, new_str_end), 0);
 
         // New object, so we can set directly
         handle.peek().str = .{
@@ -109,10 +109,10 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
         };
     } else {
         // create new string
-        const new_str = try heap.gpa.allocSentinel(u8, len, 0);
-        errdefer heap.gpa.free(new_str);
+        const new_str = try Heap.local_heap.gpa.allocSentinel(u8, len, 0);
+        errdefer Heap.local_heap.gpa.free(new_str);
         @memset(new_str, 0);
-        const did_take = try heap.setLongString(handle.index, .{ .normal = new_str });
+        const did_take = try Heap.local_heap.setLongString(handle.index, .{ .normal = new_str });
         assert(did_take);
     }
 
@@ -120,8 +120,8 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
 }
 
 /// Copies provided string.
-pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: usize) !Handle {
-    const handle = try heap.createObject();
+pub fn newStringWithCodepointLen(bytes: [:0]const u8, cp_length: usize) !Handle {
+    const handle = try Heap.local_heap.createObject();
     Heap.setString(handle, bytes);
     shimmerToString(handle);
 
@@ -148,16 +148,16 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
     return handle;
 }
 
-pub fn setStringFromEscaped(arena: std.mem.Allocator, handle: Handle, escaped: []const u8) !void {
+pub fn setStringFromEscaped(scratch: std.mem.Allocator, handle: Handle, escaped: []const u8) !void {
     // Unescaped must be equal or shorter than escaped version
-    const unescaped = try arena.allocSentinel(u8, escaped.len, 0);
-    errdefer arena.free(unescaped);
+    const unescaped = try scratch.allocSentinel(u8, escaped.len, 0);
+    errdefer scratch.free(unescaped);
     const written = stringutil.removeEscaping(escaped, unescaped);
     unescaped[written] = 0; // null terminator
 
     const did_set = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
     if (did_set) {
-        arena.free(unescaped);
+        scratch.free(unescaped);
     } else {
         // Too large for normal string, so we'll try setting as a long string.
         const did_take = try handle.getHeap().setLongString(
@@ -167,7 +167,7 @@ pub fn setStringFromEscaped(arena: std.mem.Allocator, handle: Handle, escaped: [
                 .original_capacity = unescaped.len,
             } },
         );
-        if (!did_take) arena.free(unescaped);
+        if (!did_take) scratch.free(unescaped);
     }
 }
 
@@ -186,14 +186,14 @@ pub fn compare(a: Handle, b: Handle, case_insensitive: bool) !std.math.Order {
 }
 
 // Integer related functions
-pub fn integerNew(calling_heap: *Heap, value: i64) !Handle {
-    const handle = try calling_heap.createObject();
+pub fn integerNew(value: i64) !Handle {
+    const handle = try Heap.local_heap.createObject();
     handle.peek().tag = .integer;
     handle.peek().body.integer = value;
     return handle;
 }
 
-pub fn integerGetNoShimmer(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !i64 {
+pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     if (handle.peek().tag == .integer) return handle.peek().body.integer;
 
     const bytes = try Heap.getString(handle);
@@ -202,38 +202,38 @@ pub fn integerGetNoShimmer(calling_heap: *Heap, det: ?*ErrorDetails, handle: Han
     } else |err| switch (err) {
         error.InvalidCharacter => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt(calling_heap, "expected integer but got \"{s}\"", .{bytes}),
+                .message = try newStringFmt("expected integer but got \"{s}\"", .{bytes}),
             };
             return error.BadInteger;
         },
         error.Overflow => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt(calling_heap, "integer value \"{s}\" too big to be represented", .{bytes}),
+                .message = try newStringFmt("integer value \"{s}\" too big to be represented", .{bytes}),
             };
             return error.IntegerOverflow;
         },
     }
 }
 
-pub fn shimmerToInteger(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToInteger(det: ?*ErrorDetails, handle: *Handle) !void {
     if (handle.peek().tag == .integer) return;
 
-    const integer = try integerGetNoShimmer(calling_heap, det, handle.*);
+    const integer = try integerGetNoShimmer(det, handle.*);
 
-    try Heap.prepareToShimmer(calling_heap, handle);
+    try Heap.prepareToShimmer(handle);
     handle.peek().tag = .integer;
     handle.peek().body.integer = integer;
 }
 
 // Float related functions.
-pub fn floatNew(calling_heap: *Heap, value: f64) !Handle {
-    const handle = try calling_heap.createObject();
+pub fn floatNew(value: f64) !Handle {
+    const handle = try Heap.local_heap.createObject();
     handle.peek().tag = .float;
     handle.peek().body.float = value;
     return handle;
 }
 
-pub fn floatGetNoShimmer(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !f64 {
+pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     if (handle.peek().tag == .float) return handle.peek().body.float;
 
     const bytes = try Heap.getString(handle);
@@ -242,19 +242,19 @@ pub fn floatGetNoShimmer(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handl
     } else |err| switch (err) {
         error.InvalidCharacter => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt(calling_heap, "expected floating-point number but got \"{s}\"", .{bytes}),
+                .message = try newStringFmt("expected floating-point number but got \"{s}\"", .{bytes}),
             };
             return error.BadFloat;
         },
     }
 }
 
-pub fn shimmerToFloat(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToFloat(det: ?*ErrorDetails, handle: *Handle) !void {
     if (handle.peek().tag == .float) return;
 
-    const value = try floatGetNoShimmer(calling_heap, det, handle.*);
+    const value = try floatGetNoShimmer(det, handle.*);
 
-    try Heap.prepareToShimmer(calling_heap, handle);
+    try Heap.prepareToShimmer(handle);
     handle.peek().tag = .float;
     handle.peek().body.float = value;
 }
@@ -269,9 +269,9 @@ pub const Range = struct {
     start: usize,
     end: usize,
 
-    pub fn fromObjects(calling_heap: *Heap, det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !Range {
-        const start_idx = try getIndex(calling_heap, start, det);
-        const end_idx = try getIndex(calling_heap, end, det);
+    pub fn fromObjects(det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !Range {
+        const start_idx = try getIndex(start, det);
+        const end_idx = try getIndex(end, det);
 
         return fromIndexes(list_len, .{
             .start = start_idx,
@@ -301,22 +301,22 @@ pub const Range = struct {
 };
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
-fn badIndexError(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
+fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
     if (det) |details| details.* = .{
-        .message = try newStringFmt(calling_heap, "bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
+        .message = try newStringFmt("bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
     return Error.BadIndex;
 }
 
 /// Shimmers to an index representation.
-pub fn shimmerToIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToIndex(det: ?*ErrorDetails, handle: *Handle) !void {
     if (handle.peek().tag == .index) return;
 
     const bytes = try Heap.getString(handle);
     const obj = handle.peek();
 
-    try calling_heap.prepareToShimmer(handle);
+    Heap.prepareToShimmer(handle);
     obj.tag = .index;
 
     // Does it start with "end"? If so, it might be end+5, or end-2, etc
@@ -337,7 +337,7 @@ pub fn shimmerToIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle)
     }
 }
 
-pub fn getIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap.ListIndex {
+pub fn getIndex(det: ?*ErrorDetails, handle: *Handle) !Heap.ListIndex {
     const obj = handle.peek();
 
     // Fast case: if it's an integer or float, we can quickly cast it (don't
@@ -357,12 +357,12 @@ pub fn getIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap
         return .{ .u = .{ .index = @intFromFloat(obj.body.integer) }, .is_end = false };
     }
 
-    try shimmerToIndex(calling_heap, det, handle);
+    try shimmerToIndex(det, handle);
     return obj.body.index;
 }
 
 /// Creates a substring of the passed in string. Used in `[string range]`.
-pub fn stringRange(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, start: *Handle, end: *Handle) !Handle {
+pub fn stringRange(det: ?*ErrorDetails, str: *Handle, start: *Handle, end: *Handle) !Handle {
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str);
 
@@ -373,18 +373,17 @@ pub fn stringRange(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, start
         const byte_end = stringutil.cpIndex(bytes, range.end);
 
         return try newStringWithCodepointLen(
-            calling_heap,
             bytes[byte_start..byte_end],
             range.end - range.start,
         );
     } else {
         // Invalid range, so we'll just pass through the string.
-        return try newStringWithCodepointLen(calling_heap, bytes, codepoint_len);
+        return try newStringWithCodepointLen(bytes, codepoint_len);
     }
 }
 
 /// Removes from `start` to `end`, optionally inserting `to_insert`.
-pub fn stringReplace(calling_heap: *Heap, str: *Handle, start: *Handle, end: *Handle, to_insert: ?Handle) !Handle {
+pub fn stringReplace(str: *Handle, start: *Handle, end: *Handle, to_insert: ?Handle) !Handle {
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str.*);
 
@@ -405,7 +404,7 @@ pub fn stringReplace(calling_heap: *Heap, str: *Handle, start: *Handle, end: *Ha
             // Tcl ranges are inclusive, so `- 1` is needed.
             const after_range_len = bytes.len - byte_end - 1;
 
-            const new_str = newStringToFill(calling_heap, up_to_range_len + to_insert_len + after_range_len);
+            const new_str = newStringToFill(up_to_range_len + to_insert_len + after_range_len);
             const new_bytes = Heap.getStringMut(new_str) catch |err| {
                 switch (err) {
                     // empty strings aren't mutable, so we'll just return the empty string
@@ -425,7 +424,7 @@ pub fn stringReplace(calling_heap: *Heap, str: *Handle, start: *Handle, end: *Ha
             // Tcl ranges are inclusive, so `- 1` is needed.
             const after_range_len = bytes.len - byte_end - 1;
 
-            const new_str = newStringToFill(calling_heap, up_to_range_len + after_range_len);
+            const new_str = newStringToFill(up_to_range_len + after_range_len);
             const new_bytes = Heap.getStringMut(new_str) catch |err| {
                 switch (err) {
                     // empty strings aren't mutable, so we'll just return the empty string
@@ -441,12 +440,12 @@ pub fn stringReplace(calling_heap: *Heap, str: *Handle, start: *Handle, end: *Ha
         }
     } else {
         // Invalid range, so we'll just pass through the string.
-        return try newStringWithCodepointLen(calling_heap, bytes, codepoint_len);
+        return try newStringWithCodepointLen(bytes, codepoint_len);
     }
 }
 
 /// Upper/lower/title case conversion.
-pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper, lower, title }) !Handle {
+pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Handle {
     const bytes = try Heap.getString(str);
 
     if (options.use_utf8) {
@@ -473,7 +472,7 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
             is_first_char = false;
         }
 
-        const new_str = try newStringToFill(calling_heap, new_len);
+        const new_str = try newStringToFill(new_len);
         const new_bytes = try Heap.getStringMut(new_str) catch |err| {
             switch (err) {
                 // empty strings aren't mutable, so we'll just return the empty string
@@ -506,7 +505,7 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
         }
     } else {
         const new_len = bytes.len;
-        const new_str = try newStringToFill(calling_heap, new_len);
+        const new_str = try newStringToFill(new_len);
         const new_bytes = try Heap.getStringMut(new_str) catch |err| {
             switch (err) {
                 // Empty strings aren't mutable, so we'll just return the empty string.
@@ -528,7 +527,7 @@ pub fn stringCaseConversion(calling_heap: *Heap, str: Handle, mode: enum { upper
 }
 
 /// Creates a new string if there was anything to trim.
-pub fn stringTrimLeft(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Handle {
+pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try Heap.getString(str);
     const trim_chars_bytes = try Heap.getString(trim_chars);
 
@@ -537,12 +536,12 @@ pub fn stringTrimLeft(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Han
     if (start == 0) {
         return str;
     } else {
-        return try newString(calling_heap, bytes[start..]);
+        return try newString(bytes[start..]);
     }
 }
 
 /// Creates a new string if there was anything to trim.
-pub fn stringTrimRight(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Handle {
+pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try Heap.getString(str);
     const trim_chars_bytes = try Heap.getString(trim_chars);
 
@@ -551,12 +550,12 @@ pub fn stringTrimRight(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Ha
     if (end == bytes.len) {
         return str;
     } else {
-        return try newString(calling_heap, bytes[0..end]);
+        return try newString(bytes[0..end]);
     }
 }
 
 /// Creates a new string if there was anything to trim.
-pub fn stringTrim(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Handle {
+pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try Heap.getString(str);
     const trim_chars_bytes = try Heap.getString(trim_chars);
 
@@ -566,7 +565,7 @@ pub fn stringTrim(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Handle 
     if (start == 0 and end == bytes.len) {
         return str;
     } else {
-        return try newString(calling_heap, bytes[start..end]);
+        return try newString(bytes[start..end]);
     }
 }
 
@@ -610,7 +609,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
         pub const map = (EnumMapping(T){}).map;
         pub const names = enumNames(T);
 
-        pub fn get(calling_heap: *Heap, det: ?*ErrorDetails, value: *Handle) !T {
+        pub fn get(det: ?*ErrorDetails, value: *Handle) !T {
             // TODO PERF we can optimize this by shimmering the value to an "enum" type,
             // where the enum type has a u48 storing the hash of enum_name and a u16 for
             // which variant it is, by index.
@@ -620,11 +619,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
                 return unwrapped;
             } else {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(
-                        calling_heap,
-                        "bad {s} \"{f}\": must be {s}",
-                        .{ enum_name, value.*, names },
-                    ),
+                    .message = try newStringFmt("bad {s} \"{f}\": must be {s}", .{ enum_name, value.*, names }),
                 };
 
                 return Error.BadEnumVariant;
@@ -642,7 +637,7 @@ test "tcl enum" {
 }
 
 /// Runs a string check based on requested class.
-pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to_check: *Handle, strict: bool) !bool {
+pub fn stringIs(det: ?*ErrorDetails, str: *Handle, class_to_check: *Handle, strict: bool) !bool {
     const Class = TclEnum(enum {
         integer,
         alpha,
@@ -661,7 +656,7 @@ pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to
         boolean,
     }, "class");
 
-    const class = try Class.get(calling_heap, det, class_to_check);
+    const class = try Class.get(det, class_to_check);
 
     const bytes = try Heap.getString(str.*);
     if (bytes.len == 0) {
@@ -678,7 +673,7 @@ pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to
             return true;
         },
         .boolean => {
-            _ = getBoolean(calling_heap, null, str) catch return false;
+            _ = getBoolean(null, str) catch return false;
             return true;
         },
         .alpha => return stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
@@ -697,22 +692,22 @@ pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to
 }
 
 fn testStringIs(ta: std.mem.Allocator) !void {
-    const heap = try Heap.createHeap(ta);
     defer Heap.testFinish();
+    _ = try Heap.testStart(ta);
 
-    var str = try newString(heap, "abcdefg");
+    var str = try newString("abcdefg");
     defer str.release();
-    var str2 = try newString(heap, "abcdefg123");
+    var str2 = try newString("abcdefg123");
     defer str2.release();
-    var class = try newString(heap, "alpha");
+    var class = try newString("alpha");
     defer class.release();
-    var bad_class = try newString(heap, "bad_class");
+    var bad_class = try newString("bad_class");
     defer bad_class.release();
     var details: ErrorDetails = undefined;
 
-    try testing.expectEqual(true, try stringIs(heap, &details, &str, &class, false));
-    try testing.expectEqual(false, try stringIs(heap, &details, &str2, &class, false));
-    const err = stringIs(heap, &details, &str, &bad_class, false);
+    try testing.expectEqual(true, try stringIs(&details, &str, &class, false));
+    try testing.expectEqual(false, try stringIs(&details, &str2, &class, false));
+    const err = stringIs(&details, &str, &bad_class, false);
     if (err == Error.OutOfMemory) return Error.OutOfMemory;
     try testing.expectError(Error.BadEnumVariant, err);
     try testing.expectEqualStrings(
@@ -727,31 +722,31 @@ test "string is" {
     try testing.checkAllAllocationFailures(testing.allocator, testStringIs, .{});
 }
 
-pub fn convertParserError(heap: *Heap, err: Parser.Error) error{OutOfMemory}!ErrorDetails {
+pub fn convertParserError(err: Parser.Error) error{OutOfMemory}!ErrorDetails {
     switch (err) {
         error.CharactersAfterCloseBrace => {
-            return .{ .message = try newString(heap, "extra characters after close-brace") };
+            return .{ .message = try newString("extra characters after close-brace") };
         },
         error.MissingCloseBrace => {
-            return .{ .message = try newString(heap, "missing close-brace") };
+            return .{ .message = try newString("missing close-brace") };
         },
         error.MissingCloseBracket => {
-            return .{ .message = try newString(heap, "unmatched \"[\"") };
+            return .{ .message = try newString("unmatched \"[\"") };
         },
         error.MissingCloseQuote => {
-            return .{ .message = try newString(heap, "missing quote") };
+            return .{ .message = try newString("missing quote") };
         },
         error.TrailingBackslash => {
-            return .{ .message = try newString(heap, "no character after \\") };
+            return .{ .message = try newString("no character after \\") };
         },
         error.NotVariable => unreachable,
     }
 }
 
-pub fn listUninitializedNew(heap: *Heap, len: u32) !Handle {
+pub fn listUninitializedNew(len: u32) !Handle {
     // `1 +` to make space for the list's head
-    const list_index = try heap.createObjects(1 + len);
-    const list_head: *Heap.Object = &heap.objects.items(.object)[list_index];
+    const list_index = try Heap.local_heap.createObjects(1 + len);
+    const list_head = Heap.local_heap.getLocalObject(list_index);
 
     list_head.* = .{
         .str = Heap.Object.null_string,
@@ -763,24 +758,24 @@ pub fn listUninitializedNew(heap: *Heap, len: u32) !Handle {
         },
     };
 
-    return heap.getHandle(list_index);
+    return Heap.local_heap.getHandle(list_index);
 }
 
-pub fn listNew(heap: *Heap, handles: []const Handle) !Handle {
-    const list = try listUninitializedNew(heap, @intCast(handles.len));
+pub fn listNew(handles: []const Handle) !Handle {
+    const list = try listUninitializedNew(@intCast(handles.len));
     errdefer list.release();
 
     const new_items = listItems(list);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try heap.duplicateOrReference(handle);
+        item.* = try Heap.local_heap.duplicateOrReference(handle);
     }
 
     return list;
 }
 
 /// If shimmering, it creates the object in the calling heap
-pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
     if (handle.peek().tag == .list) return;
 
     const obj = handle.peek();
@@ -793,7 +788,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         const metadata = &obj_heap.getExtraData(obj.body.dict).dict;
         const len = metadata.len; // copy
 
-        try calling_heap.prepareToShimmer(handle);
+        try Heap.prepareToShimmer(handle);
 
         // Because both lists and dicts store their values directly after,
         // we can just swap out the head to convert to a list.
@@ -828,16 +823,16 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         // Figure out how many tokens there are, so we can create the correct list size
         // in the heap.
         var tokens: std.ArrayList(Parser.Token) = .empty;
-        defer tokens.deinit(calling_heap.gpa);
+        defer tokens.deinit(Heap.local_heap.gpa);
 
         while (true) {
-            const next_token = parser.parseList() catch |e| {
-                if (det) |details| details.* = try convertParserError(calling_heap, e);
-                return e;
+            const next_token = parser.parseList() catch |err| {
+                if (det) |details| details.* = try convertParserError(err);
+                return err;
             };
             switch (next_token.tag) {
                 .simple_string, .escaped_string => {
-                    try tokens.append(calling_heap.gpa, next_token);
+                    try tokens.append(Heap.local_heap.gpa, next_token);
                 },
                 .end_of_file => break,
                 else => {
@@ -847,7 +842,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         }
 
         // TODO PERF: reuse the object backing if it was allocated with more than one object.
-        const new_list = try listUninitializedNew(calling_heap, @intCast(tokens.items.len));
+        const new_list = try listUninitializedNew(@intCast(tokens.items.len));
         errdefer new_list.release();
 
         for (tokens.items, 0..) |token, i| {
@@ -859,7 +854,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
             } else {
                 // Needs escaping. We'll create another string to copy the escaped string into.
                 try setStringFromEscaped(
-                    calling_heap.gpa,
+                    Heap.local_heap.gpa,
                     item,
                     str[token.loc.start..token.loc.end],
                 );
@@ -867,7 +862,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
 
             if (source_info) |info| {
                 var item_shouldnt_change = item;
-                try setSourceInfo(calling_heap, &item_shouldnt_change, .{
+                try setSourceInfo(&item_shouldnt_change, .{
                     .file_name = info.file_name,
                     .line_no = token.loc.line_no,
                 });
@@ -887,8 +882,8 @@ pub fn listLengthRaw(list: Handle) u32 {
     return list.peek().body.list.len;
 }
 
-pub fn listLength(calling_heap: *Heap, det: ?*ErrorDetails, list: *Handle) !u32 {
-    try shimmerToList(calling_heap, det, list);
+pub fn listLength(det: ?*ErrorDetails, list: *Handle) !u32 {
+    try shimmerToList(det, list);
 
     return list.peek().body.list.len;
 }
@@ -919,7 +914,7 @@ pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
 }
 
 /// Returns whether a reindex is needed.
-fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !bool {
+fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
     const obj = handle.peek();
 
     const current_len = blk: {
@@ -971,20 +966,20 @@ fn setCollectionLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !bool
 
     // We've exhausted all other options, so we'll need to make a new collection.
     const new_handle = switch (obj.tag) {
-        .list => try listUninitializedNew(calling_heap, new_len),
-        .dict => try dictUninitializedNew(calling_heap, new_len),
+        .list => try listUninitializedNew(new_len),
+        .dict => try dictUninitializedNew(new_len),
         else => unreachable,
     };
     errdefer Heap.freeObject(new_handle);
     const new_items = collectionItems(new_handle, new_len);
 
-    // Why `calling_heap.heapId() != handle.heap`? Because we can't steal the old collection's objects
-    // if they reference another heap's strings.
-    if (!handle.canModify() or calling_heap.heapId() != handle.heap) {
+    // Why `Heap.local_heap.heapId() != handle.heap`? Because we can't steal the old collection's
+    // objects if they reference another heap's strings.
+    if (!handle.canModify() or Heap.local_heap.heapId() != handle.heap) {
         // If the collection is shared, we need to duplicate all the items.
         for (0.., new_items) |i, *new_item| {
             new_item.* = try Heap.duplicateOrReference(
-                calling_heap,
+                Heap.local_heap,
                 collectionItem(handle.*, @intCast(i), current_len),
             );
         }
@@ -1032,9 +1027,9 @@ pub fn listItems(handle: Handle) []Heap.Object {
     return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..list.body.list.len];
 }
 
-pub fn listAppendObject(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Heap.Object) !u32 {
-    try shimmerToList(calling_heap, det, handle);
-    _ = try setCollectionLength(calling_heap, handle, handle.peek().body.list.len + 1);
+pub fn listAppendObject(det: ?*ErrorDetails, handle: *Handle, item: Heap.Object) !u32 {
+    try shimmerToList(det, handle);
+    _ = try setCollectionLength(handle, handle.peek().body.list.len + 1);
 
     const list = handle.peek();
     const index = list.body.list.len - 1;
@@ -1044,30 +1039,30 @@ pub fn listAppendObject(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
     return index;
 }
 
-pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Handle) !u32 {
-    try shimmerToList(calling_heap, det, handle);
-    _ = try setCollectionLength(calling_heap, handle, handle.peek().body.list.len + 1);
+pub fn listAppend(det: ?*ErrorDetails, handle: *Handle, item: Handle) !u32 {
+    try shimmerToList(det, handle);
+    _ = try setCollectionLength(handle, handle.peek().body.list.len + 1);
 
     const list = handle.peek();
     const index = list.body.list.len - 1;
 
-    listItems(handle.*)[index] = try calling_heap.duplicateOrReference(item);
+    listItems(handle.*)[index] = try handle.getHeap().duplicateOrReference(item);
 
     return index;
 }
 
 fn testLists(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.createHeap(ta);
+    const heap = try Heap.testStart(ta);
 
     var det: ErrorDetails = undefined;
 
     // Simple case: two objects in a list
-    const obj1 = try newString(heap, "object 1");
+    const obj1 = try newString("object 1");
     defer obj1.release();
-    const obj2 = try newString(heap, "object 2");
+    const obj2 = try newString("object 2");
     defer obj2.release();
-    var list1 = try listNew(heap, &.{ obj1, obj2 });
+    var list1 = try listNew(&.{ obj1, obj2 });
     defer list1.release();
 
     const items = listItems(list1);
@@ -1077,13 +1072,13 @@ fn testLists(ta: std.mem.Allocator) !void {
     // But it should have an identical string
     try testing.expectEqualStrings("object 1", try Heap.getString(listItem(list1, 0)));
 
-    const to_append = try newString(heap, "appended item");
+    const to_append = try newString("appended item");
     defer to_append.release();
 
-    _ = try listAppend(heap, &det, &list1, to_append);
+    _ = try listAppend(&det, &list1, to_append);
     try testing.expectEqualStrings("appended item", try Heap.getString(listItem(list1, 2)));
 
-    var string_list = try newString(heap,
+    var string_list = try newString(
         \\item1 {item 2} item\ 3
     );
     defer string_list.release();
@@ -1100,15 +1095,15 @@ test "lists" {
     try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
 }
 
-pub fn shimmerToDict(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
     if (handle.peek().tag == .dict) return;
 
     // Getting the list length will also shimmer it to a list.
-    const len = try listLength(calling_heap, det, handle);
+    const len = try listLength(det, handle);
     if (@mod(len, 2) == 1) {
         // Unmatched key.
         if (det) |details| details.* = .{
-            .message = try newString(calling_heap, "missing value to go with key"),
+            .message = try newString("missing value to go with key"),
         };
         return Error.BadDict;
     }
@@ -1179,26 +1174,26 @@ pub fn dictPairLengthRaw(handle: Handle) u32 {
 }
 
 /// Length in pairs (total length / 2).
-pub fn dictPairLength(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !u32 {
-    try shimmerToDict(calling_heap, det, handle);
+pub fn dictPairLength(det: ?*ErrorDetails, handle: *Handle) !u32 {
+    try shimmerToDict(det, handle);
     return dictPairLengthRaw(handle.*);
 }
 
-fn dictUninitializedNew(heap: *Heap, len: u32) !Handle {
+fn dictUninitializedNew(len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
     // `1 +` to make space for the dict's head.
-    const dict_index = try heap.createObjects(1 + len);
-    errdefer Heap.freeObjectBacking(heap.getHandle(dict_index));
-    const dict_metadata = try heap.createExtraData();
-    errdefer heap.destroyExtraData(dict_metadata);
+    const dict_index = try Heap.local_heap.createObjects(1 + len);
+    errdefer Heap.freeObjectBacking(Heap.local_heap.getHandle(dict_index));
+    const dict_metadata = try Heap.local_heap.createExtraData();
+    errdefer Heap.local_heap.destroyExtraData(dict_metadata);
 
-    heap.getExtraData(dict_metadata).* = .{ .dict = .{
+    Heap.local_heap.getExtraData(dict_metadata).* = .{ .dict = .{
         .table = .empty,
         .len = len,
     } };
 
-    const dict_head: *Heap.Object = &heap.objects.items(.object)[dict_index];
+    const dict_head = Heap.local_heap.getLocalObject(dict_index);
     dict_head.* = .{
         .str = Heap.Object.null_string,
         .tag = .dict,
@@ -1207,18 +1202,18 @@ fn dictUninitializedNew(heap: *Heap, len: u32) !Handle {
         },
     };
 
-    return heap.getHandle(dict_index);
+    return Heap.local_heap.getHandle(dict_index);
 }
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
-pub fn dictNew(heap: *Heap, handles: []const Handle) !Handle {
-    const dict = try dictUninitializedNew(heap, @intCast(handles.len));
+pub fn dictNew(handles: []const Handle) !Handle {
+    const dict = try dictUninitializedNew(@intCast(handles.len));
     errdefer dict.release();
 
     const new_items = dictItemsRaw(dict);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try heap.duplicateOrReference(handle);
+        item.* = try Heap.duplicateOrReference(Heap.local_heap, handle);
     }
 
     try dictReindex(dict, null);
@@ -1276,11 +1271,11 @@ fn dictHasDuplicatesRaw(handle: Handle) bool {
 /// Removes duplicate entries. Assumes handle is a dict. If the caller needs to track
 /// a key/value as it gets rearranged, set `to_track`. The result will be its new index,
 /// unless it was removed.
-fn dictRemoveDuplicates(calling_heap: *Heap, handle: *Handle, to_track: ?u32) !?u32 {
+fn dictRemoveDuplicates(handle: *Handle, to_track: ?u32) !?u32 {
     var metadata = &handle.getHeap().getExtraData(handle.peek().body.dict).dict;
 
     assert(handle.peek().tag == .dict);
-    try Heap.prepareForModification(calling_heap, handle);
+    try Heap.prepareForModification(handle);
 
     const dict_obj = handle.peek();
     const dict_heap = handle.getHeap();
@@ -1362,7 +1357,8 @@ fn dictRemoveDuplicates(calling_heap: *Heap, handle: *Handle, to_track: ?u32) !?
 }
 
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
-pub fn dictPutObject(calling_heap: *Heap, handle: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
+/// `value` must be in `Heap.local_heap`.
+pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
     assert(handle.peek().tag == .dict);
 
     // Copy on write logic.
@@ -1371,7 +1367,7 @@ pub fn dictPutObject(calling_heap: *Heap, handle: *Handle, key: Handle, value: H
             break :blk null;
         } else {
             const old = handle.*;
-            handle.* = try calling_heap.duplicate(handle.*);
+            handle.* = try Heap.local_heap.duplicate(handle.*);
             break :blk old;
         }
     };
@@ -1380,14 +1376,14 @@ pub fn dictPutObject(calling_heap: *Heap, handle: *Handle, key: Handle, value: H
 
     handle.invalidateString();
 
-    assert(handle.heap == calling_heap.heapId());
-    var metadata = &calling_heap.getExtraData(handle.peek().body.dict).dict;
+    assert(handle.heap == Heap.local_heap.heapId());
+    var metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
 
     const value_index: u32 = blk: {
         // If we hit OOM at some point, we need to be sure to roll back the new value.
         errdefer {
             var value_mut = value;
-            value_mut.deinitBodySingle(calling_heap);
+            value_mut.deinitBodySingle(Heap.local_heap);
         }
 
         // Ensure `original_key` has a string rep.
@@ -1403,25 +1399,25 @@ pub fn dictPutObject(calling_heap: *Heap, handle: *Handle, key: Handle, value: H
         } else {
             // Need to copy the key string here, because it may become invalidated when
             // calling `ensureTotalCapacity`.
-            const key_dup_str = try calling_heap.duplicateObjString(key);
-            errdefer key_dup_str.deinit(calling_heap);
+            const key_dup_str = try Heap.local_heap.duplicateObjString(key);
+            errdefer key_dup_str.deinit(Heap.local_heap);
 
             const new_length = metadata.len + 2;
 
             // Key doesn't exist, so append both key and value.
             const new_key_index = metadata.len;
             const new_value_index = metadata.len + 1;
-            const reindex_needed = try setCollectionLength(calling_heap, handle, new_length);
+            const reindex_needed = try setCollectionLength(handle, new_length);
             // `handle` may change after updating the length, so we better reload
             // the metadata pointer.
-            metadata = &calling_heap.getExtraData(handle.peek().body.dict).dict;
-            try metadata.table.ensureTotalCapacity(calling_heap.gpa, new_length / 2);
+            metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
+            try metadata.table.ensureTotalCapacity(Heap.local_heap.gpa, new_length / 2);
 
             const new_key_handle = dictItem(handle.*, new_key_index);
             const new_value_handle = dictItem(handle.*, new_value_index);
 
-            assert(new_key_handle.heap == calling_heap.heapId());
-            assert(calling_heap.exchangeString(new_key_handle.index, Heap.Object.null_string, key_dup_str));
+            assert(new_key_handle.heap == Heap.local_heap.heapId());
+            assert(Heap.local_heap.exchangeString(new_key_handle.index, Heap.Object.null_string, key_dup_str));
 
             // Reindex after we've added the new key (not the value though, because we might
             // accidentally double-free the new value).
@@ -1439,20 +1435,20 @@ pub fn dictPutObject(calling_heap: *Heap, handle: *Handle, key: Handle, value: H
 
     // Because we mutated the dictionary, we need to remove any duplicates.
     if (dictHasDuplicatesRaw(handle.*)) {
-        const new_value_index = (try dictRemoveDuplicates(calling_heap, handle, value_index)).?;
+        const new_value_index = (try dictRemoveDuplicates(handle, value_index)).?;
         return dictItem(handle.*, new_value_index);
     }
 
     return dictItem(handle.*, value_index);
 }
 
-pub fn dictPut(calling_heap: *Heap, handle: *Handle, key: Handle, value: Handle) !Heap.Handle {
-    return dictPutObject(calling_heap, handle, key, try calling_heap.duplicateOrReference(value));
+pub fn dictPut(handle: *Handle, key: Handle, value: Handle) !Heap.Handle {
+    return dictPutObject(handle, key, try Heap.local_heap.duplicateOrReference(value));
 }
 
 fn testDicts(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.createHeap(ta);
+    const heap = try Heap.testStart(ta);
 
     const key1 = try newString(heap, "foo");
     defer key1.release();
@@ -1543,8 +1539,8 @@ pub fn getSourceInfo(handle: Handle) ?SourceInfo {
     };
 }
 
-pub fn setSourceInfo(calling_heap: *Heap, handle: *Handle, source_info: SourceInfo) !void {
-    try calling_heap.prepareToShimmer(handle);
+pub fn setSourceInfo(handle: *Handle, source_info: SourceInfo) !void {
+    try Heap.prepareToShimmer(handle);
 
     const ref = handle.peek();
     ref.tag = .source;
@@ -1554,10 +1550,10 @@ pub fn setSourceInfo(calling_heap: *Heap, handle: *Handle, source_info: SourceIn
         var same_heap_file_name = unwrapped;
 
         if (same_heap_file_name.heap != handle.heap) {
-            same_heap_file_name = try calling_heap.duplicate(same_heap_file_name);
+            same_heap_file_name = try Heap.local_heap.duplicate(same_heap_file_name);
         } else {
             // Make sure to increment the ref count.
-            _ = same_heap_file_name.reference();
+            same_heap_file_name.incrRefCount();
         }
 
         // This should be true, as Heap.ensureShimmerable will make sure it's in our heap.
@@ -1565,12 +1561,12 @@ pub fn setSourceInfo(calling_heap: *Heap, handle: *Handle, source_info: SourceIn
 
         ref.body.source.file_name_obj = same_heap_file_name.index;
     } else {
-        ref.body.source.file_name_obj = calling_heap.nullObject().index;
+        ref.body.source.file_name_obj = Heap.null_object_idx;
     }
 }
 
 fn testSourceInfo(ta: std.mem.Allocator) !void {
-    const heap = try Heap.createHeap(ta);
+    const heap = try Heap.testStart(ta);
     defer Heap.testFinish();
 
     var obj = try heap.createObject();
@@ -1607,7 +1603,7 @@ var next_script_id = 1;
 //  Script related functions  //
 
 /// Not threadsafe.
-pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
+pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Get source info, or use defaults.
     const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else SourceInfo{
         .file_name = null,
@@ -1620,8 +1616,8 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     var parser = Parser.init(bytes, source_info.line_no);
 
     // Set up tokens list (to be added to).
-    var tokens = try std.ArrayList(Parser.Token).initCapacity(calling_heap.gpa, bytes.len / 8);
-    defer tokens.deinit(calling_heap.gpa);
+    var tokens = try std.ArrayList(Parser.Token).initCapacity(Heap.local_heap.gpa, bytes.len / 8);
+    defer tokens.deinit(Heap.local_heap.gpa);
 
     // Used to ignore the first token if it's .command_separator (effectively
     // trimming any starting whitespace)
@@ -1632,20 +1628,20 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
         if (next_token) |token| {
             switch (token.tag) {
                 .command_separator, .word_separator => {
-                    if (!is_trimming) try tokens.append(calling_heap.gpa, token);
+                    if (!is_trimming) try tokens.append(Heap.local_heap.gpa, token);
                 },
                 .end_of_file => {
-                    try tokens.append(calling_heap.gpa, token);
+                    try tokens.append(Heap.local_heap.gpa, token);
                     break;
                 },
                 else => {
                     is_trimming = false;
-                    try tokens.append(calling_heap.gpa, token);
+                    try tokens.append(Heap.local_heap.gpa, token);
                 },
             }
         } else |err| {
             if (det) |details| {
-                details.* = try convertParserError(calling_heap, err);
+                details.* = try convertParserError(err);
                 if (parser.error_details) |parser_details| {
                     details.index = parser_details.index;
                 }
@@ -1671,17 +1667,17 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
     const new_token_capacity: u32 = @intCast(tokens.items.len + 1);
 
     // Initialize the Heap-stored list that will contain the corrisponding value for each token.
-    var new_token_values = try listUninitializedNew(calling_heap, new_token_capacity);
+    var new_token_values = try listUninitializedNew(new_token_capacity);
     errdefer new_token_values.release();
     // Set length to 0 so we can just call listAppend().
-    _ = try setCollectionLength(calling_heap, &new_token_values, 0);
+    _ = try setCollectionLength(&new_token_values, 0);
 
-    var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, new_token_capacity);
-    errdefer new_token_tags.deinit(calling_heap.gpa);
+    var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(Heap.local_heap.gpa, new_token_capacity);
+    errdefer new_token_tags.deinit(Heap.local_heap.gpa);
 
     // Be sure to append the first .script_command token.
-    try new_token_tags.append(calling_heap.gpa, .start_of_command);
-    _ = try listAppendObject(calling_heap, det, &new_token_values, .{
+    try new_token_tags.append(Heap.local_heap.gpa, .start_of_command);
+    _ = try listAppendObject(det, &new_token_values, .{
         .str = Heap.Object.null_string,
         .tag = .script_command,
         .body = .{
@@ -1727,8 +1723,8 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
 
             // Start a new command.
             command_arg_count = 0;
-            try new_token_tags.append(calling_heap.gpa, .start_of_command);
-            script_command_idx = try listAppendObject(calling_heap, det, &new_token_values, .{
+            try new_token_tags.append(Heap.local_heap.gpa, .start_of_command);
+            script_command_idx = try listAppendObject(det, &new_token_values, .{
                 .str = Heap.Object.null_string,
                 .tag = .script_command,
                 .body = .{ .script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
@@ -1740,12 +1736,12 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
         // Append the start of the word (only if necessary).
         if (found_expansion or arg_token_count > 1) {
             if (found_expansion) {
-                try new_token_tags.append(calling_heap.gpa, .argument_expansion);
+                try new_token_tags.append(Heap.local_heap.gpa, .argument_expansion);
             } else {
-                try new_token_tags.append(calling_heap.gpa, .start_of_word);
+                try new_token_tags.append(Heap.local_heap.gpa, .start_of_word);
             }
 
-            _ = try listAppendObject(calling_heap, det, &new_token_values, .{
+            _ = try listAppendObject(det, &new_token_values, .{
                 .str = Heap.Object.null_string,
                 .tag = .integer,
                 .body = .{
@@ -1764,23 +1760,21 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
                 switch (token.tag) {
                     .argument_expansion => break :blk null,
                     .escaped_string => {
-                        try new_token_tags.append(calling_heap.gpa, .simple_string);
+                        try new_token_tags.append(Heap.local_heap.gpa, .simple_string);
                         const str_idx = try listAppendObject(
-                            calling_heap,
                             det,
                             &new_token_values,
                             .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
                         );
 
                         const item_handle = listItem(new_token_values, str_idx);
-                        try setStringFromEscaped(calling_heap.gpa, item_handle, bytes[token.loc.start..token.loc.end]);
+                        try setStringFromEscaped(Heap.local_heap.gpa, item_handle, bytes[token.loc.start..token.loc.end]);
 
                         break :blk item_handle;
                     },
                     else => {
-                        try new_token_tags.append(calling_heap.gpa, token.tag);
+                        try new_token_tags.append(Heap.local_heap.gpa, token.tag);
                         const str_idx = try listAppendObject(
-                            calling_heap,
                             det,
                             &new_token_values,
                             .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
@@ -1797,7 +1791,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
             if (str_handle) |token_str| {
                 // Since we created everything on this heap, the handle shouldn't change.
                 var token_str_should_not_change = token_str;
-                try setSourceInfo(calling_heap, &token_str_should_not_change, .{
+                try setSourceInfo(&token_str_should_not_change, .{
                     .file_name = source_info.file_name,
                     .line_no = token.loc.line_no,
                 });
@@ -1825,7 +1819,7 @@ pub fn parseScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !He
 }
 
 fn testScriptParsing(ta: std.mem.Allocator) !void {
-    const heap = try Heap.createHeap(ta);
+    const heap = try Heap.testStart(ta);
     defer Heap.testFinish();
 
     const script1 = try newString(heap,
@@ -1862,7 +1856,7 @@ test "script parsing" {
     try testing.checkAllAllocationFailures(testing.allocator, testScriptParsing, .{});
 }
 
-pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToScript(det: ?*ErrorDetails, handle: *Handle) !void {
     // Figure out whether the provided object already has a script id, or if we need to
     // generate a new one.
     var script_id: Heap.ScriptId = undefined;
@@ -1877,7 +1871,7 @@ pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle
     };
     errdefer if (using_new_id) script_id.retire();
 
-    if (calling_heap.parsed_scripts.get(script_id.index)) |existing_script| {
+    if (Heap.local_heap.parsed_scripts.get(script_id.index)) |existing_script| {
         if (existing_script.generation == script_id.generation) {
             // Object is already a script, it exists as parsed in our heap,
             // and it's the correct generation. No need to reparse!
@@ -1885,42 +1879,42 @@ pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle
         } else {
             // Wrong generation, so free the old one before overwriting (later in code).
             var script_as_mut = existing_script.script;
-            script_as_mut.deinit(calling_heap);
+            script_as_mut.deinit(Heap.local_heap);
             // Be sure to remove it, in case we hit an error before we have the chance
             // to overwrite it.
-            _ = calling_heap.parsed_scripts.remove(script_id.index);
+            _ = Heap.local_heap.parsed_scripts.remove(script_id.index);
         }
     } else {
         // We don't have this script in our heap, so keep going to generate it.
     }
 
-    var parsed = try parseScript(calling_heap, det, handle.*);
-    errdefer parsed.deinit(calling_heap);
+    var parsed = try parseScript(det, handle.*);
+    errdefer parsed.deinit(Heap.local_heap);
 
-    try calling_heap.parsed_scripts.put(calling_heap.gpa, script_id.index, .{
+    try Heap.local_heap.parsed_scripts.put(Heap.local_heap.gpa, script_id.index, .{
         .script = parsed,
         .generation = script_id.generation,
     });
 
-    try calling_heap.prepareToShimmer(handle);
+    try Heap.prepareToShimmer(handle);
     const obj = handle.peek();
     obj.body.script = .{ .id = script_id };
     obj.tag = .script;
 }
 
-pub fn getScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap.ParsedScript {
-    try shimmerToScript(calling_heap, det, handle);
+pub fn getScript(det: ?*ErrorDetails, handle: *Handle) !Heap.ParsedScript {
+    try shimmerToScript(det, handle);
     assert(handle.peek().tag == .script);
 
     const script_id = handle.peek().body.script.id;
-    const script_and_generation = calling_heap.parsed_scripts.get(script_id.index).?;
+    const script_and_generation = Heap.local_heap.parsed_scripts.get(script_id.index).?;
     assert(script_and_generation.generation == script_id.generation);
 
     return script_and_generation.script;
 }
 
 fn testScriptShimmering(ta: std.mem.Allocator) !void {
-    const heap = try Heap.createHeap(ta);
+    const heap = try Heap.testStart(ta);
     defer Heap.testFinish();
 
     const old_script_id = blk: {
@@ -1968,7 +1962,7 @@ fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.To
     try testing.expectEqualStrings(value, try Heap.getString(listItem(script.values, index)));
 }
 
-pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
     const Mapping = std.StaticStringMap(bool).initComptime(.{
         .{ "1", true },  .{ "true", true },   .{ "yes", true }, .{ "on", true },
         .{ "0", false }, .{ "false", false }, .{ "no", false }, .{ "off", false },
@@ -1978,7 +1972,6 @@ pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
     const new_value = Mapping.get(bytes) orelse {
         if (det) |details| details.* = .{
             .message = try newStringFmt(
-                calling_heap,
                 "expected boolean but got \"{f}\"",
                 .{handle},
             ),
@@ -1986,14 +1979,13 @@ pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
         return Error.BadBoolean;
     };
 
-    try calling_heap.prepareToShimmer(handle);
+    try Heap.prepareToShimmer(handle);
     const ref = handle.peek();
     ref.tag = .bool;
     ref.body.bool = new_value;
 }
 
-pub fn getBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !bool {
-    try shimmerToBoolean(calling_heap, det, handle);
-
+pub fn getBoolean(det: ?*ErrorDetails, handle: *Handle) !bool {
+    try shimmerToBoolean(det, handle);
     return handle.peek().body.bool;
 }

@@ -61,7 +61,7 @@ fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { 
         };
     }
 
-    interp.setResultOwning(try object.floatNew(interp.heap, result));
+    interp.setResultOwning(try object.floatNew(result));
 }
 
 pub fn add(interp: *Interp, args: []Heap.Handle) !void {
@@ -130,6 +130,43 @@ pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
     }
 }
 
+fn calcCommandNamespace(full_name: []const u8) !struct { namespace: []const u8, command_name: []const u8 } {
+    // Skip any leading colons.
+    var trimmed = full_name;
+    while (trimmed.len > 0 and trimmed[0] == ':') trimmed = trimmed[1..];
+
+    // Look for the last colon pair, as that's where the command name starts.
+    var command_name = trimmed;
+    if (std.mem.lastIndexOf(u8, trimmed, "::")) |last_pair| {
+        trimmed = trimmed[0..last_pair];
+        command_name = trimmed[(last_pair + 2)..];
+    } else {
+        trimmed = full_name[0..0];
+    }
+
+    return .{
+        .namespace = trimmed,
+        .command_name = command_name,
+    };
+}
+
+// pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
+//     const proc_name = try Heap.getString(args[1]);
+//     const arg_list = &args[2];
+//     const statics = if (args.len == 5) &args[3] else null;
+//     const body = if (args.len == 5) &args[4] else &args[3];
+
+//     const arg_list_len = interp.getListLength(arg_list);
+
+//     const qualified_name = Interp.qualifyName(
+//         interp.gpa,
+//         interp.namespace orelse interp.heap.emptyObject(),
+//         proc_name,
+//     ) orelse try interp.gpa.dupe(proc_name);
+
+//     interp.createCommand(try interp.gpa.dupe(u8, proc_name), .{ .namespace = getCommandNamespace(proc_name) });
+// }
+
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("+", .{ .to_call = add, .description = "?number ...?", .min_arity = 1, .max_arity = null, .multiple_of = null });
     try interp.registerCommand("*", .{ .to_call = mul, .description = "?number ...?", .min_arity = 1, .max_arity = null, .multiple_of = null });
@@ -139,11 +176,12 @@ pub fn registerCoreCommands(interp: *Interp) !void {
 
 test "commands" {
     defer Heap.testFinish();
-    var interp = try Interp.init(try Heap.createHeap(testing.allocator));
+    _ = try Heap.testStart(testing.allocator);
+    var interp = try Interp.init();
     defer interp.deinit();
     try registerCoreCommands(&interp);
 
-    var script = try object.newString(interp.heap,
+    var script = try object.newString(
         \\ puts hello
         \\ incr x
         \\ puts $x
