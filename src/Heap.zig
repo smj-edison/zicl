@@ -46,6 +46,9 @@ const cfg: HeapSettings = .{};
 var debugging_gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{}){} else undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 var debug_gpa = if (builtin.mode == .Debug) debugging_gpa.allocator() else memutil.null_allocator;
+/// Set this right before doing an operation that may cause a panic. The runtime will dump its
+/// traces on panic if set.
+threadlocal var last_touched: ?Handle = null;
 
 pub const GlobalHeapState = struct {
     initialized: bool = false,
@@ -74,8 +77,10 @@ const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
 gpa: Allocator,
 
-/// Used whenever an allocation or free is happening
+/// Used whenever an allocation or free is happening.
 mem_mgmt_mutex: Mutex = .{},
+/// Used for locking when adding trace info.
+trace_mutex: Mutex = .{},
 
 object_tracking: ObjectTracker,
 objects: ObjectList,
@@ -642,6 +647,14 @@ pub const Handle = packed struct(u64) {
         const metadata = handle.getMetadata();
         assert(!metadata.in_collection);
 
+        if (cfg.trace_mem) {
+            handle.getHeap().trace_mutex.lock();
+            defer handle.getHeap().trace_mutex.unlock();
+            handle.getHeap().objects.items(.trace)[handle.index].addAddr(
+                @returnAddress(),
+                std.fmt.allocPrint(debug_gpa, "Incr ref count of {}", .{handle.index}) catch unreachable,
+            );
+        }
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
     }
 
@@ -716,12 +729,7 @@ pub const Handle = packed struct(u64) {
             return try local_heap.duplicate(handle);
         }
 
-        // This object may have come from another heap
-        const obj_heap = handle.getHeap();
-
-        const is_cross_thread = handle.getMetadata().cross_thread;
-        incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], is_cross_thread);
-
+        handle.incrRefCount();
         return handle;
     }
 
@@ -734,6 +742,17 @@ pub const Handle = packed struct(u64) {
     pub fn release(handle: Handle) void {
         const metadata = handle.getMetadata();
         if (metadata.in_collection) return;
+
+        if (cfg.trace_mem) {
+            last_touched = handle;
+
+            handle.getHeap().trace_mutex.lock();
+            defer handle.getHeap().trace_mutex.unlock();
+            handle.getHeap().objects.items(.trace)[handle.index].addAddr(
+                @returnAddress(),
+                std.fmt.allocPrint(debug_gpa, "Decr ref count of {}", .{handle.index}) catch unreachable,
+            );
+        }
 
         const obj_heap = handle.getHeap();
         if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
@@ -1007,12 +1026,21 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     if (cfg.trace_mem) {
         self.objects.items(.trace)[index].addAddr(
             @returnAddress(),
-            try std.fmt.allocPrint(
-                debug_gpa,
-                "Alloc {} of order {}",
-                .{ index, order },
-            ),
+            std.fmt.allocPrint(debug_gpa, "Alloc at index {} of order {}", .{ index, order }) catch unreachable,
         );
+
+        if (aligned_count > 1) {
+            for ((index + 1)..end) |collection_item| {
+                self.objects.items(.trace)[collection_item].addAddr(
+                    @returnAddress(),
+                    std.fmt.allocPrint(
+                        debug_gpa,
+                        "Alloc {} of order {}",
+                        .{ index, order },
+                    ) catch unreachable,
+                );
+            }
+        }
     }
 
     // Make sure the items we're allocating are free (used to
@@ -1060,17 +1088,18 @@ pub fn freeObjectBacking(handle: Handle) void {
 
     obj_heap.mem_mgmt_mutex.lock();
     if (cfg.trace_mem) {
+        last_touched = handle;
+
         const trace = &obj_heap.objects.items(.trace)[handle.index];
         trace.addAddr(@returnAddress(), std.fmt.allocPrint(
             debug_gpa,
             "Free {} of order {}",
             .{ handle.index, metadata.order },
-        ) catch "OOM");
+        ) catch unreachable);
+    }
 
-        if (!metadata.in_use) {
-            trace.dump();
-            @panic("Double free!");
-        }
+    if (!metadata.in_use) {
+        @panic("Double free!");
     }
 
     obj_heap.object_tracking.free(handle.index, metadata.order);
@@ -1094,8 +1123,6 @@ pub fn freeObject(handle: Handle) void {
 
     const metadata = obj_heap.getLocalMetadata(handle.index);
     if (!metadata.in_collection) {
-        if (!metadata.in_use) @panic("Double free!");
-
         freeObjectBacking(handle);
     }
 }
@@ -1779,6 +1806,7 @@ pub fn leakCheck(heap: *Heap) !bool {
 
     var leaked = false;
 
+    // Go through once to print the summary, then print each individual trace.
     for (heap.objects.items(.metadata)[special_object_count..], special_object_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i));
@@ -1788,17 +1816,43 @@ pub fn leakCheck(heap: *Heap) !bool {
                 handle.debugRefCount(),
                 try getString(handle),
             });
-            if (cfg.trace_mem) {
-                const trace = heap.objects.get(i).trace;
-                trace.dump();
-                if (trace.index > 0) std.debug.print("\n\n", .{});
-            }
 
             leaked = true;
         }
     }
 
+    if (cfg.trace_mem and leaked) {
+        std.debug.print("\n===== Leak details =====\n\n", .{});
+
+        for (heap.objects.items(.metadata)[special_object_count..], special_object_count..) |metadata, i| {
+            if (metadata.in_use) {
+                const handle = heap.getHandle(@intCast(i));
+                std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
+                    handle.peek().tag,
+                    i,
+                    handle.debugRefCount(),
+                    try getString(handle),
+                });
+
+                const trace = heap.objects.get(i).trace;
+                trace.dump();
+                if (trace.index > 0) std.debug.print("\n\n", .{});
+            }
+        }
+    }
+
     return leaked;
+}
+
+pub fn printLastTouchedTrace() void {
+    if (last_touched) |val| {
+        val.getHeap().trace_mutex.lock();
+        defer val.getHeap().trace_mutex.unlock();
+
+        val.getHeap().objects.get(val.index).trace.dump();
+    } else {
+        std.debug.print("No last leaked object\n", .{});
+    }
 }
 
 const StringDetails = union(enum) {
@@ -2136,6 +2190,8 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
             _ = @atomicLoad(T, ref, .acquire);
         }
     } else {
+        // HACK: once I figure out how to register a panic handler I don't need this.
+        if (ref.* == 0) printLastTouchedTrace();
         ref.* -= 1;
         after_sub = ref.*;
     }

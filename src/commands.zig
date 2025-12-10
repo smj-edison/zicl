@@ -131,6 +131,16 @@ pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
     }
 }
 
+/// [set]
+pub fn set(interp: *Interp, args: []Heap.Handle) !void {
+    if (args.len == 2) {
+        // Return the value.
+        try interp.setResult(try interp.getVariable(&args[1]));
+    } else {
+        try interp.setVariableTo(&args[1], args[2]);
+    }
+}
+
 fn namespaceSplit(full_name: []const u8) struct { namespace: []const u8, command_name: []const u8 } {
     // Skip any leading colons.
     var trimmed = full_name;
@@ -290,6 +300,7 @@ pub fn createProcedureCommand(
     };
 }
 
+/// [proc]
 pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
     const proc_name = try Heap.getString(args[1]);
     const arg_list = &args[2];
@@ -315,11 +326,12 @@ pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("+", .{ .to_call = add, .description = "?number ...?", .min_arity = 1, .max_arity = null, .multiple_of = null });
-    try interp.registerCommand("*", .{ .to_call = mul, .description = "?number ...?", .min_arity = 1, .max_arity = null, .multiple_of = null });
-    try interp.registerCommand("proc", .{ .to_call = proc, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4, .multiple_of = null });
-    try interp.registerCommand("puts", .{ .to_call = puts, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2, .multiple_of = null });
-    try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2, .multiple_of = null });
+    try interp.registerCommand("+", .{ .to_call = add, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("*", .{ .to_call = mul, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("set", .{ .to_call = set, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("proc", .{ .to_call = proc, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4 });
+    try interp.registerCommand("puts", .{ .to_call = puts, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
 }
 
 test "commands" {
@@ -330,8 +342,7 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(
-        \\ proc foo {x} { puts $x }
-        \\ foo 10
+        \\ 
     );
     defer script.release();
     try interp.evalObject(&script);

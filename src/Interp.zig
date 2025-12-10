@@ -390,14 +390,14 @@ const ProcedureSignature = struct {
     /// the last argument name.
     has_args_parameter: bool,
 
-    pub fn borrow(signature: ProcedureSignature, heap: *Heap) !ProcedureSignature {
-        const args = try heap.borrow(signature.args);
+    pub fn borrow(signature: ProcedureSignature) !ProcedureSignature {
+        const args = try signature.args.borrow();
         errdefer args.release();
-        const body = try heap.borrow(signature.body);
+        const body = try signature.body.borrow();
         errdefer body.release();
-        const statics = try heap.borrowOptional(signature.statics);
+        const statics = try Handle.borrowOptional(signature.statics);
         errdefer if (statics) |val| val.release();
-        const optional_values = try heap.borrowOptional(signature.optional_values);
+        const optional_values = try Handle.borrowOptional(signature.optional_values);
         errdefer if (optional_values) |val| val.release();
 
         return .{
@@ -422,13 +422,13 @@ const ProcedureSignature = struct {
 pub const Command = struct {
     pub const NativeCommand = struct {
         to_call: *const CommandFn,
-        description: ?[]const u8,
-        min_arity: usize,
-        max_arity: ?usize,
+        description: ?[]const u8 = "",
+        min_arity: usize = 0,
+        max_arity: ?usize = null,
         /// If the command argument length needs to be a multiple of some
         /// amount, set this. A good example is `dict create`, as it needs
         /// an even number of arguments.
-        multiple_of: ?usize,
+        multiple_of: ?usize = null,
     };
 
     namespace: ?Handle,
@@ -504,7 +504,7 @@ fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8
         .message = try object.newStringFmt("wrong # args: should be \"{s}\"", .{command_usage}),
     };
 
-    return Error.CommandNotFound;
+    return Error.WrongArgumentCount;
 }
 
 /// Takes ownership of name.
@@ -518,7 +518,9 @@ pub fn createCommand(interp: *Interp, name: []const u8, command: Command) !void 
 }
 
 pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.NativeCommand) !void {
-    try interp.commands.put(interp.gpa, name, .{ .namespace = null, .call_info = .{ .native = details } });
+    const name_duped = try interp.gpa.dupe(u8, name);
+    errdefer interp.gpa.free(name_duped);
+    try interp.commands.put(interp.gpa, name_duped, .{ .namespace = null, .call_info = .{ .native = details } });
 }
 
 fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
@@ -591,14 +593,15 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
 fn callNative(interp: *Interp, command: *Command, args: []Handle) !void {
     const signature = command.call_info.native;
 
-    early_exit: {
+    const arg_count = args.len - 1;
+    wrong_arg_count: {
         // Check arg count.
-        if (args.len < signature.min_arity) break :early_exit;
+        if (arg_count < signature.min_arity) break :wrong_arg_count;
         if (signature.max_arity) |max_arity| {
-            if (args.len > max_arity) break :early_exit;
+            if (arg_count > max_arity) break :wrong_arg_count;
         }
         if (signature.multiple_of) |multiple_of| {
-            if (@mod(args.len, multiple_of) != 0) break :early_exit;
+            if (@mod(arg_count, multiple_of) != 0) break :wrong_arg_count;
         }
 
         try command.call_info.native.to_call(interp, args);
@@ -714,6 +717,8 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
     errdefer if (namespace) |ns| ns.release();
     const vars_handle = try object.dictNew(&.{});
     errdefer vars_handle.release();
+    const borrowed_signature = try signature.borrow();
+    errdefer borrowed_signature.release();
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
@@ -723,8 +728,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
         .call_epoch = interp.current_call_epoch,
         .level = level,
         .namespace = namespace,
-        // Take ownership.
-        .signature = signature,
+        .signature = borrowed_signature,
         // TODO PERF recycle variable hash table if possible.
         .variables = vars_handle,
         .tailcall = null,
@@ -1204,7 +1208,7 @@ pub fn init() !Interp {
     };
 
     _ = try new_interp.pushCallFrame(null, &.{}, .{
-        .args = try object.listNew(&.{}),
+        .args = Heap.local_heap.emptyObject(),
         .body = Heap.local_heap.emptyObject(),
         .has_args_parameter = false,
         .optional_arity = 0,
@@ -1220,25 +1224,13 @@ pub fn deinit(interp: *Interp) void {
     interp.result.release();
     var iter = interp.commands.iterator();
     while (iter.next()) |*entry| {
-        switch (entry.value_ptr.call_info) {
-            .native => {
-                // Don't free the string, as it's in .data
-            },
-            .tcl => {
-                interp.gpa.free(entry.key_ptr.*);
-            },
-        }
-
+        interp.gpa.free(entry.key_ptr.*);
         entry.value_ptr.deinit();
     }
     interp.commands.deinit(interp.gpa);
 
     // Deinit all frames.
     for (interp.call_frames.items) |frame| {
-        // deinit args.
-        for (frame.args) |arg| arg.release();
-        interp.gpa.free(frame.args);
-
         if (frame.namespace) |namespace| namespace.release();
         frame.variables.release();
         frame.signature.release();

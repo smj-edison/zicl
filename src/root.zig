@@ -1,6 +1,7 @@
 const std = @import("std");
 const zicl = @import("zicl.zig");
 const Parser = @import("Parser.zig");
+const Heap = @import("Heap.zig");
 const stringutil = @import("stringutil.zig");
 
 pub fn main() !void {
@@ -12,6 +13,12 @@ pub fn main() !void {
 
     const len = stringutil.removeEscaping(to_escape, to_write);
     std.debug.print("Result: {s}", .{to_write[0..len]});
+}
+
+pub const panic = std.debug.FullPanic(panicAndPrintTraces);
+fn panicAndPrintTraces(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    Heap.printLastTouchedTrace();
+    std.debug.defaultPanic(msg, first_trace_addr);
 }
 
 test {

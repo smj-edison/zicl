@@ -618,7 +618,7 @@ pub fn parseEol(self: *Parser) Token {
 pub fn parseSeparator(self: *Parser) Token {
     var token = self.newToken();
 
-    while (true) : (self.advance(1)) {
+    while (!self.atEnd()) : (self.advance(1)) {
         switch (self.current()) {
             '\t', 12, '\r', ' ' => {},
             '\\' => {
