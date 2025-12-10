@@ -251,7 +251,7 @@ pub const ParsedScript = struct {
         const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
 
         var line: u64 = 0;
-        for (script.tags.items, object.listItemsRaw(script.values), 0..) |token, value, i| {
+        for (script.tags.items, object.listItems(script.values), 0..) |token, value, i| {
             switch (token) {
                 .start_of_command => {
                     line = value.body.script_command.line;
@@ -604,14 +604,23 @@ pub const Handle = packed struct(u64) {
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
     }
 
-    pub fn isShared(handle: Handle) bool {
+    pub fn canModify(handle: Handle) bool {
         const obj_heap = handle.getHeap();
         const metadata = obj_heap.getLocalMetadata(handle.index);
 
         const cross_thread = metadata.cross_thread;
-        const multiple_owners = obj_heap.getLocalRefCount(handle.index) > 1;
-        const in_collection = metadata.in_collection;
-        return cross_thread or multiple_owners or in_collection;
+        const multiple_refs = obj_heap.getLocalRefCount(handle.index) > 1;
+
+        if (getLocalCollectionHead(handle.index, metadata)) |head_index| {
+            // If the collection head is shared, then the items are shared.
+            return obj_heap.getHandle(head_index).canModify();
+        } else |err| switch (err) {
+            error.NotInCollection => {
+                return !cross_thread and !multiple_refs;
+            },
+            // Special objects can never be modified.
+            error.SpecialObject => return false,
+        }
     }
 
     pub fn hasString(handle: Handle) bool {
@@ -635,6 +644,7 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn reference(handle: Handle) Object {
+        assert(!handle.getMetadata().in_collection);
         handle.incrRefCount();
 
         return .{
@@ -645,6 +655,11 @@ pub const Handle = packed struct(u64) {
                 .reference = handle,
             },
         };
+    }
+
+    pub fn invalidateBoth(handle: Handle) void {
+        handle.invalidateBody();
+        handle.invalidateString();
     }
 
     pub fn invalidateString(handle: Handle) void {
@@ -926,6 +941,18 @@ fn createSpecialtyObject(heap: *Heap) !Handle {
     return handle;
 }
 
+fn getLocalCollectionHead(index: u32, metadata: *ObjectAndMetadata.Metadata) error{ SpecialObject, NotInCollection }!u32 {
+    if (metadata.in_collection) {
+        if (index < special_object_count) return error.SpecialObject;
+
+        // Collections are always aligned to a power of two, so we can recover
+        // its head based on its order.
+        return (index >> metadata.order) << metadata.order;
+    }
+
+    return error.NotInCollection;
+}
+
 /// create_objects does not initialize objects, but does initialize
 /// reference counts.
 pub fn createObjects(self: *Heap, count: u32) !u32 {
@@ -1038,8 +1065,7 @@ pub fn freeObjectBacking(handle: Handle) void {
 pub fn freeObject(handle: Handle) void {
     const obj_heap = handle.getHeap();
 
-    handle.invalidateBody();
-    handle.invalidateString();
+    handle.invalidateBoth();
 
     const metadata = obj_heap.getLocalMetadata(handle.index);
     if (!metadata.in_collection) {
@@ -1052,7 +1078,7 @@ pub fn freeObject(handle: Handle) void {
 /// If the object can't be modified, this will duplicate and release
 /// the old object.
 pub fn prepareForModification(calling_heap: *Heap, handle: *Handle) !void {
-    if (handle.isShared()) {
+    if (!handle.canModify()) {
         const before_duplicating = handle.*;
         handle.* = try calling_heap.duplicate(handle.*);
         before_duplicating.release();
@@ -1215,13 +1241,27 @@ pub fn duplicateOrReference(self: *Heap, handle: Handle) !Object {
     };
 }
 
+/// Tries to reference the object, or duplicates it if it's in a collection.
+pub fn referenceOrDuplicate(heap: *Heap, handle: Handle) !Object {
+    if (handle.getMetadata().in_collection) {
+        // Must duplicate.
+        return heap.duplicateSingle(handle) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Multi-item objects can't exist in a collection.
+            error.MultiItemObject => unreachable,
+        };
+    } else {
+        return handle.reference();
+    }
+}
+
 /// If called with a multi-item object, will return error.MultiItemObject
-pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
+pub fn duplicateSingle(heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
         .none, .index, .integer, .float, .string, .bool, .script, .script_command, .marked => {
             return .{
-                .str = try self.duplicateObjString(handle),
+                .str = try heap.duplicateObjString(handle),
                 .tag = src.tag,
                 .body = src.body,
             };
@@ -1229,15 +1269,15 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
         .source => {
             const source = src.body.source;
 
-            const new_handle = blk: {
+            const file_name_handle = blk: {
                 if (source.file_name_obj == 0) {
-                    break :blk self.nullObject();
+                    break :blk heap.nullObject();
                 } else {
                     // Better make sure it's in our heap.
-                    if (handle.heap != self.heapId()) {
-                        break :blk try self.duplicate(self.getHandle(source.file_name_obj));
+                    if (handle.heap != heap.heapId()) {
+                        break :blk try heap.duplicate(heap.getHandle(source.file_name_obj));
                     } else {
-                        const to_break = self.getHandle(source.file_name_obj);
+                        const to_break = heap.getHandle(source.file_name_obj);
                         to_break.incrRefCount();
                         break :blk to_break;
                     }
@@ -1245,11 +1285,11 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
             };
 
             return .{
-                .str = try self.duplicateObjString(handle),
+                .str = try heap.duplicateObjString(handle),
                 .tag = .source,
                 .body = .{
                     .source = .{
-                        .file_name_obj = new_handle.index,
+                        .file_name_obj = file_name_handle.index,
                         .line_no = source.line_no,
                     },
                 },
@@ -1263,23 +1303,23 @@ pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiIte
 
             var new_object: Object = .{
                 // TODO make sure this doesn't leak
-                .str = try self.duplicateObjString(handle),
+                .str = try heap.duplicateObjString(handle),
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = try self.createExtraData(),
+                        .index = try heap.createExtraData(),
                         .type_id = custom_type.type_id,
                     },
                 },
             };
-            try custom_types.items[custom_type.type_id].duplicate(self, src, &new_object);
+            try custom_types.items[custom_type.type_id].duplicate(heap, src, &new_object);
 
             return new_object;
         },
         .dict_subst, .variable, .upvar, .command => {
             // Variable lookup is not stable between threads.
             return .{
-                .str = try self.duplicateObjString(handle),
+                .str = try heap.duplicateObjString(handle),
                 .tag = .none,
                 .body = undefined,
             };
