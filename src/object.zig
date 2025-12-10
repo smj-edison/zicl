@@ -1039,7 +1039,7 @@ pub fn listAppendObject(det: ?*ErrorDetails, handle: *Handle, item: Heap.Object)
     return index;
 }
 
-pub fn listAppend(det: ?*ErrorDetails, handle: *Handle, item: Handle) !u32 {
+pub fn listAppend(det: ?*ErrorDetails, handle: *Handle, item: Handle) !Handle {
     try shimmerToList(det, handle);
     _ = try setCollectionLength(handle, handle.peek().body.list.len + 1);
 
@@ -1048,7 +1048,7 @@ pub fn listAppend(det: ?*ErrorDetails, handle: *Handle, item: Handle) !u32 {
 
     listItems(handle.*)[index] = try handle.getHeap().duplicateOrReference(item);
 
-    return index;
+    return handle.getHeap().getHandle(index);
 }
 
 fn testLists(ta: std.mem.Allocator) !void {
@@ -1145,7 +1145,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
     };
 }
 
-pub fn dictItemsRaw(handle: Handle) []Heap.Object {
+pub fn dictItems(handle: Handle) []Heap.Object {
     const obj = handle.peek();
     const obj_heap = handle.getHeap();
 
@@ -1179,7 +1179,7 @@ pub fn dictPairLength(det: ?*ErrorDetails, handle: *Handle) !u32 {
     return dictPairLengthRaw(handle.*);
 }
 
-fn dictUninitializedNew(len: u32) !Handle {
+pub fn dictUninitializedNew(len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
     // `1 +` to make space for the dict's head.
@@ -1188,10 +1188,12 @@ fn dictUninitializedNew(len: u32) !Handle {
     const dict_metadata = try Heap.local_heap.createExtraData();
     errdefer Heap.local_heap.destroyExtraData(dict_metadata);
 
-    Heap.local_heap.getExtraData(dict_metadata).* = .{ .dict = .{
-        .table = .empty,
-        .len = len,
-    } };
+    Heap.local_heap.getExtraData(dict_metadata).* = .{
+        .dict = .{
+            .table = .empty,
+            .len = len,
+        },
+    };
 
     const dict_head = Heap.local_heap.getLocalObject(dict_index);
     dict_head.* = .{
@@ -1210,7 +1212,7 @@ pub fn dictNew(handles: []const Handle) !Handle {
     const dict = try dictUninitializedNew(@intCast(handles.len));
     errdefer dict.release();
 
-    const new_items = dictItemsRaw(dict);
+    const new_items = dictItems(dict);
 
     for (handles, new_items) |handle, *item| {
         item.* = try Heap.duplicateOrReference(Heap.local_heap, handle);
@@ -1284,7 +1286,7 @@ fn dictRemoveDuplicates(handle: *Handle, to_track: ?u32) !?u32 {
     var to_track_new_location: ?u32 = null;
 
     if (metadata.table.size * 2 != metadata.len) {
-        const items = dictItemsRaw(handle.*);
+        const items = dictItems(handle.*);
         var pair_index: u32 = 0;
 
         while (pair_index < metadata.len / 2) : (pair_index += 1) {
@@ -1614,6 +1616,8 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     const bytes = try Heap.getString(handle);
     var parser = Parser.init(bytes, source_info.line_no);
+
+    std.debug.print("parsing: {s}\n", .{bytes});
 
     // Set up tokens list (to be added to).
     var tokens = try std.ArrayList(Parser.Token).initCapacity(Heap.local_heap.gpa, bytes.len / 8);

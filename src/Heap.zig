@@ -849,6 +849,7 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
     // Empty object is guaranteed to have index 1.
     const empty_object = try heap.createSpecialtyObject();
     assert(empty_object.index == empty_object_idx);
+    empty_object.peek().str = Object.empty_string;
     // Temp object is guaranteed to have index 2.
     const temp_object = try heap.createSpecialtyObject();
     assert(temp_object.index == temp_object_idx);
@@ -1121,6 +1122,14 @@ pub fn prepareToShimmer(handle: *Handle) !void {
     }
 
     handle.invalidateBody();
+}
+
+pub fn ensureSameHeap(handle: *Handle) !void {
+    if (handle.heap != Heap.local_heap.heapId()) {
+        const before_duplicating = handle.*;
+        handle.* = try local_heap.duplicate(handle.*);
+        before_duplicating.release();
+    }
 }
 
 /// Get a string slice from heap string storage

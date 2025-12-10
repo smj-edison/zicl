@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const Heap = @import("Heap.zig");
+const Handle = Heap.Handle;
 const object = @import("object.zig");
 const Interp = @import("Interp.zig");
 
@@ -130,7 +131,7 @@ pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
     }
 }
 
-fn calcCommandNamespace(full_name: []const u8) !struct { namespace: []const u8, command_name: []const u8 } {
+fn namespaceSplit(full_name: []const u8) struct { namespace: []const u8, command_name: []const u8 } {
     // Skip any leading colons.
     var trimmed = full_name;
     while (trimmed.len > 0 and trimmed[0] == ':') trimmed = trimmed[1..];
@@ -150,26 +151,173 @@ fn calcCommandNamespace(full_name: []const u8) !struct { namespace: []const u8, 
     };
 }
 
-// pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
-//     const proc_name = try Heap.getString(args[1]);
-//     const arg_list = &args[2];
-//     const statics = if (args.len == 5) &args[3] else null;
-//     const body = if (args.len == 5) &args[4] else &args[3];
+pub fn createProcedureCommand(
+    interp: *Interp,
+    arg_list: *Handle,
+    statics_list: ?*Handle,
+    body: *Handle,
+    namespace: Handle,
+) !Interp.Command {
+    const arg_list_len = try interp.getListLength(arg_list);
 
-//     const arg_list_len = interp.getListLength(arg_list);
+    const statics: ?Handle = blk: {
+        if (statics_list) |list| {
+            try Heap.ensureSameHeap(list);
+            const statics_count = try interp.getListLength(list);
 
-//     const qualified_name = Interp.qualifyName(
-//         interp.gpa,
-//         interp.namespace orelse interp.heap.emptyObject(),
-//         proc_name,
-//     ) orelse try interp.gpa.dupe(proc_name);
+            const statics_dict = try object.dictUninitializedNew(statics_count * 2);
+            const dict_items = object.dictItems(statics_dict);
+            errdefer statics_dict.release();
 
-//     interp.createCommand(try interp.gpa.dupe(u8, proc_name), .{ .namespace = getCommandNamespace(proc_name) });
-// }
+            for (0..statics_count) |i| {
+                const static_name = object.listItem(list.*, @intCast(i));
+                if (interp.getVariableImpl(null, static_name)) |static_value| {
+                    const dict_name_str = try Heap.duplicateObjString(Heap.local_heap, static_name);
+                    errdefer dict_name_str.deinit(Heap.local_heap);
+                    const dict_value = try Heap.referenceOrDuplicate(Heap.local_heap, static_value);
+
+                    dict_items[i * 2] = .{
+                        .str = dict_name_str,
+                        .tag = .none,
+                        .body = undefined,
+                    };
+                    dict_items[i * 2 + 1] = dict_value;
+                } else |err| switch (err) {
+                    error.VariableNotFound => {
+                        try interp.setResultFormatted("variable for initialization of static \"{f}\" not found in the local context", .{static_name});
+                        return error.VariableNotFound;
+                    },
+                    else => return err,
+                }
+            }
+
+            try object.dictReindex(statics_dict, null);
+
+            break :blk statics_dict;
+        } else {
+            break :blk null;
+        }
+    };
+
+    const new_arg_list = try object.listUninitializedNew(arg_list_len);
+    errdefer new_arg_list.release();
+
+    // We'll set this to a list if we encounter any optional values.
+    var optional_values: ?Handle = null;
+    errdefer if (optional_values) |val| val.release();
+    // Set to true if we find args.
+    var args_parameter_found = false;
+    // Keep track of how many arguments there are.
+    var required_arity: u32 = 0;
+    var optional_arity: u32 = 0;
+
+    // Now we'll make the new args list, validating as we go along.
+    for (0..arg_list_len) |i| {
+        if (args_parameter_found) {
+            try interp.setResultString("parameter after 'args' not allowed");
+            return error.ParameterAfterArgs;
+        }
+
+        var arg = try object.listItem(arg_list.*, @intCast(i)).borrow();
+        defer arg.release();
+        const arg_len = try interp.getListLength(&arg);
+
+        if (arg_len == 0) {
+            try interp.setResultString("argument with no name");
+            return error.ArgumentWithNoName;
+        } else if (arg_len > 2) {
+            try interp.setResultFormatted("too many fields in argument specifier \"{f}\"", .{arg});
+            return error.TooManyFieldsInArgument;
+        } else if (arg_len == 2) {
+            // Optional parameter.
+            if (optional_values == null) {
+                optional_values = try object.listNew(&.{});
+            }
+
+            const arg_name = try Heap.getString(object.listItem(arg, 0));
+            if (std.mem.eql(u8, arg_name, "args")) {
+                try interp.setResultString("'args' must be a required parameter");
+                return error.ArgsWasOptional;
+            }
+
+            const arg_str_duped = try Heap.duplicateObjString(Heap.local_heap, object.listItem(arg, 0));
+            errdefer arg_str_duped.deinit(Heap.local_heap);
+            // Append value to optional values.
+            _ = try interp.listAppend(&(optional_values.?), object.listItem(arg, 1));
+            // And put the variable name onto the new arg list.
+            object.listItem(new_arg_list, @intCast(i)).peek().* = .{
+                .str = arg_str_duped,
+                .tag = .none,
+                .body = undefined,
+            };
+
+            optional_arity += 1;
+        } else {
+            if (optional_values != null) {
+                // This breaks tcl behavior, but really, it shouldn't just silently convert required
+                // values to optional values.
+                try interp.setResultString("required parameter after optional parameter not allowed");
+                return error.RequiredParameterAfterOptionalParameter;
+            }
+
+            const arg_name = try Heap.getString(object.listItem(arg, 0));
+            if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
+
+            // Required parameter.
+            object.listItem(new_arg_list, @intCast(i)).peek().* = .{
+                .str = try Heap.duplicateObjString(Heap.local_heap, object.listItem(arg, 0)),
+                .tag = .none,
+                .body = undefined,
+            };
+
+            required_arity += 1;
+        }
+    }
+
+    return .{
+        .namespace = try namespace.borrow(),
+        .call_info = .{ .tcl = .{
+            .signature = .{
+                .args = new_arg_list,
+                .body = try body.borrow(),
+                .statics = statics,
+                .has_args_parameter = args_parameter_found,
+                .required_arity = required_arity,
+                .optional_arity = optional_arity,
+                .optional_values = optional_values,
+            },
+        } },
+    };
+}
+
+pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
+    const proc_name = try Heap.getString(args[1]);
+    const arg_list = &args[2];
+    const statics = if (args.len == 5) &args[3] else null;
+    const body = if (args.len == 5) &args[4] else &args[3];
+
+    const qualified = try Interp.qualifyName(interp.gpa, interp.namespace, proc_name);
+    defer if (qualified) |val| interp.gpa.free(val);
+    const qualified_name = qualified orelse proc_name;
+
+    const name_parts = namespaceSplit(qualified_name);
+
+    // The procedure's namespace may not be the same as the current namespace.
+    const proc_namespace = try object.newString(name_parts.namespace);
+    defer proc_namespace.release();
+
+    var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.EvalError,
+    };
+    errdefer command.deinit();
+    try interp.createCommand(try interp.gpa.dupe(u8, proc_name), command);
+}
 
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("+", .{ .to_call = add, .description = "?number ...?", .min_arity = 1, .max_arity = null, .multiple_of = null });
     try interp.registerCommand("*", .{ .to_call = mul, .description = "?number ...?", .min_arity = 1, .max_arity = null, .multiple_of = null });
+    try interp.registerCommand("proc", .{ .to_call = proc, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4, .multiple_of = null });
     try interp.registerCommand("puts", .{ .to_call = puts, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2, .multiple_of = null });
     try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2, .multiple_of = null });
 }
@@ -182,12 +330,8 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(
-        \\ puts hello
-        \\ incr x
-        \\ puts $x
-        \\ incr x
-        \\ puts [incr x]
-        \\ puts [+ 5 5 10 20.5]
+        \\ proc foo {x} { puts $x }
+        \\ foo 10
     );
     defer script.release();
     try interp.evalObject(&script);

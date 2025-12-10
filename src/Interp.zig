@@ -328,7 +328,7 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
 }
 
 /// Resolves to the variable's value. Must be called with a heap-native name.
-fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Handle) !Handle {
+pub fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Handle) !Handle {
     if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
     try interp.ensureValidVariableType(det, interp.currentCallFrameIndex(), name);
@@ -507,13 +507,14 @@ fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8
     return Error.CommandNotFound;
 }
 
-fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
-    const name_obj = try object.newString(name);
-    errdefer name_obj.release();
-
+/// Takes ownership of name.
+pub fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
     // TODO make sure to check interp->local if we end up needing it in our impl
-    const old_command = try interp.commands.fetchPut(interp.gpa, name_obj, command);
-    if (old_command) |unwrapped| unwrapped.value.deinit(interp.gpa);
+    const old_command = try interp.commands.fetchPut(interp.gpa, name, command);
+    if (old_command) |unwrapped| {
+        var old_command_mut = unwrapped.value;
+        old_command_mut.deinit();
+    }
 }
 
 pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.NativeCommand) !void {
@@ -877,13 +878,14 @@ fn interpolateTokens(
 }
 
 /// Qualifies a name to its canonical version. For example, a name of "bar", and a namespace
-/// of "foo" would return "foo::bar", allocated on the arena.
-fn qualifyName(arena: std.mem.Allocator, namespace: Handle, name: []const u8) !?[]const u8 {
+/// of "foo" would return "foo::bar". Allocated on the arena. Returns null if no qualification
+/// is needed.
+pub fn qualifyName(arena: std.mem.Allocator, namespace: ?Handle, name: []const u8) !?[]const u8 {
     // We're in a non-global namespace, so we'll need to append the namespace to the
     // beginning of the name, if the name isn't globally scoped (e.g. by not
     // having :: at the beginning).
     if (name.len < 2 or name[0] != ':' or name[1] != ':') {
-        const namespace_name = try Heap.getString(namespace);
+        const namespace_name = try Heap.getString(namespace orelse Heap.local_heap.emptyObject());
         return try std.fmt.allocPrint(arena, "{s}::{s}", .{ namespace_name, name });
     }
 
@@ -1262,6 +1264,17 @@ pub fn getFloat(interp: *Interp, handle: *Handle) !f64 {
     var det: object.ErrorDetails = undefined;
     try wrapErrorDetails(interp, &det, object.shimmerToFloat(&det, handle));
     return handle.peek().body.float;
+}
+
+pub fn getListLength(interp: *Interp, handle: *Handle) !u32 {
+    var det: object.ErrorDetails = undefined;
+    try wrapErrorDetails(interp, &det, object.shimmerToList(&det, handle));
+    return handle.peek().body.list.len;
+}
+
+pub fn listAppend(interp: *Interp, list: *Handle, item: Handle) !Handle {
+    var det: object.ErrorDetails = undefined;
+    return try wrapErrorDetails(interp, &det, object.listAppend(&det, list, item));
 }
 
 pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) !void {
