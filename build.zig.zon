@@ -1,5 +1,5 @@
 .{
-    .name = .zigtcl,
+    .name = .zicl,
     .version = "0.1.0",
     .dependencies = .{
         .uucode = .{
@@ -7,6 +7,6 @@
             .hash = "uucode-0.1.0-ZZjBPkl4QADrhxZQyGOogzo8jzwEdSkD35mIxW3Gcj0I",
         },
     },
-    .fingerprint = 0x708480192236e607,
+    .fingerprint = 0x68147a5ca7ab8cd9,
     .paths = .{""},
 }

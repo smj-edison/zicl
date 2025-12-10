@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
 
     // executable
     const exe = b.addExecutable(.{
-        .name = "zigtcl",
+        .name = "zicl",
         .root_module = root,
         .use_llvm = use_llvm,
     });
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
 
     // tests
     const tests = b.addTest(.{
-        .name = "zigtcl-test",
+        .name = "zicl-test",
         .filters = test_filters,
         .root_module = root,
     });
