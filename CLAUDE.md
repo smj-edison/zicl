@@ -62,7 +62,7 @@ zig build -Dtoken-debugging=true
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
-**Parser (src/Parser.zig)**: Tokenizes TCL scripts supporting:
+**Tokenizer (src/Tokenizer.zig)**: Tokenizes TCL scripts supporting:
 
 -   Variable substitution (`$var`, `${var}`)
 -   Command substitution (`[cmd]`)
@@ -114,7 +114,7 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
 Scripts go through several stages:
 
-1. **Tokenization** (Parser): Source → tokens with location info
+1. **Tokenization** (Tokenizer): Source → tokens with location info
 2. **Preprocessing** (parseScript in object.zig): Tokens → optimized script structure
     - Precomputes word boundaries and argument counts
     - Stores tokens as `.start_of_command` + arguments
@@ -176,7 +176,7 @@ const result = try someFn(heap, &det, arg);
 
 -   `src/Heap.zig`: Memory allocator and object storage (~2000 lines)
 -   `src/object.zig`: Object type system and operations (~1700 lines)
--   `src/Parser.zig`: TCL tokenizer (~900 lines)
+-   `src/Tokenizer.zig`: TCL tokenizer (~900 lines)
 -   `src/Interp.zig`: Interpreter and command execution (in progress, ~1000 lines)
 -   `src/stringutil.zig`: String utilities with optional UTF-8 support
 -   `src/memutil.zig`: Buddy allocator and memory primitives

@@ -1,4 +1,6 @@
-// This is cobbled together from Molt, Zig's tokenizer, and Jimtcl
+//! This struct is for tokenizing both script and expression tokens.
+
+// This is cobbled together from Molt, Zig's tokenizer, and Jimtcl.
 
 const std = @import("std");
 const isWhitespace = std.ascii.isWhitespace;
@@ -11,7 +13,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const stringutil = @import("stringutil.zig");
 const options = @import("options");
 
-const Parser = @This();
+const Tokenizer = @This();
 
 buffer: []const u8,
 index: u32,
@@ -80,11 +82,78 @@ pub const Token = struct {
         /// number of tokens to combine for this word (of type .integer)
         start_of_word,
 
-        // Used for expr parsing
+        // Used for expr parsing.
+        l_paren,
+        r_paren,
+        comma,
+
+        // Operators.
+        asterisk,
+        slash,
+        percent,
+        minus,
+        plus,
+        angle_bracket_left,
+        angle_bracket_right,
+        angle_bracket_left_equal,
+        angle_bracket_right_equal,
+        angle_bracket_angle_bracket_left,
+        angle_bracket_angle_bracket_right,
+        angle_bracket_angle_bracket_angle_bracket_left,
+        angle_bracket_angle_bracket_angle_bracket_right,
+        equal_equal,
+        not_equal,
+        ampersand,
+        caret,
+        pipe,
+        ampersand_ampersand,
+        pipe_pipe,
+        question_mark,
+        colon,
+        asterisk_asterisk,
+        keyword_eq,
+        keyword_ne,
+        equal_asterisk,
+        equal_tilde,
+        keyword_in,
+        keyword_ni,
+        keyword_lt,
+        keyword_gt,
+        keyword_le,
+        keyword_ge,
+        bang,
+        tilde,
+        space_minus,
+        space_plus,
+        function_int,
+        function_wide,
+        function_abs,
+        function_double,
+        function_rand,
+        function_srand,
+        function_sin,
+        function_cos,
+        function_tan,
+        function_asin,
+        function_acos,
+        function_atan,
+        function_atan2,
+        function_sinh,
+        function_cosh,
+        function_tanh,
+        function_ceil,
+        function_floor,
+        function_exp,
+        function_log,
+        function_log10,
+        function_sqrt,
+        function_pow,
+        function_hypot,
+        function_fmod,
     };
 };
 
-pub fn init(buffer: []const u8, line_no: u32) Parser {
+pub fn init(buffer: []const u8, line_no: u32) Tokenizer {
     return .{
         .buffer = buffer,
         .index = 0,
@@ -97,44 +166,44 @@ pub fn init(buffer: []const u8, line_no: u32) Parser {
     };
 }
 
-/// Parses a single token, or returns an appropriate error (details are
+/// Returns a single token for a script, or returns an appropriate error (details are
 /// included in `parser.error_details`
-pub fn parseScript(self: *Parser) Error!Token {
+pub fn nextScriptToken(self: *Tokenizer) Error!Token {
     const token: ?Token = blk: {
         while (!self.atEnd()) {
             switch (self.current()) {
                 '\\' => {
                     if (self.peek(1) == '\n' and !self.in_quote) {
                         // escaped newline, not in quotes = word separator
-                        break :blk self.parseSeparator();
+                        break :blk self.nextSeparatorToken();
                     } else {
                         // Else we're starting a string.
-                        break :blk try self.parseString();
+                        break :blk try self.nextStringToken();
                     }
                 },
                 '\t', 12, '\r', ' ' => {
                     if (self.in_quote) {
                         self.comment_possible = false;
-                        break :blk try self.parseString();
+                        break :blk try self.nextStringToken();
                     } else {
-                        break :blk self.parseSeparator();
+                        break :blk self.nextSeparatorToken();
                     }
                 },
                 '\n', ';' => {
                     if (self.in_quote) {
-                        break :blk try self.parseString();
+                        break :blk try self.nextStringToken();
                     } else {
                         self.comment_possible = true;
-                        break :blk self.parseEol();
+                        break :blk self.nextEolToken();
                     }
                 },
                 '[' => {
                     self.comment_possible = false;
-                    break :blk try self.parseCommand();
+                    break :blk try self.nextCommandToken();
                 },
                 '$' => {
                     self.comment_possible = false;
-                    break :blk self.parseVariable() catch |err| {
+                    break :blk self.nextVariableToken() catch |err| {
                         if (err == Error.NotVariable) {
                             // An orphan '$'. Create a token for it.
                             var token = self.newToken();
@@ -149,13 +218,13 @@ pub fn parseScript(self: *Parser) Error!Token {
                 },
                 '#' => {
                     if (self.comment_possible) {
-                        _ = try self.parseComment();
+                        _ = try self.nextCommentToken();
                     } else {
-                        break :blk try self.parseString();
+                        break :blk try self.nextStringToken();
                     }
                 },
                 else => {
-                    break :blk try self.parseString();
+                    break :blk try self.nextStringToken();
                 },
             }
         }
@@ -185,7 +254,7 @@ pub fn parseScript(self: *Parser) Error!Token {
     }
 }
 
-pub fn parseString(self: *Parser) !Token {
+pub fn nextStringToken(self: *Tokenizer) !Token {
     switch (self.last_token_type) {
         .none, .word_separator, .command_separator, .argument_expansion => {
             // This branch checks if we're at the start of a new word, or right after argument
@@ -201,7 +270,7 @@ pub fn parseString(self: *Parser) !Token {
             //
             // One more example, `{can have spaces}[separator]{nospaces this_is_a_new_word`.
             switch (self.current()) {
-                '{' => return self.parseBrace(),
+                '{' => return self.nextBracedStringToken(),
                 '"' => {
                     self.in_quote = true;
                     // Save where the opening quote is, so we can point to it
@@ -269,7 +338,7 @@ pub fn parseString(self: *Parser) !Token {
     }
 }
 
-pub fn parseQuote(self: *Parser) !Token {
+fn nextQuotedStringToken(self: *Tokenizer) !Token {
     // save for potential error message later if there's a missing close quote
     const index = self.index;
     const line_no = self.line_no;
@@ -296,7 +365,7 @@ pub fn parseQuote(self: *Parser) !Token {
             },
             '[' => {
                 // parseCommand will advance the index just past the end of the command
-                _ = try self.parseCommand();
+                _ = try self.nextCommandToken();
                 // skip advancing this time, because parseCommand already did that
                 continue;
             },
@@ -321,7 +390,7 @@ pub fn parseQuote(self: *Parser) !Token {
     return Error.MissingCloseQuote;
 }
 
-pub fn parseVariable(self: *Parser) !Token {
+pub fn nextVariableToken(self: *Tokenizer) !Token {
     const start = self.mark();
 
     // Skip the '$'
@@ -331,13 +400,6 @@ pub fn parseVariable(self: *Parser) !Token {
         // rewind our location
         self.restore(start);
         return Error.NotVariable;
-    }
-
-    if (options.bracket_expr_sugar and self.current() == '[') {
-        // Parse $[...] expr shorthand syntax
-        var command_token = try self.parseCommand();
-        command_token.tag = .expression_sugar;
-        return command_token;
     }
 
     var token = self.newToken();
@@ -429,9 +491,8 @@ pub fn parseVariable(self: *Parser) !Token {
                 self.advance(1);
             }
 
-            if (!options.bracket_expr_sugar and self.buffer[token.loc.start] == '(') {
-                // We can either have $[] for expression sugar, or $(). This branch
-                // is for the latter case (we handled the former earlier).
+            if (self.buffer[token.loc.start] == '(') {
+                // Expression sugar, e.g. $(expr)
                 token.tag = .expression_sugar;
             }
         }
@@ -450,7 +511,7 @@ pub fn parseVariable(self: *Parser) !Token {
     return token;
 }
 
-pub fn parseCommand(self: *Parser) Error!Token {
+pub fn nextCommandToken(self: *Tokenizer) Error!Token {
     // Save in case the bracket is not matched for better error message.
     const index = self.index;
     const line_no = self.line_no;
@@ -491,7 +552,7 @@ pub fn parseCommand(self: *Parser) Error!Token {
             '"' => {
                 if (start_of_word) {
                     // advance to just past where the quoted word ends
-                    _ = try self.parseQuote();
+                    _ = try self.nextQuotedStringToken();
                     continue;
                 }
             },
@@ -501,7 +562,7 @@ pub fn parseCommand(self: *Parser) Error!Token {
                 self.can_parse_arg_expansion = true;
 
                 // Advance to just past where the brace ends.
-                _ = try self.parseBrace();
+                _ = try self.nextBracedStringToken();
 
                 // ...and restore.
                 self.can_parse_arg_expansion = could_parse_arg_expansion;
@@ -526,7 +587,7 @@ pub fn parseCommand(self: *Parser) Error!Token {
     return Error.MissingCloseBracket;
 }
 
-pub fn parseBrace(self: *Parser) !Token {
+pub fn nextBracedStringToken(self: *Tokenizer) !Token {
     // Save the current line in case the braces are mismatched (so we can point
     // right to where the problem is)
     const index = self.index;
@@ -599,7 +660,7 @@ pub fn parseBrace(self: *Parser) !Token {
 }
 
 /// Parse the end of the line until the next command.
-pub fn parseEol(self: *Parser) Token {
+pub fn nextEolToken(self: *Tokenizer) Token {
     var token = self.newToken();
 
     while (!self.atEnd()) : (self.advance(1)) {
@@ -614,8 +675,8 @@ pub fn parseEol(self: *Parser) Token {
     return token;
 }
 
-/// Parses a word separator (spaces, tabs, etc). Accounts for newline escapes.
-pub fn parseSeparator(self: *Parser) Token {
+/// Tokenize a word separator (spaces, tabs, etc). Accounts for newline escapes.
+pub fn nextSeparatorToken(self: *Tokenizer) Token {
     var token = self.newToken();
 
     while (!self.atEnd()) : (self.advance(1)) {
@@ -638,7 +699,7 @@ pub fn parseSeparator(self: *Parser) Token {
     return token;
 }
 
-pub fn parseComment(self: *Parser) !void {
+pub fn nextCommentToken(self: *Tokenizer) !void {
     // Consume characters until \n (excluding escaping)
     while (!self.atEnd()) : (self.advance(1)) {
         switch (self.current()) {
@@ -655,7 +716,7 @@ pub fn parseComment(self: *Parser) !void {
     }
 }
 
-pub fn parseList(self: *Parser) !Token {
+pub fn nextListToken(self: *Tokenizer) !Token {
     // Lists are data, not code, so there is no argument expansion.
     self.can_parse_arg_expansion = false;
 
@@ -671,23 +732,23 @@ pub fn parseList(self: *Parser) !Token {
     }
 
     if (isWhitespace(self.current())) {
-        return self.parseListSeparator();
+        return self.nextListSeparatorToken();
     }
 
     switch (self.current()) {
         '"' => {
-            return self.parseListQuote();
+            return self.nextListQuoteToken();
         },
         '{' => {
-            return self.parseBrace();
+            return self.nextBracedStringToken();
         },
         else => {
-            return self.parseListString();
+            return self.nextListStringToken();
         },
     }
 }
 
-pub fn parseListSeparator(self: *Parser) Token {
+fn nextListSeparatorToken(self: *Tokenizer) Token {
     var token = self.newToken();
     token.tag = .word_separator;
 
@@ -699,7 +760,7 @@ pub fn parseListSeparator(self: *Parser) Token {
     return token;
 }
 
-pub fn parseListQuote(self: *Parser) Token {
+fn nextListQuoteToken(self: *Tokenizer) Token {
     self.advance(1); // skip quote
 
     var token = self.newToken();
@@ -730,7 +791,7 @@ pub fn parseListQuote(self: *Parser) Token {
     return token;
 }
 
-pub fn parseListString(self: *Parser) Token {
+pub fn nextListStringToken(self: *Tokenizer) Token {
     var token = self.newToken();
     token.tag = .simple_string;
 
@@ -754,8 +815,168 @@ pub fn parseListString(self: *Parser) Token {
     return token;
 }
 
+pub fn nextExpressionToken(self: *Tokenizer) !Token {
+    while (!self.atEnd()) : (self.advance(1)) {
+        // Discard comments and whitespace.
+        if (isWhitespace(self.current())) {
+            // Advance past this.
+        } else if (self.startsWith("\\\n")) {
+            // Skip escaped newline.
+            self.advance(1);
+        } else if (self.current() == '#') {
+            try self.nextCommentToken();
+        } else break;
+
+        // Keep going until we skip all the whitespace.
+    }
+
+    if (self.atEnd()) return .{
+        .tag = .end_of_file,
+        .loc = .{
+            .start = self.index,
+            .end = self.index,
+            .line_no = self.line_no,
+        },
+    };
+
+    switch (self.current()) {
+        '(' => return self.singleCharToken(.l_paren),
+        ')' => return self.singleCharToken(.r_paren),
+        ',' => return self.singleCharToken(.comma),
+        '[' => return self.nextCommandToken(),
+        '$' => {
+            if (self.nextVariableToken()) |val| {
+                if (val.tag == .dict_sugar) return error.DictSugarInExpression;
+                return val;
+            } else |err| switch (err) {
+                error.NotVariable => {
+                    return self.nextOperatorToken();
+                },
+                else => return err,
+            }
+        },
+        '0'...'9' => return self.nextNumberToken(),
+        '"' => return self.nextQuotedStringToken(),
+        '{' => return self.nextBracedStringToken(),
+        // May be the start of NaN, inf, or no.
+        'N', 'n', 'I', 'i' => {
+            if (self.nextIrrationalFloatToken()) |val| {
+                return val;
+            } else |err| switch (err) {
+                error.NotIrrational => {
+                    // Might be "no"
+                    if (self.nextBooleanToken()) |val| {
+                        return val;
+                    } else |inner_err| switch (inner_err) {
+                        error.NotBoolean => return self.nextOperatorToken(),
+                    }
+                },
+            }
+        },
+        // true, false, on, off, yes (not no, as that's handled by the previous branch).
+        't', 'f', 'o', 'y' => {
+            if (self.nextBooleanToken()) |val| {
+                return val;
+            } else |err| switch (err) {
+                error.NotBoolean => return self.nextOperatorToken(),
+            }
+        },
+        else => return self.nextOperatorToken(),
+    }
+}
+
+const OperatorEntry = struct { [:0]const u8, Token.Tag };
+const operator_to_token_mapping = [_]OperatorEntry{
+    .{ "*", Token.Tag.asterisk },
+    .{ "/", Token.Tag.slash },
+    .{ "%", Token.Tag.percent },
+    .{ "-", Token.Tag.minus },
+    .{ "+", Token.Tag.plus },
+    .{ "<", Token.Tag.angle_bracket_left },
+    .{ ">", Token.Tag.angle_bracket_right },
+    .{ "<=", Token.Tag.angle_bracket_left_equal },
+    .{ ">=", Token.Tag.angle_bracket_right_equal },
+    .{ "<<", Token.Tag.angle_bracket_angle_bracket_left },
+    .{ ">>", Token.Tag.angle_bracket_angle_bracket_right },
+    .{ "<<<", Token.Tag.angle_bracket_angle_bracket_angle_bracket_left },
+    .{ ">>>", Token.Tag.angle_bracket_angle_bracket_angle_bracket_right },
+    .{ "==", Token.Tag.equal_equal },
+    .{ "!=", Token.Tag.not_equal },
+    .{ "&", Token.Tag.ampersand },
+    .{ "^", Token.Tag.caret },
+    .{ "|", Token.Tag.pipe },
+    .{ "&&", Token.Tag.ampersand_ampersand },
+    .{ "||", Token.Tag.pipe_pipe },
+    .{ "?", Token.Tag.question_mark },
+    .{ ":", Token.Tag.colon },
+    .{ "**", Token.Tag.asterisk_asterisk },
+    .{ "eq", Token.Tag.keyword_eq },
+    .{ "ne", Token.Tag.keyword_ne },
+    .{ "=*", Token.Tag.equal_asterisk },
+    .{ "=~", Token.Tag.equal_tilde },
+    .{ "in", Token.Tag.keyword_in },
+    .{ "ni", Token.Tag.keyword_ni },
+    .{ "lt", Token.Tag.keyword_lt },
+    .{ "gt", Token.Tag.keyword_gt },
+    .{ "le", Token.Tag.keyword_le },
+    .{ "ge", Token.Tag.keyword_ge },
+    .{ "!", Token.Tag.bang },
+    .{ "~", Token.Tag.tilde },
+    .{ " -", Token.Tag.space_minus },
+    .{ " +", Token.Tag.space_plus },
+    .{ "int", Token.Tag.function_int },
+    .{ "wide", Token.Tag.function_wide },
+    .{ "abs", Token.Tag.function_abs },
+    .{ "double", Token.Tag.function_double },
+    .{ "rand", Token.Tag.function_rand },
+    .{ "srand", Token.Tag.function_srand },
+    .{ "sin", Token.Tag.function_sin },
+    .{ "cos", Token.Tag.function_cos },
+    .{ "tan", Token.Tag.function_tan },
+    .{ "asin", Token.Tag.function_asin },
+    .{ "acos", Token.Tag.function_acos },
+    .{ "atan", Token.Tag.function_atan },
+    .{ "atan2", Token.Tag.function_atan2 },
+    .{ "sinh", Token.Tag.function_sinh },
+    .{ "cosh", Token.Tag.function_cosh },
+    .{ "tanh", Token.Tag.function_tanh },
+    .{ "ceil", Token.Tag.function_ceil },
+    .{ "floor", Token.Tag.function_floor },
+    .{ "exp", Token.Tag.function_exp },
+    .{ "log", Token.Tag.function_log },
+    .{ "log10", Token.Tag.function_log10 },
+    .{ "sqrt", Token.Tag.function_sqrt },
+    .{ "pow", Token.Tag.function_pow },
+    .{ "hypot", Token.Tag.function_hypot },
+    .{ "fmod", Token.Tag.function_fmod },
+};
+/// These need to be sorted by longest string first, because otherwise
+/// we might match "*" instead of matching "**" in `nextOperatorToken()`.
+const sorted_operator_to_token_mapping = blk: {
+    var mapping = operator_to_token_mapping;
+    @setEvalBranchQuota(100_000);
+    std.mem.sort(OperatorEntry, &mapping, void, struct {
+        fn lessThan(_: type, lhs: OperatorEntry, rhs: OperatorEntry) bool {
+            return lhs.@"0".len > rhs.@"0".len;
+        }
+    }.lessThan);
+
+    break :blk mapping;
+};
+
+pub fn nextOperatorToken(self: *Tokenizer) !Token {
+    inline for (sorted_operator_to_token_mapping) |mapping| {
+        const value = mapping.@"0";
+        const tag = mapping.@"1";
+
+        if (self.startsWith(value)) return tag;
+    }
+
+    return error.NotOperator;
+}
+
 /// Initializes `.start`. Caller must initialize all other fields.
-pub fn newToken(self: *Parser) Token {
+fn newToken(self: *Tokenizer) Token {
     return .{
         .tag = undefined,
         .loc = .{
@@ -766,7 +987,18 @@ pub fn newToken(self: *Parser) Token {
     };
 }
 
-pub fn errorIfAtEndAfterBackslash(self: *Parser) !void {
+fn singleCharToken(self: *Tokenizer, tag: Token.Tag) Token {
+    return .{
+        .tag = tag,
+        .loc = .{
+            .start = self.index,
+            .line_no = self.line_no,
+            .end = self.index + 1,
+        },
+    };
+}
+
+fn errorIfAtEndAfterBackslash(self: *Tokenizer) !void {
     if (self.atEnd()) {
         self.error_details = .{
             .index = self.index,
@@ -785,7 +1017,7 @@ const Mark = struct {
     can_parse_arg_expansion: bool,
 };
 
-pub fn mark(self: *Parser) Mark {
+fn mark(self: *Tokenizer) Mark {
     return .{
         .index = self.index,
         .line_no = self.line_no,
@@ -796,7 +1028,7 @@ pub fn mark(self: *Parser) Mark {
     };
 }
 
-pub fn restore(self: *Parser, to_restore: Mark) void {
+fn restore(self: *Tokenizer, to_restore: Mark) void {
     self.index = to_restore.index;
     self.line_no = to_restore.line_no;
     self.in_quote = to_restore.in_quote;
@@ -805,11 +1037,11 @@ pub fn restore(self: *Parser, to_restore: Mark) void {
     self.can_parse_arg_expansion = to_restore.can_parse_arg_expansion;
 }
 
-pub fn current(self: *Parser) u8 {
+fn current(self: *Tokenizer) u8 {
     return self.buffer[self.index];
 }
 
-pub fn peek(self: *Parser, ahead_by: usize) ?u8 {
+fn peek(self: *Tokenizer, ahead_by: usize) ?u8 {
     if (self.index + ahead_by < self.buffer.len) {
         return self.buffer[self.index + ahead_by];
     } else {
@@ -817,7 +1049,7 @@ pub fn peek(self: *Parser, ahead_by: usize) ?u8 {
     }
 }
 
-pub fn advance(self: *Parser, count: usize) void {
+fn advance(self: *Tokenizer, count: usize) void {
     for (0..count) |_| {
         if (self.buffer[self.index] == '\n') {
             self.line_no += 1;
@@ -829,7 +1061,7 @@ pub fn advance(self: *Parser, count: usize) void {
 
 /// Checks if the next characters match `str`. Returns false if there are not enough
 /// remaining characters.
-pub fn startsWith(self: *Parser, str: []const u8) bool {
+fn startsWith(self: *Tokenizer, str: []const u8) bool {
     if (self.buffer.len - self.index >= str.len) {
         return std.mem.eql(u8, self.buffer[self.index .. self.index + str.len], str);
     } else {
@@ -837,18 +1069,19 @@ pub fn startsWith(self: *Parser, str: []const u8) bool {
     }
 }
 
-pub fn atEnd(self: *Parser) bool {
+fn atEnd(self: *Tokenizer) bool {
     return self.index == self.buffer.len;
 }
 
 test "parser" {
+    std.debug.print("{}\n", .{sorted_operator_to_token_mapping[0]});
     const script =
         \\set x 5
         \\set y {a b c}
         \\set $i $x$y [foo]BAR
     ;
 
-    var parser = Parser.init(script, 1);
+    var parser = Tokenizer.init(script, 1);
 
     try testNextToken(&parser, .simple_string, "set");
     try testNextToken(&parser, .word_separator, " ");
@@ -877,29 +1110,29 @@ test "parser" {
     try testNextToken(&parser, .end_of_file, "");
 
     const broken = "set x {good}bad";
-    parser = Parser.init(broken, 1);
+    parser = Tokenizer.init(broken, 1);
 
     try testNextToken(&parser, .simple_string, "set");
     try testNextToken(&parser, .word_separator, " ");
     try testNextToken(&parser, .simple_string, "x");
     try testNextToken(&parser, .word_separator, " ");
-    try testing.expectError(error.CharactersAfterCloseBrace, parser.parseScript());
+    try testing.expectError(error.CharactersAfterCloseBrace, parser.nextScriptToken());
 
     const argument_expansion = "{*}$value";
-    parser = Parser.init(argument_expansion, 1);
+    parser = Tokenizer.init(argument_expansion, 1);
 
     try testNextToken(&parser, .argument_expansion, "*");
     try testNextToken(&parser, .variable_subst, "value");
 
     const double_asterisks = "{*}{*}";
-    parser = Parser.init(double_asterisks, 1);
+    parser = Tokenizer.init(double_asterisks, 1);
 
     try testNextToken(&parser, .argument_expansion, "*");
     try testNextToken(&parser, .simple_string, "*");
 }
 
-fn testNextToken(parser: *Parser, expected_type: Token.Tag, expected_value: []const u8) !void {
-    const next = parser.parseScript() catch |err| {
+fn testNextToken(parser: *Tokenizer, expected_type: Token.Tag, expected_value: []const u8) !void {
+    const next = parser.nextScriptToken() catch |err| {
         std.debug.print("Error caught when parsing: {}", .{err});
         return error.TestUnexpectedResult;
     };

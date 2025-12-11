@@ -7,7 +7,7 @@ const options = @import("options");
 const stringutil = @import("./stringutil.zig");
 const memutil = @import("./memutil.zig");
 const Heap = @import("./Heap.zig");
-const Parser = @import("./Parser.zig");
+const Tokenizer = @import("./Tokenizer.zig");
 const Handle = Heap.Handle;
 
 pub const Error = std.mem.Allocator.Error || error{
@@ -722,7 +722,7 @@ test "string is" {
     try testing.checkAllAllocationFailures(testing.allocator, testStringIs, .{});
 }
 
-pub fn convertParserError(err: Parser.Error) error{OutOfMemory}!ErrorDetails {
+pub fn convertTokenizerError(err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
     switch (err) {
         error.CharactersAfterCloseBrace => {
             return .{ .message = try newString("extra characters after close-brace") };
@@ -818,16 +818,16 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
         defer if (file_name) |unwrapped| unwrapped.release();
 
         const str = try Heap.getString(handle.*);
-        var parser = Parser.init(str, line_no);
+        var parser = Tokenizer.init(str, line_no);
 
         // Figure out how many tokens there are, so we can create the correct list size
         // in the heap.
-        var tokens: std.ArrayList(Parser.Token) = .empty;
+        var tokens: std.ArrayList(Tokenizer.Token) = .empty;
         defer tokens.deinit(Heap.local_heap.gpa);
 
         while (true) {
-            const next_token = parser.parseList() catch |err| {
-                if (det) |details| details.* = try convertParserError(err);
+            const next_token = parser.nextListToken() catch |err| {
+                if (det) |details| details.* = try convertTokenizerError(err);
                 return err;
             };
             switch (next_token.tag) {
@@ -1615,12 +1615,12 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Parse all the tokens of the script, handling any errors that come up.
 
     const bytes = try Heap.getString(handle);
-    var parser = Parser.init(bytes, source_info.line_no);
+    var parser = Tokenizer.init(bytes, source_info.line_no);
 
     std.debug.print("parsing: {s}\n", .{bytes});
 
     // Set up tokens list (to be added to).
-    var tokens = try std.ArrayList(Parser.Token).initCapacity(Heap.local_heap.gpa, bytes.len / 8);
+    var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.local_heap.gpa, bytes.len / 8);
     defer tokens.deinit(Heap.local_heap.gpa);
 
     // Used to ignore the first token if it's .command_separator (effectively
@@ -1628,7 +1628,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var is_trimming = true;
     // Add all tokens to the list, handling any errors that may come up.
     while (true) {
-        const next_token = parser.parseScript();
+        const next_token = parser.nextScriptToken();
         if (next_token) |token| {
             switch (token.tag) {
                 .command_separator, .word_separator => {
@@ -1645,7 +1645,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             }
         } else |err| {
             if (det) |details| {
-                details.* = try convertParserError(err);
+                details.* = try convertTokenizerError(err);
                 if (parser.error_details) |parser_details| {
                     details.index = parser_details.index;
                 }
@@ -1676,7 +1676,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Set length to 0 so we can just call listAppend().
     _ = try setCollectionLength(&new_token_values, 0);
 
-    var new_token_tags = try std.ArrayList(Parser.Token.Tag).initCapacity(Heap.local_heap.gpa, new_token_capacity);
+    var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.local_heap.gpa, new_token_capacity);
     errdefer new_token_tags.deinit(Heap.local_heap.gpa);
 
     // Be sure to append the first .script_command token.
@@ -1930,7 +1930,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
 
         const parsed_script = try getScript(heap, null, &old_script);
         const script1_id = old_script.peek().body.script.id;
-        try testing.expectEqualSlices(Parser.Token.Tag, &[_]Parser.Token.Tag{
+        try testing.expectEqualSlices(Tokenizer.Token.Tag, &[_]Tokenizer.Token.Tag{
             .start_of_command,
             .simple_string,
             .simple_string,
@@ -1961,7 +1961,7 @@ test "script shimmering" {
     try testing.checkAllAllocationFailures(testing.allocator, testScriptShimmering, .{});
 }
 
-fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Parser.Token.Tag, value: []const u8) !void {
+fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer.Token.Tag, value: []const u8) !void {
     try testing.expectEqual(tag, script.tags.items[index]);
     try testing.expectEqualStrings(value, try Heap.getString(listItem(script.values, index)));
 }

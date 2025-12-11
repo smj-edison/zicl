@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-const Parser = @import("Parser.zig");
+const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const object = @import("object.zig");
@@ -752,7 +752,7 @@ fn popEvalFrame(interp: *Interp) void {
 }
 
 /// Caller should release return value when they're done.
-fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Handle) !Handle {
+fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) !Handle {
     switch (tag) {
         .simple_string => {
             return try value.borrow();
@@ -801,7 +801,7 @@ fn substituteOneToken(interp: *Interp, tag: Parser.Token.Tag, value: Handle) !Ha
 
 fn interpolateTokens(
     interp: *Interp,
-    tags: []const Parser.Token.Tag,
+    tags: []const Tokenizer.Token.Tag,
     value_list: Handle,
     value_start: u32,
     value_len: u32,
@@ -1074,7 +1074,7 @@ fn invokeCommand(interp: *Interp, args: []Handle) !void {
     }
 }
 
-pub fn evalObject(interp: *Interp, script: *Handle) (Error || Parser.Error)!void {
+pub fn evalObject(interp: *Interp, script: *Handle) (Error || Tokenizer.Error)!void {
     // If the object is of type "list", with no string rep we can call a specialized version of eval().
     if (script.peek().tag == .list and script.hasString()) {
         return interp.evalList(script);

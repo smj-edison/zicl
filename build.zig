@@ -7,9 +7,6 @@ pub fn build(b: *std.Build) void {
     // options
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
     const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse false;
-    const bracket_expr_sugar = b.option(bool, "bracket-expr-sugar",
-        \\Expression sugar with brackets instead of with parenthesis (e.g. $[5 + 5] instead of $(5 + 5))
-    ) orelse false;
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -19,7 +16,6 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(bool, "use_utf8", use_utf8);
-    options.addOption(bool, "bracket_expr_sugar", bracket_expr_sugar);
     options.addOption(bool, "token_debugging", token_debugging);
 
     const options_mod = options.createModule();

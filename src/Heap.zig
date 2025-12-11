@@ -9,7 +9,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
-const Parser = @import("Parser.zig");
+const Tokenizer = @import("Tokenizer.zig");
 const object = @import("object.zig");
 const Interp = @import("Interp.zig");
 
@@ -173,7 +173,7 @@ pub const ScriptMetadata = packed struct(ScriptMetadata.get_full_size()) {
 };
 
 /// This is the script object internal representation. It is an array
-/// of Parser.Tokens alongside a heap-stored list for all tokens' values.
+/// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
 ///
 /// For example the script:
 ///
@@ -248,7 +248,7 @@ pub const ParsedScript = struct {
     /// the same as the stack.
     values: Handle,
     /// Tokens array.
-    tags: std.ArrayList(Parser.Token.Tag),
+    tags: std.ArrayList(Tokenizer.Token.Tag),
     /// File name.
     file_name_obj: ?Handle,
     /// Line number of the first line.

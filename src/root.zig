@@ -1,6 +1,6 @@
 const std = @import("std");
 const zicl = @import("zicl.zig");
-const Parser = @import("Parser.zig");
+const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const stringutil = @import("stringutil.zig");
 
@@ -24,7 +24,7 @@ fn panicAndPrintTraces(msg: []const u8, first_trace_addr: ?usize) noreturn {
 test {
     // @import("std").testing.refAllDecls(@This());
     _ = @import("stringutil.zig");
-    _ = @import("Parser.zig");
+    _ = @import("Tokenizer.zig");
     _ = @import("object.zig");
     _ = @import("Heap.zig");
     _ = @import("Interp.zig");
