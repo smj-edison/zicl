@@ -82,14 +82,20 @@ pub const Token = struct {
         /// number of tokens to combine for this word (of type .integer)
         start_of_word,
 
-        // Used for expr parsing.
+        // Used for expression tokenizing.
         l_paren,
         r_paren,
         comma,
 
-        // Operators.
+        // Values.
+        integer,
+        float,
+        keyword_true,
+        keyword_false,
+
+        // Expression operators.
         asterisk,
-        slash,
+        forward_slash,
         percent,
         minus,
         plus,
@@ -113,8 +119,6 @@ pub const Token = struct {
         asterisk_asterisk,
         keyword_eq,
         keyword_ne,
-        equal_asterisk,
-        equal_tilde,
         keyword_in,
         keyword_ni,
         keyword_lt,
@@ -123,8 +127,6 @@ pub const Token = struct {
         keyword_ge,
         bang,
         tilde,
-        space_minus,
-        space_plus,
         function_int,
         function_wide,
         function_abs,
@@ -151,6 +153,11 @@ pub const Token = struct {
         function_hypot,
         function_fmod,
     };
+};
+
+pub const boolean_mapping = .{
+    .{ "1", true },  .{ "true", true },   .{ "yes", true }, .{ "on", true },
+    .{ "0", false }, .{ "false", false }, .{ "no", false }, .{ "off", false },
 };
 
 pub fn init(buffer: []const u8, line_no: u32) Tokenizer {
@@ -816,6 +823,9 @@ pub fn nextListStringToken(self: *Tokenizer) Token {
 }
 
 pub fn nextExpressionToken(self: *Tokenizer) !Token {
+    // Argument expansion doesn't exist in expressions.
+    self.can_parse_arg_expansion = false;
+
     while (!self.atEnd()) : (self.advance(1)) {
         // Discard comments and whitespace.
         if (isWhitespace(self.current())) {
@@ -858,12 +868,12 @@ pub fn nextExpressionToken(self: *Tokenizer) !Token {
         '0'...'9' => return self.nextNumberToken(),
         '"' => return self.nextQuotedStringToken(),
         '{' => return self.nextBracedStringToken(),
-        // May be the start of NaN, inf, or no.
+        // May be the start of "NaN", "inf", or "no".
         'N', 'n', 'I', 'i' => {
             if (self.nextIrrationalFloatToken()) |val| {
                 return val;
             } else |err| switch (err) {
-                error.NotIrrational => {
+                error.NotIrrationalFloat => {
                     // Might be "no"
                     if (self.nextBooleanToken()) |val| {
                         return val;
@@ -888,7 +898,7 @@ pub fn nextExpressionToken(self: *Tokenizer) !Token {
 const OperatorEntry = struct { [:0]const u8, Token.Tag };
 const operator_to_token_mapping = [_]OperatorEntry{
     .{ "*", Token.Tag.asterisk },
-    .{ "/", Token.Tag.slash },
+    .{ "/", Token.Tag.forward_slash },
     .{ "%", Token.Tag.percent },
     .{ "-", Token.Tag.minus },
     .{ "+", Token.Tag.plus },
@@ -912,8 +922,6 @@ const operator_to_token_mapping = [_]OperatorEntry{
     .{ "**", Token.Tag.asterisk_asterisk },
     .{ "eq", Token.Tag.keyword_eq },
     .{ "ne", Token.Tag.keyword_ne },
-    .{ "=*", Token.Tag.equal_asterisk },
-    .{ "=~", Token.Tag.equal_tilde },
     .{ "in", Token.Tag.keyword_in },
     .{ "ni", Token.Tag.keyword_ni },
     .{ "lt", Token.Tag.keyword_lt },
@@ -922,8 +930,6 @@ const operator_to_token_mapping = [_]OperatorEntry{
     .{ "ge", Token.Tag.keyword_ge },
     .{ "!", Token.Tag.bang },
     .{ "~", Token.Tag.tilde },
-    .{ " -", Token.Tag.space_minus },
-    .{ " +", Token.Tag.space_plus },
     .{ "int", Token.Tag.function_int },
     .{ "wide", Token.Tag.function_wide },
     .{ "abs", Token.Tag.function_abs },
@@ -965,14 +971,97 @@ const sorted_operator_to_token_mapping = blk: {
 };
 
 pub fn nextOperatorToken(self: *Tokenizer) !Token {
-    inline for (sorted_operator_to_token_mapping) |mapping| {
-        const value = mapping.@"0";
-        const tag = mapping.@"1";
+    var token = self.newToken();
 
-        if (self.startsWith(value)) return tag;
+    inline for (sorted_operator_to_token_mapping) |mapping| {
+        const str_value = mapping.@"0";
+        const tag = mapping.@"1";
+        const tag_name = @tagName(tag);
+
+        // Does the parser start with the token we're checking?
+        if (self.startsWith(str_value)) {
+            if (tag_name.len > 9 and std.mem.eql(u8, tag_name[0..9], "function_")) {
+                // This is a function token, so we need to make sure that it has
+                // an opening paren before anything else.
+                while (!self.atEnd() and isWhitespace(self.current())) self.advance(1);
+
+                if (self.atEnd() or self.current() != '(') return error.FunctionMissingParentheses;
+            }
+
+            // We should now be pointing to just after the opening parenthesis.
+            token.tag = tag;
+            token.loc.end = self.index;
+
+            return token;
+        }
     }
 
     return error.NotOperator;
+}
+
+pub fn nextIrrationalFloatToken(self: *Tokenizer) !Token {
+    inline for (.{ "NaN", "nan", "NAN", "Inf", "inf", "INF" }) |irrational| {
+        if (self.startsWith(irrational)) {
+            self.advance(3);
+
+            var token = self.newToken();
+            token.tag = .float;
+            token.loc.end = self.index;
+            return token;
+        }
+    }
+
+    return error.NotIrrationalFloat;
+}
+
+pub fn nextBooleanToken(self: *Tokenizer) !Token {
+    inline for (boolean_mapping) |mapping| {
+        const str_value = mapping.@"0";
+        const bool_value = mapping.@"1";
+
+        if (self.startsWith(str_value)) {
+            self.advance(str_value.len);
+
+            var token = self.newToken();
+            token.tag = if (bool_value) .keyword_true else .keyword_false;
+            token.loc.end = self.index;
+            return token;
+        }
+    }
+
+    return error.NotBoolean;
+}
+
+pub fn nextNumberToken(self: *Tokenizer) !Token {
+    var token = self.newToken();
+    // Start by assuming it's an integer.
+    token.tag = .integer;
+
+    while (!self.atEnd()) : (self.advance(1)) {
+        switch (self.current()) {
+            '0'...'9' => {},
+            // "1e5", "nan", "infinity", "1.5", etc
+            'e', 'E', 'n', 'N', 'i', 'I', '.' => {
+                token.tag = .float;
+            },
+            else => break,
+        }
+    }
+
+    // Make sure it's a valid integer.
+    if (std.fmt.parseInt(i64, self.buffer[token.loc.start..self.index])) |_| {
+        token.loc.end = self.index;
+        return token;
+    } else if (std.fmt.parseFloat(f64, self.buffer[token.loc.start..self.index])) |_| {
+        token.loc.end = self.index;
+        return token;
+    } else |_| {
+        self.error_details = .{
+            .index = token.loc.start,
+            .line_no = token.loc.line_no,
+        };
+        return error.NotNumber;
+    }
 }
 
 /// Initializes `.start`. Caller must initialize all other fields.
@@ -1074,7 +1163,6 @@ fn atEnd(self: *Tokenizer) bool {
 }
 
 test "parser" {
-    std.debug.print("{}\n", .{sorted_operator_to_token_mapping[0]});
     const script =
         \\set x 5
         \\set y {a b c}

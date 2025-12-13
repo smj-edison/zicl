@@ -34,10 +34,12 @@ pub fn shimmerToString(handle: *Handle) !void {
 
     try Heap.prepareToShimmer(handle);
     obj.tag = .string;
-    obj.body.string = .{
-        .utf8_length = 0,
-        // Don't know the utf-8 length yet.
-        .length_determined = false,
+    obj.body = .{
+        .string = .{
+            .utf8_length = 0,
+            // Don't know the utf-8 length yet.
+            .length_determined = false,
+        },
     };
 }
 
@@ -73,8 +75,8 @@ pub fn getCodepointLength(handle: *Handle) !usize {
 }
 
 /// Copies provided string.
-pub fn newString(bytes: []const u8) !Handle {
-    var handle = try Heap.local_heap.createObject();
+pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
+    var handle = try heap.createObject();
     errdefer handle.release();
 
     try Heap.setString(handle, bytes);
@@ -82,23 +84,23 @@ pub fn newString(bytes: []const u8) !Handle {
     return handle;
 }
 
-pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
+pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
     const new_count = std.fmt.count(fmt, args);
-    const str = try newStringToFill(new_count);
+    const str = try newStringToFill(heap, new_count);
     const written = std.fmt.bufPrint(Heap.getStringMut(str) catch unreachable, fmt, args) catch return error.OutOfMemory;
     assert(written.len == new_count);
 
     return str;
 }
 
-pub fn newStringToFill(len: usize) !Handle {
-    const handle = try Heap.local_heap.createObject();
+pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
+    const handle = try heap.createObject();
     errdefer handle.release();
 
     if (len < Heap.LongString.split_point) {
-        const new_str = try Heap.local_heap.createString(@intCast(len));
+        const new_str = try heap.createString(@intCast(len));
         const new_str_end = new_str + @as(u32, @intCast(len));
-        @memset(Heap.local_heap.getHeapString(new_str, new_str_end), 0);
+        @memset(heap.getHeapString(new_str, new_str_end), 0);
 
         // New object, so we can set directly
         handle.peek().str = .{
@@ -109,10 +111,10 @@ pub fn newStringToFill(len: usize) !Handle {
         };
     } else {
         // create new string
-        const new_str = try Heap.local_heap.gpa.allocSentinel(u8, len, 0);
-        errdefer Heap.local_heap.gpa.free(new_str);
+        const new_str = try heap.gpa.allocSentinel(u8, len, 0);
+        errdefer heap.gpa.free(new_str);
         @memset(new_str, 0);
-        const did_take = try Heap.local_heap.setLongString(handle.index, .{ .normal = new_str });
+        const did_take = try heap.setLongString(handle.index, .{ .normal = new_str });
         assert(did_take);
     }
 
@@ -120,8 +122,8 @@ pub fn newStringToFill(len: usize) !Handle {
 }
 
 /// Copies provided string.
-pub fn newStringWithCodepointLen(bytes: [:0]const u8, cp_length: usize) !Handle {
-    const handle = try Heap.local_heap.createObject();
+pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: usize) !Handle {
+    const handle = try heap.createObject();
     Heap.setString(handle, bytes);
     shimmerToString(handle);
 
@@ -148,16 +150,16 @@ pub fn newStringWithCodepointLen(bytes: [:0]const u8, cp_length: usize) !Handle 
     return handle;
 }
 
-pub fn setStringFromEscaped(scratch: std.mem.Allocator, handle: Handle, escaped: []const u8) !void {
+pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
     // Unescaped must be equal or shorter than escaped version
-    const unescaped = try scratch.allocSentinel(u8, escaped.len, 0);
-    errdefer scratch.free(unescaped);
+    const unescaped = try handle.getHeap().gpa.allocSentinel(u8, escaped.len, 0);
+    errdefer handle.getHeap().gpa.free(unescaped);
     const written = stringutil.removeEscaping(escaped, unescaped);
     unescaped[written] = 0; // null terminator
 
     const did_set = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
     if (did_set) {
-        scratch.free(unescaped);
+        handle.getHeap().gpa.free(unescaped);
     } else {
         // Too large for normal string, so we'll try setting as a long string.
         const did_take = try handle.getHeap().setLongString(
@@ -167,7 +169,7 @@ pub fn setStringFromEscaped(scratch: std.mem.Allocator, handle: Handle, escaped:
                 .original_capacity = unescaped.len,
             } },
         );
-        if (!did_take) scratch.free(unescaped);
+        if (!did_take) handle.getHeap().gpa.free(unescaped);
     }
 }
 
@@ -186,8 +188,8 @@ pub fn compare(a: Handle, b: Handle, case_insensitive: bool) !std.math.Order {
 }
 
 // Integer related functions
-pub fn integerNew(value: i64) !Handle {
-    const handle = try Heap.local_heap.createObject();
+pub fn newInteger(heap: *Heap, value: i64) !Handle {
+    const handle = try heap.createObject();
     handle.peek().tag = .integer;
     handle.peek().body.integer = value;
     return handle;
@@ -226,7 +228,7 @@ pub fn shimmerToInteger(det: ?*ErrorDetails, handle: *Handle) !void {
 }
 
 // Float related functions.
-pub fn floatNew(value: f64) !Handle {
+pub fn newFloat(value: f64) !Handle {
     const handle = try Heap.local_heap.createObject();
     handle.peek().tag = .float;
     handle.peek().body.float = value;
@@ -1548,8 +1550,8 @@ pub fn setSourceInfo(handle: *Handle, source_info: SourceInfo) !void {
     ref.tag = .source;
     ref.body.source.line_no = source_info.line_no;
 
-    if (source_info.file_name) |unwrapped| {
-        var same_heap_file_name = unwrapped;
+    if (source_info.file_name) |file_name| {
+        var same_heap_file_name = file_name;
 
         if (same_heap_file_name.heap != handle.heap) {
             same_heap_file_name = try Heap.local_heap.duplicate(same_heap_file_name);
@@ -1967,10 +1969,7 @@ fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer
 }
 
 pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
-    const Mapping = std.StaticStringMap(bool).initComptime(.{
-        .{ "1", true },  .{ "true", true },   .{ "yes", true }, .{ "on", true },
-        .{ "0", false }, .{ "false", false }, .{ "no", false }, .{ "off", false },
-    });
+    const Mapping = std.StaticStringMap(bool).initComptime(Tokenizer.boolean_mapping);
 
     const bytes = try Heap.getString(handle.*);
     const new_value = Mapping.get(bytes) orelse {
