@@ -1210,14 +1210,14 @@ pub fn dictUninitializedNew(len: u32) !Handle {
 }
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
-pub fn dictNew(handles: []const Handle) !Handle {
+pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
     const dict = try dictUninitializedNew(@intCast(handles.len));
     errdefer dict.release();
 
     const new_items = dictItems(dict);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try Heap.duplicateOrReference(Heap.local_heap, handle);
+        item.* = try Heap.duplicateOrReference(heap, handle);
     }
 
     try dictReindex(dict, null);
@@ -1463,7 +1463,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const value2 = try newString(heap, "2");
     defer value2.release();
 
-    const dict1 = try dictNew(heap, &.{ key1, value1, key2, value2 });
+    const dict1 = try newDict(heap, &.{ key1, value1, key2, value2 });
     defer dict1.release();
 
     const good_key = try newString(heap, "foo");
@@ -1477,7 +1477,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Dict with duplicate entries testing.
     var dict_with_duplicates = try newString(heap, "foo 5 bar 10 foo 15");
     defer dict_with_duplicates.release();
-    const dup_len = try dictPairLength(heap, null, &dict_with_duplicates);
+    const dup_len = try dictPairLength(null, &dict_with_duplicates);
 
     try testing.expectEqual(3, dup_len);
     // When a duplicate key is queried, it should point to the last corrisponding value.
@@ -1487,7 +1487,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
 
     // Dict put testing.
-    var dict_for_put = try dictNew(heap, &.{ key1, value1, key2, value2 });
+    var dict_for_put = try newDict(heap, &.{ key1, value1, key2, value2 });
     defer dict_for_put.release();
     const key3 = try newString(heap, "baz");
     defer key3.release();
@@ -1503,7 +1503,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("3", try Heap.getString((try dictLookupRaw(dict_for_put, key3)).?));
 
     // Test dict edge cases.
-    var dict_edge_cases = try dictNew(heap, &.{ key1, value1, key2, value2 });
+    var dict_edge_cases = try newDict(heap, &.{ key1, value1, key2, value2 });
     defer dict_edge_cases.release();
     // Try using a value as a key, and a key as the value while not shared (this is to check
     // that this handles using internal objects correctly).
@@ -1570,8 +1570,8 @@ pub fn setSourceInfo(handle: *Handle, source_info: SourceInfo) !void {
 }
 
 fn testSourceInfo(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta);
     defer Heap.testFinish();
+    const heap = try Heap.testStart(ta);
 
     var obj = try heap.createObject();
     defer obj.release();

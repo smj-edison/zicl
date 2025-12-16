@@ -29,4 +29,5 @@ test {
     _ = @import("Heap.zig");
     _ = @import("Interp.zig");
     _ = @import("commands.zig");
+    _ = @import("expr.zig");
 }

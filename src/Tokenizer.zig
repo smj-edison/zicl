@@ -108,7 +108,7 @@ pub const Token = struct {
         angle_bracket_angle_bracket_angle_bracket_left,
         angle_bracket_angle_bracket_angle_bracket_right,
         equal_equal,
-        not_equal,
+        bang_equal,
         ampersand,
         caret,
         pipe,
@@ -127,31 +127,7 @@ pub const Token = struct {
         keyword_ge,
         bang,
         tilde,
-        function_int,
-        function_wide,
-        function_abs,
-        function_double,
-        function_rand,
-        function_srand,
-        function_sin,
-        function_cos,
-        function_tan,
-        function_asin,
-        function_acos,
-        function_atan,
-        function_atan2,
-        function_sinh,
-        function_cosh,
-        function_tanh,
-        function_ceil,
-        function_floor,
-        function_exp,
-        function_log,
-        function_log10,
-        function_sqrt,
-        function_pow,
-        function_hypot,
-        function_fmod,
+        function,
     };
 };
 
@@ -895,6 +871,25 @@ pub fn nextExpressionToken(self: *Tokenizer) !Token {
     }
 }
 
+pub const function_names = [_][:0]const u8{
+    "int",   "wide", "abs",   "double", "rand",
+    "srand", "sin",  "cos",   "tan",    "asin",
+    "acos",  "atan", "atan2", "sinh",   "cosh",
+    "tanh",  "ceil", "floor", "exp",    "log",
+    "log10", "sqrt", "pow",   "hypot",  "fmod",
+};
+const sorted_function_names = blk: {
+    var sorted_names = function_names;
+    @setEvalBranchQuota(100_000);
+    std.mem.sort([:0]const u8, &sorted_names, void, struct {
+        fn lessThan(_: type, lhs: []const u8, rhs: []const u8) bool {
+            return lhs.len > rhs.len;
+        }
+    }.lessThan);
+
+    break :blk sorted_names;
+};
+
 const OperatorEntry = struct { [:0]const u8, Token.Tag };
 const operator_to_token_mapping = [_]OperatorEntry{
     .{ "*", Token.Tag.asterisk },
@@ -911,7 +906,7 @@ const operator_to_token_mapping = [_]OperatorEntry{
     .{ "<<<", Token.Tag.angle_bracket_angle_bracket_angle_bracket_left },
     .{ ">>>", Token.Tag.angle_bracket_angle_bracket_angle_bracket_right },
     .{ "==", Token.Tag.equal_equal },
-    .{ "!=", Token.Tag.not_equal },
+    .{ "!=", Token.Tag.bang_equal },
     .{ "&", Token.Tag.ampersand },
     .{ "^", Token.Tag.caret },
     .{ "|", Token.Tag.pipe },
@@ -930,31 +925,6 @@ const operator_to_token_mapping = [_]OperatorEntry{
     .{ "ge", Token.Tag.keyword_ge },
     .{ "!", Token.Tag.bang },
     .{ "~", Token.Tag.tilde },
-    .{ "int", Token.Tag.function_int },
-    .{ "wide", Token.Tag.function_wide },
-    .{ "abs", Token.Tag.function_abs },
-    .{ "double", Token.Tag.function_double },
-    .{ "rand", Token.Tag.function_rand },
-    .{ "srand", Token.Tag.function_srand },
-    .{ "sin", Token.Tag.function_sin },
-    .{ "cos", Token.Tag.function_cos },
-    .{ "tan", Token.Tag.function_tan },
-    .{ "asin", Token.Tag.function_asin },
-    .{ "acos", Token.Tag.function_acos },
-    .{ "atan", Token.Tag.function_atan },
-    .{ "atan2", Token.Tag.function_atan2 },
-    .{ "sinh", Token.Tag.function_sinh },
-    .{ "cosh", Token.Tag.function_cosh },
-    .{ "tanh", Token.Tag.function_tanh },
-    .{ "ceil", Token.Tag.function_ceil },
-    .{ "floor", Token.Tag.function_floor },
-    .{ "exp", Token.Tag.function_exp },
-    .{ "log", Token.Tag.function_log },
-    .{ "log10", Token.Tag.function_log10 },
-    .{ "sqrt", Token.Tag.function_sqrt },
-    .{ "pow", Token.Tag.function_pow },
-    .{ "hypot", Token.Tag.function_hypot },
-    .{ "fmod", Token.Tag.function_fmod },
 };
 /// These need to be sorted by longest string first, because otherwise
 /// we might match "*" instead of matching "**" in `nextOperatorToken()`.
@@ -973,26 +943,39 @@ const sorted_operator_to_token_mapping = blk: {
 pub fn nextOperatorToken(self: *Tokenizer) !Token {
     var token = self.newToken();
 
-    inline for (sorted_operator_to_token_mapping) |mapping| {
+    for (sorted_operator_to_token_mapping) |mapping| {
         const str_value = mapping.@"0";
         const tag = mapping.@"1";
-        const tag_name = @tagName(tag);
 
         // Does the parser start with the token we're checking?
         if (self.startsWith(str_value)) {
-            if (tag_name.len > 9 and std.mem.eql(u8, tag_name[0..9], "function_")) {
-                // This is a function token, so we need to make sure that it has
-                // an opening paren before anything else.
-                while (!self.atEnd() and isWhitespace(self.current())) self.advance(1);
+            self.advance(str_value.len);
 
-                if (self.atEnd() or self.current() != '(') return error.FunctionMissingParentheses;
-            }
-
-            // We should now be pointing to just after the opening parenthesis.
             token.tag = tag;
             token.loc.end = self.index;
 
             return token;
+        } else {
+            // It might be a function. There's only a certain number of valid functions,
+            // so we'll check those names only.
+            for (sorted_function_names) |function_name| {
+                if (self.startsWith(function_name)) {
+                    self.advance(function_name.len);
+
+                    // This is a function token, so we need to make sure that it has
+                    // an opening paren.
+                    while (!self.atEnd() and isWhitespace(self.current())) self.advance(1);
+
+                    if (self.atEnd() or self.current() != '(') return error.FunctionMissingParentheses;
+
+                    self.advance(1);
+                    // We should now be pointing to just after the opening parenthesis.
+                    token.tag = .function;
+                    token.loc.end = self.index;
+
+                    return token;
+                }
+            }
         }
     }
 
@@ -1049,18 +1032,20 @@ pub fn nextNumberToken(self: *Tokenizer) !Token {
     }
 
     // Make sure it's a valid integer.
-    if (std.fmt.parseInt(i64, self.buffer[token.loc.start..self.index])) |_| {
-        token.loc.end = self.index;
-        return token;
-    } else if (std.fmt.parseFloat(f64, self.buffer[token.loc.start..self.index])) |_| {
+    if (std.fmt.parseInt(i64, self.buffer[token.loc.start..self.index], 10)) |_| {
         token.loc.end = self.index;
         return token;
     } else |_| {
-        self.error_details = .{
-            .index = token.loc.start,
-            .line_no = token.loc.line_no,
-        };
-        return error.NotNumber;
+        if (std.fmt.parseFloat(f64, self.buffer[token.loc.start..self.index])) |_| {
+            token.loc.end = self.index;
+            return token;
+        } else |_| {
+            self.error_details = .{
+                .index = token.loc.start,
+                .line_no = token.loc.line_no,
+            };
+            return error.NotNumber;
+        }
     }
 }
 
@@ -1077,12 +1062,14 @@ fn newToken(self: *Tokenizer) Token {
 }
 
 fn singleCharToken(self: *Tokenizer, tag: Token.Tag) Token {
+    const start = self.index;
+    self.advance(1);
     return .{
         .tag = tag,
         .loc = .{
-            .start = self.index,
+            .start = start,
             .line_no = self.line_no,
-            .end = self.index + 1,
+            .end = self.index,
         },
     };
 }
