@@ -59,7 +59,7 @@ pub const Node = struct {
         string_less_than_or_equal,
         string_greater_than_or_equal,
         // Ternary
-        ternary,
+        ternary_conditional,
         // Value
         string,
         integer,
@@ -200,13 +200,14 @@ pub const Parse = struct {
         return new_index;
     }
 
-    const Mode = enum {
-        normal,
-        in_ternary_condition,
-        in_ternary_true_branch,
-        in_function_more_args,
-        in_function_no_more_args,
-        in_parentheses,
+    const Mode = struct {
+        ternary: enum { not, true_branch, false_branch } = .not,
+        parens: enum {
+            none,
+            non_function,
+            function_more_args,
+            function_no_more_args,
+        } = .none,
     };
     fn parsePrefixExpr(p: *Parse, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
         const token = p.tokenTag(p.token_i);
@@ -229,12 +230,13 @@ pub const Parse = struct {
                 });
             },
             .l_paren => {
-                return try p.parseExprPrecedence(0, .in_parentheses);
+                p.token_i += 1;
+                return try p.parseExprPrecedence(0, .{ .parens = .non_function, .ternary = mode.ternary });
             },
             .r_paren => {
                 // We shouldn't normally hit a right paren as the first token, so something
                 // has gone awry if this is the case.
-                return p.fail(.premature_expression_end);
+                return p.fail(.too_many_r_parens);
             },
             .comma => {
                 // If we have a comma as the first node, it would be something like `atan2(,)`, or
@@ -242,7 +244,7 @@ pub const Parse = struct {
                 return p.fail(.missing_operand);
             },
             .colon => {
-                if (mode == .in_ternary_condition) {
+                if (mode.ternary == .true_branch) {
                     // There should be an operand before the colon.
                     return p.fail(.missing_operand);
                 } else {
@@ -308,21 +310,24 @@ pub const Parse = struct {
                         });
                     },
                     1 => {
-                        const func_argument = try p.parseExprPrecedence(0, .in_function_no_more_args) orelse {
-                            return p.fail(.too_few_arguments);
-                        };
+                        const func_argument = try p.parseExprPrecedence(0, .{
+                            .parens = .function_no_more_args,
+                            .ternary = mode.ternary,
+                        }) orelse return p.fail(.too_few_arguments);
                         return try p.addNode(.{
                             .tag = tag,
                             .data = .{ .unary = func_argument },
                         });
                     },
                     2 => {
-                        const first_argument = try p.parseExprPrecedence(0, .in_function_more_args) orelse {
-                            return p.fail(.too_few_arguments);
-                        };
-                        const second_argument = try p.parseExprPrecedence(0, .in_function_no_more_args) orelse {
-                            return p.fail(.too_few_arguments);
-                        };
+                        const first_argument = try p.parseExprPrecedence(0, .{
+                            .parens = .function_more_args,
+                            .ternary = mode.ternary,
+                        }) orelse return p.fail(.too_few_arguments);
+                        const second_argument = try p.parseExprPrecedence(0, .{
+                            .parens = .function_no_more_args,
+                            .ternary = mode.ternary,
+                        }) orelse return p.fail(.too_few_arguments);
                         return try p.addNode(.{
                             .tag = tag,
                             .data = .{ .binary = .{ first_argument, second_argument } },
@@ -424,11 +429,9 @@ pub const Parse = struct {
 
     fn parseExprPrecedence(p: *Parse, min_prec: i32, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
         var node: Node.Index = try p.parsePrefixExpr(mode) orelse return null;
-
         var banned_prec: i8 = -1;
 
         while (true) {
-            std.log.warn("token_i: {}", .{p.token_i});
             const token_tag = p.tokenTag(p.token_i);
             switch (token_tag) {
                 .simple_string,
@@ -437,7 +440,6 @@ pub const Parse = struct {
                 .dict_sugar,
                 .command_subst,
                 .l_paren,
-                .r_paren,
                 .integer,
                 .float,
                 .keyword_true,
@@ -446,24 +448,56 @@ pub const Parse = struct {
                 => {
                     return p.fail(.missing_operator);
                 },
-                .comma => {
-                    if (mode == .in_function_more_args) {
+                .r_paren => {
+                    if (mode.parens == .function_more_args) {
+                        return p.fail(.too_few_arguments);
+                    } else if (mode.parens == .function_no_more_args) {
                         p.token_i += 1;
                         return node;
-                    } else if (mode == .in_function_no_more_args) {
-                        return p.fail(.too_many_arguments);
+                    } else if (mode.parens == .non_function) {
+                        p.token_i += 1;
+                        return node;
+                    } else {
+                        return p.fail(.too_many_r_parens);
+                    }
+                },
+                .comma => {
+                    if (mode.parens == .function_more_args) {
+                        p.token_i += 1;
+                        return node;
+                    } else if (mode.parens == .function_no_more_args) {
+                        return p.failAt(.too_many_arguments, p.token_i + 1);
                     } else {
                         return p.fail(.comma_outside_function);
                     }
                 },
                 .colon => {
-                    if (mode == .in_ternary_condition) {
-                        p.token_i += 1;
+                    if (mode.ternary == .true_branch) {
                         return node;
                     } else {
                         return p.fail(.colon_without_question_mark);
                     }
                 },
+                .question_mark => {
+                    p.token_i += 1;
+                    const value_if_true = try p.parseExprPrecedence(0, .{
+                        .ternary = .true_branch,
+                        .parens = mode.parens,
+                    }) orelse return p.fail(.missing_operand);
+                    if (p.tokenTag(p.nextToken()) != .colon) {
+                        return p.fail(.missing_colon);
+                    }
+                    const value_if_false = try p.parseExprPrecedence(0, .{
+                        .ternary = .false_branch,
+                        .parens = mode.parens,
+                    }) orelse return p.fail(.missing_operand);
+
+                    return try p.addNode(.{
+                        .tag = .ternary_conditional,
+                        .data = .{ .ternary = .{ node, value_if_true, value_if_false } },
+                    });
+                },
+                .end_of_file => return node,
                 .argument_expansion,
                 .word_separator,
                 .command_separator,
@@ -471,11 +505,10 @@ pub const Parse = struct {
                 .start_of_command,
                 .start_of_word,
                 => unreachable,
-                .end_of_file => return node,
                 else => {
                     // We checked all things that weren't binary operators, so we're good to
                     // do binary operator stuff.
-                    const operator_tag = p.tokenTag(p.token_i);
+                    const operator_tag = token_tag;
                     const info = binary_oper_table[@as(usize, @intCast(@intFromEnum(operator_tag)))];
                     if (info.prec < min_prec) {
                         return node;
@@ -486,8 +519,8 @@ pub const Parse = struct {
 
                     p.token_i += 1;
                     const new_prec = if (info.assoc == .right) info.prec else info.prec + 1;
-                    const rhs = try p.parseExprPrecedence(new_prec, .normal) orelse {
-                        return p.fail(.missing_operator);
+                    const rhs = try p.parseExprPrecedence(new_prec, mode) orelse {
+                        return p.failAt(.missing_operand, p.token_i + 1);
                     };
 
                     node = try p.addNode(.{
@@ -510,7 +543,7 @@ pub const Parse = struct {
     }
 
     pub fn parseExpr(p: *Parse) error{ OutOfMemory, ParseError }!?Node.Index {
-        return p.parseExprPrecedence(0, .normal);
+        return p.parseExprPrecedence(0, .{});
     }
 
     /// Does not borrow source_file_name.
@@ -554,11 +587,12 @@ pub const Parse = struct {
         token: TokenIndex,
 
         const Tag = enum {
-            premature_expression_end,
             missing_operand,
             colon_without_question_mark,
+            missing_colon,
             too_few_arguments,
             too_many_arguments,
+            too_many_r_parens,
             chained_comparison_operators,
             comma_outside_function,
             missing_operator,
@@ -573,7 +607,71 @@ pub const Parse = struct {
         return error.ParseError;
     }
 
-    pub fn write(p: *Parse, writer: *std.Io.Writer, node: Node.Index) !void {
+    fn failAt(p: *Parse, err: Error.Tag, token_index: u32) error{ParseError} {
+        p.err = .{
+            .tag = err,
+            .token = token_index,
+        };
+        return error.ParseError;
+    }
+
+    pub fn renderError(p: *Parse, parse_error: Error, w: *Writer) Writer.Error!void {
+        const token_loc: Token.Location = blk: {
+            if (parse_error.token < p.tokens.len) {
+                break :blk p.tokenLoc(parse_error.token);
+            } else {
+                break :blk .{
+                    .line_no = if (p.tokens.len > 0) p.tokens.get(p.tokens.len - 1).loc.line_no else 1,
+                    .start = @intCast(p.source.len),
+                    .end = @intCast(p.source.len),
+                };
+            }
+        };
+        const line_range = blk: {
+            // Go backwards/forwards from the token until we hit eof or \n on each side.
+            var line_start = if (token_loc.start < p.source.len) token_loc.start else token_loc.start -| 1;
+            var line_end = line_start;
+
+            while (line_start > 0) {
+                line_start -= 1;
+                if (p.source[line_start] == '\n') {
+                    line_start += 1;
+                    break;
+                }
+            }
+
+            while (line_end < p.source.len) : (line_end += 1) {
+                if (p.source[line_start] == '\n') break;
+            }
+
+            break :blk .{ .start = line_start, .end = line_end };
+        };
+
+        try w.writeAll("error: ");
+        switch (parse_error.tag) {
+            .missing_operand => try w.writeAll("missing operand"),
+            .colon_without_question_mark => try w.writeAll("\":\" without \"?\" in expression"),
+            .missing_operator => try w.writeAll("missing operator"),
+            .missing_colon => try w.writeAll("missing operator \":\""),
+            .too_few_arguments => try w.writeAll("not enough arguments for function"),
+            .too_many_arguments => try w.writeAll("too many arguments for function"),
+            .too_many_r_parens => try w.writeAll("unexpected closing parenthesis"),
+            .chained_comparison_operators => try w.writeAll("unexpected chained comparison operator"),
+            .comma_outside_function => try w.writeAll("unexpected \",\""),
+        }
+        try w.writeAll("\n");
+
+        try w.splatByteAll(' ', std.fmt.count("{}", .{token_loc.line_no}));
+        try w.writeAll(" |\n");
+        try w.print("{} | {s}\n", .{ token_loc.line_no, p.source[line_range.start..line_range.end] });
+        try w.splatByteAll(' ', std.fmt.count("{}", .{token_loc.line_no}));
+        try w.writeAll(" | ");
+        const line_offset = token_loc.start - line_range.start;
+        try w.splatByteAll(' ', line_offset);
+        try w.splatByteAll('^', @max(1, token_loc.end - line_offset));
+    }
+
+    pub fn write(p: *Parse, writer: *Writer, node: Node.Index) !void {
         const tag: Node.Tag = p.nodes.items(.tag)[@intFromEnum(node)];
         const data: Node.Data = p.nodes.items(.data)[@intFromEnum(node)];
         switch (tag) {
@@ -609,10 +707,6 @@ pub const Parse = struct {
             .string_greater_than,
             .string_less_than_or_equal,
             .string_greater_than_or_equal,
-            .atan2,
-            .exp,
-            .hypot,
-            .fmod,
             => {
                 try writer.print("(", .{});
                 try p.write(writer, data.binary.@"0");
@@ -620,7 +714,19 @@ pub const Parse = struct {
                 try p.write(writer, data.binary.@"1");
                 try writer.print(")", .{});
             },
-            .ternary => {
+            // Also binary, but functions.
+            .atan2,
+            .exp,
+            .hypot,
+            .fmod,
+            => {
+                try writer.print("({} ", .{tag});
+                try p.write(writer, data.binary.@"0");
+                try writer.print(" ", .{});
+                try p.write(writer, data.binary.@"1");
+                try writer.print(")", .{});
+            },
+            .ternary_conditional => {
                 try writer.print("({} ", .{tag});
                 try p.write(writer, data.ternary.@"0");
                 try writer.print(" ", .{});
@@ -684,9 +790,79 @@ test "expr parsing" {
     defer Heap.testFinish();
     const heap = try Heap.testStart(testing.allocator);
 
+    std.debug.print(".\n\n", .{});
+
+    // Left associativity.
+    try testExprParse(heap, "1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");
+    // Right associativity.
+    try testExprParse(heap, "1 ** 2 ** 3 ** 4", "(1 .pow (2 .pow (3 .pow 4)))");
+    // No associativity.
+    try testExprParseError(heap, "1 < 2 < 3", .chained_comparison_operators, null);
+
+    // Various stress tests.
     try testExprParse(heap, "1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");
-    // try testExprParse(heap, "1 + atan2($x ? 10 : 5, 2)", "");
-    try testExprParse(heap, "atan2(1, 5)", "");
+    try testExprParse(heap, "1 ? 10 : 5", "(.ternary_conditional 1 10 5)");
+    try testExprParse(
+        heap,
+        "atan2(1 ? 10 : 5, int(0 ? 5 : 2))",
+        "(.atan2 (.ternary_conditional 1 10 5) (.int (.ternary_conditional 0 5 2)))",
+    );
+
+    // Test error messages.
+    try testExprParseError(heap, "1 + ", .missing_operand,
+        \\error: missing operand
+        \\  |
+        \\1 | 1 + 
+        \\  |     ^
+    );
+    try testExprParseError(heap, ": 5", .colon_without_question_mark,
+        \\error: ":" without "?" in expression
+        \\  |
+        \\1 | : 5
+        \\  | ^
+    );
+    try testExprParseError(heap, "1 ? 5", .missing_colon,
+        \\error: missing operator ":"
+        \\  |
+        \\1 | 1 ? 5
+        \\  |      ^
+    );
+    try testExprParseError(heap, "atan2(1)", .too_few_arguments,
+        \\error: not enough arguments for function
+        \\  |
+        \\1 | atan2(1)
+        \\  |        ^
+    );
+    try testExprParseError(heap, "atan2(1, 2, 3)", .too_many_arguments,
+        \\error: too many arguments for function
+        \\  |
+        \\1 | atan2(1, 2, 3)
+        \\  |             ^
+    );
+    try testExprParseError(heap, "(5))", .too_many_r_parens,
+        \\error: unexpected closing parenthesis
+        \\  |
+        \\1 | (5))
+        \\  |    ^
+    );
+    try testExprParseError(heap, "5 < 10 > 15", .chained_comparison_operators,
+        \\error: unexpected chained comparison operator
+        \\  |
+        \\1 | 5 < 10 > 15
+        \\  |        ^
+    );
+    try testExprParseError(heap, "atan2((1, 5)", .comma_outside_function,
+        \\error: unexpected ","
+        \\  |
+        \\1 | atan2((1, 5)
+        \\  |         ^
+    );
+    try testExprParseError(heap, "10 20", .missing_operator,
+        \\error: missing operator
+        \\  |
+        \\1 | 10 20
+        \\  |    ^^
+    );
 }
 
 fn testExprParse(heap: *Heap, expr: []const u8, comptime expected_tree: []const u8) !void {
@@ -696,8 +872,29 @@ fn testExprParse(heap: *Heap, expr: []const u8, comptime expected_tree: []const 
     defer parser.deinit();
     const root_node = (parser.parseExpr() catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
 
-    var test_writer = TestingWriter(expected_tree).writer();
-    try parser.write(&test_writer, root_node);
+    var aw = try Writer.Allocating.initCapacity(testing.allocator, expected_tree.len);
+    try parser.write(&aw.writer, root_node);
+    const result = try aw.toOwnedSlice();
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings(expected_tree, result);
+}
+
+fn testExprParseError(heap: *Heap, expr: []const u8, expected_error: Parse.Error.Tag, message: ?[]const u8) !void {
+    var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
+    defer tokens.deinit(testing.allocator);
+    var parser = Parse.init(heap, heap.emptyObject(), expr, tokens.slice());
+    defer parser.deinit();
+
+    try testing.expectError(error.ParseError, parser.parseExpr());
+    try testing.expectEqual(expected_error, parser.err.?.tag);
+
+    if (message) |expected_message| {
+        var aw = try Writer.Allocating.initCapacity(testing.allocator, expected_message.len);
+        try parser.renderError(parser.err.?, &aw.writer);
+        const actual_message = try aw.toOwnedSlice();
+        defer testing.allocator.free(actual_message);
+        try testing.expectEqualStrings(expected_message, actual_message);
+    }
 }
 
 fn tokenize(gpa: std.mem.Allocator, expr: []const u8) !std.MultiArrayList(Token) {
@@ -711,54 +908,4 @@ fn tokenize(gpa: std.mem.Allocator, expr: []const u8) !std.MultiArrayList(Token)
     }
 
     return tokens;
-}
-
-fn TestingWriter(expecting: []const u8) type {
-    return struct {
-        const vtable: Writer.VTable = .{ .drain = drain };
-        var written: usize = 0;
-
-        pub fn writer() Writer {
-            return .{
-                .vtable = &vtable,
-                .buffer = &.{},
-                .end = 0,
-            };
-        }
-
-        fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
-            not_equal: {
-                // 1. Check if buffered input is equal.
-                const buffered = w.buffered();
-                if (!std.mem.eql(u8, buffered, expecting[0..buffered.len])) break :not_equal;
-                written += buffered.len;
-
-                // 2. Check if provided data is equal.
-                for (data[0..(data.len - 1)]) |slice| {
-                    if (!std.mem.eql(u8, slice, expecting[written..][0..slice.len])) break :not_equal;
-                    written += slice.len;
-                }
-
-                // 3. Handle splat.
-                for (0..splat) |_| {
-                    const splat_data = data[data.len - 1];
-                    if (!std.mem.eql(u8, splat_data, expecting[written..][0..splat_data.len])) break :not_equal;
-                    written += splat_data.len;
-                }
-
-                // All equal!
-                return written;
-            }
-
-            std.debug.print("Expected {s}, got ", .{expecting});
-            std.debug.print("{s}", .{w.buffered()});
-            for (data) |slice| std.debug.print("{s}", .{slice});
-            for (0..splat) |_| {
-                const splat_data = data[data.len - 1];
-                std.debug.print("{s}", .{splat_data});
-            }
-
-            return Writer.Error.WriteFailed;
-        }
-    };
 }
