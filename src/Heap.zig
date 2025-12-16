@@ -10,6 +10,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
+const expr_parse = @import("expr_parse.zig");
 const object = @import("object.zig");
 const Interp = @import("Interp.zig");
 
@@ -90,6 +91,7 @@ strings: StringList,
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
+parsed_exprs: ParsedExpressions,
 
 pub const HeapId = u16;
 const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
@@ -101,6 +103,7 @@ const StringList = std.ArrayList(u8);
 
 const ExtraDataPool = memutil.IndexedMemoryPool(ExtraData, cfg.use_vmem);
 const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
+const ParsedExpressions = std.AutoHashMapUnmanaged(u32, struct { expr: ParsedExpression, generation: u32 });
 
 /// Each script is assigned a unique id when created. Each interpreter
 /// has a hashmap that associates a script id with its local parsed
@@ -280,6 +283,16 @@ pub const ParsedScript = struct {
     }
 };
 
+pub const ParsedExpression = struct {
+    root_node: expr_parse.Node.Index,
+    nodes: std.MultiArrayList(expr_parse.Node),
+
+    pub fn deinit(expr: *ParsedExpression, gpa: std.mem.Allocator) void {
+        expr_parse.deinitNodes(gpa, &expr.nodes);
+        expr.* = undefined;
+    }
+};
+
 pub const Object = packed struct(u128) {
     pub const null_string: StrOrPtr = .{
         .u = .{ .str = .{ .index = 0, .len = 0 } },
@@ -314,9 +327,20 @@ pub const Object = packed struct(u128) {
         }
     };
 
+    // Make sure this stays in sync with Head fields.
     str: StrOrPtr,
     tag: Tag,
     body: Body,
+
+    // Make sure this stays in sync with Object fields.
+    pub const Head = packed struct(u64) {
+        str: StrOrPtr,
+        tag: Tag,
+    };
+
+    pub fn asHead(obj: *Object) *Head {
+        return @ptrCast(obj);
+    }
 
     pub fn deinitSingle(obj: *Object, heap: *Heap) void {
         obj.deinitBodySingle(heap);
@@ -351,9 +375,15 @@ pub const Object = packed struct(u128) {
                 // from its cached length.
             },
             .script => {
-                const script = obj.body.script; // copy
+                const script = obj.body.script;
                 if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, cfg.threading)) {
                     script.id.retire();
+                }
+            },
+            .expr => {
+                const expr = obj.body.expr;
+                if (decrRefCountOf(u32, &script_metadata.items[expr.id.index].ref_count, cfg.threading)) {
+                    expr.id.retire();
                 }
             },
             .source => {
@@ -414,6 +444,7 @@ pub const Tag = enum(u5) {
     command,
     script_command,
     script,
+    expr,
     reference,
     variable,
     upvar,
@@ -488,6 +519,9 @@ pub const Body = packed union {
         arg_count: u32,
     },
     script: packed struct {
+        id: ScriptId,
+    },
+    expr: packed struct {
         id: ScriptId,
     },
     reference: Handle,
@@ -834,8 +868,8 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
     var extra: ExtraDataPool = try .initWithCapacity(gpa, object_capacity);
     errdefer extra.deinit(gpa);
 
-    var parsed_scripts: ParsedScripts = .empty;
-    errdefer parsed_scripts.deinit(gpa);
+    const parsed_scripts: ParsedScripts = .empty;
+    const parsed_exprs: ParsedExpressions = .empty;
 
     // Create heap
     heap.* = .{
@@ -848,6 +882,7 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
 
         .extra = extra,
         .parsed_scripts = parsed_scripts,
+        .parsed_exprs = parsed_exprs,
     };
 
     // null string is guaranteed to have index 0
@@ -882,14 +917,20 @@ fn clearParsedScripts(self: *Heap) void {
     while (parsed_script_iter.next()) |parsed_script| {
         parsed_script.script.deinit(self);
     }
-
     self.parsed_scripts.clearRetainingCapacity();
+
+    var parsed_expr_iter = self.parsed_exprs.valueIterator();
+    while (parsed_expr_iter.next()) |parsed_expr| {
+        parsed_expr.expr.deinit(self.gpa);
+    }
+    self.parsed_exprs.clearRetainingCapacity();
 }
 
 pub fn deinit(heap: *Heap) void {
     // Parsed scripts have references to objects, so we'll deinit scripts before objects.
     heap.clearParsedScripts();
     heap.parsed_scripts.deinit(heap.gpa);
+    heap.parsed_exprs.deinit(heap.gpa);
 
     for (special_object_count..heap.objects.len) |i| {
         const metadata = heap.objects.get(i).metadata;
@@ -1148,6 +1189,8 @@ pub fn prepareToShimmer(handle: *Handle) !void {
         before_duplicating.release();
     }
 
+    // Make sure it has a string rep before invalidating it.
+    _ = try Heap.getString(handle.*);
     handle.invalidateBody();
 }
 
@@ -1297,7 +1340,25 @@ pub fn referenceOrDuplicate(heap: *Heap, handle: Handle) !Object {
 pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
-        .none, .index, .integer, .float, .string, .bool, .script, .script_command, .marked => {
+        .none, .index, .integer, .float, .string, .bool, .script_command, .marked => {
+            return .{
+                .str = try dest_heap.duplicateObjString(handle),
+                .tag = src.tag,
+                .body = src.body,
+            };
+        },
+        .script => {
+            const script = src.body.script;
+            incrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, cfg.threading);
+            return .{
+                .str = try dest_heap.duplicateObjString(handle),
+                .tag = src.tag,
+                .body = src.body,
+            };
+        },
+        .expr => {
+            const expr = src.body.expr;
+            incrRefCountOf(u32, &script_metadata.items[expr.id.index].ref_count, cfg.threading);
             return .{
                 .str = try dest_heap.duplicateObjString(handle),
                 .tag = src.tag,
@@ -1734,7 +1795,7 @@ fn getLocalString(heap: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 break :blk try std.fmt.allocPrintSentinel(heap.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
-        .string, .source, .script, .dict_subst, .variable, .upvar, .command => {
+        .string, .source, .script, .expr, .dict_subst, .variable, .upvar, .command => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     };

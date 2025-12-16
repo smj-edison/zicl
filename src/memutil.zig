@@ -395,7 +395,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
                 next_free = int_ptr.*;
             }
 
-            for (0..self.items.len) |i| {
+            for (0..self.len) |i| {
                 if (!not_leaked.contains(i)) {
                     std.debug.print(fmt, .{ i, self.items[i] });
                 }

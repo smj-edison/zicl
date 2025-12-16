@@ -180,7 +180,7 @@ const result = try someFn(heap, &det, arg);
 -   `src/Interp.zig`: Interpreter and command execution (in progress, ~1000 lines)
 -   `src/stringutil.zig`: String utilities with optional UTF-8 support
 -   `src/memutil.zig`: Buddy allocator and memory primitives
--   `src/expr.zig`: Expression AST nodes (minimal, not yet implemented)
+-   `src/expr_parse.zig`: Expression AST nodes (minimal, not yet implemented)
 
 ## Configuration
 
@@ -226,7 +226,7 @@ In progress:
 
 Not yet implemented:
 
--   Expression evaluation (expr.zig is stub)
+-   Expression evaluation (expr_parse.zig is stub)
 -   Most TCL standard library commands
 -   Namespaces (partial support exists)
 -   Upvar/uplevel (structures exist but incomplete)

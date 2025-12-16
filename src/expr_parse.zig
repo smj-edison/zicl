@@ -5,6 +5,7 @@ const Writer = std.io.Writer;
 const Tokenizer = @import("Tokenizer.zig");
 // Used to store parsed strings.
 const Heap = @import("Heap.zig");
+const Handle = Heap.Handle;
 const object = @import("object.zig");
 const Token = Tokenizer.Token;
 
@@ -22,7 +23,7 @@ pub const Node = struct {
         unary: Index,
         binary: struct { Index, Index },
         ternary: struct { Index, Index, Index },
-        object: Heap.Handle,
+        object: Handle,
     };
 
     pub const Tag = enum(u8) {
@@ -180,7 +181,7 @@ pub const Parse = struct {
     gpa: std.mem.Allocator,
     heap: *Heap,
     source: []const u8,
-    source_file_name: Heap.Handle,
+    source_file_name: ?Handle,
     tokens: Tokens,
     nodes: std.MultiArrayList(Node),
     err: ?Error,
@@ -381,11 +382,11 @@ pub const Parse = struct {
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                var command_handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
+                const command_handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
                 errdefer command_handle.release();
 
                 // Be sure to save the source info.
-                try object.setSourceInfo(&command_handle, .{
+                try object.setSourceInfo(command_handle, .{
                     .file_name = p.source_file_name,
                     .line_no = loc.line_no,
                 });
@@ -547,7 +548,7 @@ pub const Parse = struct {
     }
 
     /// Does not borrow source_file_name.
-    pub fn init(heap: *Heap, source_file_name: Heap.Handle, source: []const u8, tokens: Tokens) Parse {
+    pub fn init(heap: *Heap, source_file_name: ?Handle, source: []const u8, tokens: Tokens) Parse {
         return .{
             .gpa = heap.gpa,
             .heap = heap,
@@ -561,25 +562,7 @@ pub const Parse = struct {
     }
 
     pub fn deinit(p: *Parse) void {
-        for (0..p.nodes.len) |i| {
-            const node = p.nodes.get(i);
-            switch (node.tag) {
-                .variable_subst,
-                .dict_sugar,
-                .value_false,
-                .value_true,
-                .command_subst,
-                .string,
-                .float,
-                .integer,
-                => {
-                    node.data.object.release();
-                },
-                else => {},
-            }
-        }
-
-        p.nodes.deinit(p.gpa);
+        deinitNodes(p.gpa, &p.nodes);
     }
 
     const Error = struct {
@@ -597,6 +580,14 @@ pub const Parse = struct {
             comma_outside_function,
             missing_operator,
         };
+
+        pub fn sourceIndex(err: Error, p: *Parse) u32 {
+            if (err.token >= p.nodes.len) {
+                return @intCast(p.source.len);
+            } else {
+                return p.tokens.get(err.token).loc.start;
+            }
+        }
     };
 
     fn fail(p: *Parse, err: Error.Tag) error{ParseError} {
@@ -785,6 +776,28 @@ pub const Parse = struct {
         p.write(writer, node) catch @panic("couldn't write");
     }
 };
+
+pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) void {
+    for (0..nodes.len) |i| {
+        const node = nodes.get(i);
+        switch (node.tag) {
+            .variable_subst,
+            .dict_sugar,
+            .value_false,
+            .value_true,
+            .command_subst,
+            .string,
+            .float,
+            .integer,
+            => {
+                node.data.object.release();
+            },
+            else => {},
+        }
+    }
+
+    nodes.deinit(gpa);
+}
 
 test "expr parsing" {
     defer Heap.testFinish();

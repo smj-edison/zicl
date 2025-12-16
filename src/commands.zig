@@ -62,7 +62,7 @@ fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { 
         };
     }
 
-    interp.setResultOwning(try object.floatNew(result));
+    interp.setResultOwning(try object.newFloat(result));
 }
 
 pub fn add(interp: *Interp, args: []Heap.Handle) !void {
@@ -314,7 +314,7 @@ pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
     const name_parts = namespaceSplit(qualified_name);
 
     // The procedure's namespace may not be the same as the current namespace.
-    const proc_namespace = try object.newString(name_parts.namespace);
+    const proc_namespace = try object.newString(interp.heap, name_parts.namespace);
     defer proc_namespace.release();
 
     var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace) catch |err| switch (err) {
@@ -336,12 +336,12 @@ pub fn registerCoreCommands(interp: *Interp) !void {
 
 test "commands" {
     defer Heap.testFinish();
-    _ = try Heap.testStart(testing.allocator);
+    const heap = try Heap.testStart(testing.allocator);
     var interp = try Interp.init();
     defer interp.deinit();
     try registerCoreCommands(&interp);
 
-    var script = try object.newString(
+    var script = try object.newString(heap,
         \\ 
     );
     defer script.release();

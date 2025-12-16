@@ -32,7 +32,7 @@ can_parse_arg_expansion: bool,
 last_token_type: Token.Tag,
 error_details: ?struct { index: u32, line_no: u32 },
 
-pub const Error = error{
+const ScriptError = error{
     MissingCloseBracket,
     MissingCloseBrace,
     MissingCloseQuote,
@@ -40,6 +40,13 @@ pub const Error = error{
     TrailingBackslash,
     NotVariable,
 };
+const ExpressionError = error{
+    DictSugarInExpression,
+    FunctionMissingParentheses,
+    NotOperator,
+    NotNumber,
+};
+pub const Error = ScriptError || ExpressionError;
 
 pub const Token = struct {
     tag: Tag,
@@ -798,7 +805,7 @@ pub fn nextListStringToken(self: *Tokenizer) Token {
     return token;
 }
 
-pub fn nextExpressionToken(self: *Tokenizer) !Token {
+pub fn nextExpressionToken(self: *Tokenizer) Error!Token {
     // Argument expansion doesn't exist in expressions.
     self.can_parse_arg_expansion = false;
 

@@ -76,7 +76,7 @@ fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype)
 
 fn variableNotFoundError(det: ?*object.ErrorDetails, var_name: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try object.newStringFmt("can't read \"{s}\": no such variable", .{var_name}),
+        .message = try object.newStringFmt(Heap.local_heap, "can't read \"{s}\": no such variable", .{var_name}),
     };
 
     return error.VariableNotFound;
@@ -352,14 +352,14 @@ pub fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Handle
 
 fn testVariables(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    _ = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta);
     var interp = try Interp.init();
     defer interp.deinit();
 
     try testing.expectEqual(null, interp.resolveVariable(0, "foo"));
-    var foo = try object.newString("foo");
+    var foo = try object.newString(heap, "foo");
     defer foo.release();
-    const value = try object.newString("value");
+    const value = try object.newString(heap, "value");
     defer value.release();
     try interp.setVariableTo(&foo, value);
 
@@ -501,7 +501,7 @@ pub const CommandHashTable = std.StringArrayHashMapUnmanaged(Command);
 
 fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try object.newStringFmt("wrong # args: should be \"{s}\"", .{command_usage}),
+        .message = try object.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
     };
 
     return Error.WrongArgumentCount;
@@ -639,19 +639,19 @@ pub fn setResultOwning(interp: *Interp, handle: Handle) void {
 }
 
 pub fn setResultInteger(interp: *Interp, value: i64) !void {
-    interp.setResultOwning(try object.integerNew(value));
+    interp.setResultOwning(try object.newInteger(interp.heap, value));
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.freeLastResult();
-    const bytes_handle = try object.newString(bytes);
+    const bytes_handle = try object.newString(interp.heap, bytes);
 
     try setResult(interp, bytes_handle);
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
     interp.freeLastResult();
-    const fmt_handle = try object.newStringFmt(fmt, args);
+    const fmt_handle = try object.newStringFmt(interp.heap, fmt, args);
 
     try setResult(interp, fmt_handle);
 }
@@ -715,7 +715,7 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: ProcedureSignature) !u32 {
     const namespace = try Handle.borrowOptional(interp.namespace);
     errdefer if (namespace) |ns| ns.release();
-    const vars_handle = try object.dictNew(&.{});
+    const vars_handle = try object.newDict(interp.heap, &.{});
     errdefer vars_handle.release();
     const borrowed_signature = try signature.borrow();
     errdefer borrowed_signature.release();
@@ -862,7 +862,7 @@ fn interpolateTokens(
         new_str_len += (try Heap.getString(new_value)).len;
     }
 
-    const new_str = try object.newStringToFill(new_str_len);
+    const new_str = try object.newStringToFill(interp.heap, new_str_len);
     errdefer new_str.release();
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
@@ -998,7 +998,7 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Handle) 
     } else {
         // If it was null, we better error.
         if (det) |details| details.* = .{
-            .message = try object.newStringFmt("invalid command name \"{s}\"", .{command_name}),
+            .message = try object.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
         };
         return error.CommandNotFound;
     }
@@ -1083,6 +1083,8 @@ pub fn evalObject(interp: *Interp, script: *Handle) (Error || Tokenizer.Error)!v
     // Try to get the script, parsing if necessary.
     var det: object.ErrorDetails = undefined;
     const parsed = try interp.wrapErrorDetails(&det, object.getScript(&det, script));
+    // Don't evaluate empty scripts.
+    if (parsed.tags.items.len <= 1) return;
 
     // Reset the interpreter result. This is useful to return the empty result in the case of empty program.
     interp.setEmptyResult();

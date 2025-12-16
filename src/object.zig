@@ -4,10 +4,11 @@ const Io = std.Io;
 const testing = std.testing;
 
 const options = @import("options");
-const stringutil = @import("./stringutil.zig");
-const memutil = @import("./memutil.zig");
-const Heap = @import("./Heap.zig");
-const Tokenizer = @import("./Tokenizer.zig");
+const stringutil = @import("stringutil.zig");
+const expr_parse = @import("expr_parse.zig");
+const memutil = @import("memutil.zig");
+const Heap = @import("Heap.zig");
+const Tokenizer = @import("Tokenizer.zig");
 const Handle = Heap.Handle;
 
 pub const Error = std.mem.Allocator.Error || error{
@@ -19,6 +20,7 @@ pub const Error = std.mem.Allocator.Error || error{
     BadInteger,
     IntegerOverflow,
     BadFloat,
+    ParseError,
 };
 
 pub const ErrorDetails = struct {
@@ -204,13 +206,13 @@ pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     } else |err| switch (err) {
         error.InvalidCharacter => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt("expected integer but got \"{s}\"", .{bytes}),
+                .message = try newStringFmt(Heap.local_heap, "expected integer but got \"{s}\"", .{bytes}),
             };
             return error.BadInteger;
         },
         error.Overflow => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt("integer value \"{s}\" too big to be represented", .{bytes}),
+                .message = try newStringFmt(Heap.local_heap, "integer value \"{s}\" too big to be represented", .{bytes}),
             };
             return error.IntegerOverflow;
         },
@@ -244,7 +246,7 @@ pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     } else |err| switch (err) {
         error.InvalidCharacter => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt("expected floating-point number but got \"{s}\"", .{bytes}),
+                .message = try newStringFmt(Heap.local_heap, "expected floating-point number but got \"{s}\"", .{bytes}),
             };
             return error.BadFloat;
         },
@@ -621,7 +623,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
                 return unwrapped;
             } else {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt("bad {s} \"{f}\": must be {s}", .{ enum_name, value.*, names }),
+                    .message = try newStringFmt(Heap.local_heap, "bad {s} \"{f}\": must be {s}", .{ enum_name, value.*, names }),
                 };
 
                 return Error.BadEnumVariant;
@@ -695,15 +697,15 @@ pub fn stringIs(det: ?*ErrorDetails, str: *Handle, class_to_check: *Handle, stri
 
 fn testStringIs(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    _ = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta);
 
-    var str = try newString("abcdefg");
+    var str = try newString(heap, "abcdefg");
     defer str.release();
-    var str2 = try newString("abcdefg123");
+    var str2 = try newString(heap, "abcdefg123");
     defer str2.release();
-    var class = try newString("alpha");
+    var class = try newString(heap, "alpha");
     defer class.release();
-    var bad_class = try newString("bad_class");
+    var bad_class = try newString(heap, "bad_class");
     defer bad_class.release();
     var details: ErrorDetails = undefined;
 
@@ -724,22 +726,34 @@ test "string is" {
     try testing.checkAllAllocationFailures(testing.allocator, testStringIs, .{});
 }
 
-pub fn convertTokenizerError(err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
+pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
     switch (err) {
         error.CharactersAfterCloseBrace => {
-            return .{ .message = try newString("extra characters after close-brace") };
+            return .{ .message = try newString(heap, "extra characters after close-brace") };
         },
         error.MissingCloseBrace => {
-            return .{ .message = try newString("missing close-brace") };
+            return .{ .message = try newString(heap, "missing close-brace") };
         },
         error.MissingCloseBracket => {
-            return .{ .message = try newString("unmatched \"[\"") };
+            return .{ .message = try newString(heap, "unmatched \"[\"") };
         },
         error.MissingCloseQuote => {
-            return .{ .message = try newString("missing quote") };
+            return .{ .message = try newString(heap, "missing quote") };
         },
         error.TrailingBackslash => {
-            return .{ .message = try newString("no character after \\") };
+            return .{ .message = try newString(heap, "no character after \\") };
+        },
+        error.DictSugarInExpression => {
+            return .{ .message = try newString(heap, "dict sugar in expression") };
+        },
+        error.FunctionMissingParentheses => {
+            return .{ .message = try newString(heap, "function missing parentheses") };
+        },
+        error.NotOperator => {
+            return .{ .message = try newString(heap, "not operator") };
+        },
+        error.NotNumber => {
+            return .{ .message = try newString(heap, "not number") };
         },
         error.NotVariable => unreachable,
     }
@@ -829,7 +843,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
 
         while (true) {
             const next_token = parser.nextListToken() catch |err| {
-                if (det) |details| details.* = try convertTokenizerError(err);
+                if (det) |details| details.* = try convertTokenizerError(Heap.local_heap, err);
                 return err;
             };
             switch (next_token.tag) {
@@ -855,20 +869,14 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
                 try Heap.setString(item, str[token.loc.start..token.loc.end]);
             } else {
                 // Needs escaping. We'll create another string to copy the escaped string into.
-                try setStringFromEscaped(
-                    Heap.local_heap.gpa,
-                    item,
-                    str[token.loc.start..token.loc.end],
-                );
+                try setStringFromEscaped(item, str[token.loc.start..token.loc.end]);
             }
 
             if (source_info) |info| {
-                var item_shouldnt_change = item;
-                try setSourceInfo(&item_shouldnt_change, .{
+                try setSourceInfo(item, .{
                     .file_name = info.file_name,
                     .line_no = token.loc.line_no,
                 });
-                assert(item_shouldnt_change == item);
             }
         }
 
@@ -1060,9 +1068,9 @@ fn testLists(ta: std.mem.Allocator) !void {
     var det: ErrorDetails = undefined;
 
     // Simple case: two objects in a list
-    const obj1 = try newString("object 1");
+    const obj1 = try newString(heap, "object 1");
     defer obj1.release();
-    const obj2 = try newString("object 2");
+    const obj2 = try newString(heap, "object 2");
     defer obj2.release();
     var list1 = try listNew(&.{ obj1, obj2 });
     defer list1.release();
@@ -1074,19 +1082,19 @@ fn testLists(ta: std.mem.Allocator) !void {
     // But it should have an identical string
     try testing.expectEqualStrings("object 1", try Heap.getString(listItem(list1, 0)));
 
-    const to_append = try newString("appended item");
+    const to_append = try newString(heap, "appended item");
     defer to_append.release();
 
     _ = try listAppend(&det, &list1, to_append);
     try testing.expectEqualStrings("appended item", try Heap.getString(listItem(list1, 2)));
 
-    var string_list = try newString(
+    var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
     );
     defer string_list.release();
 
     const old_string_list_handle = string_list;
-    try shimmerToList(heap, &det, &string_list);
+    try shimmerToList(&det, &string_list);
     try testing.expect(old_string_list_handle != string_list);
     try testing.expectEqualStrings("item1", try Heap.getString(listItem(string_list, 0)));
     try testing.expectEqualStrings("item 2", try Heap.getString(listItem(string_list, 1)));
@@ -1105,7 +1113,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
     if (@mod(len, 2) == 1) {
         // Unmatched key.
         if (det) |details| details.* = .{
-            .message = try newString("missing value to go with key"),
+            .message = try newString(Heap.local_heap, "missing value to go with key"),
         };
         return Error.BadDict;
     }
@@ -1483,7 +1491,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // When a duplicate key is queried, it should point to the last corrisponding value.
     try testing.expectEqualStrings("15", try Heap.getString((try dictLookupRaw(dict_with_duplicates, key1)).?));
 
-    _ = try dictRemoveDuplicates(heap, &dict_with_duplicates, null);
+    _ = try dictRemoveDuplicates(&dict_with_duplicates, null);
     try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
 
     // Dict put testing.
@@ -1495,10 +1503,10 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer value3.release();
 
     try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
-    _ = try dictPut(heap, &dict_for_put, key2, value3);
+    _ = try dictPut(&dict_for_put, key2, value3);
     try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
 
-    _ = try dictPut(heap, &dict_for_put, key3, value3);
+    _ = try dictPut(&dict_for_put, key3, value3);
     try testing.expectEqual(3, dictPairLengthRaw(dict_for_put));
     try testing.expectEqualStrings("3", try Heap.getString((try dictLookupRaw(dict_for_put, key3)).?));
 
@@ -1508,15 +1516,15 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Try using a value as a key, and a key as the value while not shared (this is to check
     // that this handles using internal objects correctly).
     assert(dict_edge_cases.canModify());
-    _ = try dictPut(heap, &dict_edge_cases, dictItem(dict_edge_cases, 1), dictItem(dict_edge_cases, 2));
+    _ = try dictPut(&dict_edge_cases, dictItem(dict_edge_cases, 1), dictItem(dict_edge_cases, 2));
     try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupRaw(dict_edge_cases, value1)).?));
 
     // Try aliasing a key by using it as key and value.
-    _ = try dictPut(heap, &dict_edge_cases, dictItem(dict_edge_cases, 0), dictItem(dict_edge_cases, 0));
+    _ = try dictPut(&dict_edge_cases, dictItem(dict_edge_cases, 0), dictItem(dict_edge_cases, 0));
     try testing.expectEqualStrings("foo", try Heap.getString((try dictLookupRaw(dict_edge_cases, key1)).?));
 
     // Try aliasing a value by using it as key and value.
-    _ = try dictPut(heap, &dict_edge_cases, dictItem(dict_edge_cases, 3), dictItem(dict_edge_cases, 3));
+    _ = try dictPut(&dict_edge_cases, dictItem(dict_edge_cases, 3), dictItem(dict_edge_cases, 3));
     try testing.expectEqualStrings("2", try Heap.getString((try dictLookupRaw(dict_edge_cases, value2)).?));
 }
 
@@ -1530,21 +1538,23 @@ pub const SourceInfo = struct {
 };
 
 /// .file_name will become invalid if the file name object's string becomes invalid.
+/// Does not borrow the file_name object, so be sure to borrow shimmering the handle.
 pub fn getSourceInfo(handle: Handle) ?SourceInfo {
-    const ref = handle.peek();
-    if (ref.tag != .source) return null;
+    const obj = handle.peek();
+    if (obj.tag != .source) return null;
 
-    const file_name_handle = handle.getHeap().getHandle(ref.body.source.file_name_obj);
+    const file_name_handle = handle.getHeap().getHandle(obj.body.source.file_name_obj);
     const file_name = if (file_name_handle.index != 0) file_name_handle else null;
 
     return .{
         .file_name = file_name,
-        .line_no = ref.body.source.line_no,
+        .line_no = obj.body.source.line_no,
     };
 }
 
-pub fn setSourceInfo(handle: *Handle, source_info: SourceInfo) !void {
-    try Heap.prepareToShimmer(handle);
+/// `handle` must be able to shimmer.
+pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
+    assert(handle.canShimmer());
 
     const ref = handle.peek();
     ref.tag = .source;
@@ -1579,7 +1589,7 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     const file_name = try newString(heap, "test_file.tcl");
     defer file_name.release();
 
-    try setSourceInfo(heap, &obj, .{ .file_name = file_name, .line_no = 42 });
+    try setSourceInfo(obj, .{ .file_name = file_name, .line_no = 42 });
 
     // Verify the object has the source tag
     const ref = obj.peek();
@@ -1609,7 +1619,7 @@ var next_script_id = 1;
 /// Not threadsafe.
 pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Get source info, or use defaults.
-    const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else SourceInfo{
+    const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else .{
         .file_name = null,
         .line_no = 1,
     };
@@ -1618,8 +1628,6 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     const bytes = try Heap.getString(handle);
     var parser = Tokenizer.init(bytes, source_info.line_no);
-
-    std.debug.print("parsing: {s}\n", .{bytes});
 
     // Set up tokens list (to be added to).
     var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.local_heap.gpa, bytes.len / 8);
@@ -1647,7 +1655,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             }
         } else |err| {
             if (det) |details| {
-                details.* = try convertTokenizerError(err);
+                details.* = try convertTokenizerError(Heap.local_heap, err);
                 if (parser.error_details) |parser_details| {
                     details.index = parser_details.index;
                 }
@@ -1774,7 +1782,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                         );
 
                         const item_handle = listItem(new_token_values, str_idx);
-                        try setStringFromEscaped(Heap.local_heap.gpa, item_handle, bytes[token.loc.start..token.loc.end]);
+                        try setStringFromEscaped(item_handle, bytes[token.loc.start..token.loc.end]);
 
                         break :blk item_handle;
                     },
@@ -1795,13 +1803,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             };
 
             if (str_handle) |token_str| {
-                // Since we created everything on this heap, the handle shouldn't change.
-                var token_str_should_not_change = token_str;
-                try setSourceInfo(&token_str_should_not_change, .{
+                try setSourceInfo(token_str, .{
                     .file_name = source_info.file_name,
                     .line_no = token.loc.line_no,
                 });
-                assert(token_str_should_not_change == token_str);
             }
         }
 
@@ -1833,7 +1838,7 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
         \\ set y $x[set x]
     );
     defer script1.release();
-    var parsed = try parseScript(heap, null, script1);
+    var parsed = try parseScript(null, script1);
     defer parsed.deinit(heap);
 
     const tokens = parsed.tags.items;
@@ -1865,9 +1870,7 @@ test "script parsing" {
 pub fn shimmerToScript(det: ?*ErrorDetails, handle: *Handle) !void {
     // Figure out whether the provided object already has a script id, or if we need to
     // generate a new one.
-    var script_id: Heap.ScriptId = undefined;
-    var using_new_id: bool = undefined;
-    script_id, using_new_id = blk: {
+    const script_info = blk: {
         if (handle.peek().tag == .script) {
             const script = handle.peek().body.script;
             break :blk .{ script.id, false };
@@ -1875,6 +1878,8 @@ pub fn shimmerToScript(det: ?*ErrorDetails, handle: *Handle) !void {
             break :blk .{ try Heap.ScriptId.next(), true };
         }
     };
+    const script_id = script_info.@"0";
+    const using_new_id = script_info.@"1";
     errdefer if (using_new_id) script_id.retire();
 
     if (Heap.local_heap.parsed_scripts.get(script_id.index)) |existing_script| {
@@ -1930,7 +1935,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
         );
         defer old_script.release();
 
-        const parsed_script = try getScript(heap, null, &old_script);
+        const parsed_script = try getScript(null, &old_script);
         const script1_id = old_script.peek().body.script.id;
         try testing.expectEqualSlices(Tokenizer.Token.Tag, &[_]Tokenizer.Token.Tag{
             .start_of_command,
@@ -1951,7 +1956,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     var new_script = try newString(heap, "set x 5");
     defer new_script.release();
 
-    try shimmerToScript(heap, null, &new_script);
+    try shimmerToScript(null, &new_script);
     const new_script_id = new_script.peek().body.script.id;
 
     // Make sure the new script recycles the old script's index.
@@ -1968,6 +1973,136 @@ fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer
     try testing.expectEqualStrings(value, try Heap.getString(listItem(script.values, index)));
 }
 
+pub fn shimmerToExpression(det: ?*ErrorDetails, handle: *Handle) !void {
+    // Figure out whether the provided object already has a script id, or if we need to
+    // generate a new one.
+    const expr_info = blk: {
+        if (handle.peek().tag == .expr) {
+            const expr = handle.peek().body.expr;
+            // We didn't create a new script id here.
+            break :blk .{ expr.id, false };
+        } else {
+            break :blk .{ try Heap.ScriptId.next(), true };
+        }
+    };
+    const expr_id = expr_info.@"0";
+    const using_new_id = expr_info.@"1";
+    errdefer if (using_new_id) expr_id.retire();
+
+    // Check if this expression is already parsed in this heap.
+    if (Heap.local_heap.parsed_exprs.get(expr_id.index)) |existing_expr| {
+        if (existing_expr.generation == expr_id.generation) {
+            // Object is already an expression, it exists as parsed in our heap,
+            // and it's the correct generation. No need to reparse!
+            return;
+        } else {
+            // Wrong generation, so free the old one before overwriting (later in code).
+            var expr_as_mut = existing_expr.expr;
+            expr_as_mut.deinit(Heap.local_heap.gpa);
+            // Be sure to remove it, in case we hit an error before we have the chance
+            // to overwrite it.
+            _ = Heap.local_heap.parsed_scripts.remove(expr_id.index);
+        }
+    } else {
+        // We don't have this expression in our heap, so keep going to generate it.
+    }
+
+    const source_info: SourceInfo = getSourceInfo(handle.*) orelse .{ .file_name = null, .line_no = 1 };
+    const file_name = try Handle.borrowOptional(source_info.file_name);
+    errdefer if (file_name) |val| val.release();
+    const line_no = source_info.line_no;
+
+    try Heap.prepareToShimmer(handle);
+
+    // Parse all the tokens of the expr, handling any errors that come up.
+    const bytes = try Heap.getString(handle.*);
+    var tokenizer = Tokenizer.init(bytes, line_no);
+    var tokens = std.MultiArrayList(Tokenizer.Token).empty;
+    defer tokens.deinit(Heap.local_heap.gpa);
+    while (true) {
+        const next_token = tokenizer.nextExpressionToken();
+        if (next_token) |token| {
+            try tokens.append(Heap.local_heap.gpa, token);
+            if (token.tag == .end_of_file) break;
+        } else |err| if (det) |details| {
+            details.* = try convertTokenizerError(Heap.local_heap, err);
+            if (tokenizer.error_details) |parser_details| {
+                details.index = parser_details.index;
+            }
+            return err;
+        }
+    }
+
+    if (tokens.len == 0) {
+        if (det) |details| details.* = .{
+            .message = try newString(Heap.local_heap, "empty expression"),
+        };
+        return error.ParseError;
+    }
+
+    // Next, go ahead and parse the expression from the tokens.
+    var parsed: Heap.ParsedExpression = blk: {
+        var parser = expr_parse.Parse.init(Heap.local_heap, file_name, bytes, tokens.slice());
+        errdefer parser.deinit();
+        if (parser.parseExpr()) |root_node| {
+            break :blk .{ .nodes = parser.nodes, .root_node = root_node.? };
+            // Note we don't deinit parser here, since we take ownership.
+        } else |err| {
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ParseError => {
+                    if (det) |details| {
+                        var aw = std.Io.Writer.Allocating.init(Heap.local_heap.gpa);
+                        errdefer aw.deinit();
+                        const err_details = parser.err.?;
+                        parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
+                        const rendered_error = try aw.toOwnedSlice();
+                        defer Heap.local_heap.gpa.free(rendered_error);
+                        const err_on_heap = try newString(Heap.local_heap, rendered_error);
+                        errdefer err_on_heap.release();
+
+                        details.* = .{
+                            .message = err_on_heap,
+                            .index = err_details.sourceIndex(&parser),
+                        };
+                    }
+                    return error.ParseError;
+                },
+            }
+        }
+    };
+    errdefer parsed.deinit(Heap.local_heap.gpa);
+
+    try Heap.local_heap.parsed_exprs.put(Heap.local_heap.gpa, expr_id.index, .{
+        .expr = parsed,
+        .generation = expr_id.generation,
+    });
+
+    handle.peek().tag = .expr;
+    handle.peek().body = .{
+        .expr = .{ .id = expr_id },
+    };
+}
+
+fn testExpressions(ta: std.mem.Allocator) !void {
+    const heap = try Heap.testStart(ta);
+    defer Heap.testFinish();
+
+    var expr1 = try newString(heap, "1 + 2 * 3 + 4");
+    defer expr1.release();
+
+    try shimmerToExpression(null, &expr1);
+
+    const expr_id = expr1.peek().body.expr.id;
+    const parsed = heap.parsed_exprs.get(expr_id.index).?;
+
+    try testing.expectEqual(.add, parsed.expr.nodes.get(@intFromEnum(parsed.expr.root_node)).tag);
+}
+
+test "expressions" {
+    try testing.checkAllAllocationFailures(testing.allocator, testExpressions, .{});
+}
+
 pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
     const Mapping = std.StaticStringMap(bool).initComptime(Tokenizer.boolean_mapping);
 
@@ -1975,6 +2110,7 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
     const new_value = Mapping.get(bytes) orelse {
         if (det) |details| details.* = .{
             .message = try newStringFmt(
+                Heap.local_heap,
                 "expected boolean but got \"{f}\"",
                 .{handle},
             ),
