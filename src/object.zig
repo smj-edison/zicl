@@ -2206,7 +2206,7 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, handle: *Handle) !void {
 
 pub fn getExpression(det: ?*ErrorDetails, handle: *Handle) !Heap.ParsedExpression {
     try shimmerToExpression(det, handle);
-    assert(handle.peek().tag == .script);
+    assert(handle.peek().tag == .expr);
 
     const expr_id = handle.peek().body.script.id;
     const expr_and_generation = Heap.local_heap.parsed_exprs.get(expr_id.index).?;
