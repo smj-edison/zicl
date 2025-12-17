@@ -81,7 +81,7 @@ pub fn getCodepointLength(handle: *Handle) !usize {
 /// Copies provided string.
 pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
     var handle = try heap.createObject();
-    errdefer handle.release();
+    errdefer handle.decrRefCount();
 
     try Heap.setString(handle, bytes);
     try shimmerToString(&handle);
@@ -99,7 +99,7 @@ pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handl
 
 pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
     const handle = try heap.createObject();
-    errdefer handle.release();
+    errdefer handle.decrRefCount();
 
     if (len < Heap.LongString.split_point) {
         const new_str = try heap.createString(@intCast(len));
@@ -726,26 +726,26 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     const heap = try Heap.testStart(ta);
 
     var str = try newString(heap, "abcdefg");
-    defer str.release();
+    defer str.decrRefCount();
     var str2 = try newString(heap, "abcdefg123");
-    defer str2.release();
+    defer str2.decrRefCount();
     var class = try newString(heap, "alpha");
-    defer class.release();
+    defer class.decrRefCount();
     var bad_class = try newString(heap, "bad_class");
-    defer bad_class.release();
-    var details: ErrorDetails = undefined;
+    defer bad_class.decrRefCount();
+    var det: ErrorDetails = undefined;
 
-    try testing.expectEqual(true, try stringIs(&details, &str, &class, false));
-    try testing.expectEqual(false, try stringIs(&details, &str2, &class, false));
-    const err = stringIs(&details, &str, &bad_class, false);
+    try testing.expectEqual(true, try stringIs(null, &str, &class, false));
+    try testing.expectEqual(false, try stringIs(null, &str2, &class, false));
+    const err = stringIs(&det, &str, &bad_class, false);
     if (err == Error.OutOfMemory) return Error.OutOfMemory;
     try testing.expectError(Error.BadEnumVariant, err);
     try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
-        try Heap.getString(details.message),
+        try Heap.getString(det.message),
     );
-    details.message.release();
+    det.message.decrRefCount();
 }
 
 test "string is" {
@@ -805,12 +805,12 @@ pub fn listUninitializedNew(len: u32) !Handle {
 
 pub fn listNew(handles: []const Handle) !Handle {
     const list = try listUninitializedNew(@intCast(handles.len));
-    errdefer list.release();
+    errdefer list.decrRefCount();
 
     const new_items = listItems(list);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try Heap.local_heap.duplicateOrReference(handle);
+        item.* = try Heap.local_heap.dupOrReference(handle);
     }
 
     return list;
@@ -853,11 +853,10 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
             line_no = info.line_no;
 
             if (info.file_name) |unwrapped| {
-                file_name = unwrapped;
-                _ = unwrapped.reference(); // Increment ref count.
+                file_name = unwrapped.borrow();
             }
         }
-        defer if (file_name) |unwrapped| unwrapped.release();
+        defer if (file_name) |unwrapped| unwrapped.decrRefCount();
 
         const str = try Heap.getString(handle.*);
         var parser = Tokenizer.init(str, line_no);
@@ -885,7 +884,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
 
         // TODO PERF: reuse the object backing if it was allocated with more than one object.
         const new_list = try listUninitializedNew(@intCast(tokens.items.len));
-        errdefer new_list.release();
+        errdefer new_list.decrRefCount();
 
         for (tokens.items, 0..) |token, i| {
             const item = listItem(new_list, @intCast(i));
@@ -908,7 +907,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
 
         const old_handle = handle.*;
         handle.* = new_list;
-        old_handle.release();
+        old_handle.decrRefCount();
     }
 }
 
@@ -925,6 +924,20 @@ pub fn listLength(det: ?*ErrorDetails, list: *Handle) !u32 {
 }
 
 fn collectionItem(handle: Handle, index: u32, len: u32) Heap.Handle {
+    const obj = handle.peek();
+    assert(obj.tag == .list or obj.tag == .dict);
+
+    if (index < len) {
+        const elem: Heap.Handle = .{
+            .index = handle.index + 1 + index,
+            .heap = handle.heap,
+        };
+
+        return elem;
+    } else @panic("Element out of bounds");
+}
+
+fn collectionItemFollowRefs(handle: Handle, index: u32, len: u32) Heap.Handle {
     const obj = handle.peek();
     assert(obj.tag == .list or obj.tag == .dict);
 
@@ -961,12 +974,23 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
         }
     };
 
-    // We can only do these quick changes if the collection is not shared.
-    if (handle.canModify()) {
+    if (current_len == new_len) return false;
+
+    new_collection_needed: {
+        // We can only do these quick changes if the collection is not shared.
+        if (!handle.canModify()) break :new_collection_needed;
+
         // No need to realloc if we're shrinking.
-        if (new_len <= current_len) {
-            // Be sure to free the abandoned objects when we shrink.
+        if (new_len < current_len) {
+            // We need to check if any of the abandoned items are shared. If so, we'll need to
+            // dissolve this collection and create a new one.
             const freed_count = current_len - new_len;
+            for (0..freed_count) |to_free| {
+                const to_free_handle = listItem(handle.*, @intCast(current_len - freed_count + to_free));
+                if (to_free_handle.isShared()) break :new_collection_needed;
+            }
+
+            // Be sure to free the abandoned items when we shrink.
             for (0..freed_count) |to_free| {
                 const to_free_handle = listItem(handle.*, @intCast(current_len - freed_count + to_free));
                 if (obj.tag == .dict and @mod(to_free, 2) == 0) {
@@ -985,18 +1009,18 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             }
 
             return false;
-        }
+        } else {
+            // Even if there's not enough length, there may be enough capacity.
+            const capacity = memutil.getOrderSize(handle.getMetadata().order) - 1; // -1 for list head
+            if (new_len <= capacity) {
+                switch (obj.tag) {
+                    .list => obj.body.list.len = new_len,
+                    .dict => handle.getHeap().getExtraData(obj.body.dict).dict.len = new_len,
+                    else => unreachable,
+                }
 
-        // Even if there's not enough length, there may be enough capacity.
-        const capacity = memutil.getOrderSize(handle.getMetadata().order) - 1; // -1 for list head
-        if (new_len <= capacity) {
-            switch (obj.tag) {
-                .list => obj.body.list.len = new_len,
-                .dict => handle.getHeap().getExtraData(obj.body.dict).dict.len = new_len,
-                else => unreachable,
+                return false;
             }
-
-            return false;
         }
     }
 
@@ -1009,26 +1033,28 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
     errdefer Heap.freeObject(new_handle);
     const new_items = collectionItems(new_handle, new_len);
 
-    // Why `Heap.local_heap.heapId() != handle.heap`? Because we can't steal the old collection's
+    // Why `Heap.local_heap.heapId() == handle.heap`? Because we can't steal the old collection's
     // objects if they reference another heap's strings.
-    if (!handle.canModify() or Heap.local_heap.heapId() != handle.heap) {
-        // If the collection is shared, we need to duplicate all the items.
-        for (0.., new_items) |i, *new_item| {
-            new_item.* = try Heap.duplicateOrReference(
-                Heap.local_heap,
-                collectionItem(handle.*, @intCast(i), current_len),
-            );
-        }
+    if (handle.canModify() and Heap.local_heap.heapId() == handle.heap) {
+        var found_shared_items = false;
 
-        const old_handle = handle.*;
-        handle.* = new_handle;
-        old_handle.release();
-    } else {
-        // If the collection isn't shared, we can move the objects over without
-        // any duplication.
-        const old_items = collectionItems(handle.*, current_len);
-        for (old_items, new_items[0..old_items.len]) |old_item, *new_item| {
-            new_item.* = old_item;
+        // If the collection isn't shared, we can move the objects over without any duplication.
+        for (new_items[0..current_len], 0..) |*new_item, i| {
+            const item_handle = collectionItem(handle.*, @intCast(i), current_len);
+            // However, if an item within the list was shared, we can't move it, we have to reference
+            // it. (Why not use `item_handle.reference()`? Because that would create one too many references
+            // as the list already has one ref count for owning the item.)
+            if (item_handle.isShared()) {
+                found_shared_items = true;
+                new_item.* = .{
+                    .str = Heap.Object.null_string,
+                    .tag = .reference,
+                    .body = .{ .reference = item_handle },
+                };
+            } else {
+                new_item.* = item_handle.peek().*;
+                item_handle.peek().tag = .marked;
+            }
         }
 
         // Free the old collection without running destructors (because the objects are
@@ -1039,8 +1065,44 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             old_dict_metadata.table.deinit(handle.getHeap().gpa);
             handle.getHeap().destroyExtraData(handle.peek().body.dict);
         }
-        Heap.freeObjectBacking(handle.*);
+
+        if (found_shared_items) {
+            // Because we found shared items, we can't free the backing directly, as that would
+            // free an item that someone else is currently referencing. Instead, we'll split the
+            // allocation, and free all non-marked objects.
+            handle.getHeap().splitAlloc(handle.index, 0);
+
+            for (0..current_len) |i| {
+                const item_handle: Handle = .{
+                    .index = @intCast(handle.index + 1 + i),
+                    .heap = handle.heap,
+                };
+
+                // Only free marked items, so we don't release the backing of a shared item.
+                if (item_handle.peek().tag == .marked) {
+                    Heap.freeObjectBacking(item_handle);
+                }
+            }
+
+            // Be sure to free the old head too.
+            Heap.freeObjectBacking(handle.*);
+        } else {
+            Heap.freeObjectBacking(handle.*);
+        }
+
         handle.* = new_handle;
+    } else {
+        // If the collection is shared, we need to duplicate all the items.
+        for (0.., new_items) |i, *new_item| {
+            new_item.* = try Heap.dupOrReference(
+                Heap.local_heap,
+                collectionItemFollowRefs(handle.*, @intCast(i), current_len),
+            );
+        }
+
+        const old_handle = handle.*;
+        handle.* = new_handle;
+        old_handle.decrRefCount();
     }
 
     if (handle.peek().tag == .dict) return true;
@@ -1082,7 +1144,7 @@ pub fn listAppend(det: ?*ErrorDetails, handle: *Handle, item: Handle) !Handle {
     const list = handle.peek();
     const index = list.body.list.len - 1;
 
-    listItems(handle.*)[index] = try handle.getHeap().duplicateOrReference(item);
+    listItems(handle.*)[index] = try handle.getHeap().dupOrReference(item);
 
     return handle.getHeap().getHandle(index);
 }
@@ -1095,11 +1157,11 @@ fn testLists(ta: std.mem.Allocator) !void {
 
     // Simple case: two objects in a list
     const obj1 = try newString(heap, "object 1");
-    defer obj1.release();
+    defer obj1.decrRefCount();
     const obj2 = try newString(heap, "object 2");
-    defer obj2.release();
+    defer obj2.decrRefCount();
     var list1 = try listNew(&.{ obj1, obj2 });
-    defer list1.release();
+    defer list1.decrRefCount();
 
     const items = listItems(list1);
     try testing.expectEqual(2, items.len);
@@ -1109,7 +1171,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("object 1", try Heap.getString(listItem(list1, 0)));
 
     const to_append = try newString(heap, "appended item");
-    defer to_append.release();
+    defer to_append.decrRefCount();
 
     _ = try listAppend(&det, &list1, to_append);
     try testing.expectEqualStrings("appended item", try Heap.getString(listItem(list1, 2)));
@@ -1117,7 +1179,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
     );
-    defer string_list.release();
+    defer string_list.decrRefCount();
 
     const old_string_list_handle = string_list;
     try shimmerToList(&det, &string_list);
@@ -1199,6 +1261,14 @@ pub fn dictItem(handle: Handle, index: u32) Handle {
     return collectionItem(handle, index, metadata.len);
 }
 
+pub fn dictItemFollowRefs(handle: Handle, index: u32) Handle {
+    const dict = handle.peek();
+    assert(dict.tag == .dict);
+    const metadata = &handle.getHeap().getExtraData(dict.body.dict).dict;
+
+    return collectionItemFollowRefs(handle, index, metadata.len);
+}
+
 pub fn dictItemLengthRaw(handle: Handle) u32 {
     assert(handle.peek().tag == .dict);
     return handle.getHeap().getExtraData(handle.peek().body.dict).dict.len;
@@ -1246,12 +1316,12 @@ pub fn dictUninitializedNew(len: u32) !Handle {
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
 pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
     const dict = try dictUninitializedNew(@intCast(handles.len));
-    errdefer dict.release();
+    errdefer dict.decrRefCount();
 
     const new_items = dictItems(dict);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try Heap.duplicateOrReference(heap, handle);
+        item.* = try Heap.dupOrReference(heap, handle);
     }
 
     try dictReindex(dict, null);
@@ -1284,7 +1354,7 @@ pub fn dictReindex(handle: Handle, up_to: ?usize) !void {
     }
 }
 
-pub fn dictLookupRaw(dict: Handle, key: Handle) error{OutOfMemory}!?Handle {
+pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!?Handle {
     assert(dict.peek().tag == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
     _ = try Heap.getString(key);
@@ -1293,7 +1363,7 @@ pub fn dictLookupRaw(dict: Handle, key: Handle) error{OutOfMemory}!?Handle {
     const metadata = &dict_heap.getExtraData(dict.peek().body.dict).dict;
 
     if (metadata.table.get(key)) |value_offset| {
-        return dictItem(dict, value_offset);
+        return dictItemFollowRefs(dict, value_offset);
     } else return null;
 }
 
@@ -1399,7 +1469,7 @@ fn dictRemoveDuplicates(handle: *Handle, to_track: ?u32) !?u32 {
 pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
     assert(handle.peek().tag == .dict);
 
-    // Copy on write logic.
+    // Copy on write logic for the dictionary.
     const old_dict: ?Heap.Handle = blk: {
         if (handle.canModify()) {
             break :blk null;
@@ -1410,31 +1480,50 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
         }
     };
     // The old dict needs to be released at the very end, because `key` may come from the old dict.
-    defer if (old_dict) |val| val.release();
+    defer if (old_dict) |val| val.decrRefCount();
 
     handle.invalidateString();
 
     assert(handle.heap == Heap.local_heap.heapId());
     var metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
 
+    var value_mut = value; // Used for error cleanup.
     const value_index: u32 = blk: {
-        // If we hit OOM at some point, we need to be sure to roll back the new value.
-        errdefer {
-            var value_mut = value;
+        // Ensure `key` has a string rep.
+        _ = Heap.getString(key) catch {
+            // Be sure to clean up the value if not.
             value_mut.deinitBodySingle(Heap.local_heap);
-        }
+            return error.OutOfMemory;
+        };
 
-        // Ensure `original_key` has a string rep.
-        _ = try Heap.getString(key);
         // Does the key already exist?
         if (metadata.table.get(key)) |existing_value| {
             // Key exists, so replace the value in place.
             const value_handle = dictItem(handle.*, existing_value);
+            if (value_handle.isShared()) {
+                // Looks like this dictionary value is shared, so we can't replace the value in place
+                // (else we'd smash up a value someone else is using). Instead, we'll start this whole
+                // process over with a new dictionary.
+                assert(old_dict == null);
+                const local_old_dict = handle.*;
+                handle.* = Heap.local_heap.duplicate(handle.*) catch {
+                    value_mut.deinitBodySingle(Heap.local_heap);
+                    return error.OutOfMemory;
+                };
+                // Now we've set the new dict, we can prepare to release the old one.
+                defer local_old_dict.decrRefCount();
+
+                return dictPutObject(handle, key, value);
+            }
+            assert(!value_handle.isShared());
             value_handle.invalidateBoth();
             value_handle.peek().* = value;
 
             break :blk existing_value;
         } else {
+            // If we hit OOM at some point, we need to be sure to roll back the new value.
+            errdefer value_mut.deinitBodySingle(Heap.local_heap);
+
             // Need to copy the key string here, because it may become invalidated when
             // calling `ensureTotalCapacity`.
             const key_dup_str = try Heap.local_heap.duplicateObjString(key);
@@ -1466,6 +1555,8 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
                 metadata.table.putAssumeCapacity(new_key_handle, new_value_index);
             }
 
+            // Now that we've set the new value, we can be rest assured that `value`
+            // won't need to be cleaned up, as now it's owned by the dict.
             new_value_handle.peek().* = value;
             break :blk new_value_index;
         }
@@ -1481,7 +1572,7 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
 }
 
 pub fn dictPut(handle: *Handle, key: Handle, value: Handle) !Heap.Handle {
-    return dictPutObject(handle, key, try Heap.local_heap.duplicateOrReference(value));
+    return dictPutObject(handle, key, try Heap.local_heap.dupOrReference(value));
 }
 
 fn testDicts(ta: std.mem.Allocator) !void {
@@ -1489,44 +1580,44 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const heap = try Heap.testStart(ta);
 
     const key1 = try newString(heap, "foo");
-    defer key1.release();
+    defer key1.decrRefCount();
     const value1 = try newString(heap, "1");
-    defer value1.release();
+    defer value1.decrRefCount();
     const key2 = try newString(heap, "bar");
-    defer key2.release();
+    defer key2.decrRefCount();
     const value2 = try newString(heap, "2");
-    defer value2.release();
+    defer value2.decrRefCount();
 
     const dict1 = try newDict(heap, &.{ key1, value1, key2, value2 });
-    defer dict1.release();
+    defer dict1.decrRefCount();
 
     const good_key = try newString(heap, "foo");
-    defer good_key.release();
+    defer good_key.decrRefCount();
     const bad_key = try newString(heap, "bogus");
-    defer bad_key.release();
+    defer bad_key.decrRefCount();
 
-    try testing.expectEqualStrings("1", try Heap.getString((try dictLookupRaw(dict1, good_key)).?));
-    try testing.expectEqual(null, try dictLookupRaw(dict1, bad_key));
+    try testing.expectEqualStrings("1", try Heap.getString((try dictLookupFollowRefs(dict1, good_key)).?));
+    try testing.expectEqual(null, try dictLookupFollowRefs(dict1, bad_key));
 
     // Dict with duplicate entries testing.
     var dict_with_duplicates = try newString(heap, "foo 5 bar 10 foo 15");
-    defer dict_with_duplicates.release();
+    defer dict_with_duplicates.decrRefCount();
     const dup_len = try dictPairLength(null, &dict_with_duplicates);
 
     try testing.expectEqual(3, dup_len);
     // When a duplicate key is queried, it should point to the last corrisponding value.
-    try testing.expectEqualStrings("15", try Heap.getString((try dictLookupRaw(dict_with_duplicates, key1)).?));
+    try testing.expectEqualStrings("15", try Heap.getString((try dictLookupFollowRefs(dict_with_duplicates, key1)).?));
 
     _ = try dictRemoveDuplicates(&dict_with_duplicates, null);
     try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
 
     // Dict put testing.
     var dict_for_put = try newDict(heap, &.{ key1, value1, key2, value2 });
-    defer dict_for_put.release();
+    defer dict_for_put.decrRefCount();
     const key3 = try newString(heap, "baz");
-    defer key3.release();
+    defer key3.decrRefCount();
     const value3 = try newString(heap, "3");
-    defer value3.release();
+    defer value3.decrRefCount();
 
     try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
     _ = try dictPut(&dict_for_put, key2, value3);
@@ -1534,24 +1625,24 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     _ = try dictPut(&dict_for_put, key3, value3);
     try testing.expectEqual(3, dictPairLengthRaw(dict_for_put));
-    try testing.expectEqualStrings("3", try Heap.getString((try dictLookupRaw(dict_for_put, key3)).?));
+    try testing.expectEqualStrings("3", try Heap.getString((try dictLookupFollowRefs(dict_for_put, key3)).?));
 
     // Test dict edge cases.
     var dict_edge_cases = try newDict(heap, &.{ key1, value1, key2, value2 });
-    defer dict_edge_cases.release();
+    defer dict_edge_cases.decrRefCount();
     // Try using a value as a key, and a key as the value while not shared (this is to check
     // that this handles using internal objects correctly).
     assert(dict_edge_cases.canModify());
-    _ = try dictPut(&dict_edge_cases, dictItem(dict_edge_cases, 1), dictItem(dict_edge_cases, 2));
-    try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupRaw(dict_edge_cases, value1)).?));
+    _ = try dictPut(&dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 1), dictItemFollowRefs(dict_edge_cases, 2));
+    try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, value1)).?));
 
     // Try aliasing a key by using it as key and value.
-    _ = try dictPut(&dict_edge_cases, dictItem(dict_edge_cases, 0), dictItem(dict_edge_cases, 0));
-    try testing.expectEqualStrings("foo", try Heap.getString((try dictLookupRaw(dict_edge_cases, key1)).?));
+    _ = try dictPut(&dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 0), dictItemFollowRefs(dict_edge_cases, 0));
+    try testing.expectEqualStrings("foo", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, key1)).?));
 
     // Try aliasing a value by using it as key and value.
-    _ = try dictPut(&dict_edge_cases, dictItem(dict_edge_cases, 3), dictItem(dict_edge_cases, 3));
-    try testing.expectEqualStrings("2", try Heap.getString((try dictLookupRaw(dict_edge_cases, value2)).?));
+    _ = try dictPut(&dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 3), dictItemFollowRefs(dict_edge_cases, 3));
+    try testing.expectEqualStrings("2", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, value2)).?));
 }
 
 test "dicts" {
@@ -1610,10 +1701,10 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     const heap = try Heap.testStart(ta);
 
     var obj = try heap.createObject();
-    defer obj.release();
+    defer obj.decrRefCount();
 
     const file_name = try newString(heap, "test_file.tcl");
-    defer file_name.release();
+    defer file_name.decrRefCount();
 
     try setSourceInfo(obj, .{ .file_name = file_name, .line_no = 42 });
 
@@ -1627,7 +1718,7 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
     const obj2 = try newString(heap, "hello");
-    defer obj2.release();
+    defer obj2.decrRefCount();
 
     const empty_info = getSourceInfo(obj2);
     try testing.expect(empty_info == null);
@@ -1708,7 +1799,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     // Initialize the Heap-stored list that will contain the corrisponding value for each token.
     var new_token_values = try listUninitializedNew(new_token_capacity);
-    errdefer new_token_values.release();
+    errdefer new_token_values.decrRefCount();
     // Set length to 0 so we can just call listAppend().
     _ = try setCollectionLength(&new_token_values, 0);
 
@@ -1843,7 +1934,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     }
 
     // Increment reference count to file name, if not null.
-    if (source_info.file_name) |file_name| _ = file_name.reference();
+    if (source_info.file_name) |file_name| file_name.incrRefCount();
     const parsed_script: Heap.ParsedScript = .{
         .tags = new_token_tags,
         .values = new_token_values,
@@ -1863,7 +1954,7 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
         \\ set x 5
         \\ set y $x[set x]
     );
-    defer script1.release();
+    defer script1.decrRefCount();
     var parsed = try parseScript(null, script1);
     defer parsed.deinit(heap);
 
@@ -1962,7 +2053,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
             \\ set foo 5
             \\ set y $foo[set foo]
         );
-        defer old_script.release();
+        defer old_script.decrRefCount();
 
         const parsed_script = try getScript(null, &old_script);
         const script1_id = old_script.peek().body.script.id;
@@ -1983,7 +2074,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     };
 
     var new_script = try newString(heap, "set x 5");
-    defer new_script.release();
+    defer new_script.decrRefCount();
 
     try shimmerToScript(null, &new_script);
     const new_script_id = new_script.peek().body.script.id;
@@ -2037,8 +2128,8 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, handle: *Handle) !void {
     }
 
     const source_info: SourceInfo = getSourceInfo(handle.*) orelse .{ .file_name = null, .line_no = 1 };
-    const file_name = try Handle.borrowOptional(source_info.file_name);
-    errdefer if (file_name) |val| val.release();
+    const file_name = Handle.borrowOptional(source_info.file_name);
+    errdefer if (file_name) |val| val.decrRefCount();
     const line_no = source_info.line_no;
 
     try Heap.prepareToShimmer(handle);
@@ -2088,7 +2179,7 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, handle: *Handle) !void {
                         const rendered_error = try aw.toOwnedSlice();
                         defer Heap.local_heap.gpa.free(rendered_error);
                         const err_on_heap = try newString(Heap.local_heap, rendered_error);
-                        errdefer err_on_heap.release();
+                        errdefer err_on_heap.decrRefCount();
 
                         details.* = .{
                             .message = err_on_heap,
@@ -2129,7 +2220,7 @@ fn testExpressions(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
 
     var expr1 = try newString(heap, "1 + 2 * 3 + 4");
-    defer expr1.release();
+    defer expr1.decrRefCount();
 
     try shimmerToExpression(null, &expr1);
 

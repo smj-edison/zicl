@@ -10,7 +10,21 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
-const FreeList = std.ArrayListUnmanaged(usize);
+const options = @import("options");
+
+/// Mutex, or DummyMutex if single threaded.
+pub const Mutex = if (options.threading) std.Thread.Mutex else DummyMutex;
+const DummyMutex = struct {
+    fn lock(self: *DummyMutex) void {
+        _ = self;
+    }
+    fn tryLock(self: *DummyMutex) void {
+        _ = self;
+    }
+    fn unlock(self: *DummyMutex) void {
+        _ = self;
+    }
+};
 
 // These functions are all when appending to the free list (it should have
 // already resized itself)
@@ -54,103 +68,235 @@ pub const null_allocator: Allocator = .{
     },
 };
 
-pub fn getOrder(count: usize) u6 {
-    return @intCast(math.log2_int_ceil(usize, count));
+pub fn getOrder(count: u32) u5 {
+    return @intCast(math.log2_int_ceil(u32, count));
 }
 
-pub fn getOrderSize(order: u6) usize {
-    return @as(usize, 1) << order;
+pub fn getOrderSize(order: u5) u32 {
+    return @as(u32, 1) << order;
 }
 
-/// Dependant on parent allocator to resize the internal free lists
-pub fn BuddyUnmanaged(max_order: comptime_int) type {
+pub fn buddy_of_order(index: u32, order: u5) u32 {
+    return buddy_of(index, getOrderSize(order));
+}
+
+fn buddy_of(index: u32, order_size: u32) u32 {
+    const mask = (order_size * 2) - 1;
+
+    if (index & mask == 0) {
+        return index + order_size;
+    } else {
+        return index - order_size;
+    }
+}
+
+/// Dependant on parent allocator to resize the internal free lists.
+///
+/// Design:
+/// This is a pretty standard buddy allocator, with a small twist: there's a
+/// non-thread-safe pool that can be used to quickly allocate/free, and when
+/// the pool overflows it allocates/frees from the main list.
+pub fn BuddyUnmanaged(comptime cfg: struct {
+    max_order: u5,
+    max_pool_order: u5,
+    pool_size: usize,
+}) type {
+    const FreeList = std.AutoArrayHashMapUnmanaged(u32, void);
+
+    assert(cfg.max_pool_order <= cfg.max_order);
+
     return struct {
+        gpa: Allocator,
         // TODO: make this one data structure
-        free_lists: [max_order]FreeList,
-        alloc_count: [max_order]usize,
+        free_lists: [cfg.max_order]FreeList,
+        alloc_count: [cfg.max_order]usize,
+        pools: [cfg.max_pool_order][cfg.pool_size]u32,
+        pools_len: [cfg.max_pool_order]usize,
+        mutex: Mutex = .{},
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, initial_capacity: usize) error{OutOfMemory}!Self {
+        pub fn init(gpa: Allocator, initial_capacity: usize) error{OutOfMemory}!Self {
             var new_alloc: Self = .{
+                .gpa = gpa,
                 .free_lists = undefined,
-                .alloc_count = [_]usize{0} ** max_order,
+                .alloc_count = @splat(0),
+                .pools = @splat(@splat(0)),
+                .pools_len = @splat(0),
             };
 
             var initialized: usize = 0;
             errdefer for (0..initialized) |i| {
-                new_alloc.free_lists[i].deinit(allocator);
+                new_alloc.free_lists[i].deinit(gpa);
             };
-            while (initialized < max_order) : (initialized += 1) {
-                new_alloc.free_lists[initialized] = try FreeList.initCapacity(allocator, initial_capacity);
+            while (initialized < cfg.max_order) : (initialized += 1) {
+                new_alloc.free_lists[initialized] = .empty;
+                try new_alloc.free_lists[initialized].ensureTotalCapacity(gpa, initial_capacity);
             }
 
-            try new_alloc.free_lists[max_order - 1].append(allocator, 0);
+            // Add the top-most block.
+            try new_alloc.free_lists[cfg.max_order - 1].put(gpa, 0, {});
 
             return new_alloc;
         }
 
-        pub fn deinit(self: *Self, allocator: Allocator) void {
-            for (0..max_order) |i| {
-                self.free_lists[i].deinit(allocator);
+        // Not threadsafe.
+        pub fn deinit(self: *Self) enum { normal, leaked } {
+            // FIXME why does this panic if I use defer?
+            self.mutex.lock();
+            self.mutex.unlock();
+
+            self.drainPool();
+
+            // Leak check.
+            var leaked = false;
+            for (self.alloc_count) |count| {
+                if (count != 0) leaked = true;
             }
+
+            if (leaked) {
+                std.debug.print("Heap alloc counts: {any}\n", .{self.alloc_count});
+                for (self.free_lists[0..], 0..) |free_list, order| {
+                    if (free_list.count() > 0) {
+                        std.debug.print("Free list for order {}: {any}\n", .{ order, free_list.entries.items(.key) });
+                    }
+                }
+            }
+
+            // Deinit free lists.
+            for (0..cfg.max_order) |i| {
+                self.free_lists[i].deinit(self.gpa);
+            }
+
+            self.* = undefined;
+
+            return if (leaked) .leaked else .normal;
         }
 
-        pub fn allocCount(self: *Self, gpa: Allocator, count: usize) !usize {
-            assert(count > 0);
-            const order: u6 = @intCast(math.log2_int_ceil(usize, count));
-            return self.alloc(gpa, order);
+        /// Caller must have the block already allocated. `new_order` must be smaller than
+        /// `current_order`.
+        pub fn splitBlock(self: *Self, current_order: u5, new_order: u5) void {
+            assert(new_order < current_order);
+
+            // 2 ** (current_order - new_order)
+            const new_block_count = @as(u32, 1) << (current_order - new_order);
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.alloc_count[current_order] -= 1;
+            self.alloc_count[new_order] += new_block_count;
         }
 
-        pub fn alloc(self: *Self, allocator: Allocator, requested_order: u6) error{OutOfMemory}!usize {
-            // Ensure that the free list has enough space when the object needs to be freed
+        pub fn allocFromAnyThread(self: *Self, requested_order: u5) !u32 {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.allocOnMainList(requested_order);
+        }
+
+        pub fn freeFromAnyThread(self: *Self, index: u32, order: u5) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.freeOnMainList(index, order);
+        }
+
+        pub fn allocFromOwningThread(self: *Self, requested_order: u5) !u32 {
+            // Try allocating from the pool, if available.
+            if (self.allocOnPool(requested_order)) |pool_alloc| {
+                return pool_alloc;
+            } else |_| {}
+
+            // We still need to lock if another thread is using this allocator right now.
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.allocOnMainList(requested_order);
+        }
+
+        pub fn freeFromOwningThread(self: *Self, index: u32, order: u5) void {
+            // Try freeing onto the pool, if there's room left.
+            if (order < cfg.max_pool_order) {
+                if (self.freeOnPool(index, order)) |_| {
+                    return;
+                } else |_| {}
+            }
+
+            // We should transfer the pool over to the main list, since there wasn't any room
+            // left on the pool.
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.drainPool();
+            self.freeOnMainList(index, order);
+        }
+
+        /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
+        /// small objects is fast. Not threadsafe.
+        fn allocOnPool(self: *Self, requested_order: u5) !u32 {
+            if (requested_order < cfg.max_pool_order) {
+                if (self.pools_len[requested_order] > 0) {
+                    const open = self.pools[requested_order][self.pools_len[requested_order] - 1];
+                    self.pools_len[requested_order] -= 1;
+                    return open;
+                }
+            }
+
+            return error.PoolEmpty;
+        }
+
+        /// Caller is responsible for locking the allocator.
+        fn allocOnMainList(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
+            // Ensure that the free list has enough space for when the object needs to be freed.
             try self.free_lists[requested_order].ensureTotalCapacity(
-                allocator,
+                self.gpa,
                 (self.alloc_count[requested_order] + 1) / 2 + 1,
             );
             self.alloc_count[requested_order] += 1; // Allocation stats.
 
-            // look for an open block of any size >= requested_order (if the open block
-            // is too big, we'll split it).
-            var open_index: usize = undefined;
+            // look for an open block of any size >= requested_order (if the open block is too big, we'll split it).
+            var open_index: u32 = undefined;
             var open_order = requested_order;
-            while (open_order < max_order) : (open_order += 1) {
+            while (open_order < cfg.max_order) : (open_order += 1) {
                 if (self.free_lists[open_order].pop()) |open| {
-                    open_index = open;
+                    open_index = open.key;
                     break;
                 }
             } else return error.OutOfMemory;
 
             // split blocks (if needed).
             while (open_order > requested_order) : (open_order -= 1) {
-                try self.free_lists[open_order - 1].append(allocator, open_index + getOrderSize(open_order - 1));
+                try self.free_lists[open_order - 1].put(self.gpa, open_index + getOrderSize(open_order - 1), {});
                 // Lower half is implicitly passed along `open_index`, since
-                // the lower block index stays the same as it descends
+                // the lower block index stays the same as it descends.
             }
+
+            const looking_for = buddy_of_order(104, 1);
+            if (open_index == looking_for) @panic("here");
 
             return open_index;
         }
 
-        pub fn freeCount(self: *Self, index: usize, count: usize) void {
-            assert(count > 0);
-            const order: u6 = @intCast(math.log2_int_ceil(usize, count));
-            return self.free(index, order);
+        /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
+        /// small objects is fast. We also don't coalesce on the pool, so this also prevents
+        /// churning where blocks are split and merged constantly. Not threadsafe.
+        fn freeOnPool(self: *Self, index: u32, order: u5) !void {
+            assert(order < cfg.max_pool_order);
+
+            if (self.pools_len[order] >= cfg.pool_size) return error.PoolFull;
+
+            self.pools[order][self.pools_len[order]] = index;
+            self.pools_len[order] += 1;
         }
 
-        pub fn free(self: *Self, index: usize, order: u6) void {
-            // TODO: add safety check that the allocation exists before freeing it.
+        /// Caller is responsible for locking the allocator.
+        fn freeOnMainList(self: *Self, index: u32, order: u5) void {
             self.alloc_count[order] -= 1; // Allocation stats.
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
             const freed_buddy = buddy_of(index, getOrderSize(order));
-            var buddy_free_list_index = blk: {
-                for (self.free_lists[order].items, 0..) |block, i| {
-                    if (block == freed_buddy) {
-                        break :blk i;
-                    }
+            var buddy_free_list_index: u32 = blk: {
+                if (self.free_lists[order].getIndex(freed_buddy)) |buddy_index| {
+                    break :blk @intCast(buddy_index); // Found buddy.
                 } else {
-                    // Unreachable as we reserved enough space during alloc.
-                    self.free_lists[order].append(null_allocator, index) catch unreachable;
+                    // We can assume as we reserved enough space during alloc.
+                    self.free_lists[order].putAssumeCapacity(index, {});
                     return; // No buddy, return.
                 }
             };
@@ -161,10 +307,10 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             var buddy_being_merged = freed_buddy;
 
             // Why `< max_order - 1`? Because the top order has no sibling to merge with.
-            while (order_being_merged < max_order - 1) {
-                // Remove buddy from its free list (no longer free since it's being merged)
-                _ = self.free_lists[order_being_merged].swapRemove(buddy_free_list_index);
-                // No need to remove the block, since we never added it in the first place
+            while (order_being_merged < cfg.max_order - 1) {
+                // Remove buddy from its free list (no longer free since it's being merged).
+                _ = self.free_lists[order_being_merged].swapRemoveAt(buddy_free_list_index);
+                // No need to remove the block, since we never added it in the first place.
 
                 // We've effectively merged the two blocks now, but we're not going to put
                 // the merged result on the higher free list, because it'll be passed up
@@ -178,18 +324,12 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
 
                 // Search for its buddy.
                 buddy_being_merged = buddy_of(block_being_merged, getOrderSize(order_being_merged));
-                for (self.free_lists[order_being_merged].items, 0..) |block, i| {
-                    if (block == buddy_being_merged) {
-                        buddy_free_list_index = i;
-                        break;
-                    }
+                if (self.free_lists[order_being_merged].getIndex(buddy_being_merged)) |free_parent_block| {
+                    buddy_free_list_index = @intCast(free_parent_block);
                 } else {
                     // In this case, we actually _do_ need to append the merged block,
                     // since we're no longer implicitly passing it up `block_being_merged`.
-                    self.free_lists[order_being_merged].append(
-                        null_allocator,
-                        block_being_merged,
-                    ) catch unreachable;
+                    self.free_lists[order_being_merged].putAssumeCapacity(block_being_merged, {});
                     return;
                 }
 
@@ -197,13 +337,13 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             }
         }
 
-        fn buddy_of(index: usize, order_size: usize) usize {
-            const mask = (order_size * 2) - 1;
-
-            if (index & mask == 0) {
-                return index + order_size;
-            } else {
-                return index - order_size;
+        /// Caller is responsible for locking the allocator.
+        fn drainPool(self: *Self) void {
+            for (&self.pools, &self.pools_len, 0..) |pool, *pool_len, order| {
+                for (pool[0..pool_len.*]) |to_free| {
+                    self.freeOnMainList(to_free, @intCast(order));
+                }
+                pool_len.* = 0;
             }
         }
 
@@ -221,40 +361,44 @@ const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-const TestAlloc = BuddyUnmanaged(5);
+const TestAlloc = BuddyUnmanaged(.{
+    .max_order = 5,
+    .max_pool_order = 0,
+    .pool_size = 0,
+});
 
 test "buddy allocator" {
     const ta = std.testing.allocator;
 
     var alloc = try TestAlloc.init(ta, 16);
-    defer alloc.deinit(ta);
+    defer if (alloc.deinit() == .leaked) @panic("Found leaks");
 
-    try expectEqual(0, try alloc.alloc(ta, 0));
-    try expectEqual(1, try alloc.alloc(ta, 0));
-    try expectEqual(2, try alloc.alloc(ta, 0));
+    try expectEqual(0, try alloc.allocFromAnyThread(0));
+    try expectEqual(1, try alloc.allocFromAnyThread(0));
+    try expectEqual(2, try alloc.allocFromAnyThread(0));
 
-    try expectEqual(4, try alloc.alloc(ta, 1));
-    try expectEqual(3, try alloc.alloc(ta, 0));
+    try expectEqual(4, try alloc.allocFromAnyThread(1));
+    try expectEqual(3, try alloc.allocFromAnyThread(0));
 
-    try expectEqual(8, try alloc.alloc(ta, 3));
+    try expectEqual(8, try alloc.allocFromAnyThread(3));
 
-    // --- //
-    alloc.free(0, 0);
-    alloc.free(1, 0);
-    alloc.free(2, 0);
+    // And now free.
+    alloc.freeFromAnyThread(0, 0);
+    alloc.freeFromAnyThread(1, 0);
+    alloc.freeFromAnyThread(2, 0);
 
-    alloc.free(4, 1);
-    alloc.free(3, 0);
+    alloc.freeFromAnyThread(4, 1);
+    alloc.freeFromAnyThread(3, 0);
 
-    alloc.free(8, 3);
+    alloc.freeFromAnyThread(8, 3);
 
     // Ensure the allocator is back to how it started
-    try expectEqual(0, alloc.free_lists[0].items.len);
-    try expectEqual(0, alloc.free_lists[1].items.len);
-    try expectEqual(0, alloc.free_lists[2].items.len);
-    try expectEqual(0, alloc.free_lists[3].items.len);
-    try expectEqual(1, alloc.free_lists[4].items.len);
-    try expectEqual(0, alloc.free_lists[4].items[0]);
+    try expectEqual(0, alloc.free_lists[0].count());
+    try expectEqual(0, alloc.free_lists[1].count());
+    try expectEqual(0, alloc.free_lists[2].count());
+    try expectEqual(0, alloc.free_lists[3].count());
+    try expectEqual(1, alloc.free_lists[4].count());
+    try expectEqual(0, alloc.free_lists[4].entries.get(0).key);
 }
 
 pub fn vmemMap(byte_count: usize) ![]align(heap.page_size_min) u8 {

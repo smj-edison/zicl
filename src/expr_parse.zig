@@ -359,7 +359,7 @@ pub const Parse = struct {
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
                 const handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
-                errdefer handle.release();
+                errdefer handle.decrRefCount();
 
                 return try p.addNode(.{
                     .tag = .string,
@@ -369,7 +369,7 @@ pub const Parse = struct {
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
                 const handle = try p.heap.createObject();
-                errdefer handle.release();
+                errdefer handle.decrRefCount();
                 try object.setStringFromEscaped(handle, p.source[loc.start..loc.end]);
 
                 return try p.addNode(.{
@@ -380,7 +380,7 @@ pub const Parse = struct {
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
                 const command_handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
-                errdefer command_handle.release();
+                errdefer command_handle.decrRefCount();
 
                 // Be sure to save the source info.
                 try object.setSourceInfo(command_handle, .{
@@ -400,7 +400,7 @@ pub const Parse = struct {
             => {
                 const loc = p.tokenLoc(p.nextToken());
                 var string_handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
-                errdefer string_handle.release();
+                errdefer string_handle.decrRefCount();
 
                 return try p.addNode(.{
                     .tag = switch (token) {
@@ -784,7 +784,7 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
             .command_subst,
             .string,
             => {
-                node.data.object.release();
+                node.data.object.decrRefCount();
             },
             else => {},
         }

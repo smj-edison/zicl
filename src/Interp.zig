@@ -123,7 +123,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         interp.heap.setTempObjectString(trimmed_var_name);
         defer interp.heap.resetTempObject();
         // Can't fail since we know a string exists for it.
-        var_value = (object.dictLookupRaw(var_dict, interp.heap.tempObject()) catch unreachable);
+        var_value = (object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable);
 
         // Global scope doesn't have statics.
     } else {
@@ -135,7 +135,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         // Check the variables dictionary.
         interp.heap.setTempObjectString(var_name);
         // Can't fail since we know a string exists for it.
-        var_value = (object.dictLookupRaw(var_dict, interp.heap.tempObject()) catch unreachable);
+        var_value = (object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable);
         interp.heap.resetTempObject();
 
         // Maybe it's in the statics dictionary instead?
@@ -146,7 +146,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
                 // allocating a heap object, just to immediately drop it.
                 interp.heap.setTempObjectString(var_name);
                 // Can't fail since we know a string exists for it.
-                var_value = object.dictLookupRaw(dict, interp.heap.tempObject()) catch unreachable;
+                var_value = object.dictLookupFollowRefs(dict, interp.heap.tempObject()) catch unreachable;
                 interp.heap.resetTempObject();
             }
         }
@@ -376,15 +376,15 @@ fn testVariables(ta: std.mem.Allocator) !void {
 
     try testing.expectEqual(null, interp.resolveVariable(0, "foo"));
     var foo = try object.newString(heap, "foo");
-    defer foo.release();
+    defer foo.decrRefCount();
     const value = try object.newString(heap, "value");
-    defer value.release();
+    defer value.decrRefCount();
     try interp.setVariableTo(&foo, value);
 
     const lookup_value = interp.resolveVariable(0, "foo").?.target_index;
     try testing.expectEqualStrings("value", try Heap.getString(Heap.local_heap.getHandle(lookup_value)));
-    // Should be copied.
-    try testing.expect(lookup_value != value.index);
+    // Should be referenced.
+    try testing.expect(lookup_value == value.index);
 }
 
 test "variables" {
@@ -408,32 +408,32 @@ const ProcedureSignature = struct {
     /// the last argument name.
     has_args_parameter: bool,
 
-    pub fn borrow(signature: ProcedureSignature) !ProcedureSignature {
-        const args = try signature.args.borrow();
-        errdefer args.release();
-        const body = try signature.body.borrow();
-        errdefer body.release();
-        const statics = try Handle.borrowOptional(signature.statics);
-        errdefer if (statics) |val| val.release();
-        const optional_values = try Handle.borrowOptional(signature.optional_values);
-        errdefer if (optional_values) |val| val.release();
+    pub fn borrow(sign: ProcedureSignature) !ProcedureSignature {
+        sign.args.incrRefCount();
+        errdefer sign.args.decrRefCount();
+        sign.body.incrRefCount();
+        errdefer sign.body.decrRefCount();
+        if (sign.statics) |val| val.incrRefCount();
+        errdefer if (sign.statics) |val| val.decrRefCount();
+        if (sign.optional_values) |val| val.incrRefCount();
+        errdefer if (sign.optional_values) |val| val.decrRefCount();
 
         return .{
-            .args = args,
-            .body = body,
-            .statics = statics,
-            .required_arity = signature.required_arity,
-            .optional_arity = signature.optional_arity,
-            .optional_values = optional_values,
-            .has_args_parameter = signature.has_args_parameter,
+            .args = sign.args,
+            .body = sign.body,
+            .statics = sign.statics,
+            .required_arity = sign.required_arity,
+            .optional_arity = sign.optional_arity,
+            .optional_values = sign.optional_values,
+            .has_args_parameter = sign.has_args_parameter,
         };
     }
 
     pub fn release(signature: ProcedureSignature) void {
-        signature.args.release();
-        signature.body.release();
-        if (signature.statics) |statics| statics.release();
-        if (signature.optional_values) |values| values.release();
+        signature.args.decrRefCount();
+        signature.body.decrRefCount();
+        if (signature.statics) |statics| statics.decrRefCount();
+        if (signature.optional_values) |values| values.decrRefCount();
     }
 };
 
@@ -458,7 +458,7 @@ pub const Command = struct {
     },
 
     pub fn deinit(command: *Command) void {
-        if (command.namespace) |namespace| namespace.release();
+        if (command.namespace) |namespace| namespace.decrRefCount();
 
         switch (command.call_info) {
             .tcl => |val| val.signature.release(),
@@ -583,22 +583,22 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
         if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
             // Assign remaining arguments to `args`.
             const list = try object.listNew(args[called_idx..]);
-            defer list.release();
+            defer list.decrRefCount();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
         } else if (signature_idx > signature.required_arity) {
             // This is an optional argument.
 
             // Are there any remaining unassigned arguments?
             if (called_idx < args.len) {
-                try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.referenceOrDuplicate(args[called_idx]));
+                try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(args[called_idx]));
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
                 const default_value = object.listItem(signature.optional_values.?, signature_idx - signature.required_arity);
-                try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.referenceOrDuplicate(default_value));
+                try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(default_value));
             }
         } else {
-            try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.referenceOrDuplicate(args[called_idx]));
+            try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(args[called_idx]));
             called_idx += 1;
         }
     }
@@ -642,13 +642,13 @@ pub fn evalList(interp: *Interp, list: *Handle) !void {
     @panic("unimplemented");
 }
 fn freeLastResult(interp: *Interp) void {
-    interp.result.release();
+    interp.result.decrRefCount();
     interp.result = interp.heap.emptyObject();
 }
 
 pub fn setResult(interp: *Interp, handle: Handle) !void {
     interp.freeLastResult();
-    interp.result = try handle.borrow();
+    interp.result = handle.borrow();
 }
 
 pub fn setResultOwning(interp: *Interp, handle: Handle) void {
@@ -731,10 +731,10 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: ProcedureSignature) !u32 {
-    const namespace = try Handle.borrowOptional(interp.namespace);
-    errdefer if (namespace) |ns| ns.release();
+    if (interp.namespace) |val| val.incrRefCount();
+    errdefer if (interp.namespace) |ns| ns.decrRefCount();
     const vars_handle = try object.newDict(interp.heap, &.{});
-    errdefer vars_handle.release();
+    errdefer vars_handle.decrRefCount();
     const borrowed_signature = try signature.borrow();
     errdefer borrowed_signature.release();
 
@@ -745,7 +745,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
         .args = args,
         .call_epoch = interp.current_call_epoch,
         .level = level,
-        .namespace = namespace,
+        .namespace = interp.namespace,
         .signature = borrowed_signature,
         // TODO PERF recycle variable hash table if possible.
         .variables = vars_handle,
@@ -773,12 +773,12 @@ fn popEvalFrame(interp: *Interp) void {
 fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) !Handle {
     switch (tag) {
         .simple_string => {
-            return try value.borrow();
+            return value.borrow();
         },
         .variable_subst => {
             var det: object.ErrorDetails = undefined;
             const var_target = try interp.wrapErrorDetails(&det, interp.getVariableImpl(&det, value));
-            return try var_target.borrow();
+            return var_target.borrow();
         },
         .dict_sugar => {
             @panic("Dict sugar unimplemented");
@@ -806,7 +806,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
 
             // Be sure to propagate any error that eval returned.
             if (result) {
-                return try interp.result.borrow();
+                return interp.result.borrow();
             } else |err| {
                 return err;
             }
@@ -833,7 +833,7 @@ fn interpolateTokens(
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len), 0..) |tag, value_index, i| {
-        if (interp.substituteOneToken(tag, object.dictItem(value_list, @intCast(value_index)))) |new_value| {
+        if (interp.substituteOneToken(tag, object.dictItemFollowRefs(value_list, @intCast(value_index)))) |new_value| {
             new_values[i] = new_value;
         } else |err| {
             // Due to the error, we're actually going to return early, after we take care
@@ -868,7 +868,7 @@ fn interpolateTokens(
 
             // Clean everything up before we return.
             for (0..i) |cleanup_idx| {
-                new_values[cleanup_idx].release();
+                new_values[cleanup_idx].decrRefCount();
             }
 
             return new_err;
@@ -881,7 +881,7 @@ fn interpolateTokens(
     }
 
     const new_str = try object.newStringToFill(interp.heap, new_str_len);
-    errdefer new_str.release();
+    errdefer new_str.decrRefCount();
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
         for (new_values) |new_value| {
@@ -986,8 +986,8 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Handle) 
         if (current_namespace) |namespace| {
             assert(handle.heap == interp.heap.heapId());
 
-            const borrowed_namespace = try namespace.borrow();
-            errdefer borrowed_namespace.release();
+            const borrowed_namespace = namespace.borrow();
+            errdefer borrowed_namespace.decrRefCount();
             assert(borrowed_namespace.heap == handle.heap);
 
             const extra_data = try interp.heap.createExtraData();
@@ -1069,7 +1069,7 @@ fn invokeCommand(interp: *Interp, args: []Handle) !void {
             if (interp.currentCallFrame().tailcall) |tailcall| {
                 // Be sure to free the previous tailcall.
                 if (tailcall_info) |prev_tailcall| {
-                    for (prev_tailcall.args) |arg| arg.release();
+                    for (prev_tailcall.args) |arg| arg.decrRefCount();
                     interp.gpa.free(prev_tailcall.args);
                 }
 
@@ -1271,8 +1271,8 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
             const lhs_tag = std.meta.activeTag(lhs_value);
             const rhs_tag = std.meta.activeTag(rhs_value);
-            defer if (lhs_tag == .string) lhs_value.string.release();
-            defer if (rhs_tag == .string) rhs_value.string.release();
+            defer if (lhs_tag == .string) lhs_value.string.decrRefCount();
+            defer if (rhs_tag == .string) rhs_value.string.decrRefCount();
 
             // Fast case, both integers, or both floats.
             if (lhs_tag == .integer and rhs_tag == .integer) {
@@ -1323,8 +1323,8 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
             const lhs_tag = std.meta.activeTag(lhs_value);
             const rhs_tag = std.meta.activeTag(rhs_value);
-            defer if (lhs_tag == .string) lhs_value.string.release();
-            defer if (rhs_tag == .string) rhs_value.string.release();
+            defer if (lhs_tag == .string) lhs_value.string.decrRefCount();
+            defer if (rhs_tag == .string) rhs_value.string.decrRefCount();
 
             var lhs_buffer: [50]u8 = @splat(0);
             const lhs_alloc = std.heap.FixedBufferAllocator.init(lhs_buffer[0..]);
@@ -1594,7 +1594,7 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
         var args = try args_alloc.alloc(Handle, command_info.arg_count);
         @memset(args, interp.heap.nullObject());
         defer args_alloc.free(args);
-        defer for (args) |arg| arg.release();
+        defer for (args) |arg| arg.decrRefCount();
 
         // Populate the arguments by looping through each word of the command and
         // substituting.
@@ -1697,7 +1697,7 @@ pub fn init() !Interp {
 }
 
 pub fn deinit(interp: *Interp) void {
-    interp.result.release();
+    interp.result.decrRefCount();
     var iter = interp.commands.iterator();
     while (iter.next()) |*entry| {
         interp.gpa.free(entry.key_ptr.*);
@@ -1707,8 +1707,8 @@ pub fn deinit(interp: *Interp) void {
 
     // Deinit all frames.
     for (interp.call_frames.items) |frame| {
-        if (frame.namespace) |namespace| namespace.release();
-        frame.variables.release();
+        if (frame.namespace) |namespace| namespace.decrRefCount();
+        frame.variables.decrRefCount();
         frame.signature.release();
     }
     interp.call_frames.deinit(interp.gpa);
@@ -1762,7 +1762,7 @@ pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) !vo
 
 pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) !void {
     try Heap.prepareToShimmer(name);
-    return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, try Heap.local_heap.duplicateOrReference(handle));
+    return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, try Heap.local_heap.dupOrReference(handle));
 }
 
 pub fn getVariableNoDetails(interp: *Interp, name: *Handle) !Handle {

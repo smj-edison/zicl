@@ -177,14 +177,14 @@ pub fn createProcedureCommand(
 
             const statics_dict = try object.dictUninitializedNew(statics_count * 2);
             const dict_items = object.dictItems(statics_dict);
-            errdefer statics_dict.release();
+            errdefer statics_dict.decrRefCount();
 
             for (0..statics_count) |i| {
                 const static_name = object.listItem(list.*, @intCast(i));
                 if (interp.getVariableImpl(null, static_name)) |static_value| {
                     const dict_name_str = try Heap.duplicateObjString(Heap.local_heap, static_name);
                     errdefer dict_name_str.deinit(Heap.local_heap);
-                    const dict_value = try Heap.referenceOrDuplicate(Heap.local_heap, static_value);
+                    const dict_value = try Heap.local_heap.dupOrReference(static_value);
 
                     dict_items[i * 2] = .{
                         .str = dict_name_str,
@@ -210,11 +210,11 @@ pub fn createProcedureCommand(
     };
 
     const new_arg_list = try object.listUninitializedNew(arg_list_len);
-    errdefer new_arg_list.release();
+    errdefer new_arg_list.decrRefCount();
 
     // We'll set this to a list if we encounter any optional values.
     var optional_values: ?Handle = null;
-    errdefer if (optional_values) |val| val.release();
+    errdefer if (optional_values) |val| val.decrRefCount();
     // Set to true if we find args.
     var args_parameter_found = false;
     // Keep track of how many arguments there are.
@@ -228,8 +228,8 @@ pub fn createProcedureCommand(
             return error.ParameterAfterArgs;
         }
 
-        var arg = try object.listItem(arg_list.*, @intCast(i)).borrow();
-        defer arg.release();
+        var arg = object.listItem(arg_list.*, @intCast(i)).borrow();
+        defer arg.decrRefCount();
         const arg_len = try interp.getListLength(&arg);
 
         if (arg_len == 0) {
@@ -285,11 +285,11 @@ pub fn createProcedureCommand(
     }
 
     return .{
-        .namespace = try namespace.borrow(),
+        .namespace = namespace.borrow(),
         .call_info = .{ .tcl = .{
             .signature = .{
                 .args = new_arg_list,
-                .body = try body.borrow(),
+                .body = body.borrow(),
                 .statics = statics,
                 .has_args_parameter = args_parameter_found,
                 .required_arity = required_arity,
@@ -315,7 +315,7 @@ pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
 
     // The procedure's namespace may not be the same as the current namespace.
     const proc_namespace = try object.newString(interp.heap, name_parts.namespace);
-    defer proc_namespace.release();
+    defer proc_namespace.decrRefCount();
 
     var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -344,6 +344,6 @@ test "commands" {
     var script = try object.newString(heap,
         \\ 
     );
-    defer script.release();
+    defer script.decrRefCount();
     try interp.evalObject(&script);
 }
