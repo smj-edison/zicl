@@ -1,3 +1,7 @@
 zig-out
 .zig-cache
 .vscode
+
+graph.svg
+perf.data
+per.data.old
