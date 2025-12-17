@@ -744,22 +744,22 @@ pub const Handle = packed struct(u64) {
     fn invalidateCollection(handle: Handle, len: u32) void {
         assert(handle.peek().tag == .dict or handle.peek().tag == .list);
 
-        // First, we need to check if any of the elements have been referenced.
+        // First, we need to check if any of the items have been referenced.
         const any_elems_referenced = blk: {
             for (0..len) |i| {
-                const elem_handle: Handle = .{
+                const item_handle: Handle = .{
                     .index = @intCast(handle.index + i + 1),
                     .heap = handle.heap,
                 };
 
-                if (elem_handle.isShared()) {
+                if (item_handle.isShared()) {
                     break :blk true;
                 }
             } else break :blk false;
         };
 
         if (any_elems_referenced) {
-            // Since an element was referenced, we'll need to split this allocation
+            // Since an item was referenced, we'll need to split this allocation
             // into individual objects.
             handle.getHeap().splitAlloc(handle.index, 0);
         }

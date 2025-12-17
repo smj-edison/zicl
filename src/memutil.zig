@@ -183,8 +183,11 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
             self.mutex.lock();
             defer self.mutex.unlock();
+
             self.alloc_count[current_order] -= 1;
+            errdefer self.alloc_count[current_order] += 1;
             self.alloc_count[new_order] += new_block_count;
+            errdefer self.alloc_count[new_order] -= new_block_count;
         }
 
         pub fn allocFromAnyThread(self: *Self, requested_order: u5) !u32 {
@@ -243,12 +246,11 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
         /// Caller is responsible for locking the allocator.
         fn allocOnMainList(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
-            // Ensure that the free list has enough space for when the object needs to be freed.
-            try self.free_lists[requested_order].ensureTotalCapacity(
-                self.gpa,
-                (self.alloc_count[requested_order] + 1) / 2 + 1,
-            );
             self.alloc_count[requested_order] += 1; // Allocation stats.
+            errdefer self.alloc_count[requested_order] -= 1;
+
+            // Ensure that the free list has enough space for when the object needs to be freed.
+            try self.ensureSufficientCapacity(requested_order);
 
             // look for an open block of any size >= requested_order (if the open block is too big, we'll split it).
             var open_index: u32 = undefined;
@@ -262,13 +264,10 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
             // split blocks (if needed).
             while (open_order > requested_order) : (open_order -= 1) {
-                try self.free_lists[open_order - 1].put(self.gpa, open_index + getOrderSize(open_order - 1), {});
+                try self.free_lists[open_order - 1].putNoClobber(self.gpa, open_index + getOrderSize(open_order - 1), {});
                 // Lower half is implicitly passed along `open_index`, since
                 // the lower block index stays the same as it descends.
             }
-
-            const looking_for = buddy_of_order(104, 1);
-            if (open_index == looking_for) @panic("here");
 
             return open_index;
         }
@@ -296,7 +295,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                     break :blk @intCast(buddy_index); // Found buddy.
                 } else {
                     // We can assume as we reserved enough space during alloc.
-                    self.free_lists[order].putAssumeCapacity(index, {});
+                    self.free_lists[order].putAssumeCapacityNoClobber(index, {});
                     return; // No buddy, return.
                 }
             };
@@ -329,7 +328,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                 } else {
                     // In this case, we actually _do_ need to append the merged block,
                     // since we're no longer implicitly passing it up `block_being_merged`.
-                    self.free_lists[order_being_merged].putAssumeCapacity(block_being_merged, {});
+                    self.free_lists[order_being_merged].putAssumeCapacityNoClobber(block_being_merged, {});
                     return;
                 }
 
@@ -344,6 +343,24 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                     self.freeOnMainList(to_free, @intCast(order));
                 }
                 pool_len.* = 0;
+            }
+        }
+
+        fn ensureSufficientCapacity(self: *Self, order: u5) !void {
+            const backup = self.alloc_count;
+            errdefer self.alloc_count = backup;
+
+            var free_list_size = self.alloc_count[order] / 2 + 1;
+            try self.free_lists[order].ensureTotalCapacity(self.gpa, free_list_size);
+
+            var current_order = order;
+            while (current_order > 0) {
+                current_order -= 1;
+                // Be sure to have enough space on the smaller block list, as we may want
+                // to split this block in the future.
+                const parent_free_list_size = free_list_size;
+                free_list_size = (parent_free_list_size * 2) + self.alloc_count[current_order] / 2 + 1;
+                try self.free_lists[current_order].ensureTotalCapacity(self.gpa, free_list_size);
             }
         }
 
@@ -399,6 +416,35 @@ test "buddy allocator" {
     try expectEqual(0, alloc.free_lists[3].count());
     try expectEqual(1, alloc.free_lists[4].count());
     try expectEqual(0, alloc.free_lists[4].entries.get(0).key);
+}
+
+const BlockTestAlloc = BuddyUnmanaged(.{
+    .max_order = 10,
+    .max_pool_order = 0,
+    .pool_size = 0,
+});
+test "block splitting" {
+    var alloc = try BlockTestAlloc.init(testing.allocator, 16);
+    defer if (alloc.deinit() == .leaked) @panic("Found leaks");
+
+    // Make sure enough space was allocated on the free list for any split blocks.
+    for (0..8) |_| {
+        _ = try alloc.allocFromAnyThread(4);
+        alloc.splitBlock(4, 0);
+    }
+
+    var block_i: u32 = 0;
+    while (block_i < (8 * getOrderSize(4))) : (block_i += 2) {
+        // Increment by 2 in order to hit every other block--the maximum amount
+        // of fragmentation.
+        alloc.freeFromAnyThread(block_i, 0);
+    }
+
+    // Free the rest so we don't have any leaks.
+    block_i = 1;
+    while (block_i < (8 * getOrderSize(4))) : (block_i += 2) {
+        alloc.freeFromAnyThread(block_i, 0);
+    }
 }
 
 pub fn vmemMap(byte_count: usize) ![]align(heap.page_size_min) u8 {
