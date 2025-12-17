@@ -24,6 +24,8 @@ pub const Node = struct {
         binary: struct { Index, Index },
         ternary: struct { Index, Index, Index },
         object: Handle,
+        integer: i64,
+        float: f64,
     };
 
     pub const Tag = enum(u8) {
@@ -49,7 +51,6 @@ pub const Node = struct {
         bit_or,
         bool_and,
         bool_or,
-        colon,
         pow,
         string_equal,
         string_not_equal,
@@ -76,10 +77,10 @@ pub const Node = struct {
         identity,
         negation,
         // Builtin functions
-        int,
-        wide,
+        to_int,
+        to_wide,
         abs,
-        double,
+        to_double,
         round,
         rand,
         srand,
@@ -160,8 +161,8 @@ const binary_oper_table = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, 
 
 const FunctionArity = struct { arity: u8, tag: Node.Tag };
 const function_arity = std.StaticStringMap(FunctionArity).initComptime([_]struct { []const u8, FunctionArity }{
-    .{ "int", .{ .arity = 1, .tag = .int } },     .{ "wide", .{ .arity = 1, .tag = .wide } },
-    .{ "abs", .{ .arity = 1, .tag = .abs } },     .{ "double", .{ .arity = 1, .tag = .double } },
+    .{ "int", .{ .arity = 1, .tag = .to_int } },  .{ "wide", .{ .arity = 1, .tag = .to_wide } },
+    .{ "abs", .{ .arity = 1, .tag = .abs } },     .{ "double", .{ .arity = 1, .tag = .to_double } },
     .{ "rand", .{ .arity = 0, .tag = .rand } },   .{ "srand", .{ .arity = 1, .tag = .srand } },
     .{ "sin", .{ .arity = 1, .tag = .sin } },     .{ "cos", .{ .arity = 1, .tag = .cos } },
     .{ "tan", .{ .arity = 1, .tag = .tan } },     .{ "asin", .{ .arity = 1, .tag = .asin } },
@@ -340,23 +341,19 @@ pub const Parse = struct {
             .integer => {
                 const loc = p.tokenLoc(p.nextToken());
                 const value = std.fmt.parseInt(i64, p.source[loc.start..loc.end], 10) catch unreachable;
-                const handle = try object.newInteger(p.heap, value);
-                errdefer handle.release();
 
                 return try p.addNode(.{
                     .tag = .integer,
-                    .data = .{ .object = handle },
+                    .data = .{ .integer = value },
                 });
             },
             .float => {
                 const loc = p.tokenLoc(p.nextToken());
                 const value = std.fmt.parseFloat(f64, p.source[loc.start..loc.end]) catch unreachable;
-                const handle = try object.newFloat(value);
-                errdefer handle.release();
 
                 return try p.addNode(.{
                     .tag = .float,
-                    .data = .{ .object = handle },
+                    .data = .{ .float = value },
                 });
             },
             .simple_string => {
@@ -688,7 +685,6 @@ pub const Parse = struct {
             .bit_or,
             .bool_and,
             .bool_or,
-            .colon,
             .pow,
             .string_equal,
             .string_not_equal,
@@ -728,8 +724,8 @@ pub const Parse = struct {
             },
             // Value
             .string => try writer.print("\"{f}\"", .{data.object}),
-            .integer => try writer.print("{f}", .{data.object}),
-            .float => try writer.print("{f}", .{data.object}),
+            .integer => try writer.print("{}", .{data.integer}),
+            .float => try writer.print("{}", .{data.float}),
             .command_subst => try writer.print("[{f}]", .{data.object}),
             .variable_subst => try writer.print("${f}", .{data.object}),
             .dict_sugar => try writer.print("${f}", .{data.object}),
@@ -740,10 +736,10 @@ pub const Parse = struct {
             .bit_not,
             .identity,
             .negation,
-            .int,
-            .wide,
+            .to_int,
+            .to_wide,
             .abs,
-            .double,
+            .to_double,
             .round,
             .rand,
             .srand,
@@ -787,8 +783,6 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
             .value_true,
             .command_subst,
             .string,
-            .float,
-            .integer,
             => {
                 node.data.object.release();
             },
@@ -803,8 +797,6 @@ test "expr parsing" {
     defer Heap.testFinish();
     const heap = try Heap.testStart(testing.allocator);
 
-    std.debug.print(".\n\n", .{});
-
     // Left associativity.
     try testExprParse(heap, "1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");
     // Right associativity.
@@ -818,7 +810,7 @@ test "expr parsing" {
     try testExprParse(
         heap,
         "atan2(1 ? 10 : 5, int(0 ? 5 : 2))",
-        "(.atan2 (.ternary_conditional 1 10 5) (.int (.ternary_conditional 0 5 2)))",
+        "(.atan2 (.ternary_conditional 1 10 5) (.to_int (.ternary_conditional 0 5 2)))",
     );
 
     // Test error messages.

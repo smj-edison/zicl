@@ -19,6 +19,8 @@ pub const Error = std.mem.Allocator.Error || error{
     BadDict,
     BadInteger,
     IntegerOverflow,
+    DivisionByZero,
+    NegativeDenominator,
     BadFloat,
     ParseError,
 };
@@ -197,6 +199,28 @@ pub fn newInteger(heap: *Heap, value: i64) !Handle {
     return handle;
 }
 
+pub fn integerOverflowError(det: ?*ErrorDetails, value: ?[]const u8) error{ OutOfMemory, IntegerOverflow } {
+    if (det) |details| {
+        if (value) |val| {
+            details.* = .{
+                .message = try newStringFmt(Heap.local_heap, "integer value \"{s}\" too big to be represented", .{val}),
+            };
+        } else {
+            details.* = .{
+                .message = try newString(Heap.local_heap, "integer overflow"),
+            };
+        }
+    }
+    return error.IntegerOverflow;
+}
+
+pub fn integerOverflowErrorWithWide(det: ?*ErrorDetails, value: i128) error{ OutOfMemory, IntegerOverflow } {
+    if (det) |details| details.* = .{
+        .message = try newStringFmt(Heap.local_heap, "integer value \"{}\" too big to be represented", .{value}),
+    };
+    return error.IntegerOverflow;
+}
+
 pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     if (handle.peek().tag == .integer) return handle.peek().body.integer;
 
@@ -211,10 +235,7 @@ pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
             return error.BadInteger;
         },
         error.Overflow => {
-            if (det) |details| details.* = .{
-                .message = try newStringFmt(Heap.local_heap, "integer value \"{s}\" too big to be represented", .{bytes}),
-            };
-            return error.IntegerOverflow;
+            return integerOverflowError(det, bytes);
         },
     }
 }
@@ -227,6 +248,11 @@ pub fn shimmerToInteger(det: ?*ErrorDetails, handle: *Handle) !void {
     try Heap.prepareToShimmer(handle);
     handle.peek().tag = .integer;
     handle.peek().body.integer = integer;
+}
+
+pub fn integerGet(det: ?*ErrorDetails, handle: *Handle) !i64 {
+    try shimmerToInteger(det, handle);
+    return handle.peek().body.integer;
 }
 
 // Float related functions.
@@ -1899,7 +1925,10 @@ pub fn shimmerToScript(det: ?*ErrorDetails, handle: *Handle) !void {
         // We don't have this script in our heap, so keep going to generate it.
     }
 
-    var parsed = try parseScript(det, handle.*);
+    var parsed = parseScript(det, handle.*) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ParseError,
+    };
     errdefer parsed.deinit(Heap.local_heap);
 
     try Heap.local_heap.parsed_scripts.put(Heap.local_heap.gpa, script_id.index, .{
@@ -2082,6 +2111,17 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, handle: *Handle) !void {
     handle.peek().body = .{
         .expr = .{ .id = expr_id },
     };
+}
+
+pub fn getExpression(det: ?*ErrorDetails, handle: *Handle) !Heap.ParsedExpression {
+    try shimmerToExpression(det, handle);
+    assert(handle.peek().tag == .script);
+
+    const expr_id = handle.peek().body.script.id;
+    const expr_and_generation = Heap.local_heap.parsed_exprs.get(expr_id.index).?;
+    assert(expr_and_generation.generation == expr_id.generation);
+
+    return expr_and_generation.expr;
 }
 
 fn testExpressions(ta: std.mem.Allocator) !void {

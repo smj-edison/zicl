@@ -6,6 +6,7 @@ const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const object = @import("object.zig");
+const expr_parse = @import("expr_parse.zig");
 
 const Interp = @This();
 
@@ -39,9 +40,11 @@ max_call_depth: usize,
 /// Stack trace from a function error.
 stack_trace: ?Handle,
 
+prng: std.Random.DefaultPrng,
+
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
 
-pub const Error = std.mem.Allocator.Error || object.Error || error{
+pub const Error = std.mem.Allocator.Error || error{
     EvaluatingSafeExpression,
     EvalError,
     Break,
@@ -57,9 +60,24 @@ const Tailcall = struct {
     args: []Handle,
 };
 
+fn wrapErrorDetailsReturnType(result_type: type) type {
+    if (comptime std.meta.activeTag(@typeInfo(result_type)) == .error_set) {
+        return error{ OutOfMemory, EvalError };
+    } else {
+        return error{ OutOfMemory, EvalError }!@typeInfo(result_type).error_union.payload;
+    }
+}
 /// Used to convert from an object error to an interpreter error (e.g. putting
 /// it in the interpreter result, instead of det)
-fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype) @TypeOf(result) {
+pub fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
+    if (comptime std.meta.activeTag(@typeInfo(@TypeOf(result))) == .error_set) {
+        if (result == error.OutOfMemory) {
+            return error.OutOfMemory;
+        } else {
+            return error.EvalError;
+        }
+    }
+
     if (result) |unwrapped| {
         return unwrapped;
     } else |err| {
@@ -68,7 +86,7 @@ fn wrapErrorDetails(interp: *Interp, det: *object.ErrorDetails, result: anytype)
             else => {
                 // This error should have error details, if it's not OOM.
                 interp.setResultOwning(det.message);
-                return err;
+                return error.EvalError;
             },
         }
     }
@@ -1006,11 +1024,12 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Handle) 
 
 fn invokeCommand(interp: *Interp, args: []Handle) !void {
     var det: object.ErrorDetails = undefined;
-    const command = interp.wrapErrorDetails(&det, getCommand(interp, &det, &args[0])) catch |err| switch (err) {
+    const command = getCommand(interp, &det, &args[0]) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // TODO invoke jim unknown
             @panic("unimplemented");
+            // try interp.wrapErrorDetails(&det, err);
         },
     };
 
@@ -1074,12 +1093,465 @@ fn invokeCommand(interp: *Interp, args: []Handle) !void {
     }
 }
 
-pub fn evalObject(interp: *Interp, script: *Handle) (Error || Tokenizer.Error)!void {
-    // If the object is of type "list", with no string rep we can call a specialized version of eval().
-    if (script.peek().tag == .list and script.hasString()) {
-        return interp.evalList(script);
+fn evalResultAsBool(interp: *Interp, result: EvalResult) !bool {
+    switch (result) {
+        .integer => |int| return int != 0,
+        .float => |float| {
+            try interp.setResultFormatted("expected boolean but got \"{}\"", .{float});
+            return error.BadBoolean;
+        },
+        .string => |string| {
+            const as_int = object.shimmerToInteger(null, string) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
+                    return error.BadBoolean;
+                },
+            };
+            return as_int != 0;
+        },
     }
+}
 
+fn evalResultAsNumber(interp: *Interp, result: EvalResult) !EvalResult {
+    switch (result) {
+        .integer, .float => result,
+        .string => |*string| {
+            const as_int = object.shimmerToInteger(null, string) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    // Try parsing it as a float.
+                    return .{ .float = try interp.getFloat(string) };
+                },
+            };
+            return .{ .integer = as_int };
+        },
+    }
+}
+
+const division_by_zero_message = "division by zero";
+const negative_denom_message = "negative denominator";
+fn evalBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
+    var det: object.ErrorDetails = undefined;
+    return switch (oper) {
+        .mul => blk: {
+            break :blk std.math.mul(i64, lhs, rhs) catch {
+                const rendered = std.math.mulWide(i64, lhs, rhs);
+                return interp.wrapErrorDetails(&det, object.integerOverflowErrorWithWide(&det, rendered));
+            };
+        },
+        .div => std.math.divFloor(i64, lhs, rhs) catch |err| switch (err) {
+            error.Overflow => {
+                return interp.wrapErrorDetails(&det, object.integerOverflowError(&det, null));
+            },
+            error.DivisionByZero => {
+                try interp.setResultString(division_by_zero_message);
+                return error.DivisionByZero;
+            },
+        },
+        .mod => std.math.mod(i64, lhs, rhs) catch |err| switch (err) {
+            error.NegativeDenominator => {
+                try interp.setResultString(negative_denom_message);
+                return error.NegativeDenominator;
+            },
+            error.DivisionByZero => {
+                try interp.setResultString(division_by_zero_message);
+                return error.DivisionByZero;
+            },
+        },
+        .sub => std.math.sub(i64, lhs, rhs) catch return interp.wrapErrorDetails(&det, object.integerOverflowError(&det, null)),
+        .add => std.math.add(i64, lhs, rhs) catch return interp.wrapErrorDetails(&det, object.integerOverflowError(&det, null)),
+        .shiftl => blk: {
+            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) << rhs_constrained));
+        },
+        .shiftr => blk: {
+            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) >> rhs_constrained));
+        },
+        .rotl => blk: {
+            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            break :blk @as(i64, @bitCast(std.math.rotl(@as(u64, @bitCast(lhs)), rhs_constrained)));
+        },
+        .rotr => blk: {
+            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            break :blk @as(i64, @bitCast(std.math.rotr(@as(u64, @bitCast(lhs)), rhs_constrained)));
+        },
+        .less_than => lhs < rhs,
+        .greater_than => lhs > rhs,
+        .less_or_equal => lhs <= rhs,
+        .greater_or_equal => lhs >= rhs,
+        .equal => lhs == rhs,
+        .not_equal => lhs != rhs,
+        .bit_and => lhs & rhs,
+        .bit_xor => lhs ^ rhs,
+        .bit_or => lhs | rhs,
+        .bool_and => (lhs != 0) and (rhs != 0),
+        .bool_or => (lhs != 0) or (rhs != 0),
+        .pow => std.math.powi(i64, lhs, rhs) catch {
+            // Report overflow for both underflow and overflow. Maybe I should report both?
+            return interp.wrapErrorDetails(&det, object.integerOverflowError(&det, null));
+        },
+    };
+}
+
+fn evalBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !f64 {
+    return switch (oper) {
+        .mul => lhs * rhs,
+        .div => blk: {
+            if (rhs == 0.0) {
+                try interp.setResultString(division_by_zero_message);
+                return error.DivisionByZero;
+            } else {
+                break :blk lhs / rhs;
+            }
+        },
+        .mod => std.math.mod(f32, lhs, rhs) catch |err| switch (err) {
+            error.DivisionByZero => {
+                try interp.setResultString(division_by_zero_message);
+                return error.DivisionByZero;
+            },
+            error.NegativeDenominator => {
+                try interp.setResultString(negative_denom_message);
+                return error.NegativeDenominator;
+            },
+        },
+        .sub => lhs - rhs,
+        .add => lhs + rhs,
+        .shiftl, .shiftr, .rotl, .rotr => {
+            try interp.setResultFormatted("cannot bit shift on floats {} and {}", .{ lhs, rhs });
+            return error.BadInteger;
+        },
+        .less_than => lhs < rhs,
+        .greater_than => lhs > rhs,
+        .less_or_equal => lhs <= rhs,
+        .greater_or_equal => lhs >= rhs,
+        .equal => lhs == rhs,
+        .not_equal => lhs != rhs,
+        .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or => {
+            try interp.setResultFormatted("cannot do bitwise operations on floats {} and {}", .{ lhs, rhs });
+            return error.BadInteger;
+        },
+        .pow => std.math.pow(f64, lhs, rhs),
+    };
+}
+
+const EvalResult = union(enum) {
+    integer: i64,
+    float: f64,
+    string: Handle,
+};
+fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !EvalResult {
+    const node = nodes.get(@intFromEnum(node_index));
+    switch (node.tag) {
+        .mul,
+        .div,
+        .mod,
+        .sub,
+        .add,
+        .shiftl,
+        .shiftr,
+        .rotl,
+        .rotr,
+        .less_than,
+        .greater_than,
+        .less_or_equal,
+        .greater_or_equal,
+        .equal,
+        .not_equal,
+        .bit_and,
+        .bit_xor,
+        .bit_or,
+        .bool_and,
+        .bool_or,
+        .pow,
+        => {
+            const children = node.data.binary;
+            const lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
+            const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
+            const lhs_tag = std.meta.activeTag(lhs_value);
+            const rhs_tag = std.meta.activeTag(rhs_value);
+            defer if (lhs_tag == .string) lhs_value.string.release();
+            defer if (rhs_tag == .string) rhs_value.string.release();
+
+            // Fast case, both integers, or both floats.
+            if (lhs_tag == .integer and rhs_tag == .integer) {
+                return .{
+                    .integer = try interp.evalBinaryOperatorInteger(node.tag, lhs_value.integer, rhs_value.integer),
+                };
+            } else if (lhs_tag == .float and rhs_tag == .float) {
+                return .{
+                    .float = try interp.evalBinaryOperatorFloat(node.tag, lhs_value.float, rhs_value.float),
+                };
+            }
+
+            // Slow case: 1. try to get both as integers, 2. try getting both as floats, 3. error.
+            const lhs_converted: EvalResult = interp.evalResultAsNumber(lhs_value);
+            const rhs_converted: EvalResult = interp.evalResultAsNumber(rhs_value);
+
+            if (std.meta.activeTag(lhs_converted) == .integer and std.meta.activeTag(rhs_converted) == .integer) {
+                return .{
+                    .integer = try interp.evalBinaryOperatorInteger(node.tag, lhs_converted.integer, rhs_converted.integer),
+                };
+            } else {
+                const lhs_as_float: f64 = switch (lhs_converted) {
+                    .integer => |int| @floatFromInt(int),
+                    .float => |float| float,
+                    .string => unreachable,
+                };
+                const rhs_as_float: f64 = switch (rhs_converted) {
+                    .integer => |int| @floatFromInt(int),
+                    .float => |float| float,
+                    .string => unreachable,
+                };
+                return .{
+                    .float = try interp.evalBinaryOperatorFloat(node.tag, lhs_as_float, rhs_as_float),
+                };
+            }
+        },
+        .string_equal,
+        .string_not_equal,
+        .string_in,
+        .string_not_in,
+        .string_less_than,
+        .string_greater_than,
+        .string_less_than_or_equal,
+        .string_greater_than_or_equal,
+        => {
+            const children = node.data.binary;
+            const lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
+            const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
+            const lhs_tag = std.meta.activeTag(lhs_value);
+            const rhs_tag = std.meta.activeTag(rhs_value);
+            defer if (lhs_tag == .string) lhs_value.string.release();
+            defer if (rhs_tag == .string) rhs_value.string.release();
+
+            var lhs_buffer: [50]u8 = @splat(0);
+            const lhs_alloc = std.heap.FixedBufferAllocator.init(lhs_buffer[0..]);
+            const lhs_string = switch (lhs_value) {
+                .float => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
+                .integer => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
+                .string => |val| (try Heap.getString(val))[0..],
+            };
+            var rhs_buffer: [50]u8 = @splat(0);
+            const rhs_alloc = std.heap.FixedBufferAllocator.init(rhs_buffer[0..]);
+            const rhs_string = switch (lhs_value) {
+                .float => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
+                .integer => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
+                .string => |val| (try Heap.getString(val))[0..],
+            };
+
+            const result = switch (node.tag) {
+                .string_equal => std.mem.eql(u8, lhs_string, rhs_string),
+                .string_not_equal => !std.mem.eql(u8, lhs_string, rhs_string),
+                .string_in => std.mem.indexOf(u8, rhs_string, lhs_string) != null,
+                .string_not_in => std.mem.indexOf(u8, rhs_string, lhs_string) == null,
+                .string_less_than => std.mem.order(u8, rhs_string, lhs_string).compare(.lt),
+                .string_greater_than => std.mem.order(u8, rhs_string, lhs_string).compare(.gt),
+                .string_less_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.le),
+                .string_greater_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.ge),
+                inline else => unreachable,
+            };
+
+            return if (result) .{ .integer = 1 } else .{ .integer = 0 };
+        },
+        .ternary_conditional => {
+            const children = node.data.ternary;
+            const condition = try interp.evalExpressionNode(nodes, children.@"0");
+
+            if (try evalResultAsBool(interp, condition)) {
+                return interp.evalExpressionNode(nodes, children.@"1");
+            } else {
+                return interp.evalExpressionNode(nodes, children.@"2");
+            }
+        },
+        .string => return try node.data.object.borrow(),
+        .integer => return node.data.integer,
+        .float => return node.data.float,
+        .command_subst => {
+            var new_value = node.data.object;
+            const result = interp.evalObject(&new_value);
+            // This should not change, since it should be a local heap object.
+            assert(node.data.object == new_value);
+
+            // Be sure to propagate any error that eval returned.
+            if (result) {
+                return .{ .string = try interp.result.borrow() };
+            } else |err| {
+                return err;
+            }
+        },
+        .variable_subst => {
+            const borrowed = try (try interp.getVariable(&node.data.object)).borrow();
+            return .{ .string = borrowed };
+        },
+        .dict_sugar => @panic("dict sugar not implemented"),
+        .value_false => return .{ .integer = 0 },
+        .value_true => return .{ .integer = 1 },
+        .bool_not => {
+            const result = try interp.evalExpressionNode(nodes, node.data.unary);
+            const result_bool = try evalResultAsBool(interp, result);
+            return .{ .integer = if (result_bool) 0 else 1 };
+        },
+        .bit_not => {
+            const result = try interp.evalExpressionNode(node.data.unary);
+            const value = switch (result) {
+                .integer => |val| val,
+                .float => |val| {
+                    try interp.setResultFormatted("cannot bit invert on float {}", .{val});
+                    return error.BadInteger;
+                },
+                .string => |*val| try interp.getInteger(val),
+            };
+
+            return .{ .integer = ~value };
+        },
+        .identity => {
+            return try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+        },
+        .negation => {
+            const result = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+            switch (result) {
+                .integer => |int| return .{ .integer = -int },
+                .float => |float| return .{ .float = -float },
+                .string => unreachable,
+            }
+        },
+        .to_int, .to_wide => {
+            const result = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+            switch (result) {
+                .integer => |int| return .{ .integer = int },
+                .float => |float| {
+                    bad_int: {
+                        if (float > std.math.maxInt(i64)) break :bad_int;
+                        if (float < std.math.minInt(i64)) break :bad_int;
+                        if (std.math.isNan(float)) break :bad_int;
+                        return .{ .integer = @intFromFloat(float) };
+                    }
+                    interp.setResultFormatted("could not convert float \"{}\" to integer", .{float});
+                    return error.BadInteger;
+                },
+                .string => unreachable,
+            }
+        },
+        .abs => {
+            const result = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+            switch (result) {
+                .integer => |int| return .{ .integer = @abs(int) },
+                .float => |float| return .{ .float = @abs(float) },
+                .string => unreachable,
+            }
+        },
+        .to_double => {
+            const result = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+            switch (result) {
+                .integer => |int| return .{ .float = @floatFromInt(int) },
+                .float => return result,
+                .string => unreachable,
+            }
+        },
+        .round => {
+            const result = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+            switch (result) {
+                .float => |float| return .{ .integer = @round(float) },
+                .integer => return result,
+                .string => unreachable,
+            }
+        },
+        .rand => {
+            return .{ .float = interp.nextRandomFloat() };
+        },
+        .srand => {
+            const result = try interp.evalExpressionNode(node.data.unary);
+            const value = switch (result) {
+                .integer => |val| val,
+                .float => |val| {
+                    try interp.setResultFormatted("cannot seed random with {}", .{val});
+                    return error.BadInteger;
+                },
+                .string => |*val| try interp.getInteger(val),
+            };
+
+            interp.prng.seed(@bitCast(value));
+
+            return .{ .float = interp.nextRandomFloat() };
+        },
+        .sin,
+        .cos,
+        .tan,
+        .asin,
+        .acos,
+        .atan,
+        .sinh,
+        .cosh,
+        .tanh,
+        .ceil,
+        .floor,
+        .exp,
+        .log,
+        .log10,
+        .sqrt,
+        => {
+            const result = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.unary));
+            const as_float: f64 = switch (result) {
+                .integer => |int| @floatFromInt(int),
+                .float => |float| float,
+            };
+
+            const computed = switch (node.tag) {
+                .sin => @sin(as_float),
+                .cos => @cos(as_float),
+                .tan => @tan(as_float),
+                .asin => std.math.asin(as_float),
+                .acos => std.math.acos(as_float),
+                .atan => std.math.atan(as_float),
+                .sinh => std.math.sinh(as_float),
+                .cosh => std.math.cosh(as_float),
+                .tanh => std.math.tanh(as_float),
+                .ceil => @ceil(as_float),
+                .floor => @floor(as_float),
+                .exp => @exp(as_float),
+                .log => @log(as_float),
+                .log10 => @log10(as_float),
+                .sqrt => @sqrt(as_float),
+                inline else => unreachable,
+            };
+
+            return .{ .float = computed };
+        },
+        .atan2, .fmod, .hypot => {
+            const lhs_raw = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.binary.@"0"));
+            const rhs_raw = try interp.evalResultAsNumber(try interp.evalExpressionNode(node.data.binary.@"0"));
+            const lhs: f64 = switch (lhs_raw) {
+                .integer => |int| @floatFromInt(int),
+                .float => |float| float,
+            };
+            const rhs: f64 = switch (rhs_raw) {
+                .integer => |int| @floatFromInt(int),
+                .float => |float| float,
+            };
+
+            const computed = switch (node.tag) {
+                .atan2 => std.math.atan2(lhs, rhs),
+                .fmod => @mod(lhs, rhs),
+                .hypot => @sqrt(lhs * lhs + rhs + rhs),
+            };
+            return .{ .float = computed };
+        },
+        .none => unreachable,
+    }
+}
+
+pub fn evalExpression(interp: *Interp, handle: *Handle) !EvalResult {
+    // Try to get the expression, parsing if necessary.
+    var det: object.ErrorDetails = undefined;
+    const expr = try interp.wrapErrorDetails(&det, object.getExpression(&det, handle));
+
+    const root_node = expr.nodes.get(expr.root_node);
+    return try evalExpressionNode(interp, expr.nodes, root_node);
+}
+
+pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
     // Try to get the script, parsing if necessary.
     var det: object.ErrorDetails = undefined;
     const parsed = try interp.wrapErrorDetails(&det, object.getScript(&det, script));
@@ -1207,6 +1679,8 @@ pub fn init() !Interp {
         .max_eval_depth = 100_000,
         .max_call_depth = 100_000,
         .stack_trace = null,
+        // TODO: init per interpreter
+        .prng = .init(0),
     };
 
     _ = try new_interp.pushCallFrame(null, &.{}, .{
@@ -1243,6 +1717,11 @@ pub fn deinit(interp: *Interp) void {
 }
 
 // Export various utility functions with a nicer interface.
+pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMemory, EvalError } {
+    var det: object.ErrorDetails = undefined;
+    interp.wrapErrorDetails(&det, object.integerOverflowError(&det, value)) catch return error.EvalError;
+}
+
 pub fn getInteger(interp: *Interp, handle: *Handle) !i64 {
     var det: object.ErrorDetails = undefined;
     try wrapErrorDetails(interp, &det, object.shimmerToInteger(&det, handle));
@@ -1258,6 +1737,11 @@ pub fn getFloat(interp: *Interp, handle: *Handle) !f64 {
     var det: object.ErrorDetails = undefined;
     try wrapErrorDetails(interp, &det, object.shimmerToFloat(&det, handle));
     return handle.peek().body.float;
+}
+
+pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) !f64 {
+    var det: object.ErrorDetails = undefined;
+    return wrapErrorDetails(interp, &det, object.floatGetNoShimmer(&det, handle));
 }
 
 pub fn getListLength(interp: *Interp, handle: *Handle) !u32 {
@@ -1290,4 +1774,12 @@ pub fn getVariable(interp: *Interp, name: *Handle) !Handle {
     try Heap.prepareToShimmer(name);
     var det: object.ErrorDetails = undefined;
     return interp.wrapErrorDetails(&det, interp.getVariableImpl(&det, name.*));
+}
+
+pub fn nextRandomFloat(interp: *Interp) f64 {
+    // https://stackoverflow.com/questions/46901022/how-to-convert-a-uint64-t-to-a-double-float-between-0-and-1-with-maximum-accurac
+    const two63: u64 = 0x8000000000000000;
+    const two64f = @as(f64, @bitCast(two63)) * 2.0;
+    const as_float = @as(f64, @bitCast(interp.prng.next())) / two64f;
+    return .{ .float = as_float };
 }

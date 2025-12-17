@@ -6,11 +6,6 @@ const Handle = Heap.Handle;
 const object = @import("object.zig");
 const Interp = @import("Interp.zig");
 
-fn integerOverflowError(interp: *Interp) !void {
-    try interp.setResultString("integer overflow");
-    return error.IntegerOverflow;
-}
-
 fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { add, mul }) !void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
@@ -24,7 +19,7 @@ fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    break :blk interp.getInteger(&args[i]) catch |err| switch (err) {
+                    break :blk object.integerGet(null, &args[i]) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
@@ -34,8 +29,10 @@ fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { 
             };
 
             result = switch (operator) {
-                .add => std.math.add(i64, result, operand) catch return integerOverflowError(interp),
-                .mul => std.math.mul(i64, result, operand) catch return integerOverflowError(interp),
+                .add => std.math.add(i64, result, operand),
+                .mul => std.math.mul(i64, result, operand),
+            } catch {
+                interp.integerOverflowError(null) catch return error.EvalError;
             };
         }
 
@@ -100,7 +97,10 @@ pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
 
     if (interp.getVariableNoDetails(&args[1])) |val| {
         const contents = try interp.getIntegerNoShimmer(val);
-        const new_contents = std.math.add(i64, contents, increment_by) catch return integerOverflowError(interp);
+        const new_contents = std.math.add(i64, contents, increment_by) catch {
+            var det: object.ErrorDetails = undefined;
+            return interp.wrapErrorDetails(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
+        };
 
         if (val.canModify()) {
             // Can modify directly.
