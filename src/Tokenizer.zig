@@ -305,6 +305,8 @@ pub fn nextStringToken(self: *Tokenizer) !Token {
                 if (!self.in_quote) {
                     token.loc.end = self.index;
                     return token;
+                } else {
+                    self.advance(1);
                 }
             },
             '"' => {
@@ -312,6 +314,7 @@ pub fn nextStringToken(self: *Tokenizer) !Token {
                     self.in_quote = false;
                     token.tag = .escaped_string;
                     token.loc.end = self.index;
+                    self.advance(1);
                     return token;
                 }
             },

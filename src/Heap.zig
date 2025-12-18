@@ -1641,6 +1641,11 @@ pub fn getString(handle: Handle) Allocator.Error![:0]const u8 {
     return try handle.getHeap().getLocalString(handle.index);
 }
 
+pub fn stringEquals(handle: Handle, value: []const u8) !bool {
+    const bytes = try getString(handle);
+    return std.mem.eql(u8, bytes, value);
+}
+
 /// Copies provided string.
 pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
     const heap = handle.getHeap();
@@ -1869,7 +1874,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 break :blk try std.fmt.allocPrintSentinel(self.gpa, "<none>", .{}, 0);
             } else {
                 last_touched = self.getHandle(index);
-                Heap.printLastTouchedTrace();
+                Heap.dumpLastTouchedTrace();
                 @panic("Tried to generate a string for .none");
             }
         },
@@ -1989,7 +1994,7 @@ pub fn leakCheck(heap: *Heap) !bool {
     return leaked;
 }
 
-pub fn printLastTouchedTrace() void {
+pub fn dumpLastTouchedTrace() void {
     if (last_touched) |val| {
         val.getHeap().trace_mutex.lock();
         defer val.getHeap().trace_mutex.unlock();
@@ -2323,7 +2328,7 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
         }
     } else {
         // HACK: once I figure out how to register a panic handler I don't need this.
-        if (ref.* == 0) printLastTouchedTrace();
+        if (ref.* == 0) dumpLastTouchedTrace();
         ref.* -= 1;
         after_sub = ref.*;
     }

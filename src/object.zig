@@ -256,8 +256,8 @@ pub fn integerGet(det: ?*ErrorDetails, handle: *Handle) !i64 {
 }
 
 // Float related functions.
-pub fn newFloat(value: f64) !Handle {
-    const handle = try Heap.local_heap.createObject();
+pub fn newFloat(heap: *Heap, value: f64) !Handle {
+    const handle = try heap.createObject();
     handle.peek().tag = .float;
     handle.peek().body.float = value;
     return handle;
@@ -1752,21 +1752,29 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     // Used to ignore the first token if it's .command_separator (effectively
     // trimming any starting whitespace)
-    var is_trimming = true;
+    var is_trimming_start = true;
     // Add all tokens to the list, handling any errors that may come up.
     while (true) {
         const next_token = parser.nextScriptToken();
         if (next_token) |token| {
             switch (token.tag) {
                 .command_separator, .word_separator => {
-                    if (!is_trimming) try tokens.append(Heap.local_heap.gpa, token);
+                    if (!is_trimming_start) try tokens.append(Heap.local_heap.gpa, token);
                 },
                 .end_of_file => {
+                    // Be sure to trim the ending spacing.
+                    while (tokens.getLastOrNull()) |last| {
+                        if (last.tag == .command_separator or last.tag == .word_separator) {
+                            _ = tokens.pop();
+                        } else {
+                            break;
+                        }
+                    }
                     try tokens.append(Heap.local_heap.gpa, token);
                     break;
                 },
                 else => {
-                    is_trimming = false;
+                    is_trimming_start = false;
                     try tokens.append(Heap.local_heap.gpa, token);
                 },
             }
@@ -1780,7 +1788,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             return err;
         }
 
-        is_trimming = false;
+        is_trimming_start = false;
     }
 
     if (options.token_debugging) {
@@ -1941,7 +1949,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         .first_line = source_info.line_no,
         .file_name_obj = source_info.file_name,
     };
-    if (options.token_debugging) parsed_script.printTokens();
+    if (options.token_debugging) {
+        std.debug.print("Dumping tokens\n", .{});
+        parsed_script.printTokens();
+    }
 
     return parsed_script;
 }
@@ -2235,24 +2246,36 @@ test "expressions" {
 }
 
 pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
+    if (handle.peek().tag == .bool) return;
+    // Fast case: if it's an int, we can get the value directly.
+    if (handle.peek().tag == .integer) {
+        const new_value = handle.peek().body.integer != 0;
+        try Heap.prepareToShimmer(handle);
+        handle.peek().tag = .bool;
+        handle.peek().body.bool = new_value;
+    }
+
     const Mapping = std.StaticStringMap(bool).initComptime(Tokenizer.boolean_mapping);
 
     const bytes = try Heap.getString(handle.*);
-    const new_value = Mapping.get(bytes) orelse {
-        if (det) |details| details.* = .{
-            .message = try newStringFmt(
-                Heap.local_heap,
-                "expected boolean but got \"{f}\"",
-                .{handle},
-            ),
+    const new_value = Mapping.get(bytes) orelse blk: {
+        // It might be an integer, so be sure to try parsing it as an int before giving up.
+        const as_int = integerGetNoShimmer(null, handle.*) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                // Finally, give up.
+                if (det) |details| details.* = .{
+                    .message = try newStringFmt(Heap.local_heap, "expected boolean but got \"{f}\"", .{handle}),
+                };
+                return error.BadBoolean;
+            },
         };
-        return Error.BadBoolean;
+        break :blk as_int != 0;
     };
 
     try Heap.prepareToShimmer(handle);
-    const ref = handle.peek();
-    ref.tag = .bool;
-    ref.body.bool = new_value;
+    handle.peek().tag = .bool;
+    handle.peek().body.bool = new_value;
 }
 
 pub fn getBoolean(det: ?*ErrorDetails, handle: *Handle) !bool {

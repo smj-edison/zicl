@@ -53,7 +53,7 @@ pub const Error = std.mem.Allocator.Error || error{
     VariableNotFound,
     CommandNotFound,
     InfiniteRecursion,
-    WrongArgumentCount,
+    WrongUsage,
 };
 
 const Tailcall = struct {
@@ -362,7 +362,7 @@ pub fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Handle
             return name_heap.getHandle(name_heap.getExtraData(name_obj.body.upvar).upvar.index);
         },
         .dict_subst => {
-            @panic("Dict sugar unimplemented");
+            @panic("Dict sugar not implemented");
         },
         else => unreachable,
     }
@@ -522,7 +522,7 @@ fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8
         .message = try object.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
     };
 
-    return Error.WrongArgumentCount;
+    return Error.WrongUsage;
 }
 
 /// Takes ownership of name.
@@ -1102,24 +1102,22 @@ fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
         },
         .owned_handle => |string| {
             string.incrRefCount();
-            const as_int = object.integerGet(null, string) catch |err| switch (err) {
+            return object.getBoolean(null, string) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
                     return error.BadBoolean;
                 },
             };
-            return as_int != 0;
         },
         .stack_handle => |*string| {
-            const as_int = object.integerGet(null, string) catch |err| switch (err) {
+            return object.getBoolean(null, string) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
                     return error.BadBoolean;
                 },
             };
-            return as_int != 0;
         },
     }
 }
@@ -1282,6 +1280,15 @@ const ExprResult = union(enum) {
             .int, .float => {},
         }
     }
+
+    pub fn toObject(result: ExprResult, interp: *Interp) !Handle {
+        switch (result) {
+            .int => |int| return try object.newInteger(interp.heap, int),
+            .float => |float| return try object.newFloat(interp.heap, float),
+            .owned_handle => |handle| return handle.borrow(),
+            .stack_handle => |handle| return handle,
+        }
+    }
 };
 fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !ExprResult {
     const node_tag = nodes.items(.tag)[@intFromEnum(node_index)];
@@ -1435,7 +1442,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .bool_not => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const result_bool = try exprResultAsBool(interp, &result);
+            const result_bool = try interp.exprResultAsBool(&result);
             return .{ .int = if (result_bool) 0 else 1 };
         },
         .bit_not => {
@@ -1624,7 +1631,19 @@ pub fn evalExpression(interp: *Interp, handle: *Handle) !ExprResult {
     var det: object.ErrorDetails = undefined;
     const expr: Heap.ParsedExpression = try interp.wrapErrorDetails(&det, object.getExpression(&det, handle));
 
-    return try evalExpressionNode(interp, expr.nodes, expr.root_node);
+    return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.EvalError,
+    };
+}
+
+pub fn getBoolFromExpression(interp: *Interp, handle: *Handle) !bool {
+    var result = try interp.evalExpression(handle);
+    defer result.release();
+    return interp.exprResultAsBool(&result) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => error.EvalError,
+    };
 }
 
 test "eval expression" {
@@ -1665,8 +1684,6 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
     // Execute every command sequentially until the end of the script or an error occurs.
     var command_token_i: u32 = 0;
 
-    parsed.printTokens();
-
     const tags = parsed.tags.items;
     const values = object.listItems(parsed.values);
     // Loop through the script's commands.
@@ -1687,10 +1704,6 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
         // substituting.
         var word_token_i: u32 = command_token_i;
         while (word_token_i < command_token_i + command_info.arg_count) : (word_token_i += 1) {
-            std.debug.print(
-                "word_token_i: {}, command_token_i: {}, command_info.arg_count: {}\n",
-                .{ word_token_i, command_token_i, command_info.arg_count },
-            );
             var word_parts: u32 = 1;
             const argument_expansion = tags[word_token_i] == .argument_expansion;
             if (tags[word_token_i] == .start_of_word or argument_expansion) {
@@ -1737,7 +1750,7 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
 
         // Now that we've populated the arguments for this command, we'll go ahead and run it.
         std.debug.print("Calling command: ", .{});
-        for (args) |arg| std.debug.print("{s} ", .{try Heap.getString(arg)});
+        for (args) |arg| std.debug.print("{{{s}}} ", .{try Heap.getString(arg)});
         std.debug.print("\n", .{});
 
         const result = interp.invokeCommand(args);

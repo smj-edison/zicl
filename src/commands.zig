@@ -59,7 +59,7 @@ fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { 
         };
     }
 
-    interp.setResultOwning(try object.newFloat(result));
+    interp.setResultOwning(try object.newFloat(interp.heap, result));
 }
 
 pub fn add(interp: *Interp, args: []Heap.Handle) !void {
@@ -68,6 +68,12 @@ pub fn add(interp: *Interp, args: []Heap.Handle) !void {
 
 pub fn mul(interp: *Interp, args: []Heap.Handle) !void {
     return addMulHelper(interp, args, .mul);
+}
+
+pub fn expr(interp: *Interp, args: []Heap.Handle) Interp.Error!void {
+    const result = try (try interp.evalExpression(&args[1])).toObject(interp);
+    defer result.decrRefCount();
+    try interp.setResult(result);
 }
 
 /// [puts]
@@ -87,6 +93,51 @@ pub fn puts(interp: *Interp, args: []Heap.Handle) !void {
     }
 }
 
+/// [if]
+pub fn @"if"(interp: *Interp, args: []Heap.Handle) Interp.Error!void {
+    var remaining_args = args[1..];
+    while (true) {
+        // Need a condition and a body after.
+        if (remaining_args.len < 2) return error.WrongUsage;
+
+        // Check condition.
+        if (try interp.getBoolFromExpression(&remaining_args[0])) {
+            // Evaluate true branch.
+            try interp.evalObject(&remaining_args[1]);
+            return;
+        }
+
+        // False branch, is there an else or elseif condition?
+        remaining_args = remaining_args[2..];
+
+        if (remaining_args.len == 0) {
+            // `if` doesn't return anything if there's no else branch, and
+            // the condition returned false.
+            interp.setEmptyResult();
+            return;
+        }
+
+        if (try Heap.stringEquals(remaining_args[0], "else")) {
+            // There should only be one more argument, since there shouldn't
+            // be anything after "else".
+            if (remaining_args.len > 2) return error.WrongUsage;
+            try interp.evalObject(&remaining_args[1]);
+            return;
+        }
+
+        if (try Heap.stringEquals(remaining_args[0], "elseif")) {
+            // Keep going.
+            remaining_args = remaining_args[1..];
+            continue;
+        }
+
+        // tcl doesn't require "else" for the last condition, but I think that's
+        // too lax. We're more strict.
+        return error.WrongUsage;
+    }
+}
+
+/// [incr]
 pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
     var increment_by: i64 = 1;
 
@@ -102,20 +153,23 @@ pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
             return interp.wrapErrorDetails(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
         };
 
+        std.debug.print("contents: {}, new_contents: {}\n", .{ contents, new_contents });
+        std.debug.print("Val ref count: {}\n", .{val.debugRefCount()});
+
         if (val.canModify()) {
             // Can modify directly.
             val.invalidateBoth();
             val.peek().tag = .integer;
             val.peek().body = .{ .integer = new_contents };
+            try interp.setResult(val);
         } else {
             try interp.setVariableToObject(&args[1], .{
                 .str = Heap.Object.null_string,
                 .tag = .integer,
                 .body = .{ .integer = new_contents },
             });
+            try interp.setResult(interp.getVariableNoDetails(&args[1]) catch unreachable);
         }
-
-        try interp.setResult(val);
     } else |err| {
         switch (err) {
             error.VariableNotFound => {
@@ -328,10 +382,12 @@ pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("+", .{ .to_call = add, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mul, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("set", .{ .to_call = set, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("expr", .{ .to_call = expr, .description = "expression", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("if", .{ .to_call = @"if", .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
+    try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("proc", .{ .to_call = proc, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4 });
     try interp.registerCommand("puts", .{ .to_call = puts, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("set", .{ .to_call = set, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
 }
 
 test "commands" {
@@ -342,8 +398,15 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(heap,
-        \\ 
+        \\ set x 0
+        \\ if {$x} {
+        \\   incr y
+        \\ } else {
+        \\   incr x
+        \\ }
     );
     defer script.decrRefCount();
     try interp.evalObject(&script);
+
+    std.debug.print("result: {f}\n", .{interp.result});
 }
