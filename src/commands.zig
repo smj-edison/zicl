@@ -6,7 +6,7 @@ const Handle = Heap.Handle;
 const object = @import("object.zig");
 const Interp = @import("Interp.zig");
 
-fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { add, mul }) !void {
+fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) !void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
         var result: i64 = 0;
@@ -62,22 +62,42 @@ fn addMulHelper(interp: *Interp, args: []Heap.Handle, comptime operator: enum { 
     interp.setResultOwning(try object.newFloat(interp.heap, result));
 }
 
-pub fn add(interp: *Interp, args: []Heap.Handle) !void {
-    return addMulHelper(interp, args, .add);
+pub fn @"+"(interp: *Interp, args: []Handle) !void {
+    try addMulHelper(interp, args, .add);
 }
 
-pub fn mul(interp: *Interp, args: []Heap.Handle) !void {
-    return addMulHelper(interp, args, .mul);
+pub fn @"*"(interp: *Interp, args: []Handle) !void {
+    try addMulHelper(interp, args, .mul);
 }
 
-pub fn expr(interp: *Interp, args: []Heap.Handle) Interp.Error!void {
+pub fn apply(interp: *Interp, args: []Handle) !void {
+    const lambda_len = try interp.getListLength(&args[1]);
+    if (lambda_len < 2 or lambda_len > 3) {
+        try interp.setResultFormatted("can't interpret \"{f}\" as a lambda expression", .{args[1]});
+        return error.EvalError;
+    }
+
+    var namespace: ?Handle = null;
+    if (lambda_len == 3) {
+        namespace = object.listItemFollowRefs(args[1], 2);
+    }
+
+    // const arg_list = object.listItemFollowRefs(args[1], 0);
+    // const body = object.listItemFollowRefs(args[1], 1);
+
+    // var new_arg_list = arg_list.borrow();
+    // var new_body = body.borrow();
+    // const command = createProcedureCommand(interp, &new_arg_list, null, &new_body, namespace);
+}
+
+pub fn expr(interp: *Interp, args: []Handle) Interp.Error!void {
     const result = try (try interp.evalExpression(&args[1])).toObject(interp);
     defer result.decrRefCount();
     try interp.setResult(result);
 }
 
 /// [puts]
-pub fn puts(interp: *Interp, args: []Heap.Handle) !void {
+pub fn puts(interp: *Interp, args: []Handle) !void {
     if (args.len == 3) {
         const first_arg_str = try Heap.getString(args[1]);
         if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
@@ -94,7 +114,7 @@ pub fn puts(interp: *Interp, args: []Heap.Handle) !void {
 }
 
 /// [if]
-pub fn @"if"(interp: *Interp, args: []Heap.Handle) Interp.Error!void {
+pub fn @"if"(interp: *Interp, args: []Handle) Interp.Error!void {
     var remaining_args = args[1..];
     while (true) {
         // Need a condition and a body after.
@@ -138,7 +158,7 @@ pub fn @"if"(interp: *Interp, args: []Heap.Handle) Interp.Error!void {
 }
 
 /// [incr]
-pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
+pub fn incr(interp: *Interp, args: []Handle) !void {
     var increment_by: i64 = 1;
 
     if (args.len == 3) {
@@ -186,7 +206,7 @@ pub fn incr(interp: *Interp, args: []Heap.Handle) !void {
 }
 
 /// [set]
-pub fn set(interp: *Interp, args: []Heap.Handle) !void {
+pub fn set(interp: *Interp, args: []Handle) !void {
     if (args.len == 2) {
         // Return the value.
         try interp.setResult(try interp.getVariable(&args[1]));
@@ -215,26 +235,26 @@ fn namespaceSplit(full_name: []const u8) struct { namespace: []const u8, command
     };
 }
 
+/// Modifies arg_list to only contain names of variables (optional values
+/// are stored elsewhere).
 pub fn createProcedureCommand(
     interp: *Interp,
     arg_list: *Handle,
-    statics_list: ?*Handle,
+    statics_names: ?*Handle,
     body: *Handle,
     namespace: Handle,
 ) !Interp.Command {
-    const arg_list_len = try interp.getListLength(arg_list);
-
     const statics: ?Handle = blk: {
-        if (statics_list) |list| {
-            try Heap.ensureSameHeap(list);
-            const statics_count = try interp.getListLength(list);
+        if (statics_names) |names| {
+            try Heap.ensureSameHeap(names);
+            const statics_count = try interp.getListLength(names);
 
             const statics_dict = try object.dictUninitializedNew(statics_count * 2);
             const dict_items = object.dictItems(statics_dict);
             errdefer statics_dict.decrRefCount();
 
             for (0..statics_count) |i| {
-                const static_name = object.listItem(list.*, @intCast(i));
+                const static_name = object.listItem(names.*, @intCast(i));
                 if (interp.getVariableImpl(null, static_name)) |static_value| {
                     const dict_name_str = try Heap.duplicateObjString(Heap.local_heap, static_name);
                     errdefer dict_name_str.deinit(Heap.local_heap);
@@ -263,8 +283,7 @@ pub fn createProcedureCommand(
         }
     };
 
-    const new_arg_list = try object.listUninitializedNew(arg_list_len);
-    errdefer new_arg_list.decrRefCount();
+    const arg_list_len = try interp.getListLength(arg_list);
 
     // We'll set this to a list if we encounter any optional values.
     var optional_values: ?Handle = null;
@@ -275,7 +294,8 @@ pub fn createProcedureCommand(
     var required_arity: u32 = 0;
     var optional_arity: u32 = 0;
 
-    // Now we'll make the new args list, validating as we go along.
+    // Validate the args as we go along, replacing any optional arguments with just
+    // their variables' name.
     for (0..arg_list_len) |i| {
         if (args_parameter_found) {
             try interp.setResultString("parameter after 'args' not allowed");
@@ -295,25 +315,20 @@ pub fn createProcedureCommand(
         } else if (arg_len == 2) {
             // Optional parameter.
             if (optional_values == null) {
-                optional_values = try object.listNew(&.{});
+                // Init the optional_values list.
+                optional_values = try object.listNew(&.{}, false);
             }
 
-            const arg_name = try Heap.getString(object.listItem(arg, 0));
-            if (std.mem.eql(u8, arg_name, "args")) {
+            if (try Heap.stringEquals(object.listItem(arg, 0), "args")) {
                 try interp.setResultString("'args' must be a required parameter");
                 return error.ArgsWasOptional;
             }
 
-            const arg_str_duped = try Heap.duplicateObjString(Heap.local_heap, object.listItem(arg, 0));
-            errdefer arg_str_duped.deinit(Heap.local_heap);
             // Append value to optional values.
             _ = try interp.listAppend(&(optional_values.?), object.listItem(arg, 1));
-            // And put the variable name onto the new arg list.
-            object.listItem(new_arg_list, @intCast(i)).peek().* = .{
-                .str = arg_str_duped,
-                .tag = .none,
-                .body = undefined,
-            };
+            // And replace the `arg_list`'s parameter/value with just the parameter name.
+            var det: object.ErrorDetails = undefined;
+            try object.listSetItem(&det, arg_list, @intCast(i), object.listItem(arg, 0));
 
             optional_arity += 1;
         } else {
@@ -328,12 +343,6 @@ pub fn createProcedureCommand(
             if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
 
             // Required parameter.
-            object.listItem(new_arg_list, @intCast(i)).peek().* = .{
-                .str = try Heap.duplicateObjString(Heap.local_heap, object.listItem(arg, 0)),
-                .tag = .none,
-                .body = undefined,
-            };
-
             required_arity += 1;
         }
     }
@@ -342,7 +351,7 @@ pub fn createProcedureCommand(
         .namespace = namespace.borrow(),
         .call_info = .{ .tcl = .{
             .signature = .{
-                .args = new_arg_list,
+                .args = arg_list.borrow(),
                 .body = body.borrow(),
                 .statics = statics,
                 .has_args_parameter = args_parameter_found,
@@ -355,7 +364,7 @@ pub fn createProcedureCommand(
 }
 
 /// [proc]
-pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
+pub fn proc(interp: *Interp, args: []Handle) !void {
     const proc_name = try Heap.getString(args[1]);
     const arg_list = &args[2];
     const statics = if (args.len == 5) &args[3] else null;
@@ -380,8 +389,9 @@ pub fn proc(interp: *Interp, args: []Heap.Handle) !void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("+", .{ .to_call = add, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("*", .{ .to_call = mul, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("+", .{ .to_call = @"+", .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("*", .{ .to_call = @"*", .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("apply", .{ .to_call = apply, .description = "lambdaExpr ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = expr, .description = "expression", .min_arity = 1, .max_arity = 1 });
     try interp.registerCommand("if", .{ .to_call = @"if", .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });

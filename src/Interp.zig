@@ -528,11 +528,11 @@ fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8
 /// Takes ownership of name.
 pub fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
     // TODO make sure to check interp->local if we end up needing it in our impl
-    const old_command = try interp.commands.fetchPut(interp.gpa, name, command);
-    if (old_command) |unwrapped| {
-        var old_command_mut = unwrapped.value;
-        old_command_mut.deinit();
-    }
+    var old_command = try interp.commands.fetchPut(interp.gpa, name, command);
+    if (old_command) |*val| val.value.deinit();
+
+    // FIXME need to handle this if it wraps around.
+    interp.current_procedure_epoch += 1;
 }
 
 pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.NativeCommand) !void {
@@ -582,7 +582,7 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
         // Are we at the last argument? If so, is it `args`?
         if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
             // Assign remaining arguments to `args`.
-            const list = try object.listNew(args[called_idx..]);
+            const list = try object.listNew(args[called_idx..], false);
             defer list.decrRefCount();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
         } else if (signature_idx > signature.required_arity) {

@@ -1391,6 +1391,15 @@ pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     }
 }
 
+pub fn dupSingleOrReference(dest_heap: *Heap, handle: Handle) !Object {
+    if (dest_heap.duplicateSingle(handle)) |new_obj| {
+        return new_obj;
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MultiItemObject => return handle.reference(),
+    }
+}
+
 /// Duplicates the object if it's a fast duplication, else references it.
 pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
     _ = dest_heap;

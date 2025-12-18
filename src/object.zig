@@ -803,14 +803,18 @@ pub fn listUninitializedNew(len: u32) !Handle {
     return Heap.local_heap.getHandle(list_index);
 }
 
-pub fn listNew(handles: []const Handle) !Handle {
+pub fn listNew(handles: []const Handle, force_dup: bool) !Handle {
     const list = try listUninitializedNew(@intCast(handles.len));
     errdefer list.decrRefCount();
 
     const new_items = listItems(list);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try Heap.local_heap.dupOrReference(handle);
+        if (force_dup) {
+            item.* = try Heap.local_heap.dupSingleOrReference(handle);
+        } else {
+            item.* = try Heap.local_heap.dupOrReference(handle);
+        }
     }
 
     return list;
@@ -983,7 +987,7 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
         // No need to realloc if we're shrinking.
         if (new_len < current_len) {
             // We need to check if any of the abandoned items are shared. If so, we'll need to
-            // dissolve this collection and create a new one.
+            // split this collection and create a new one.
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
                 const to_free_handle = listItem(handle.*, @intCast(current_len - freed_count + to_free));
@@ -1078,13 +1082,14 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
                     .heap = handle.heap,
                 };
 
-                // Only free marked items, so we don't release the backing of a shared item.
+                // Only free the backing marked items, so we don't release the backing of a shared item.
+                // Why not a full free? Because the marked values are in use on another list now.
                 if (item_handle.peek().tag == .marked) {
                     Heap.freeObjectBacking(item_handle);
                 }
             }
 
-            // Be sure to free the old head too.
+            // Be sure to free the old head backing too.
             Heap.freeObjectBacking(handle.*);
         } else {
             Heap.freeObjectBacking(handle.*);
@@ -1117,12 +1122,45 @@ pub fn listItem(handle: Handle, index: u32) Handle {
     return collectionItem(handle, index, list.body.list.len);
 }
 
+/// Assumes provided handle is a list.
+pub fn listItemFollowRefs(handle: Handle, index: u32) Handle {
+    const list = handle.peek();
+    assert(list.tag == .list);
+
+    return collectionItemFollowRefs(handle, index, list.body.list.len);
+}
+
 /// Assumes handle is a list.
 pub fn listItems(handle: Handle) []Heap.Object {
     const list = handle.peek();
     assert(list.tag == .list);
 
     return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..list.body.list.len];
+}
+
+pub fn listSetItem(det: ?*ErrorDetails, handle: *Handle, index: u32, value: Handle) !void {
+    // Be sure to acquire the value first thing, so it doesn't potentially get
+    // freed as we do the following list transformations.
+    var new_value = try Heap.local_heap.dupOrReference(value);
+    errdefer new_value.deinitBodySingle(Heap.local_heap);
+
+    const length = try listLength(det, handle);
+    if (index > length) return error.OutOfBounds;
+
+    try Heap.prepareForModification(handle);
+    if (listItem(handle.*, index).isShared()) {
+        const before_dup = handle.*;
+        // We need to create a new list if one of the items is shared.
+        handle.* = try Heap.local_heap.duplicate(handle.*);
+        before_dup.decrRefCount();
+    }
+
+    // We know that this index is now safe to modify.
+    const item = listItem(handle.*, index);
+    assert(!item.isShared());
+
+    item.invalidateBoth();
+    item.peek().* = new_value;
 }
 
 pub fn listAppendObject(det: ?*ErrorDetails, handle: *Handle, item: Heap.Object) !u32 {
@@ -1160,13 +1198,13 @@ fn testLists(ta: std.mem.Allocator) !void {
     defer obj1.decrRefCount();
     const obj2 = try newString(heap, "object 2");
     defer obj2.decrRefCount();
-    var list1 = try listNew(&.{ obj1, obj2 });
+    var list1 = try listNew(&.{ obj1, obj2 }, true);
     defer list1.decrRefCount();
 
     const items = listItems(list1);
     try testing.expectEqual(2, items.len);
     // The object should have been copied when being moved into the list
-    try testing.expect(obj1.peek().str != items[0].str);
+    try testing.expect(obj1.peek() != &items[0]);
     // But it should have an identical string
     try testing.expectEqualStrings("object 1", try Heap.getString(listItem(list1, 0)));
 
@@ -1469,51 +1507,38 @@ fn dictRemoveDuplicates(handle: *Handle, to_track: ?u32) !?u32 {
 pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
     assert(handle.peek().tag == .dict);
 
-    // Copy on write logic for the dictionary.
-    const old_dict: ?Heap.Handle = blk: {
-        if (handle.canModify()) {
-            break :blk null;
-        } else {
-            const old = handle.*;
-            handle.* = try Heap.local_heap.duplicate(handle.*);
-            break :blk old;
-        }
-    };
-    // The old dict needs to be released at the very end, because `key` may come from the old dict.
-    defer if (old_dict) |val| val.decrRefCount();
+    // Make sure we borrow the key, so it doesn't get freed if the old dictionary gets freed.
+    key.incrRefCount();
+    defer key.decrRefCount();
+    // Also, make sure the key has a string representation.
+    _ = try Heap.getString(key);
 
-    handle.invalidateString();
+    try Heap.prepareForModification(handle);
 
     assert(handle.heap == Heap.local_heap.heapId());
     var metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
 
-    var value_mut = value; // Used for error cleanup.
     const value_index: u32 = blk: {
-        // Ensure `key` has a string rep.
-        _ = Heap.getString(key) catch {
-            // Be sure to clean up the value if not.
+        // Make sure to clean up the value if we run into OOM.
+        errdefer {
+            var value_mut = value;
             value_mut.deinitBodySingle(Heap.local_heap);
-            return error.OutOfMemory;
-        };
+        }
 
         // Does the key already exist?
         if (metadata.table.get(key)) |existing_value| {
             // Key exists, so replace the value in place.
-            const value_handle = dictItem(handle.*, existing_value);
+            var value_handle = dictItem(handle.*, existing_value);
             if (value_handle.isShared()) {
                 // Looks like this dictionary value is shared, so we can't replace the value in place
                 // (else we'd smash up a value someone else is using). Instead, we'll start this whole
                 // process over with a new dictionary.
-                assert(old_dict == null);
-                const local_old_dict = handle.*;
-                handle.* = Heap.local_heap.duplicate(handle.*) catch {
-                    value_mut.deinitBodySingle(Heap.local_heap);
-                    return error.OutOfMemory;
-                };
-                // Now we've set the new dict, we can prepare to release the old one.
-                defer local_old_dict.decrRefCount();
+                const before_dup = handle.*;
+                handle.* = try Heap.local_heap.duplicate(handle.*);
+                before_dup.decrRefCount();
 
-                return dictPutObject(handle, key, value);
+                // Reload the value handle, since we have a new dict.
+                value_handle = dictItem(handle.*, existing_value);
             }
             assert(!value_handle.isShared());
             value_handle.invalidateBoth();
@@ -1521,15 +1546,8 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
 
             break :blk existing_value;
         } else {
-            // If we hit OOM at some point, we need to be sure to roll back the new value.
-            errdefer value_mut.deinitBodySingle(Heap.local_heap);
-
-            // Need to copy the key string here, because it may become invalidated when
-            // calling `ensureTotalCapacity`.
-            const key_dup_str = try Heap.local_heap.duplicateObjString(key);
-            errdefer key_dup_str.deinit(Heap.local_heap);
-
             const new_length = metadata.len + 2;
+            try metadata.table.ensureTotalCapacity(Heap.local_heap.gpa, new_length / 2);
 
             // Key doesn't exist, so append both key and value.
             const new_key_index = metadata.len;
@@ -1538,16 +1556,23 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
             // `handle` may change after updating the length, so we better reload
             // the metadata pointer.
             metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
-            try metadata.table.ensureTotalCapacity(Heap.local_heap.gpa, new_length / 2);
 
             const new_key_handle = dictItem(handle.*, new_key_index);
             const new_value_handle = dictItem(handle.*, new_value_index);
 
             assert(new_key_handle.heap == Heap.local_heap.heapId());
-            assert(Heap.local_heap.exchangeString(new_key_handle.index, Heap.Object.null_string, key_dup_str));
 
-            // Reindex after we've added the new key (not the value though, because we might
-            // accidentally double-free the new value).
+            // Set the new key.
+            new_key_handle.peek().* = .{
+                .str = try Heap.local_heap.duplicateObjString(key),
+                .tag = .none,
+                .body = undefined,
+            };
+            errdefer new_key_handle.invalidateBoth();
+
+            // Reindex after we've added the new key (not the value though,
+            // because we might accidentally double-free the new value due to
+            // `errdefer value_mut.deinitBodySingle...`).
             if (reindex_needed) {
                 // dictReindex could still fail if one of the objects doesn't have a string rep.
                 try dictReindex(handle.*, null);
@@ -1555,14 +1580,14 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
                 metadata.table.putAssumeCapacity(new_key_handle, new_value_index);
             }
 
-            // Now that we've set the new value, we can be rest assured that `value`
-            // won't need to be cleaned up, as now it's owned by the dict.
             new_value_handle.peek().* = value;
+            // Now that we've set the new value, we can be rest assured that `value`
+            // won't need to be cleaned up, as it's now owned by the dict.
             break :blk new_value_index;
         }
     };
 
-    // Because we mutated the dictionary, we need to remove any duplicates.
+    // Because we mutated the dictionary, we need to remove any duplicates, if applicable.
     if (dictHasDuplicatesRaw(handle.*)) {
         const new_value_index = (try dictRemoveDuplicates(handle, value_index)).?;
         return dictItem(handle.*, new_value_index);
