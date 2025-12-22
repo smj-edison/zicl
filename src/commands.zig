@@ -82,12 +82,35 @@ pub fn apply(interp: *Interp, args: []Handle) !void {
         namespace = object.listItemFollowRefs(args[1], 2);
     }
 
-    // const arg_list = object.listItemFollowRefs(args[1], 0);
-    // const body = object.listItemFollowRefs(args[1], 1);
+    const arg_list = object.listItemFollowRefs(args[1], 0);
+    const body = object.listItemFollowRefs(args[1], 1);
 
-    // var new_arg_list = arg_list.borrow();
-    // var new_body = body.borrow();
-    // const command = createProcedureCommand(interp, &new_arg_list, null, &new_body, namespace);
+    var new_arg_list = arg_list.borrow();
+    defer new_arg_list.decrRefCount();
+    var new_body = body.borrow();
+    defer new_body.decrRefCount();
+    var command = createProcedureCommand(interp, &new_arg_list, null, &new_body, namespace) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.EvalError,
+    };
+    defer command.deinit();
+
+    // Create a new arg array with a dummy arg[0] for error messages (as the command name
+    // is the first argument).
+    var sf = std.heap.stackFallback(32, interp.gpa);
+    const stack_alloc = sf.get();
+
+    // 1 (the first argument, "apply lambdaProc") + args.len - 2 (skip "apply" and the lambda).
+    const lambda_args = try stack_alloc.alloc(Heap.Handle, 1 + args.len - 2);
+    defer stack_alloc.free(lambda_args);
+
+    lambda_args[0] = interp.heap.getInternedString(.lambda_apply_expr);
+    for (args[2..], lambda_args[1..]) |provided_arg, *lambda_arg| {
+        lambda_arg.* = provided_arg.borrow();
+    }
+    defer for (lambda_args[1..]) |lambda_arg| lambda_arg.decrRefCount();
+
+    try interp.callProcedure(&command, lambda_args);
 }
 
 pub fn expr(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -242,7 +265,7 @@ pub fn createProcedureCommand(
     arg_list: *Handle,
     statics_names: ?*Handle,
     body: *Handle,
-    namespace: Handle,
+    namespace: ?Handle,
 ) !Interp.Command {
     const statics: ?Handle = blk: {
         if (statics_names) |names| {
@@ -348,7 +371,7 @@ pub fn createProcedureCommand(
     }
 
     return .{
-        .namespace = namespace.borrow(),
+        .namespace = Handle.borrowOptional(namespace),
         .call_info = .{ .tcl = .{
             .signature = .{
                 .args = arg_list.borrow(),
@@ -408,15 +431,9 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(heap,
-        \\ set x 0
-        \\ if {$x} {
-        \\   incr y
-        \\ } else {
-        \\   incr x
-        \\ }
+        \\ set lambda {{x} { + $x 1 }}
+        \\ puts [apply $lambda 5]
     );
     defer script.decrRefCount();
     try interp.evalObject(&script);
-
-    std.debug.print("result: {f}\n", .{interp.result});
 }

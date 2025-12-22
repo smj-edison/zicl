@@ -429,7 +429,7 @@ const ProcedureSignature = struct {
         };
     }
 
-    pub fn release(signature: ProcedureSignature) void {
+    pub fn deinit(signature: ProcedureSignature) void {
         signature.args.decrRefCount();
         signature.body.decrRefCount();
         if (signature.statics) |statics| statics.decrRefCount();
@@ -461,7 +461,7 @@ pub const Command = struct {
         if (command.namespace) |namespace| namespace.decrRefCount();
 
         switch (command.call_info) {
-            .tcl => |val| val.signature.release(),
+            .tcl => |val| val.signature.deinit(),
             .native => {},
         }
     }
@@ -541,7 +541,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.Nativ
     try interp.commands.put(interp.gpa, name_duped, .{ .namespace = null, .call_info = .{ .native = details } });
 }
 
-fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
+pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
     const signature = &command.call_info.tcl.signature;
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
@@ -567,6 +567,7 @@ fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
 
     const parent_idx = interp.currentCallFrameIndex();
     const call_frame_idx = try interp.pushCallFrame(parent_idx, args, signature.*);
+    defer interp.call_frames.pop().?.deinit();
 
     // Populate call frame.
 
@@ -688,7 +689,7 @@ const CallFrame = struct {
     level: u32,
     /// Dictionary containing the frame's variables.
     variables: Handle,
-    /// Arguments of the procedure call.
+    /// Arguments of the procedure call. Managed by creator.
     args: []Handle,
     /// Signature of the procedure that this is being called with.
     signature: ProcedureSignature,
@@ -700,6 +701,13 @@ const CallFrame = struct {
     call_epoch: u31,
     /// Set this during evaluation to trigger a tailcall.
     tailcall: ?Tailcall,
+
+    pub fn deinit(frame: *const CallFrame) void {
+        // Args are managed externally, so we don't free them.
+        if (frame.namespace) |namespace| namespace.decrRefCount();
+        frame.variables.decrRefCount();
+        frame.signature.deinit();
+    }
 };
 
 fn currentCallFrameIndex(interp: *Interp) u32 {
@@ -736,7 +744,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
     const vars_handle = try object.newDict(interp.heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = try signature.borrow();
-    errdefer borrowed_signature.release();
+    errdefer borrowed_signature.deinit();
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
@@ -1807,9 +1815,7 @@ pub fn deinit(interp: *Interp) void {
 
     // Deinit all frames.
     for (interp.call_frames.items) |frame| {
-        if (frame.namespace) |namespace| namespace.decrRefCount();
-        frame.variables.decrRefCount();
-        frame.signature.release();
+        frame.deinit();
     }
     interp.call_frames.deinit(interp.gpa);
 

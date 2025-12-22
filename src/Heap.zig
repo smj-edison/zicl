@@ -86,6 +86,7 @@ object_tracking: ObjectTracker,
 objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
+interned_strings: std.EnumMap(InternedStrings, Heap.Handle),
 
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
@@ -110,6 +111,12 @@ const StringList = std.ArrayList(u8);
 const ExtraDataPool = memutil.IndexedMemoryPool(ExtraData, cfg.use_vmem);
 const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
 const ParsedExpressions = std.AutoHashMapUnmanaged(u32, struct { expr: ParsedExpression, generation: u32 });
+
+const InternedStrings = enum {
+    lambda_apply_expr,
+};
+
+const interned_string_count = std.enums.values(InternedStrings).len;
 
 /// Each script is assigned a unique id when created. Each interpreter
 /// has a hashmap that associates a script id with its local parsed
@@ -647,6 +654,9 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn canShimmer(handle: Handle) bool {
+        // Specialty objects can't shimmer.
+        if (handle.index < special_object_count + interned_string_count) return false;
+
         // Can't shimmer if it's shared between threads
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
     }
@@ -703,7 +713,7 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn incrRefCount(handle: Handle) void {
-        if (handle.index < special_object_count) return;
+        if (handle.index < special_object_count + interned_string_count) return;
 
         const metadata = handle.getMetadata();
         if (cfg.trace_mem) {
@@ -801,7 +811,7 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn decrRefCount(handle: Handle) void {
-        if (handle.index < special_object_count) return;
+        if (handle.index < special_object_count + interned_string_count) return;
 
         const metadata = handle.getMetadata();
         if (cfg.trace_mem) {
@@ -863,6 +873,22 @@ fn heapAlloc(self: *Heap) Allocator {
     }
 }
 
+fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
+    const interned = try heap.createObject();
+    errdefer interned.decrRefCount();
+    const cast_len: u26 = @intCast(str.len);
+    const str_index = try heap.createString(cast_len);
+    assert(interned.index == (expected_index + special_object_count));
+
+    @memcpy(heap.getHeapString(str_index, str_index + cast_len), str);
+    assert(heap.exchangeString(interned.index, Object.null_string, .{
+        .is_ptr = false,
+        .u = .{ .str = .{ .index = str_index, .len = cast_len } },
+    }));
+
+    return interned;
+}
+
 pub fn init(heap: *Heap, gpa: Allocator) !void {
     // Init objects
     var object_tracking = try ObjectTracker.init(gpa, cfg.object_heap_order);
@@ -919,6 +945,7 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
         .objects = objects,
         .string_tracking = string_tracking,
         .strings = strings,
+        .interned_strings = undefined,
 
         .extra = extra,
         .parsed_scripts = parsed_scripts,
@@ -948,6 +975,11 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
     const temp_object = try heap.createObject();
     assert(temp_object.index == temp_object_idx);
 
+    // Intern all the interned strings.
+    heap.interned_strings = .init(.{
+        .lambda_apply_expr = try createInternedString(heap, 0, "apply lambdaExpr"),
+    });
+
     // We need to init the temp object as well by setting its string to a long string.
     assert(try heap.setLongString(temp_object_idx, .{ .temp = "" }));
 }
@@ -972,32 +1004,28 @@ pub fn deinit(heap: *Heap) void {
     heap.parsed_scripts.deinit(heap.gpa);
     heap.parsed_exprs.deinit(heap.gpa);
 
-    for (special_object_count..heap.objects.len) |i| {
+    for ((special_object_count + interned_string_count)..heap.objects.len) |i| {
         const metadata = heap.objects.get(i).metadata;
         if (metadata.in_use) {
             // We don't use free object here, as it may cause a double-free when
             // freeing recursive structures. For example, if there was a list with
             // two items, we'll free the list (first free of items), then free
             // the items individually (second free)
-            const handle = heap.getHandle(@intCast(i));
-            handle.invalidateBody();
-            handle.invalidateString();
+            heap.getHandle(@intCast(i)).invalidateBoth();
         }
     }
-    Heap.getStringDetails(heap.tempObject()).long.freeUnchecked(heap.gpa);
 
-    if (cfg.use_vmem) {
-        memutil.vmemUnmap(@alignCast(heap.strings.items));
-        memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
-    } else {
-        // Don't use self.heapAlloc() in this case, as that will error
-        // with the null allocator
-        heap.strings.deinit(heap.gpa);
-        heap.objects.deinit(heap.gpa);
+    for (special_object_count..(special_object_count + interned_string_count)) |i| {
+        // Need to free these objects diectly, since they're not normally allowed
+        // to be modified.
+        const interned = heap.getHandle(@intCast(i));
+        interned.peek().str.deinit(heap);
+        freeObjectBacking(interned);
     }
 
     // Be sure to free the specialty objects and strings.
     assert(special_object_count == 3);
+    Heap.getStringDetails(heap.tempObject()).long.freeUnchecked(heap.gpa);
     heap.object_tracking.freeFromOwningThread(0, 0);
     heap.object_tracking.freeFromOwningThread(1, 0);
     heap.object_tracking.freeFromOwningThread(2, 0);
@@ -1005,10 +1033,21 @@ pub fn deinit(heap: *Heap) void {
     heap.string_tracking.freeFromOwningThread(0, 0);
     heap.string_tracking.freeFromOwningThread(1, 0);
 
+    if (cfg.use_vmem) {
+        memutil.vmemUnmap(@alignCast(heap.strings.items));
+        memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
+    } else {
+        // Don't use self.heapAlloc() in this case, as that will error
+        // with the null allocator.
+        heap.strings.deinit(heap.gpa);
+        heap.objects.deinit(heap.gpa);
+    }
+
     if (heap.object_tracking.deinit() == .leaked) @panic("Heap leaks when deiniting");
     if (heap.string_tracking.deinit() == .leaked) @panic("Heap leaks when deiniting");
 
     heap.extra.deinit(heap.gpa);
+    heap.* = undefined;
 }
 
 pub inline fn heapId(self: *Heap) HeapId {
@@ -1053,13 +1092,16 @@ pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
     // extremely unlikely for its ref_count to reach zero.
     long_string.ref_count = std.math.maxInt(usize) / 2;
     // Reset anything that may have previously been computed.
-    temp_handle.invalidateBody();
     long_string.utf8_length = null;
     long_string.hash = null;
 
     long_string.string_type = .{
         .temp = bytes,
     };
+}
+
+pub fn getInternedString(heap: *Heap, string: InternedStrings) Heap.Handle {
+    return heap.interned_strings.get(string).?;
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -1965,7 +2007,8 @@ pub fn leakCheck(heap: *Heap) !bool {
     var leaked = false;
 
     // Go through once to print the summary, then print each individual trace.
-    for (heap.objects.items(.metadata)[special_object_count..], special_object_count..) |metadata, i| {
+    const skip_count = special_object_count + interned_string_count;
+    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i));
             std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
@@ -1983,7 +2026,7 @@ pub fn leakCheck(heap: *Heap) !bool {
     if (cfg.trace_mem and leaked) {
         std.debug.print("\n===== Leak details =====\n\n", .{});
 
-        for (heap.objects.items(.metadata)[special_object_count..], special_object_count..) |metadata, i| {
+        for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
             if (metadata.in_use) {
                 const handle = heap.getHandle(@intCast(i));
                 std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
