@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
 
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
@@ -119,6 +120,54 @@ pub fn expr(interp: *Interp, args: []Handle) Interp.Error!void {
     try interp.setResult(result);
 }
 
+pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.Error!enum { @"continue", @"break", none } {
+    if (result) |_| {
+        return .none;
+    } else |err| switch (err) {
+        error.Continue, error.Break => {
+            if (interp.loop_propagate > 0) {
+                interp.loop_propagate -= 1;
+                return err;
+            } else {
+                return switch (err) {
+                    error.Continue => .@"continue",
+                    error.Break => .@"break",
+                    inline else => unreachable,
+                };
+            }
+        },
+        else => return err,
+    }
+
+    return .none;
+}
+
+pub fn @"for"(interp: *Interp, args: []Handle) Interp.Error!void {
+    // Do the initialization.
+    try interp.evalObject(&args[1]);
+
+    // Check condition.
+    while (try interp.getBoolFromExpression(&args[2])) {
+        // Evaluate body.
+        switch (try propagateLoopControl(interp, interp.evalObject(&args[4]))) {
+            .@"break" => {
+                break;
+            },
+            .@"continue" => {
+                // No need to do anything, because as the called body
+                // returned `error.Continue` early, it skipped running
+                // the rest of the commands.
+            },
+            .none => {},
+        }
+
+        // Run increment.
+        try interp.evalObject(&args[3]);
+    }
+
+    interp.setEmptyResult();
+}
+
 /// [puts]
 pub fn puts(interp: *Interp, args: []Handle) !void {
     if (args.len == 3) {
@@ -195,9 +244,6 @@ pub fn incr(interp: *Interp, args: []Handle) !void {
             var det: object.ErrorDetails = undefined;
             return interp.wrapErrorDetails(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
         };
-
-        std.debug.print("contents: {}, new_contents: {}\n", .{ contents, new_contents });
-        std.debug.print("Val ref count: {}\n", .{val.debugRefCount()});
 
         if (val.canModify()) {
             // Can modify directly.
@@ -416,6 +462,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("*", .{ .to_call = @"*", .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("apply", .{ .to_call = apply, .description = "lambdaExpr ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = expr, .description = "expression", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("for", .{ .to_call = @"for", .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = @"if", .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("proc", .{ .to_call = proc, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4 });
@@ -431,8 +478,9 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(heap,
-        \\ set lambda {{x} { + $x 1 }}
-        \\ puts [apply $lambda 5]
+        \\ for {set i 0} {$i < 10} {incr i} {
+        \\     puts $i
+        \\ }
     );
     defer script.decrRefCount();
     try interp.evalObject(&script);

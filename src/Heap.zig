@@ -541,7 +541,7 @@ pub const Body = packed union {
     variable: packed struct {
         index: u32,
         /// Used to invalidate `index`'s cached value, if it doesn't match
-        /// the current evaluator's epoch.
+        /// the current call frame's epoch.
         call_epoch: u31,
         /// Whether the variable is global, e.g. prefixed with ::
         is_global: bool,
@@ -728,6 +728,8 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn reference(handle: Handle) Object {
+        // Make sure we're never making a reference to a reference.
+        assert(handle.peek().tag != .reference);
         handle.incrRefCount();
 
         return .{
@@ -1447,7 +1449,12 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
     _ = dest_heap;
 
     const tag = handle.peek().tag;
-    if (tag == .float or tag == .integer) {
+    if (tag == .reference) {
+        // We can't reference a reference, so we'll create a new reference.
+        return handle.peek().body.reference.reference();
+    } else if (handle.peek().str == Object.null_string and tag == .float or tag == .integer) {
+        // We can't just use a number if it has a string rep, because the string may
+        // be different than how the number will be rendered.
         return .{
             .str = Object.null_string,
             .tag = tag,
@@ -1517,7 +1524,11 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
             };
         },
         .reference => {
-            return src.body.reference.reference();
+            // Try to duplicate what it's referencing, else create a new reference to it.
+            return dest_heap.duplicateSingle(src.body.reference) catch |err| switch (err) {
+                error.MultiItemObject => return src.body.reference.reference(),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
         },
         .custom_type => {
             const custom_type = src.body.custom_type;

@@ -1504,8 +1504,8 @@ fn dictRemoveDuplicates(handle: *Handle, to_track: ?u32) !?u32 {
 
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
 /// `value` must be in `Heap.local_heap`.
-pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
-    assert(handle.peek().tag == .dict);
+pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
+    assert(dict.peek().tag == .dict);
 
     // Make sure we borrow the key, so it doesn't get freed if the old dictionary gets freed.
     key.incrRefCount();
@@ -1513,10 +1513,10 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
     // Also, make sure the key has a string representation.
     _ = try Heap.getString(key);
 
-    try Heap.prepareForModification(handle);
+    try Heap.prepareForModification(dict);
 
-    assert(handle.heap == Heap.local_heap.heapId());
-    var metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
+    assert(dict.heap == Heap.local_heap.heapId());
+    var metadata = &Heap.local_heap.getExtraData(dict.peek().body.dict).dict;
 
     const value_index: u32 = blk: {
         // Make sure to clean up the value if we run into OOM.
@@ -1528,17 +1528,17 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
         // Does the key already exist?
         if (metadata.table.get(key)) |existing_value| {
             // Key exists, so replace the value in place.
-            var value_handle = dictItem(handle.*, existing_value);
+            var value_handle = dictItem(dict.*, existing_value);
             if (value_handle.isShared()) {
                 // Looks like this dictionary value is shared, so we can't replace the value in place
                 // (else we'd smash up a value someone else is using). Instead, we'll start this whole
                 // process over with a new dictionary.
-                const before_dup = handle.*;
-                handle.* = try Heap.local_heap.duplicate(handle.*);
+                const before_dup = dict.*;
+                dict.* = try Heap.local_heap.duplicate(dict.*);
                 before_dup.decrRefCount();
 
                 // Reload the value handle, since we have a new dict.
-                value_handle = dictItem(handle.*, existing_value);
+                value_handle = dictItem(dict.*, existing_value);
             }
             assert(!value_handle.isShared());
             value_handle.invalidateBoth();
@@ -1552,13 +1552,13 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
             // Key doesn't exist, so append both key and value.
             const new_key_index = metadata.len;
             const new_value_index = metadata.len + 1;
-            const reindex_needed = try setCollectionLength(handle, new_length);
+            const reindex_needed = try setCollectionLength(dict, new_length);
             // `handle` may change after updating the length, so we better reload
             // the metadata pointer.
-            metadata = &Heap.local_heap.getExtraData(handle.peek().body.dict).dict;
+            metadata = &Heap.local_heap.getExtraData(dict.peek().body.dict).dict;
 
-            const new_key_handle = dictItem(handle.*, new_key_index);
-            const new_value_handle = dictItem(handle.*, new_value_index);
+            const new_key_handle = dictItem(dict.*, new_key_index);
+            const new_value_handle = dictItem(dict.*, new_value_index);
 
             assert(new_key_handle.heap == Heap.local_heap.heapId());
 
@@ -1575,7 +1575,7 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
             // `errdefer value_mut.deinitBodySingle...`).
             if (reindex_needed) {
                 // dictReindex could still fail if one of the objects doesn't have a string rep.
-                try dictReindex(handle.*, null);
+                try dictReindex(dict.*, null);
             } else {
                 metadata.table.putAssumeCapacity(new_key_handle, new_value_index);
             }
@@ -1588,12 +1588,12 @@ pub fn dictPutObject(handle: *Handle, key: Handle, value: Heap.Object) !Heap.Han
     };
 
     // Because we mutated the dictionary, we need to remove any duplicates, if applicable.
-    if (dictHasDuplicatesRaw(handle.*)) {
-        const new_value_index = (try dictRemoveDuplicates(handle, value_index)).?;
-        return dictItem(handle.*, new_value_index);
+    if (dictHasDuplicatesRaw(dict.*)) {
+        const new_value_index = (try dictRemoveDuplicates(dict, value_index)).?;
+        return dictItem(dict.*, new_value_index);
     }
 
-    return dictItem(handle.*, value_index);
+    return dictItem(dict.*, value_index);
 }
 
 pub fn dictPut(handle: *Handle, key: Handle, value: Handle) !Heap.Handle {

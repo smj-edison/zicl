@@ -40,6 +40,15 @@ max_call_depth: usize,
 /// Stack trace from a function error.
 stack_trace: ?Handle,
 
+/// Used to propagate `error.Continue` or `error.Break` up multiple
+/// loop levels.
+loop_propagate: u32 = 0,
+/// Used for propagating a return code up multiple eval levels.
+return_propagate: struct {
+    left_to_go: u32 = 0,
+    return_at_end: ?Error = null,
+} = .{},
+
 prng: std.Random.DefaultPrng,
 
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
@@ -50,6 +59,7 @@ pub const Error = std.mem.Allocator.Error || error{
     Break,
     Continue,
     Signal,
+    PropagateResult,
     VariableNotFound,
     CommandNotFound,
     InfiniteRecursion,
@@ -123,7 +133,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         interp.heap.setTempObjectString(trimmed_var_name);
         defer interp.heap.resetTempObject();
         // Can't fail since we know a string exists for it.
-        var_value = (object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable);
+        var_value = object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable;
 
         // Global scope doesn't have statics.
     } else {
@@ -135,7 +145,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         // Check the variables dictionary.
         interp.heap.setTempObjectString(var_name);
         // Can't fail since we know a string exists for it.
-        var_value = (object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable);
+        var_value = object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable;
         interp.heap.resetTempObject();
 
         // Maybe it's in the statics dictionary instead?
@@ -152,11 +162,11 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         }
     }
 
-    if (var_value) |unwrapped| {
-        assert(unwrapped.heap == interp.heap.heapId());
+    if (var_value) |val| {
+        assert(val.heap == interp.heap.heapId());
 
         return .{
-            .target_index = unwrapped.index,
+            .target_index = val.index,
             .call_frame_idx = call_frame_idx,
         };
     }
@@ -164,7 +174,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
     return null;
 }
 
-/// This always shimmers to .variable. You probably should be using `ensureValidVariableType`.
+/// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name.
 fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
     assert(name.canShimmer());
@@ -291,12 +301,30 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
             .variable => {
                 const variable = &name.peek().body.variable;
                 const var_call_frame_idx = if (variable.is_global) 0 else call_frame_idx;
-                const var_call_frame = &interp.call_frames.items[var_call_frame_idx];
+                var var_call_frame = &interp.call_frames.items[var_call_frame_idx];
 
-                const value_handle = try object.dictPutObject(&var_call_frame.variables, name, value);
+                const old_variables_handle = var_call_frame.variables; // Copy
+                const new_value_handle = blk: {
+                    const potentially_ref = try object.dictPutObject(&var_call_frame.variables, name, value);
+                    if (potentially_ref.peek().tag == .reference) {
+                        break :blk potentially_ref.peek().body.reference;
+                    } else {
+                        break :blk potentially_ref;
+                    }
+                };
+                // Did the dict change locations? If so, all cached lookups are now invalid.
+                const did_dict_move = old_variables_handle != var_call_frame.variables;
+                // Also, if the variable moved, its cached lookup is invalid, so we still
+                // need to bump the epoch.
+                const did_variable_move = variable.index != new_value_handle.index;
+                if (did_dict_move or did_variable_move) {
+                    var_call_frame.call_epoch = interp.nextCallEpoch();
+                }
+
                 variable.* = .{
                     .call_epoch = var_call_frame.call_epoch,
-                    .index = value_handle.index,
+                    // The cached index is relative to the variables dict.
+                    .index = new_value_handle.index - var_call_frame.variables.index,
                     .is_global = variable.is_global,
                 };
             },
@@ -718,8 +746,10 @@ fn currentCallFrame(interp: *Interp) *CallFrame {
     return &interp.call_frames.items[interp.currentCallFrameIndex()];
 }
 
-fn incrementCallEpoch(interp: *Interp) void {
+fn nextCallEpoch(interp: *Interp) u31 {
+    const epoch = interp.current_call_epoch;
     interp.current_call_epoch = std.math.add(u31, interp.current_call_epoch, 1) catch @panic("TODO handle overflow properly");
+    return epoch;
 }
 
 /// Evaluation frame.
@@ -751,7 +781,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
     try interp.call_frames.append(interp.gpa, .{
         .parent = parent,
         .args = args,
-        .call_epoch = interp.current_call_epoch,
+        .call_epoch = interp.nextCallEpoch(),
         .level = level,
         .namespace = interp.namespace,
         .signature = borrowed_signature,
@@ -759,8 +789,6 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
         .variables = vars_handle,
         .tailcall = null,
     });
-
-    interp.incrementCallEpoch();
 
     return @intCast(new_call_frame_idx);
 }
@@ -1036,6 +1064,7 @@ fn invokeCommand(interp: *Interp, args: []Handle) !void {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // TODO invoke jim unknown
+            std.debug.print("Tried to call command: {f}\n", .{args[0]});
             @panic("unimplemented");
             // try interp.wrapErrorDetails(&det, err);
         },
@@ -1764,9 +1793,26 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
         const result = interp.invokeCommand(args);
         // TODO actually check for signals.
         if (false) {
-            return Error.Signal;
+            return error.Signal;
         } else {
-            if (result) |_| {} else |err| return err;
+            if (result) |_| {
+                // Keep going through the commands.
+            } else |err| switch (err) {
+                error.PropagateResult => {
+                    interp.return_propagate.left_to_go -= 1;
+                    if (interp.return_propagate.left_to_go == 0) {
+                        if (interp.return_propagate.return_at_end) |return_at_end| {
+                            return return_at_end;
+                        } else {
+                            // Equivalent of TCL_OK.
+                            return;
+                        }
+                    } else {
+                        return error.PropagateResult;
+                    }
+                },
+                else => return err,
+            }
         }
     }
 }
