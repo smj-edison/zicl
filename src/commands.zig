@@ -7,7 +7,7 @@ const Handle = Heap.Handle;
 const object = @import("object.zig");
 const Interp = @import("Interp.zig");
 
-fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) !void {
+fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
         var result: i64 = 0;
@@ -63,15 +63,15 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
     interp.setResultOwning(try object.newFloat(interp.heap, result));
 }
 
-pub fn @"+"(interp: *Interp, args: []Handle) !void {
+pub fn @"+"(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .add);
 }
 
-pub fn @"*"(interp: *Interp, args: []Handle) !void {
+pub fn @"*"(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .mul);
 }
 
-pub fn apply(interp: *Interp, args: []Handle) !void {
+pub fn apply(interp: *Interp, args: []Handle) Interp.Error!void {
     const lambda_len = try interp.getListLength(&args[1]);
     if (lambda_len < 2 or lambda_len > 3) {
         try interp.setResultFormatted("can't interpret \"{f}\" as a lambda expression", .{args[1]});
@@ -114,10 +114,103 @@ pub fn apply(interp: *Interp, args: []Handle) !void {
     try interp.callProcedure(&command, lambda_args);
 }
 
+pub fn @"break"(interp: *Interp, args: []Handle) Interp.Error!void {
+    if (args.len == 2) {
+        const level = try interp.getInteger(&args[1]);
+        if (level < 1) {
+            try interp.setResultFormatted("break level \"{}\" lower than 1", .{level});
+        } else if (level > std.math.maxInt(u32)) {
+            try interp.setResultFormatted("break level \"{}\" too high", .{level});
+        }
+
+        interp.loop_propagate = @intCast(level);
+    }
+
+    return error.Break;
+}
+
+pub fn @"continue"(interp: *Interp, args: []Handle) Interp.Error!void {
+    if (args.len == 2) {
+        const level = try interp.getInteger(&args[1]);
+        if (level < 1) {
+            try interp.setResultFormatted("continue level \"{}\" lower than 1", .{level});
+        } else if (level > std.math.maxInt(u32)) {
+            try interp.setResultFormatted("continue level \"{}\" too high", .{level});
+        }
+
+        interp.loop_propagate = @intCast(level);
+    }
+
+    return error.Continue;
+}
+
+/// [dict]
+pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const SubcommandName = enum {
+        create,
+        get,
+        getdef,
+        set,
+        unset,
+        exists,
+        keys,
+        size,
+        info,
+        merge,
+        with,
+        append,
+        lappend,
+        incr,
+        remove,
+        values,
+        @"for",
+        replace,
+        update,
+    };
+    const SubcommandEnum = object.TclEnum(SubcommandName, "dict_subcommand");
+
+    var det: object.ErrorDetails = undefined;
+    const subcommand: SubcommandName = try interp.wrapError(&det, SubcommandEnum.get(&det, &args[1]));
+
+    switch (subcommand) {
+        .get => {
+            interp.setResult(try interp.getDictValueRecursivelyOrError(&args[2], args[3..]));
+        },
+        .getdef => {
+            if (try interp.getDictValueRecursively(&args[2], args[3..(args.len - 1)])) |val| {
+                interp.setResult(val);
+            } else {
+                interp.setResult(args[args.len - 1]);
+            }
+        },
+        .set => {
+            const dict = blk: {
+                if (try interp.getVariable(&args[2])) |val| {
+                    break :blk val;
+                } else {
+                    const new_variable_dict = try object.newDictWithCapacity(2);
+                    errdefer new_variable_dict.decrRefCount();
+                    try interp.setVariableTo(&args[2], new_variable_dict);
+                    break :blk (try interp.getVariable(&args[2])).?;
+                }
+            };
+            var new_dict = dict;
+            _ = try interp.putDictValueRecursively(&new_dict, args[3..(args.len - 1)], args[args.len - 1]);
+            if (new_dict != dict) {
+                dict.incrRefCount();
+                try interp.setVariableTo(&args[2], new_dict);
+                new_dict.decrRefCount();
+            }
+            interp.setResult(new_dict);
+        },
+        else => unreachable,
+    }
+}
+
 pub fn expr(interp: *Interp, args: []Handle) Interp.Error!void {
     const result = try (try interp.evalExpression(&args[1])).toObject(interp);
     defer result.decrRefCount();
-    try interp.setResult(result);
+    interp.setResult(result);
 }
 
 pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.Error!enum { @"continue", @"break", none } {
@@ -238,11 +331,11 @@ pub fn incr(interp: *Interp, args: []Handle) !void {
         increment_by = try interp.getInteger(&args[2]);
     }
 
-    if (interp.getVariableNoDetails(&args[1])) |val| {
+    if (try interp.getVariable(&args[1])) |val| {
         const contents = try interp.getIntegerNoShimmer(val);
         const new_contents = std.math.add(i64, contents, increment_by) catch {
             var det: object.ErrorDetails = undefined;
-            return interp.wrapErrorDetails(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
+            return interp.wrapError(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
         };
 
         if (val.canModify()) {
@@ -250,27 +343,22 @@ pub fn incr(interp: *Interp, args: []Handle) !void {
             val.invalidateBoth();
             val.peek().tag = .integer;
             val.peek().body = .{ .integer = new_contents };
-            try interp.setResult(val);
+            interp.setResult(val);
         } else {
             try interp.setVariableToObject(&args[1], .{
                 .str = Heap.Object.null_string,
                 .tag = .integer,
                 .body = .{ .integer = new_contents },
             });
-            try interp.setResult(interp.getVariableNoDetails(&args[1]) catch unreachable);
+            interp.setResult((interp.getVariable(&args[1]) catch unreachable).?);
         }
-    } else |err| {
-        switch (err) {
-            error.VariableNotFound => {
-                try interp.setVariableToObject(&args[1], .{
-                    .str = Heap.Object.null_string,
-                    .tag = .integer,
-                    .body = .{ .integer = increment_by },
-                });
-                try interp.setResult(try interp.getVariable(&args[1]));
-            },
-            else => return err,
-        }
+    } else {
+        try interp.setVariableToObject(&args[1], .{
+            .str = Heap.Object.null_string,
+            .tag = .integer,
+            .body = .{ .integer = increment_by },
+        });
+        interp.setResult((try interp.getVariable(&args[1])).?);
     }
 }
 
@@ -278,7 +366,7 @@ pub fn incr(interp: *Interp, args: []Handle) !void {
 pub fn set(interp: *Interp, args: []Handle) !void {
     if (args.len == 2) {
         // Return the value.
-        try interp.setResult(try interp.getVariable(&args[1]));
+        interp.setResult(try interp.getVariableOrError(&args[1]));
     } else {
         try interp.setVariableTo(&args[1], args[2]);
     }
@@ -318,7 +406,8 @@ pub fn createProcedureCommand(
             try Heap.ensureSameHeap(names);
             const statics_count = try interp.getListLength(names);
 
-            const statics_dict = try object.dictUninitializedNew(statics_count * 2);
+            const statics_dict = try object.newDictWithCapacity(statics_count * 2);
+            object.dictGetMetadata(statics_dict).len = statics_count * 2;
             const dict_items = object.dictItems(statics_dict);
             errdefer statics_dict.decrRefCount();
 
@@ -385,7 +474,7 @@ pub fn createProcedureCommand(
             // Optional parameter.
             if (optional_values == null) {
                 // Init the optional_values list.
-                optional_values = try object.listNew(&.{}, false);
+                optional_values = try object.newList(&.{}, false);
             }
 
             if (try Heap.stringEquals(object.listItem(arg, 0), "args")) {
@@ -461,6 +550,9 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("+", .{ .to_call = @"+", .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = @"*", .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("apply", .{ .to_call = apply, .description = "lambdaExpr ?arg ...?", .min_arity = 1 });
+    try interp.registerCommand("break", .{ .to_call = @"break", .description = "?level?", .min_arity = 0, .max_arity = 1 });
+    try interp.registerCommand("continue", .{ .to_call = @"continue", .description = "?level?", .min_arity = 0, .max_arity = 1 });
+    try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = expr, .description = "expression", .min_arity = 1, .max_arity = 1 });
     try interp.registerCommand("for", .{ .to_call = @"for", .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = @"if", .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
@@ -478,9 +570,8 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(heap,
-        \\ for {set i 0} {$i < 10} {incr i} {
-        \\     puts $i
-        \\ }
+        \\ dict set x a 5
+        \\ puts [dict get $x a]
     );
     defer script.decrRefCount();
     try interp.evalObject(&script);

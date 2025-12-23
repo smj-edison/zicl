@@ -785,9 +785,9 @@ pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemor
     }
 }
 
-pub fn listUninitializedNew(len: u32) !Handle {
+pub fn newListWithCapacity(capacity: u32) !Handle {
     // `1 +` to make space for the list's head
-    const list_index = try Heap.local_heap.createObjects(1 + len);
+    const list_index = try Heap.local_heap.createObjects(1 + capacity);
     const list_head = Heap.local_heap.getLocalObject(list_index);
 
     list_head.* = .{
@@ -795,7 +795,7 @@ pub fn listUninitializedNew(len: u32) !Handle {
         .tag = .list,
         .body = .{
             .list = .{
-                .len = len,
+                .len = 0,
             },
         },
     };
@@ -803,8 +803,8 @@ pub fn listUninitializedNew(len: u32) !Handle {
     return Heap.local_heap.getHandle(list_index);
 }
 
-pub fn listNew(handles: []const Handle, force_dup: bool) !Handle {
-    const list = try listUninitializedNew(@intCast(handles.len));
+pub fn newList(handles: []const Handle, force_dup: bool) !Handle {
+    const list = try newListWithCapacity(@intCast(handles.len));
     errdefer list.decrRefCount();
 
     const new_items = listItems(list);
@@ -817,6 +817,7 @@ pub fn listNew(handles: []const Handle, force_dup: bool) !Handle {
         }
     }
 
+    list.peek().body.list.len = @intCast(handles.len);
     return list;
 }
 
@@ -887,7 +888,8 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
         }
 
         // TODO PERF: reuse the object backing if it was allocated with more than one object.
-        const new_list = try listUninitializedNew(@intCast(tokens.items.len));
+        const new_list = try newListWithCapacity(@intCast(tokens.items.len));
+        new_list.peek().body.list.len = @intCast(tokens.items.len);
         errdefer new_list.decrRefCount();
 
         for (tokens.items, 0..) |token, i| {
@@ -908,6 +910,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
                 });
             }
         }
+        new_list.peek().body.list.len = @intCast(tokens.items.len);
 
         const old_handle = handle.*;
         handle.* = new_list;
@@ -927,7 +930,12 @@ pub fn listLength(det: ?*ErrorDetails, list: *Handle) !u32 {
     return list.peek().body.list.len;
 }
 
-fn collectionItem(handle: Handle, index: u32, len: u32) Heap.Handle {
+pub fn followIfRef(handle: Handle) Handle {
+    if (handle.peek().tag == .reference) return handle.peek().body.reference;
+    return handle;
+}
+
+fn collectionItem(handle: Handle, index: u32, len: u32) Handle {
     const obj = handle.peek();
     assert(obj.tag == .list or obj.tag == .dict);
 
@@ -951,11 +959,7 @@ fn collectionItemFollowRefs(handle: Handle, index: u32, len: u32) Heap.Handle {
             .heap = handle.heap,
         };
 
-        if (elem.peek().tag == .reference) {
-            return elem.peek().body.reference;
-        } else {
-            return elem;
-        }
+        return followIfRef(elem);
     } else @panic("Element out of bounds");
 }
 
@@ -1002,8 +1006,7 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
                     _ = handle.getHeap().getExtraData(obj.body.dict).dict.table.remove(to_free_handle);
                 }
 
-                to_free_handle.invalidateBody();
-                to_free_handle.invalidateString();
+                to_free_handle.invalidateBoth();
             }
 
             switch (obj.tag) {
@@ -1030,8 +1033,8 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
 
     // We've exhausted all other options, so we'll need to make a new collection.
     const new_handle = switch (obj.tag) {
-        .list => try listUninitializedNew(new_len),
-        .dict => try dictUninitializedNew(new_len),
+        .list => try newListWithCapacity(new_len),
+        .dict => try newDictWithCapacity(new_len),
         else => unreachable,
     };
     errdefer Heap.freeObject(new_handle);
@@ -1095,6 +1098,11 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             Heap.freeObjectBacking(handle.*);
         }
 
+        switch (new_handle.peek().tag) {
+            .dict => dictGetMetadata(new_handle).len = new_len,
+            .list => new_handle.peek().body.list.len = new_len,
+            else => unreachable,
+        }
         handle.* = new_handle;
     } else {
         // If the collection is shared, we need to duplicate all the items.
@@ -1105,6 +1113,11 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             );
         }
 
+        switch (new_handle.peek().tag) {
+            .dict => dictGetMetadata(new_handle).len = new_len,
+            .list => new_handle.peek().body.list.len = new_len,
+            else => unreachable,
+        }
         const old_handle = handle.*;
         handle.* = new_handle;
         old_handle.decrRefCount();
@@ -1198,7 +1211,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     defer obj1.decrRefCount();
     const obj2 = try newString(heap, "object 2");
     defer obj2.decrRefCount();
-    var list1 = try listNew(&.{ obj1, obj2 }, true);
+    var list1 = try newList(&.{ obj1, obj2 }, true);
     defer list1.decrRefCount();
 
     const items = listItems(list1);
@@ -1231,6 +1244,11 @@ test "lists" {
     try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
 }
 
+pub fn dictGetMetadata(dict: Handle) *Heap.ExtraData.Dictionary {
+    assert(dict.peek().tag == .dict);
+    return &dict.getHeap().getExtraData(dict.peek().body.dict).dict;
+}
+
 pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
     if (handle.peek().tag == .dict) return;
 
@@ -1241,7 +1259,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
         if (det) |details| details.* = .{
             .message = try newString(Heap.local_heap, "missing value to go with key"),
         };
-        return Error.BadDict;
+        return error.BadDict;
     }
 
     const handle_heap = handle.getHeap();
@@ -1323,7 +1341,7 @@ pub fn dictPairLength(det: ?*ErrorDetails, handle: *Handle) !u32 {
     return dictPairLengthRaw(handle.*);
 }
 
-pub fn dictUninitializedNew(len: u32) !Handle {
+pub fn newDictWithCapacity(len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
     // `1 +` to make space for the dict's head.
@@ -1335,7 +1353,7 @@ pub fn dictUninitializedNew(len: u32) !Handle {
     Heap.local_heap.getExtraData(dict_metadata).* = .{
         .dict = .{
             .table = .empty,
-            .len = len,
+            .len = 0,
         },
     };
 
@@ -1353,7 +1371,7 @@ pub fn dictUninitializedNew(len: u32) !Handle {
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
 pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
-    const dict = try dictUninitializedNew(@intCast(handles.len));
+    const dict = try newDictWithCapacity(@intCast(handles.len));
     errdefer dict.decrRefCount();
 
     const new_items = dictItems(dict);
@@ -1362,6 +1380,7 @@ pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
         item.* = try Heap.dupOrReference(heap, handle);
     }
 
+    dictGetMetadata(dict).len = @intCast(handles.len);
     try dictReindex(dict, null);
 
     return dict;
@@ -1392,6 +1411,7 @@ pub fn dictReindex(handle: Handle, up_to: ?usize) !void {
     }
 }
 
+/// asserts `dict` is a .dict.
 pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!?Handle {
     assert(dict.peek().tag == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
@@ -1596,6 +1616,7 @@ pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handl
     return dictItem(dict.*, value_index);
 }
 
+/// Assumes `handle` is a dict.
 pub fn dictPut(handle: *Handle, key: Handle, value: Handle) !Heap.Handle {
     return dictPutObject(handle, key, try Heap.local_heap.dupOrReference(value));
 }
@@ -1831,10 +1852,8 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     const new_token_capacity: u32 = @intCast(tokens.items.len + 1);
 
     // Initialize the Heap-stored list that will contain the corrisponding value for each token.
-    var new_token_values = try listUninitializedNew(new_token_capacity);
+    var new_token_values = try newListWithCapacity(new_token_capacity);
     errdefer new_token_values.decrRefCount();
-    // Set length to 0 so we can just call listAppend().
-    _ = try setCollectionLength(&new_token_values, 0);
 
     var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.local_heap.gpa, new_token_capacity);
     errdefer new_token_tags.deinit(Heap.local_heap.gpa);

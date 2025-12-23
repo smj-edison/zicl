@@ -571,9 +571,7 @@ comptime {
 pub const ExtraDataIndex = enum(u32) { _ };
 /// Extra data, for when you can't store enough in the main object.
 pub const ExtraData = union {
-    /// This does not store the key/value pairs directly, instead it
-    /// is an mapping of key to value index.
-    dict: struct {
+    pub const Dictionary = struct {
         /// Caller needs to ensure that any string this is called with
         /// is valid, as hash map methods don't return errors.
         table: std.HashMapUnmanaged(Handle, u32, struct {
@@ -593,7 +591,11 @@ pub const ExtraData = union {
         /// Length of dictionaries' backing list, including potential duplicated
         /// keys when shimmering from list.
         len: u32,
-    },
+    };
+
+    /// This does not store the key/value pairs directly, instead it
+    /// is an mapping of key to value index.
+    dict: Dictionary,
     upvar: struct {
         call_frame_idx: u32,
         call_frame_epoch: u31,
@@ -716,15 +718,16 @@ pub const Handle = packed struct(u64) {
         if (handle.index < special_object_count + interned_string_count) return;
 
         const metadata = handle.getMetadata();
+        incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
+
         if (cfg.trace_mem) {
             handle.getHeap().trace_mutex.lock();
             defer handle.getHeap().trace_mutex.unlock();
             handle.getHeap().objects.items(.trace)[handle.index].addAddr(
                 @returnAddress(),
-                std.fmt.allocPrint(debug_gpa, "Incr ref count of {}", .{handle.index}) catch unreachable,
+                std.fmt.allocPrint(debug_gpa, "Incr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() }) catch unreachable,
             );
         }
-        incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
     }
 
     pub fn reference(handle: Handle) Object {
@@ -753,14 +756,16 @@ pub const Handle = packed struct(u64) {
         handle.peek().deinitString(handle.getHeap());
     }
 
-    fn invalidateCollection(handle: Handle, len: u32) void {
+    fn invalidateCollection(handle: Handle) void {
         assert(handle.peek().tag == .dict or handle.peek().tag == .list);
+
+        const len = memutil.getOrderSize(handle.getMetadata().order) - 1;
 
         // First, we need to check if any of the items have been referenced.
         const any_elems_referenced = blk: {
             for (0..len) |i| {
                 const item_handle: Handle = .{
-                    .index = @intCast(handle.index + i + 1),
+                    .index = @intCast(handle.index + 1 + i),
                     .heap = handle.heap,
                 };
 
@@ -778,7 +783,7 @@ pub const Handle = packed struct(u64) {
 
         for (0..len) |i| {
             const elem_handle: Handle = .{
-                .index = @intCast(handle.index + i + 1),
+                .index = @intCast(handle.index + 1 + i),
                 .heap = handle.heap,
             };
 
@@ -795,12 +800,12 @@ pub const Handle = packed struct(u64) {
 
         switch (obj.tag) {
             .list => {
-                handle.invalidateCollection(obj.body.list.len);
+                handle.invalidateCollection();
             },
             .dict => {
                 const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
 
-                handle.invalidateCollection(dict_metadata.len);
+                handle.invalidateCollection();
 
                 dict_metadata.table.deinit(obj_heap.gpa);
                 obj_heap.destroyExtraData(obj.body.dict);
@@ -816,20 +821,20 @@ pub const Handle = packed struct(u64) {
         if (handle.index < special_object_count + interned_string_count) return;
 
         const metadata = handle.getMetadata();
-        if (cfg.trace_mem) {
-            last_touched = handle;
+        const obj_heap = handle.getHeap();
 
+        if (cfg.trace_mem) last_touched = handle;
+        if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
+            freeObject(handle);
+        }
+
+        if (cfg.trace_mem) {
             handle.getHeap().trace_mutex.lock();
             defer handle.getHeap().trace_mutex.unlock();
             handle.getHeap().objects.items(.trace)[handle.index].addAddr(
                 @returnAddress(),
-                std.fmt.allocPrint(debug_gpa, "Decr ref count of {}", .{handle.index}) catch unreachable,
+                std.fmt.allocPrint(debug_gpa, "Decr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() }) catch unreachable,
             );
-        }
-
-        const obj_heap = handle.getHeap();
-        if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
-            freeObject(handle);
         }
     }
 
@@ -1271,11 +1276,6 @@ pub fn freeObjectBacking(handle: Handle) void {
     } else {
         obj_heap.object_tracking.freeFromAnyThread(handle.index, metadata.order);
     }
-
-    if (cfg.trace_mem) {
-        const trace = &obj_heap.objects.items(.trace)[handle.index];
-        trace.* = .init; // Reset trace.
-    }
 }
 
 pub fn freeObject(handle: Handle) void {
@@ -1288,6 +1288,11 @@ pub fn freeObject(handle: Handle) void {
 /// the old object.
 pub fn prepareForModification(handle: *Handle) !void {
     if (!handle.canModify()) {
+        // It's very sketchy to modify a collection item in place if
+        // its parent is shared, so if this isn't the head this is
+        // probably incorrect.
+        assert(handle.isAllocHead());
+
         const before_duplicating = handle.*;
         handle.* = try local_heap.duplicate(handle.*);
         before_duplicating.decrRefCount();
