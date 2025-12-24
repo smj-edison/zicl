@@ -189,7 +189,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                     break :blk val;
                 } else {
                     const new_variable_dict = try object.newDictWithCapacity(2);
-                    errdefer new_variable_dict.decrRefCount();
+                    defer new_variable_dict.decrRefCount();
                     try interp.setVariableTo(&args[2], new_variable_dict);
                     break :blk (try interp.getVariable(&args[2])).?;
                 }
@@ -570,9 +570,9 @@ test "commands" {
     try registerCoreCommands(&interp);
 
     var script = try object.newString(heap,
-        \\ dict set x a 5
-        \\ puts [dict get $x a]
+        \\ dict set x a 10
+        \\ puts [dict get $x a 5]
     );
     defer script.decrRefCount();
-    try interp.evalObject(&script);
+    interp.evalObject(&script) catch {};
 }

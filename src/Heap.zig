@@ -716,6 +716,9 @@ pub const Handle = packed struct(u64) {
 
     pub fn incrRefCount(handle: Handle) void {
         if (handle.index < special_object_count + interned_string_count) return;
+        // Make sure we never try to borrow a freed object.
+        assert(handle.debugRefCount() > 0);
+        assert(handle.peek().tag != .reference);
 
         const metadata = handle.getMetadata();
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
@@ -1244,6 +1247,10 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 pub fn freeObjectBacking(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
+
+    // HACK: should use a custom panic handler for this.
+    last_touched = handle;
+    if (!handle.isAllocHead()) Heap.dumpLastTouchedTrace();
     assert(handle.isAllocHead());
 
     if (cfg.trace_mem) {
@@ -1619,45 +1626,44 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
             const old_start = handle.index + 1;
 
             const new_dict_idx = try dest_heap.createObjects(1 + old_head.len);
-            errdefer {
-                // Free elements before freeing the head, as the head could
-                // be realloced before finishing if freed too early
-                for (0..old_head.len) |i| {
-                    freeObject(.{
-                        .index = @intCast(new_dict_idx + 1 + i),
-                        .heap = handle.heap,
-                    });
-                }
-                freeObject(.{ .index = new_dict_idx, .heap = handle.heap });
-            }
-            const new_head = dest_heap.getLocalObject(new_dict_idx);
+            errdefer dest_heap.getHandle(new_dict_idx).decrRefCount();
+            const new_head = dest_heap.getHandle(new_dict_idx);
             const new_start = new_dict_idx + 1;
             const new_items = dest_heap.objectSlice(new_start, new_start + old_head.len);
 
-            // Duplicate head of dict
-            new_head.* = .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = .dict,
-                .body = .{
-                    .dict = try dest_heap.createExtraData(),
-                },
-            };
-            errdefer dest_heap.destroyExtraData(new_head.body.dict);
+            // Duplicate head of dict.
+            {
+                const new_str = try dest_heap.duplicateObjString(handle);
+                errdefer new_str.deinit(dest_heap);
+                const extra_data = try dest_heap.createExtraData();
+                errdefer dest_heap.destroyExtraData(extra_data);
+
+                new_head.peek().* = .{
+                    .str = new_str,
+                    .tag = .dict,
+                    .body = .{
+                        .dict = extra_data,
+                    },
+                };
+                dest_heap.getExtraData(extra_data).* = .{
+                    .dict = .{ .table = .empty, .len = 0 },
+                };
+            }
 
             // Duplicate items of dict
             for (new_items, 0..) |*new_item, i| {
                 new_item.* = dest_heap.duplicateSingle(.{
-                    .heap = handle.heap,
                     .index = @intCast(old_start + i),
+                    .heap = handle.heap,
                 }) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    // Dicts can't contain multi item objects
+                    // Dicts can't contain multi item objects.
                     error.MultiItemObject => unreachable,
                 };
             }
 
-            const dict = &dest_heap.getExtraData(new_head.body.dict).dict;
-            dict.len = old_head.len;
+            const dict_metadata = object.dictGetMetadata(new_head);
+            dict_metadata.len = old_head.len;
             try object.dictReindex(dest_heap.getHandle(new_dict_idx), null);
 
             return dest_heap.getHandle(new_dict_idx);
@@ -1756,44 +1762,58 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
 /// Returns whether the exchange was successful (if not, caller is responsible
 /// for cleaning up).
 pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set_to: Object.StrOrPtr) bool {
-    const obj: *Object = self.getLocalObject(index);
-    if (options.threading and self.objects.get(index).metadata.cross_thread) {
-        // Atomically swap only the first half of the object
-        if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
-        if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
-        if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
+    const success = blk: {
+        const obj: *Object = self.getLocalObject(index);
+        if (options.threading and self.objects.get(index).metadata.cross_thread) {
+            // Atomically swap only the first half of the object
+            if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
+            if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
+            if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
 
-        const str_mask: u64 = (1 << 59) - 1;
+            const str_mask: u64 = (1 << 59) - 1;
 
-        const object_head: *u64 = @ptrCast(obj);
-        var current_head = @atomicLoad(u64, object_head, .acquire);
+            const object_head: *u64 = @ptrCast(obj);
+            var current_head = @atomicLoad(u64, object_head, .acquire);
 
-        while (true) {
-            // Is the string pointer what we expected?
-            if (current_head & str_mask != @as(u59, @bitCast(expected))) {
-                // If not, somebody else must've won this, so let the caller know
-                return false;
+            while (true) {
+                // Is the string pointer what we expected?
+                if (current_head & str_mask != @as(u59, @bitCast(expected))) {
+                    // If not, somebody else must've won this, so let the caller know.
+                    break :blk false;
+                }
+
+                const to_set_to_bits: u59 = @bitCast(to_set_to);
+                // Preserve type tag from current_head.
+                var new_head = current_head & ~str_mask;
+                new_head |= to_set_to_bits;
+
+                const res: ?u64 = @cmpxchgWeak(u64, object_head, current_head, new_head, .release, .acquire);
+
+                if (res) |winning_head| {
+                    current_head = winning_head;
+                    continue;
+                } else {
+                    // Successfully swapped.
+                    break :blk true;
+                }
             }
-
-            const to_set_to_bits: u59 = @bitCast(to_set_to);
-            // Preserve type tag from current_head
-            var new_head = current_head & ~str_mask;
-            new_head |= to_set_to_bits;
-
-            const res: ?u64 = @cmpxchgWeak(u64, object_head, current_head, new_head, .release, .acquire);
-
-            if (res) |winning_head| {
-                current_head = winning_head;
-                continue;
-            } else {
-                // Successfully swapped
-                return true;
-            }
+        } else {
+            obj.str = to_set_to;
+            break :blk true;
         }
-    } else {
-        obj.str = to_set_to;
-        return true;
+    };
+
+    if (cfg.trace_mem) {
+        const handle = self.getHandle(index);
+        handle.getHeap().trace_mutex.lock();
+        defer handle.getHeap().trace_mutex.unlock();
+        handle.getHeap().objects.items(.trace)[handle.index].addAddr(
+            @returnAddress(),
+            std.fmt.allocPrint(debug_gpa, "Set string to \"{f}\"", .{handle}) catch unreachable,
+        );
     }
+
+    return success;
 }
 
 /// Returns whether the heap took ownership. It may copy the bytes into

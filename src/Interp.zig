@@ -1963,13 +1963,18 @@ pub fn getDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
         return try interp.getDictValue(dict, keys[0]);
     }
 
-    const next_dict = try interp.getDictValue(dict, keys[0]);
-    if (next_dict) |val| {
-        var new_next_dict = val;
-        const dict_value = try interp.getDictValueRecursively(&new_next_dict, keys[1..]);
-        if (val != new_next_dict) {
+    if (try interp.getDictValue(dict, keys[0])) |next_dict| {
+        var new_next_dict = next_dict;
+        // Note: we do not use `try` when calling `getDictValueRecursively`, because
+        // `new_next_dict` may change even if `getDictValueRecursively` returns an error.
+        const dict_value = interp.getDictValueRecursively(&new_next_dict, keys[1..]);
+        if (next_dict != new_next_dict) {
+            // See explanation in `putDictValueRecursively` for why we do this reference
+            // counting dance.
+            next_dict.incrRefCount();
             // Recursively propagate the new dict up through the parent dicts.
             _ = try interp.putDictValue(dict, keys[0], new_next_dict);
+            new_next_dict.decrRefCount();
         }
         return dict_value;
     } else {
@@ -2017,24 +2022,28 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
     };
 
     var new_dict_value = dict_value;
-    const value_handle = try interp.putDictValueRecursively(&new_dict_value, keys[1..], value);
+    // Note: we do not use `try` when calling `getDictValueRecursively`, because
+    // `new_next_dict` may change even if `getDictValueRecursively` returns an error.
+    const value_handle = interp.putDictValueRecursively(&new_dict_value, keys[1..], value);
     if (dict_value != new_dict_value) {
         assert(new_dict_value.peek().tag == .dict);
-        // Why do we have `dict_value.incrRefCount()`? It's in order to
-        // correct `dict_value`'s ref count before calling `putDictValue`.
-        // When `putDictValue` is called, it will replace `dict_value`
-        // with `new_dict_value`. However, earlier in this function (though
-        // deeper in the recursion), in the `keys.len == 1` branch,
-        // `dict_value` had its reference count decremented when it was
-        // replaced with a new dictionary (`new_dict_value`). We're in this
-        // current branch precisely because `dict_value` was replaced with
-        // `new_dict_value`, though the dictionary doesn't realize they
-        // were swapped. So, we'll make sure `dict_value` isn't double-
-        // decremented by incrementing it once here, and we'll also make
-        // sure `new_dict_value` isn't double-counted by decrementing it.
+        // Why do we have `dict_value.incrRefCount()`? Because let's remember
+        // that `dict_value` is currently owned by `dict`. We put `dict_value`
+        // into `new_dict_value`, in preparation to modify it. When
+        // `new_dict_value` is changed, the old value's reference count
+        // (`dict_value`) goes down by one, and the new value's reference
+        // count (`new_dict_value`) is 1. This is normally correct, but
+        // when we call `putDictValue` it _also_ lowers the reference count
+        // of the old value, which is what `dict_value` points to! So, we
+        // released it once when swapping, and released it again when
+        // setting to a new value! To compensate for this double release,
+        // we bump the reference count by 1.
         dict_value.incrRefCount();
         // Recursively propagate the new dict up through the parent dicts.
         _ = try interp.putDictValue(dict, keys[0], new_dict_value);
+        // Also, we need to decrement the reference count of the new value,
+        // because it started as 1, but then was also referenced by the
+        // dictionary, so now it's at 2. We go down by one to compensate.
         new_dict_value.decrRefCount();
     }
 

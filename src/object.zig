@@ -806,6 +806,7 @@ pub fn newListWithCapacity(capacity: u32) !Handle {
 pub fn newList(handles: []const Handle, force_dup: bool) !Handle {
     const list = try newListWithCapacity(@intCast(handles.len));
     errdefer list.decrRefCount();
+    list.peek().body.list.len = @intCast(handles.len);
 
     const new_items = listItems(list);
 
@@ -1373,6 +1374,7 @@ pub fn newDictWithCapacity(len: u32) !Handle {
 pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
     const dict = try newDictWithCapacity(@intCast(handles.len));
     errdefer dict.decrRefCount();
+    dictGetMetadata(dict).len = @intCast(handles.len);
 
     const new_items = dictItems(dict);
 
@@ -1617,8 +1619,8 @@ pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handl
 }
 
 /// Assumes `handle` is a dict.
-pub fn dictPut(handle: *Handle, key: Handle, value: Handle) !Heap.Handle {
-    return dictPutObject(handle, key, try Heap.local_heap.dupOrReference(value));
+pub fn dictPut(dict: *Handle, key: Handle, value: Handle) !Heap.Handle {
+    return dictPutObject(dict, key, try Heap.local_heap.dupOrReference(value));
 }
 
 fn testDicts(ta: std.mem.Allocator) !void {
