@@ -1258,7 +1258,11 @@ pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
     if (@mod(len, 2) == 1) {
         // Unmatched key.
         if (det) |details| details.* = .{
-            .message = try newString(Heap.local_heap, "missing value to go with key"),
+            .message = try newStringFmt(
+                Heap.local_heap,
+                "Missing value to go with key when converting \"{f}\" to a dictionary.",
+                .{handle.*},
+            ),
         };
         return error.BadDict;
     }

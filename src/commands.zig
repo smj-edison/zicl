@@ -63,15 +63,15 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
     interp.setResultOwning(try object.newFloat(interp.heap, result));
 }
 
-pub fn @"+"(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .add);
 }
 
-pub fn @"*"(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn mulCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .mul);
 }
 
-pub fn apply(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const lambda_len = try interp.getListLength(&args[1]);
     if (lambda_len < 2 or lambda_len > 3) {
         try interp.setResultFormatted("can't interpret \"{f}\" as a lambda expression", .{args[1]});
@@ -114,7 +114,7 @@ pub fn apply(interp: *Interp, args: []Handle) Interp.Error!void {
     try interp.callProcedure(&command, lambda_args);
 }
 
-pub fn @"break"(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     if (args.len == 2) {
         const level = try interp.getInteger(&args[1]);
         if (level < 1) {
@@ -129,7 +129,7 @@ pub fn @"break"(interp: *Interp, args: []Handle) Interp.Error!void {
     return error.Break;
 }
 
-pub fn @"continue"(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     if (args.len == 2) {
         const level = try interp.getInteger(&args[1]);
         if (level < 1) {
@@ -139,6 +139,8 @@ pub fn @"continue"(interp: *Interp, args: []Handle) Interp.Error!void {
         }
 
         interp.loop_propagate = @intCast(level);
+    } else {
+        interp.loop_propagate = 1;
     }
 
     return error.Continue;
@@ -207,6 +209,24 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     }
 }
 
+test "dict commands" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    try testing.expectError(error.EvalError, testRunScript(&interp,
+        \\ dict set x a 10
+        \\ puts [dict get $x a 5]
+    ));
+    try testing.expectEqualStrings(
+        \\Missing value to go with key when converting "10" to a dictionary.
+    , try Heap.getString(interp.result));
+
+    try testExpectScriptResult(&interp, "qux",
+        \\ dict set foo bar baz qux
+        \\ dict get $foo bar baz
+    );
+}
+
 pub fn expr(interp: *Interp, args: []Handle) Interp.Error!void {
     const result = try (try interp.evalExpression(&args[1])).toObject(interp);
     defer result.decrRefCount();
@@ -218,7 +238,7 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
         return .none;
     } else |err| switch (err) {
         error.Continue, error.Break => {
-            if (interp.loop_propagate > 0) {
+            if (interp.loop_propagate > 1) {
                 interp.loop_propagate -= 1;
                 return err;
             } else {
@@ -235,7 +255,7 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
     return .none;
 }
 
-pub fn @"for"(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     // Do the initialization.
     try interp.evalObject(&args[1]);
 
@@ -261,8 +281,34 @@ pub fn @"for"(interp: *Interp, args: []Handle) Interp.Error!void {
     interp.setEmptyResult();
 }
 
+test "loop commands" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Basic loop.
+    try testExpectScriptResult(&interp, "5",
+        \\ for {set i 0} {$i < 5} {incr i} {}
+        \\ set i
+    );
+
+    // [continue]
+    try testExpectScriptResult(&interp, "5",
+        \\ for {set i 0} {$i < 5} {incr i} { continue }
+        \\ set i
+    );
+
+    try testExpectScriptResult(&interp, "0",
+        \\ for {set i 0} {$i < 5} {incr i} {
+        \\   for {set j 0} {$j < 5} {incr j} {
+        \\     continue 2
+        \\   }
+        \\ }
+        \\ set j
+    );
+}
+
 /// [puts]
-pub fn puts(interp: *Interp, args: []Handle) !void {
+pub fn putsCmd(interp: *Interp, args: []Handle) !void {
     if (args.len == 3) {
         const first_arg_str = try Heap.getString(args[1]);
         if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
@@ -279,7 +325,7 @@ pub fn puts(interp: *Interp, args: []Handle) !void {
 }
 
 /// [if]
-pub fn @"if"(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     var remaining_args = args[1..];
     while (true) {
         // Need a condition and a body after.
@@ -323,7 +369,7 @@ pub fn @"if"(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 /// [incr]
-pub fn incr(interp: *Interp, args: []Handle) !void {
+pub fn incrCmd(interp: *Interp, args: []Handle) !void {
     var increment_by: i64 = 1;
 
     if (args.len == 3) {
@@ -363,7 +409,7 @@ pub fn incr(interp: *Interp, args: []Handle) !void {
 }
 
 /// [set]
-pub fn set(interp: *Interp, args: []Handle) !void {
+pub fn setCmd(interp: *Interp, args: []Handle) !void {
     if (args.len == 2) {
         // Return the value.
         interp.setResult(try interp.getVariableOrError(&args[1]));
@@ -522,7 +568,7 @@ pub fn createProcedureCommand(
 }
 
 /// [proc]
-pub fn proc(interp: *Interp, args: []Handle) !void {
+pub fn procCmd(interp: *Interp, args: []Handle) !void {
     const proc_name = try Heap.getString(args[1]);
     const arg_list = &args[2];
     const statics = if (args.len == 5) &args[3] else null;
@@ -547,29 +593,51 @@ pub fn proc(interp: *Interp, args: []Handle) !void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("+", .{ .to_call = @"+", .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("*", .{ .to_call = @"*", .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("apply", .{ .to_call = apply, .description = "lambdaExpr ?arg ...?", .min_arity = 1 });
-    try interp.registerCommand("break", .{ .to_call = @"break", .description = "?level?", .min_arity = 0, .max_arity = 1 });
-    try interp.registerCommand("continue", .{ .to_call = @"continue", .description = "?level?", .min_arity = 0, .max_arity = 1 });
+    try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambdaExpr ?arg ...?", .min_arity = 1 });
+    try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
+    try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = expr, .description = "expression", .min_arity = 1, .max_arity = 1 });
-    try interp.registerCommand("for", .{ .to_call = @"for", .description = "start test next body", .min_arity = 4, .max_arity = 4 });
-    try interp.registerCommand("if", .{ .to_call = @"if", .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
-    try interp.registerCommand("incr", .{ .to_call = incr, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("proc", .{ .to_call = proc, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4 });
-    try interp.registerCommand("puts", .{ .to_call = puts, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("set", .{ .to_call = set, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
+    try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
+    try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("proc", .{ .to_call = procCmd, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4 });
+    try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
+}
+
+pub fn testStart(ta: std.mem.Allocator) !Interp {
+    errdefer Heap.testFinish();
+    _ = try Heap.testStart(ta);
+    var interp = try Interp.init();
+    errdefer interp.deinit();
+    try registerCoreCommands(&interp);
+    return interp;
+}
+
+pub fn testFinish(interp: *Interp) void {
+    interp.deinit();
+    Heap.testFinish();
+}
+
+fn testRunScript(interp: *Interp, script: []const u8) !Handle {
+    var script_handle = try object.newString(interp.heap, script);
+    defer script_handle.decrRefCount();
+    try interp.evalObject(&script_handle);
+    return interp.result;
+}
+
+fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
+    try testing.expectEqualStrings(expected, try Heap.getString(try testRunScript(interp, script)));
 }
 
 test "commands" {
-    defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator);
-    var interp = try Interp.init();
-    defer interp.deinit();
-    try registerCoreCommands(&interp);
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
 
-    var script = try object.newString(heap,
+    var script = try object.newString(interp.heap,
         \\ dict set x a 10
         \\ puts [dict get $x a 5]
     );
