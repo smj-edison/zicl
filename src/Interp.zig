@@ -2005,6 +2005,7 @@ pub fn putDictValue(interp: *Interp, dict: *Handle, key: Handle, value: Handle) 
 
 /// Returns a new handle to where the value (or reference to the value) resides.
 pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle, value: Handle) Interp.Error!Handle {
+    assert(keys.len > 0);
     if (keys.len == 1) {
         const new_value_handle = try interp.putDictValue(dict, keys[0], value);
         return new_value_handle;
@@ -2053,7 +2054,11 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
     return value_handle;
 }
 
-test "put dict recursively" {
+// pub fn removeDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle, value: Handle) Interp.Error!Handle {
+//     assert(keys.len > 0);
+// }
+
+test "recursive dict keys" {
     defer Heap.testFinish();
     const heap = try Heap.testStart(testing.allocator);
     var interp = try Interp.init();

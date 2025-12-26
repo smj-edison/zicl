@@ -753,71 +753,16 @@ pub const Handle = packed struct(u64) {
         handle.invalidateString();
     }
 
-    pub fn invalidateString(handle: Handle) void {
-        assert(handle.canShimmer());
-
-        handle.peek().deinitString(handle.getHeap());
-    }
-
-    fn invalidateCollection(handle: Handle) void {
-        assert(handle.peek().tag == .dict or handle.peek().tag == .list);
-
-        const len = memutil.getOrderSize(handle.getMetadata().order) - 1;
-
-        // First, we need to check if any of the items have been referenced.
-        const any_elems_referenced = blk: {
-            for (0..len) |i| {
-                const item_handle: Handle = .{
-                    .index = @intCast(handle.index + 1 + i),
-                    .heap = handle.heap,
-                };
-
-                if (item_handle.isShared()) {
-                    break :blk true;
-                }
-            } else break :blk false;
-        };
-
-        if (any_elems_referenced) {
-            // Since an item was referenced, we'll need to split this allocation
-            // into individual objects.
-            handle.getHeap().splitAlloc(handle.index, 0);
-        }
-
-        for (0..len) |i| {
-            const elem_handle: Handle = .{
-                .index = @intCast(handle.index + 1 + i),
-                .heap = handle.heap,
-            };
-
-            elem_handle.invalidateBoth();
-            if (any_elems_referenced) elem_handle.decrRefCount();
-        }
-    }
-
     pub fn invalidateBody(handle: Handle) void {
         assert(handle.canShimmer());
 
-        const obj_heap = handle.getHeap();
-        const obj = obj_heap.getLocalObject(handle.index);
+        invalidateBodyUnchecked(handle);
+    }
 
-        switch (obj.tag) {
-            .list => {
-                handle.invalidateCollection();
-            },
-            .dict => {
-                const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
+    pub fn invalidateString(handle: Handle) void {
+        assert(handle.canModify());
 
-                handle.invalidateCollection();
-
-                dict_metadata.table.deinit(obj_heap.gpa);
-                obj_heap.destroyExtraData(obj.body.dict);
-            },
-            else => obj.deinitBodySingle(obj_heap),
-        }
-
-        obj.body = undefined;
-        obj.tag = .none;
+        invalidateStringUnchecked(handle);
     }
 
     pub fn decrRefCount(handle: Handle) void {
@@ -857,6 +802,79 @@ pub const Handle = packed struct(u64) {
         };
     }
 };
+
+fn invalidateBothUnchecked(handle: Handle) void {
+    invalidateStringUnchecked(handle);
+    invalidateBodyUnchecked(handle);
+}
+
+fn invalidateStringUnchecked(handle: Handle) void {
+    handle.peek().deinitString(handle.getHeap());
+}
+
+fn invalidateCollection(handle: Handle) void {
+    assert(handle.peek().tag == .dict or handle.peek().tag == .list);
+
+    const len = memutil.getOrderSize(handle.getMetadata().order) - 1;
+
+    // First, we need to check if any of the items have been referenced.
+    const any_elems_referenced = blk: {
+        for (0..len) |i| {
+            const item_handle: Handle = .{
+                .index = @intCast(handle.index + 1 + i),
+                .heap = handle.heap,
+            };
+
+            if (item_handle.isShared()) {
+                break :blk true;
+            }
+        } else break :blk false;
+    };
+
+    if (any_elems_referenced) {
+        // Since an item was referenced, we'll need to split this allocation
+        // into individual objects.
+        handle.getHeap().splitAlloc(handle.index, 0);
+    }
+
+    for (0..len) |i| {
+        const elem_handle: Handle = .{
+            .index = @intCast(handle.index + 1 + i),
+            .heap = handle.heap,
+        };
+
+        invalidateBothUnchecked(elem_handle);
+        if (any_elems_referenced) elem_handle.decrRefCount();
+    }
+}
+
+fn invalidateBodyUnchecked(handle: Handle) void {
+    if (cfg.trace_mem) {
+        const trace = &handle.getHeap().objects.items(.trace)[handle.index];
+        trace.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, "Invalidate body", .{}) catch unreachable);
+    }
+
+    const obj_heap = handle.getHeap();
+    const obj = obj_heap.getLocalObject(handle.index);
+
+    switch (obj.tag) {
+        .list => {
+            invalidateCollection(handle);
+        },
+        .dict => {
+            const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
+
+            invalidateCollection(handle);
+
+            dict_metadata.table.deinit(obj_heap.gpa);
+            obj_heap.destroyExtraData(obj.body.dict);
+        },
+        else => obj.deinitBodySingle(obj_heap),
+    }
+
+    obj.body = undefined;
+    obj.tag = .none;
+}
 
 const ObjectAndMetadata = struct {
     pub const Metadata = packed struct(u8) {
@@ -1060,7 +1078,7 @@ pub fn deinit(heap: *Heap) void {
             // freeing recursive structures. For example, if there was a list with
             // two items, we'll free the list (first free of items), then free
             // the items individually (second free)
-            heap.getHandle(@intCast(i)).invalidateBoth();
+            invalidateBothUnchecked(heap.getHandle(@intCast(i)));
         }
     }
 
@@ -1329,7 +1347,7 @@ pub fn freeObjectBacking(handle: Handle) void {
 }
 
 pub fn freeObject(handle: Handle) void {
-    handle.invalidateBoth();
+    invalidateBothUnchecked(handle);
 
     freeObjectBacking(handle);
 }
@@ -1428,15 +1446,21 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
     blk: {
         const a_long_str = switch (a_details) {
             .long => |unwrapped| unwrapped,
-            // We generated string reps when calling getString, so
-            // we know it's not null.
-            .null => unreachable,
+            // The only case where an object can have a null string after getting
+            // its string value is a reference.
+            .null => {
+                assert(a.peek().tag == .reference);
+                break :blk;
+            },
             else => break :blk,
         };
 
         const b_long_str = switch (b_details) {
             .long => |unwrapped| unwrapped,
-            .null => unreachable,
+            .null => {
+                assert(b.peek().tag == .reference);
+                break :blk;
+            },
             else => break :blk,
         };
 
