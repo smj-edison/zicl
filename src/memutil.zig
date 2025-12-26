@@ -76,11 +76,11 @@ pub fn getOrderSize(order: u5) u32 {
     return @as(u32, 1) << order;
 }
 
-pub fn buddy_of_order(index: u32, order: u5) u32 {
-    return buddy_of(index, getOrderSize(order));
+pub fn buddyOfOrder(index: u32, order: u5) u32 {
+    return buddyOf(index, getOrderSize(order));
 }
 
-fn buddy_of(index: u32, order_size: u32) u32 {
+fn buddyOf(index: u32, order_size: u32) u32 {
     const mask = (order_size * 2) - 1;
 
     if (index & mask == 0) {
@@ -289,7 +289,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             self.alloc_count[order] -= 1; // Allocation stats.
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
-            const freed_buddy = buddy_of(index, getOrderSize(order));
+            const freed_buddy = buddyOf(index, getOrderSize(order));
             var buddy_free_list_index: u32 = blk: {
                 if (self.free_lists[order].getIndex(freed_buddy)) |buddy_index| {
                     break :blk @intCast(buddy_index); // Found buddy.
@@ -322,7 +322,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                 // for the presence of its buddy in the free list.
 
                 // Search for its buddy.
-                buddy_being_merged = buddy_of(block_being_merged, getOrderSize(order_being_merged));
+                buddy_being_merged = buddyOf(block_being_merged, getOrderSize(order_being_merged));
                 if (self.free_lists[order_being_merged].getIndex(buddy_being_merged)) |free_parent_block| {
                     buddy_free_list_index = @intCast(free_parent_block);
                 } else {

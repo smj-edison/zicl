@@ -86,7 +86,7 @@ object_tracking: ObjectTracker,
 objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
-interned_strings: std.EnumMap(InternedStrings, Heap.Handle),
+interned_strings: std.EnumArray(InternedString, Heap.Handle),
 
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
@@ -112,11 +112,11 @@ const ExtraDataPool = memutil.IndexedMemoryPool(ExtraData, cfg.use_vmem);
 const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
 const ParsedExpressions = std.AutoHashMapUnmanaged(u32, struct { expr: ParsedExpression, generation: u32 });
 
-const InternedStrings = enum {
+const InternedString = enum {
     lambda_apply_expr,
 };
 
-const interned_string_count = std.enums.values(InternedStrings).len;
+const interned_string_count = std.enums.values(InternedString).len;
 
 /// Each script is assigned a unique id when created. Each interpreter
 /// has a hashmap that associates a script id with its local parsed
@@ -885,9 +885,10 @@ fn heapAlloc(self: *Heap) Allocator {
 
 fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
     const interned = try heap.createObject();
-    errdefer interned.decrRefCount();
+    errdefer freeObjectBackingUnchecked(interned);
     const cast_len: u26 = @intCast(str.len);
     const str_index = try heap.createString(cast_len);
+    errdefer heap.freeString(str_index, cast_len);
     assert(interned.index == (expected_index + special_object_count));
 
     @memcpy(heap.getHeapString(str_index, str_index + cast_len), str);
@@ -899,75 +900,111 @@ fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Hand
     return interned;
 }
 
-pub fn init(heap: *Heap, gpa: Allocator) !void {
-    // Init objects
-    var object_tracking = try ObjectTracker.init(gpa, cfg.object_heap_order);
-    errdefer _ = object_tracking.deinit();
+fn createInternedStrings(heap: *Heap) !void {
+    const MappingEntry = struct { InternedString, []const u8 };
+    const mapping = [_]MappingEntry{
+        .{ .lambda_apply_expr, "apply lambdaExpr" },
+    };
+    var converted_mapping: std.enums.EnumFieldStruct(InternedString, Handle, null) = undefined;
 
-    var objects: ObjectList = .{};
+    // Init all the interned strings, handling failure as needed.
+    var converted: usize = 0;
+    errdefer {
+        // Since we can't loop up to `converted` at comptime, we'll generate
+        // an if-ladder that only deinits fields that have been initialized.
+        inline for (0..mapping.len) |i| {
+            const key = @tagName(mapping[i].@"0");
+            if (i < converted) {
+                const handle: Handle = @field(converted_mapping, key);
+                handle.peek().str.deinit(heap);
+                freeObjectBackingUnchecked(handle);
+            }
+        }
+    }
+    // Fill the mapping.
+    inline for (0..mapping.len) |i| {
+        const key = @tagName(mapping[i].@"0");
+        const value = mapping[i].@"1";
+        const new_str = try heap.createInternedString(i, value);
+        converted += 1; // After `new_str` is successfully created
+        @field(converted_mapping, key) = new_str;
+    }
+
+    heap.interned_strings = .init(converted_mapping);
+}
+
+pub fn init(heap: *Heap, gpa: Allocator) !void {
+    heap.* = undefined;
+    // Clean up if we hit an error.
+    errdefer heap.* = undefined;
+
+    heap.gpa = gpa;
+
+    // Init objects
+    heap.object_tracking = try .init(gpa, cfg.object_heap_order);
+    errdefer _ = heap.object_tracking.deinit();
+
+    heap.objects = .empty;
     if (cfg.use_vmem) {
-        objects.bytes = (try memutil.vmemMap(object_heap_max_bytes)).ptr;
-        objects.capacity = object_heap_max_count;
+        heap.objects.bytes = (try memutil.vmemMap(object_heap_max_bytes)).ptr;
+        heap.objects.capacity = object_heap_max_count;
     } else if (options.threading) {
         // if multithreading, we can't have objects moving around. We better allocate
         // everything up front.
-        try objects.ensureTotalCapacity(gpa, object_heap_max_count);
+        try heap.objects.ensureTotalCapacity(gpa, object_heap_max_count);
     } else {
-        try objects.ensureTotalCapacity(gpa, 32);
+        try heap.objects.ensureTotalCapacity(gpa, 32);
     }
     errdefer {
         if (cfg.use_vmem) {
-            memutil.vmemUnmap(@alignCast(objects.bytes[0..object_heap_max_bytes]));
+            memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
         } else {
-            objects.deinit(gpa);
+            heap.objects.deinit(gpa);
         }
     }
 
     // Init strings
-    var string_tracking = try StringTracker.init(gpa, cfg.string_heap_order);
-    errdefer _ = string_tracking.deinit();
+    heap.string_tracking = try .init(gpa, cfg.string_heap_order);
+    errdefer _ = heap.string_tracking.deinit();
 
-    var strings: StringList = .{};
+    heap.strings = .empty;
     if (cfg.use_vmem) {
-        strings.items = try memutil.vmemMap(string_heap_max_bytes);
+        const string_vmem = try memutil.vmemMap(string_heap_max_bytes);
+        heap.strings.items = string_vmem.ptr[0..0];
+        heap.strings.capacity = string_vmem.len;
     } else if (options.threading) {
         // if multithreading, we can't have strings moving around. We better allocate
         // everything up front.
-        try strings.ensureTotalCapacity(gpa, string_heap_max_bytes);
+        try heap.strings.ensureTotalCapacity(gpa, string_heap_max_bytes);
     } else {
-        try strings.ensureTotalCapacity(gpa, 32);
+        try heap.strings.ensureTotalCapacity(gpa, 32);
     }
-    errdefer if (cfg.use_vmem) memutil.vmemUnmap(@alignCast(strings.items)) else strings.deinit(gpa);
+    errdefer {
+        if (cfg.use_vmem) {
+            memutil.vmemUnmap(@alignCast(heap.strings.items.ptr[0..heap.strings.capacity]));
+        } else {
+            heap.strings.deinit(gpa);
+        }
+    }
 
     const object_capacity = if (options.threading) object_heap_max_count else 32;
 
-    var extra: ExtraDataPool = try .initWithCapacity(gpa, object_capacity);
-    errdefer extra.deinit(gpa);
+    heap.extra = try .initWithCapacity(gpa, object_capacity);
+    errdefer heap.extra.deinit(gpa);
 
-    const parsed_scripts: ParsedScripts = .empty;
-    const parsed_exprs: ParsedExpressions = .empty;
+    heap.parsed_scripts = .empty;
+    heap.parsed_exprs = .empty;
 
-    // Create heap
-    heap.* = .{
-        .gpa = gpa,
-
-        .object_tracking = object_tracking,
-        .objects = objects,
-        .string_tracking = string_tracking,
-        .strings = strings,
-        .interned_strings = undefined,
-
-        .extra = extra,
-        .parsed_scripts = parsed_scripts,
-        .parsed_exprs = parsed_exprs,
-    };
+    // Done initializing heap fields, so now we'll create all the specialty objects.
 
     // null string is guaranteed to have index 0
     const null_string_idx = try heap.string_tracking.allocFromOwningThread(0);
     assert(null_string_idx == null_string);
+    errdefer heap.string_tracking.freeFromOwningThread(null_string_idx, 0);
     // empty string is guaranteed to have index 1
     const empty_string_idx = try heap.string_tracking.allocFromOwningThread(0);
     assert(empty_string_idx == empty_string);
+    errdefer heap.string_tracking.freeFromOwningThread(empty_string_idx, 0);
 
     // This is to remember to update this section whenever the special
     // objects change.
@@ -977,21 +1014,23 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
     // null object is guaranteed to have index 0.
     const null_object = try heap.createObject();
     assert(null_object.index == null_object_idx);
+    errdefer freeObjectBackingUnchecked(null_object);
     // Empty object is guaranteed to have index 1.
     const empty_object = try heap.createObject();
     assert(empty_object.index == empty_object_idx);
     empty_object.peek().str = Object.empty_string;
+    errdefer freeObjectBackingUnchecked(empty_object);
     // Temp object is guaranteed to have index 2.
     const temp_object = try heap.createObject();
     assert(temp_object.index == temp_object_idx);
-
-    // Intern all the interned strings.
-    heap.interned_strings = .init(.{
-        .lambda_apply_expr = try createInternedString(heap, 0, "apply lambdaExpr"),
-    });
+    errdefer freeObjectBackingUnchecked(temp_object);
 
     // We need to init the temp object as well by setting its string to a long string.
     assert(try heap.setLongString(temp_object_idx, .{ .temp = "" }));
+    errdefer heap.tempObject().peek().str.deinit(heap);
+
+    // Create all the interned strings.
+    try heap.createInternedStrings();
 }
 
 fn clearParsedScripts(self: *Heap) void {
@@ -1026,11 +1065,11 @@ pub fn deinit(heap: *Heap) void {
     }
 
     for (special_object_count..(special_object_count + interned_string_count)) |i| {
-        // Need to free these objects diectly, since they're not normally allowed
+        // Need to free these objects directly, since they're not normally allowed
         // to be modified.
         const interned = heap.getHandle(@intCast(i));
         interned.peek().str.deinit(heap);
-        freeObjectBacking(interned);
+        freeObjectBackingUnchecked(interned);
     }
 
     // Be sure to free the specialty objects and strings.
@@ -1110,8 +1149,8 @@ pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
     };
 }
 
-pub fn getInternedString(heap: *Heap, string: InternedStrings) Heap.Handle {
-    return heap.interned_strings.get(string).?;
+pub fn getInternedString(heap: *Heap, string: InternedString) Heap.Handle {
+    return heap.interned_strings.get(string);
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -1243,15 +1282,9 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     return index;
 }
 
-/// Does not run any destructors, frees the object directly.
-pub fn freeObjectBacking(handle: Handle) void {
+fn freeObjectBackingUnchecked(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
-
-    // HACK: should use a custom panic handler for this.
-    last_touched = handle;
-    if (!handle.isAllocHead()) Heap.dumpLastTouchedTrace();
-    assert(handle.isAllocHead());
 
     if (cfg.trace_mem) {
         obj_heap.trace_mutex.lock();
@@ -1283,6 +1316,16 @@ pub fn freeObjectBacking(handle: Handle) void {
     } else {
         obj_heap.object_tracking.freeFromAnyThread(handle.index, metadata.order);
     }
+}
+
+/// Does not run any destructors, frees the object directly.
+pub fn freeObjectBacking(handle: Handle) void {
+    // HACK: should use a custom panic handler for this.
+    last_touched = handle;
+    if (!handle.isAllocHead()) Heap.dumpLastTouchedTrace();
+    assert(handle.isAllocHead());
+
+    freeObjectBackingUnchecked(handle);
 }
 
 pub fn freeObject(handle: Handle) void {
@@ -1353,6 +1396,9 @@ pub fn createString(self: *Heap, len: u32) !u32 {
             break :blk try self.string_tracking.allocFromAnyThread(order);
         }
     };
+    errdefer self.string_tracking.freeFromAnyThread(new_string, order);
+    try self.strings.ensureTotalCapacity(self.heapAlloc(), new_string + length_with_null);
+    self.strings.items.len = @max(self.strings.items.len, new_string + length_with_null);
 
     self.strings.items[new_string + len] = 0; // Set null byte.
     return new_string;
