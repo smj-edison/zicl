@@ -36,9 +36,6 @@ zig build -Duse-utf8=false
 # Force LLVM backend
 zig build -Duse-llvm=true
 
-# Enable bracket expression sugar ($[5+5] instead of $(5+5))
-zig build -Dbracket-expr-sugar=true
-
 # Enable token debugging (prints tokens during parsing)
 zig build -Dtoken-debugging=true
 ```
@@ -60,6 +57,8 @@ zig build -Dtoken-debugging=true
 -   Objects can dynamically convert between types (string → list → dict, etc.)
 -   Maintains string representation alongside typed representation when beneficial
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
+-   Dictionary operations: `dictGet`, `dictGetDefault`, `dictSet`, `dictPut`, `dictRemove`, `dictRemoveDuplicates`, `dictReindex`
+-   Supports recursive key lookups for nested dictionaries
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
 **Tokenizer (src/Tokenizer.zig)**: Tokenizes TCL scripts supporting:
@@ -67,15 +66,17 @@ zig build -Dtoken-debugging=true
 -   Variable substitution (`$var`, `${var}`)
 -   Command substitution (`[cmd]`)
 -   Dictionary sugar (`$var(key)`)
--   Expression sugar (optional, via build flag)
 -   Argument expansion (`{*}`)
 -   Proper quote/brace/bracket balancing with detailed error reporting
 
-**Interpreter (src/Interp.zig)**: Executes parsed scripts (work in progress):
+**Interpreter (src/Interp.zig)**: Executes parsed scripts:
 
 -   Dual frame system: call frames (scope) and eval frames (execution state)
 -   Variable resolution with caching via epochs (invalidated on scope changes)
 -   Command dispatch supporting both native and TCL procedures
+-   Expression evaluation system
+-   Loop control (break/continue with level support)
+-   Procedure support with optional/required parameters, default values, and `args` parameter
 -   Tail call optimization preparation
 
 ### Object Representation
@@ -140,6 +141,17 @@ test "foo" {
 
 Always call `Heap.testFinish()` to verify no memory leaks.
 
+The project has 14 comprehensive test suites covering:
+- Object system: dicts, lists, script parsing, script shimmering
+- Commands: commands, dict commands, loop commands
+- Expressions: eval expression, expressions
+- Variables: variables, recursive dict keys
+- Utilities: source info, string is, tcl enum
+
+Helper functions available:
+- `testRunScript(heap, script)` - Execute script and return result
+- `testExpectScriptResult(heap, script, expected)` - Assert result matches expected value
+
 ### Important Code Patterns
 
 **Creating Objects**:
@@ -174,20 +186,23 @@ const result = try someFn(heap, &det, arg);
 
 ## Key Files
 
--   `src/Heap.zig`: Memory allocator and object storage (~2000 lines)
--   `src/object.zig`: Object type system and operations (~1700 lines)
--   `src/Tokenizer.zig`: TCL tokenizer (~900 lines)
--   `src/Interp.zig`: Interpreter and command execution (in progress, ~1000 lines)
--   `src/stringutil.zig`: String utilities with optional UTF-8 support
--   `src/memutil.zig`: Buddy allocator and memory primitives
--   `src/expr_parse.zig`: Expression AST nodes (minimal, not yet implemented)
+-   `src/Heap.zig`: Memory allocator and object storage (~2500 lines)
+-   `src/object.zig`: Object type system and operations (~2400 lines)
+-   `src/Interp.zig`: Interpreter and command execution (~2100 lines)
+-   `src/Tokenizer.zig`: TCL tokenizer (~1200 lines)
+-   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
+-   `src/stringutil.zig`: String utilities with optional UTF-8 support (~900 lines)
+-   `src/commands.zig`: Built-in command implementations (~650 lines)
+-   `src/memutil.zig`: Buddy allocator and memory primitives (~600 lines)
+-   `src/repl.zig`: REPL (stub, not yet implemented)
 
 ## Configuration
 
 Build options (in build.zig):
 
 -   `use_utf8`: Enable UTF-8 support (default: true)
--   `bracket_expr_sugar`: Use `$[expr]` instead of `$(expr)` (default: false)
+-   `use_llvm`: Force LLVM backend (default: false)
+-   `test_filter`: Filter for specific tests
 -   `token_debugging`: Print tokens during parsing (default: false)
 
 Heap settings (in Heap.zig cfg):
@@ -208,29 +223,61 @@ Heap settings (in Heap.zig cfg):
 
 **String Representation**: Some operations require string representations. The heap will auto-generate them when calling `Heap.getString()`, but this can fail with OOM.
 
+**Command Naming**: Command implementation functions follow the pattern `nameCmd` (e.g., `ifCmd`, `forCmd`, `dictCmd`) with a `Cmd` prefix.
+
+## Recent Development
+
+Recent fixes and improvements:
+- Dictionary operations: Added `dictRemove`, fixed duplicate handling
+- Command architecture: Standardized function naming conventions
+- Loop control: Fixed break/continue propagation with level support
+- Memory safety: Fixed double-free on initialization failure and interned string leaks
+- Dictionary commands: Fixed `[dict set]` bugs for nested operations
+
 ## Development Status
 
 Currently implemented:
 
 -   Complete tokenizer with full TCL syntax support
--   Object system with all major types (string, integer, float, list, dict, bool, index), though methods are still incomplete.
+-   Object system with all major types (string, integer, float, list, dict, bool, index, enum, script, source_info)
 -   Memory management with reference counting and buddy allocation
 -   Script parsing and caching
+-   Expression evaluation with full AST
+    - Binary/unary operators, ternary conditional
+    - Math functions: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh
+    - Utility functions: ceil, floor, exp, log, log10, sqrt, abs, round
+    - Type conversion: int(), wide(), double()
+    - Random: rand(), srand()
+-   Variable management and scoping with epoch-based caching
+-   Command registration and dispatch system
+-   Core built-in commands (13 implemented):
+    - Math: [+], [*], [incr], [expr]
+    - Control flow: [if], [for], [break], [continue]
+    - Variables: [set]
+    - Procedures: [proc], [apply]
+    - Data structures: [dict] (get, getdef, set, remove)
+    - I/O: [puts]
 
-In progress:
+Partially complete:
 
--   Interpreter evaluation loop (partially complete)
--   Variable management and scoping
--   Command registration and dispatch
--   Built-in commands
+-   Dictionary operations (comprehensive API, subset of subcommands implemented)
+-   Interpreter evaluation (core complete, needs more built-in commands)
 
 Not yet implemented:
 
--   Expression evaluation (expr_parse.zig is stub)
+-   String commands (string length, range, match, etc.)
+-   List commands (lindex, lrange, lappend, llength, etc.)
+-   While/foreach loops
+-   File I/O (open, close, read, write)
 -   Most TCL standard library commands
 -   Namespaces (partial support exists)
 -   Upvar/uplevel (structures exist but incomplete)
 -   Error stack traces
+-   REPL
+
+## Notes
+
+**Experimental Files**: The repository contains `foo.zig` and `bar.zig` which are one-off prototypes not relevant to the overall architecture and can be ignored.
 
 ## Style guide
 
