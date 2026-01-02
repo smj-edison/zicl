@@ -142,15 +142,17 @@ test "foo" {
 Always call `Heap.testFinish()` to verify no memory leaks.
 
 The project has 14 comprehensive test suites covering:
-- Object system: dicts, lists, script parsing, script shimmering
-- Commands: commands, dict commands, loop commands
-- Expressions: eval expression, expressions
-- Variables: variables, recursive dict keys
-- Utilities: source info, string is, tcl enum
+
+-   Object system: dicts, lists, script parsing, script shimmering
+-   Commands: commands, dict commands, loop commands
+-   Expressions: eval expression, expressions
+-   Variables: variables, recursive dict keys
+-   Utilities: source info, string is, tcl enum
 
 Helper functions available:
-- `testRunScript(heap, script)` - Execute script and return result
-- `testExpectScriptResult(heap, script, expected)` - Assert result matches expected value
+
+-   `testRunScript(heap, script)` - Execute script and return result
+-   `testExpectScriptResult(heap, script, expected)` - Assert result matches expected value
 
 ### Important Code Patterns
 
@@ -213,26 +215,48 @@ Heap settings (in Heap.zig cfg):
 -   `string_heap_order`: Max 2^28 bytes for strings (default: 28)
 -   `max_heaps`: Maximum concurrent heaps (default: 128)
 
+## Development Principles
+
+**Memory Leak Prevention**: This project has ZERO tolerance for memory leaks, even in obscure edge cases or OOM scenarios. Every allocation must have a clear deallocation path, including error paths. When adding new code that allocates memory:
+
+-   Always add `errdefer` cleanup for allocations that might fail before ownership transfer
+-   Test with `testing.checkAllAllocationFailures()` to verify all OOM paths are leak-free
+-   If a function allocates and returns data, document ownership clearly
+-   Use `defer` for immediate cleanup, `errdefer` for error-path cleanup
+
+Example pattern:
+```zig
+const data = try allocator.alloc(u8, size);
+errdefer allocator.free(data);  // Free if subsequent operations fail
+const result = try processData(data);  // This might fail
+// data ownership transferred to result, no explicit free needed
+```
+
 ## Common Issues
 
 **Double Free**: If you see double-free panics, check that objects from collections (lists/dicts) aren't being released. List items are not ref-counted handles. Enable cfg.trace_mem to figure out why.
 
 **Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `prepareToShimmer()` which will duplicate if needed.
 
-**OOM in Tests**: Use `testing.checkAllAllocationFailures()` wrapper to test all OOM code paths.
+**OOM in Tests**: Use `testing.checkAllAllocationFailures()` wrapper to test all OOM code paths. All tests should pass without leaks even when allocations fail at any point.
 
 **String Representation**: Some operations require string representations. The heap will auto-generate them when calling `Heap.getString()`, but this can fail with OOM.
 
 **Command Naming**: Command implementation functions follow the pattern `nameCmd` (e.g., `ifCmd`, `forCmd`, `dictCmd`) with a `Cmd` prefix.
 
+## Debugging
+
+This project has comprehensive tracing for all memory operations. _Always_ read the complete trace before jumping into the code—the trace often holds the answer.
+
 ## Recent Development
 
 Recent fixes and improvements:
-- Dictionary operations: Added `dictRemove`, fixed duplicate handling
-- Command architecture: Standardized function naming conventions
-- Loop control: Fixed break/continue propagation with level support
-- Memory safety: Fixed double-free on initialization failure and interned string leaks
-- Dictionary commands: Fixed `[dict set]` bugs for nested operations
+
+-   Dictionary operations: Added `dictRemove`, fixed duplicate handling
+-   Command architecture: Standardized function naming conventions
+-   Loop control: Fixed break/continue propagation with level support
+-   Memory safety: Fixed double-free on initialization failure and interned string leaks
+-   Dictionary commands: Fixed `[dict set]` bugs for nested operations
 
 ## Development Status
 
@@ -243,20 +267,20 @@ Currently implemented:
 -   Memory management with reference counting and buddy allocation
 -   Script parsing and caching
 -   Expression evaluation with full AST
-    - Binary/unary operators, ternary conditional
-    - Math functions: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh
-    - Utility functions: ceil, floor, exp, log, log10, sqrt, abs, round
-    - Type conversion: int(), wide(), double()
-    - Random: rand(), srand()
+    -   Binary/unary operators, ternary conditional
+    -   Math functions: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh
+    -   Utility functions: ceil, floor, exp, log, log10, sqrt, abs, round
+    -   Type conversion: int(), wide(), double()
+    -   Random: rand(), srand()
 -   Variable management and scoping with epoch-based caching
 -   Command registration and dispatch system
 -   Core built-in commands (13 implemented):
-    - Math: [+], [*], [incr], [expr]
-    - Control flow: [if], [for], [break], [continue]
-    - Variables: [set]
-    - Procedures: [proc], [apply]
-    - Data structures: [dict] (get, getdef, set, remove)
-    - I/O: [puts]
+    -   Math: [+], [*], [incr], [expr]
+    -   Control flow: [if], [for], [break], [continue]
+    -   Variables: [set]
+    -   Procedures: [proc], [apply]
+    -   Data structures: [dict] (get, getdef, set, remove)
+    -   I/O: [puts]
 
 Partially complete:
 
