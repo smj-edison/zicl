@@ -30,52 +30,63 @@ pub const ErrorDetails = struct {
     index: ?u32 = null,
 };
 
-pub fn shimmerToString(handle: *Handle) !void {
-    if (handle.peek().tag == .string) return;
+/// If the object changed locations, return the new object handle.
+pub fn shimmerToString(provided_handle: Handle) !?Handle {
+    if (provided_handle.peek().tag == .string) return null;
 
-    const obj = handle.peek();
-    _ = try Heap.getString(handle.*); // Ensure string representation
+    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
+    errdefer if (new_handle) |val| val.decrRefCount();
+    const handle = new_handle orelse provided_handle;
 
-    try Heap.prepareToShimmer(handle);
-    obj.tag = .string;
-    obj.body = .{
+    _ = try Heap.getString(provided_handle.*); // Ensure string representation
+
+    handle.invalidateBody();
+    handle.peek().tag = .string;
+    handle.peek().body = .{
         .string = .{
             .utf8_length = 0,
             // Don't know the utf-8 length yet.
             .length_determined = false,
         },
     };
+
+    if (new_handle) return new_handle else return null;
 }
 
-pub fn getCodepointLength(handle: *Handle) !usize {
-    shimmerToString(handle);
+pub fn getCodepointLength(provided_handle: Handle) !struct { new_handle: ?Handle, len: usize } {
+    const new_handle: ?Handle = try shimmerToString(provided_handle);
+    errdefer if (new_handle) |val| val.decrRefCount();
+    const handle = new_handle orelse provided_handle;
 
-    const obj = handle.peek();
-    const bytes = try Heap.getString(handle);
+    assert(handle.peek().tag == .string);
 
-    if (obj.tag == .string) {
-        // See if we already calculated the utf8 length
-        if (obj.str.is_ptr) {
-            // LongString stores the utf8 length in the string body
-            const long_string = Heap.LongString.fromInt(obj.str.u.ptr);
-            if (long_string.utf8_length) |utf8_length| {
-                return utf8_length;
+    // See if we already calculated the utf8 length.
+    switch (Heap.getStringDetails(handle)) {
+        .long => |long_str| {
+            const current_len = long_str.getUtf8Length();
+            if (current_len != std.math.maxInt(u64)) return current_len;
+
+            // String length hasn't been computed yet, so compute now.
+            const utf8_length = stringutil.codepointLength(long_str.getString());
+            long_str.setUtf8Length(utf8_length); // Cache utf8 length
+            return .{ .new_handle = new_handle, .len = utf8_length };
+        },
+        .normal => {
+            if (handle.peek().body.string.length_determined) {
+                return handle.peek().body.string.utf8_length;
             } else {
+                const bytes = try Heap.getString(handle);
                 const utf8_length = stringutil.codepointLength(bytes);
-                long_string.utf8_length = utf8_length; // cache utf8 length
-                return utf8_length;
+                handle.peek().body.string = .{
+                    .utf8_length = utf8_length, // Cache utf8 length
+                    .length_determined = true,
+                };
+                return .{ .new_handle = new_handle, .len = utf8_length };
             }
-        } else {
-            if (obj.body.string.length_determined) {
-                return obj.body.string.utf8_length;
-            } else {
-                const utf8_length = stringutil.codepointLength(bytes);
-                obj.body.string.utf8_length = utf8_length; // cache utf8 length
-                obj.body.string.length_determined = true;
-                return utf8_length;
-            }
-        }
-    } else unreachable;
+        },
+        .empty => return .{ .new_handle = new_handle, .len = 0 },
+        .null => unreachable,
+    }
 }
 
 /// Copies provided string.
@@ -84,13 +95,16 @@ pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
     errdefer handle.decrRefCount();
 
     try Heap.setString(handle, bytes);
-    try shimmerToString(&handle);
+    assert(try shimmerToString(handle) == null);
     return handle;
 }
 
 pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
     const new_count = std.fmt.count(fmt, args);
     const str = try newStringToFill(heap, new_count);
+    // Don't try setting the string of an empty object.
+    if (str == heap.emptyObject()) return str;
+
     const written = std.fmt.bufPrint(Heap.getStringMut(str) catch unreachable, fmt, args) catch return error.OutOfMemory;
     assert(written.len == new_count);
 
@@ -98,6 +112,8 @@ pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handl
 }
 
 pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
+    if (len == 0) return heap.emptyObject();
+
     const handle = try heap.createObject();
     errdefer handle.decrRefCount();
 
@@ -106,7 +122,7 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
         const new_str_end = new_str + @as(u32, @intCast(len));
         @memset(heap.getHeapString(new_str, new_str_end), 0);
 
-        // New object, so we can set directly
+        // New object, so we can set directly.
         handle.peek().str = .{
             .u = .{
                 .str = .{ .index = new_str, .len = @intCast(len) },
@@ -114,7 +130,7 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
             .is_ptr = false,
         };
     } else {
-        // create new string
+        // Create new string.
         const new_str = try heap.gpa.allocSentinel(u8, len, 0);
         errdefer heap.gpa.free(new_str);
         @memset(new_str, 0);
@@ -129,21 +145,22 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
 pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: usize) !Handle {
     const handle = try heap.createObject();
     Heap.setString(handle, bytes);
-    shimmerToString(handle);
 
-    const obj = handle.peek();
+    handle.peek().tag = .string;
+
     switch (Heap.getStringDetails(handle)) {
         .long => |long_str| {
-            long_str.utf8_length = cp_length;
+            long_str.setUtf8Length(cp_length);
+            handle.peek().body = undefined;
         },
         .normal => {
-            obj.body.string.* = .{
+            handle.peek().body.string.* = .{
                 .utf8_length = cp_length,
                 .length_determined = true,
             };
         },
         .empty => {
-            obj.body.string = .{
+            handle.peek().body.string = .{
                 .utf8_length = 0,
                 .length_determined = true,
             };
@@ -155,7 +172,7 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
 }
 
 pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
-    // Unescaped must be equal or shorter than escaped version
+    // Unescaped will be equal or shorter than escaped version.
     const unescaped = try handle.getHeap().gpa.allocSentinel(u8, escaped.len, 0);
     errdefer handle.getHeap().gpa.free(unescaped);
     const written = stringutil.removeEscaping(escaped, unescaped);
@@ -240,19 +257,25 @@ pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     }
 }
 
-pub fn shimmerToInteger(det: ?*ErrorDetails, handle: *Handle) !void {
-    if (handle.peek().tag == .integer) return;
+/// If the object changed locations, return the new object handle.
+pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
+    if (provided_handle.peek().tag == .integer) return;
 
-    const integer = try integerGetNoShimmer(det, handle.*);
+    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
+    const handle = new_handle orelse provided_handle;
 
-    try Heap.prepareToShimmer(handle);
+    const value: i64 = try integerGetNoShimmer(det, handle);
+
+    handle.invalidateBody();
     handle.peek().tag = .integer;
-    handle.peek().body.integer = integer;
+    handle.peek().body.integer = value;
+
+    return new_handle;
 }
 
-pub fn integerGet(det: ?*ErrorDetails, handle: *Handle) !i64 {
-    try shimmerToInteger(det, handle);
-    return handle.peek().body.integer;
+pub fn integerGet(det: ?*ErrorDetails, handle: Handle) !struct { new_handle: Handle, value: i64 } {
+    const new_handle = try shimmerToInteger(det, handle);
+    return .{ .new_handle = new_handle, .value = handle.peek().body.integer };
 }
 
 // Float related functions.
@@ -279,35 +302,30 @@ pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     }
 }
 
-pub fn shimmerToFloat(det: ?*ErrorDetails, handle: *Handle) !void {
-    if (handle.peek().tag == .float) return;
+pub fn shimmerToFloat(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
+    if (provided_handle.peek().tag == .float) return;
+
+    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
+    const handle = new_handle orelse provided_handle;
 
     const value = try floatGetNoShimmer(det, handle.*);
 
-    try Heap.prepareToShimmer(handle);
+    handle.invalidateBody();
     handle.peek().tag = .float;
     handle.peek().body.float = value;
+
+    return new_handle;
 }
 
 ///////////////////////////////
 //  Index related functions  //
 
 /// `start` is inclusive, `end` is exclusive. (Note, this is different from tcl's
-/// convention, where both are inclusive. `fromObjects` accounts for this when
+/// convention, where both are inclusive. `fromIndexes` accounts for this when
 /// running the conversion).
 pub const Range = struct {
     start: usize,
     end: usize,
-
-    pub fn fromObjects(det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !Range {
-        const start_idx = try getIndex(start, det);
-        const end_idx = try getIndex(end, det);
-
-        return fromIndexes(list_len, .{
-            .start = start_idx,
-            .end = end_idx,
-        });
-    }
 
     /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
     pub fn fromIndexes(list_len: usize, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
@@ -336,99 +354,132 @@ fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
         .message = try newStringFmt("bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
-    return Error.BadIndex;
+    return error.BadIndex;
 }
 
 /// Shimmers to an index representation.
-pub fn shimmerToIndex(det: ?*ErrorDetails, handle: *Handle) !void {
-    if (handle.peek().tag == .index) return;
+pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
+    if (provided_handle.peek().tag == .index) return;
+
+    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
+    const handle = new_handle orelse provided_handle;
 
     const bytes = try Heap.getString(handle);
-    const obj = handle.peek();
 
-    Heap.prepareToShimmer(handle);
-    obj.tag = .index;
+    const index: Heap.ListIndex = blk: {
+        // Does it start with "end"? If so, it might be end+5, or end-2, etc
+        if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
+            if (bytes.len >= 4) {
+                if (bytes[3] != '+' or bytes[3] != '-') return badIndexError(det, handle);
 
-    // Does it start with "end"? If so, it might be end+5, or end-2, etc
-    if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
-        if (bytes.len >= 4) {
-            if (bytes[3] != '+' or bytes[3] != '-') return badIndexError(det, handle);
+                const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, handle);
+                break :blk .{
+                    .u = .{ .end_offset = index_offset },
+                    .is_end = true,
+                };
+            }
 
-            const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, handle);
-            obj.body.index = .{ .u = .{ .end_offset = index_offset }, .is_end = true };
+            break :blk Heap.ListIndex.end;
+        } else {
+            break :blk std.fmt.parseInt(u32, bytes, 10) catch return badIndexError(det, handle);
         }
+    };
 
-        obj.body.index = Heap.ListIndex.end;
-    } else {
-        const index = std.fmt.parseInt(u32, bytes, 10) catch {
-            return badIndexError(det, handle);
-        };
-        obj.body.index = index;
-    }
+    handle.invalidateBody();
+    handle.peek().tag = .index;
+    handle.peek().index = index;
+
+    return new_handle;
 }
 
-pub fn getIndex(det: ?*ErrorDetails, handle: *Handle) !Heap.ListIndex {
-    const obj = handle.peek();
-
+pub fn getIndex(det: ?*ErrorDetails, handle: Handle) !struct { new_handle: ?Handle, index: Heap.ListIndex } {
     // Fast case: if it's an integer or float, we can quickly cast it (don't
     // shimmer though, as it'll probably still be used for its original purpose)
-    if (obj.tag == .integer) {
-        if (obj.body.integer < 0) return badIndexError(det, handle);
-        if (obj.body.integer > std.math.maxInt(u32)) return badIndexError(det, handle);
+    if (handle.peek().tag == .integer) {
+        const integer = handle.peek().body.integer;
+        if (integer < 0) return badIndexError(det, handle);
+        if (integer > std.math.maxInt(u32)) return badIndexError(det, handle);
 
-        return .{ .u = .{ .index = @intCast(obj.body.integer) }, .is_end = false };
-    } else if (obj.tag == .float) {
-        const value = obj.body.float;
+        return .{ .u = .{ .index = @intCast(integer) }, .is_end = false };
+    } else if (handle.peek().tag == .float) {
+        const float = handle.peek().body.float;
 
-        if (std.math.isNan(value)) return badIndexError(det, handle);
-        if (value < 0) return badIndexError(det, handle);
-        if (value > std.math.maxInt(u32)) return badIndexError(det, handle);
+        if (std.math.isNan(float)) return badIndexError(det, handle);
+        if (float < 0) return badIndexError(det, handle);
+        if (float > std.math.maxInt(u32)) return badIndexError(det, handle);
 
-        return .{ .u = .{ .index = @intFromFloat(obj.body.integer) }, .is_end = false };
+        return .{ .u = .{ .index = @intFromFloat(float) }, .is_end = false };
     }
 
-    try shimmerToIndex(det, handle);
-    return obj.body.index;
+    const new_handle = try shimmerToIndex(det, handle);
+    return .{ .new_handle = new_handle, .index = handle.peek().body.index };
 }
 
 /// Creates a substring of the passed in string. Used in `[string range]`.
-pub fn stringRange(det: ?*ErrorDetails, str: *Handle, start: *Handle, end: *Handle) !Handle {
+pub fn stringRange(det: ?*ErrorDetails, str: Handle, start: Handle, end: Handle) !struct {
+    substring: Handle,
+    new_start: ?Handle,
+    new_end: ?Handle,
+} {
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str);
 
-    const unchecked_range = try Range.fromObjects(det, codepoint_len, start, end);
-    if (unchecked_range) |range| {
-        // cpIndex is generic across ascii or utf8.
-        const byte_start = stringutil.cpIndex(bytes, range.start);
-        const byte_end = stringutil.cpIndex(bytes, range.end);
+    const start_result = try getIndex(det, start);
+    const new_start = start_result.new_handle;
+    errdefer new_start.decrRefCount();
+    const start_index = start_result.index;
 
-        return try newStringWithCodepointLen(
+    const end_result = try getIndex(det, end);
+    const new_end = end_result.new_handle;
+    errdefer new_end.decrRefCount();
+    const end_index = end_result.index;
+
+    const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
+
+    // cpIndex is generic across ASCII and UTF-8.
+    const byte_start = stringutil.cpIndex(bytes, range.start);
+    const byte_end = stringutil.cpIndex(bytes, range.end);
+
+    return .{
+        .substring = try newStringWithCodepointLen(
             bytes[byte_start..byte_end],
             range.end - range.start,
-        );
-    } else {
-        // Invalid range, so we'll just pass through the string.
-        return try newStringWithCodepointLen(bytes, codepoint_len);
-    }
+        ),
+        .new_start = new_start,
+        .new_end = new_end,
+    };
 }
 
 /// Removes from `start` to `end`, optionally inserting `to_insert`.
-pub fn stringReplace(str: *Handle, start: *Handle, end: *Handle, to_insert: ?Handle) !Handle {
+pub fn stringReplace(det: ?*ErrorDetails, str: Handle, start: Handle, end: Handle, to_insert: ?Handle) !struct {
+    replaced: Handle,
+    new_start: ?Handle,
+    new_end: ?Handle,
+} {
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str.*);
 
-    const unchecked_range = try Range.fromObjects(codepoint_len, start, end);
+    const start_result = try getIndex(det, start);
+    const new_start = start_result.new_handle;
+    errdefer if (new_start) |val| val.decrRefCount();
+    const start_index = start_result.index;
 
-    if (unchecked_range) |range| {
-        // cpIndex is generic across ascii or utf8.
-        const byte_start = stringutil.cpIndex(bytes, range.start);
-        const byte_end = stringutil.cpIndex(bytes, range.end);
+    const end_result = try getIndex(det, end);
+    const new_end = end_result.new_handle;
+    errdefer if (new_end) |val| val.decrRefCount();
+    const end_index = end_result.index;
 
+    const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
+
+    const byte_start = stringutil.cpIndex(bytes, range.start);
+    const byte_end = stringutil.cpIndex(bytes, range.end);
+
+    const replaced: Handle = blk: {
         // Is there anything to insert?
-        if (to_insert) |unwrapped| {
-            const to_insert_bytes = try Heap.getString(unwrapped);
+        if (to_insert) |val| {
+            const to_insert_bytes = try Heap.getString(val);
 
-            // Figure out how long the new string needs to be
+            // Figure out how long the new string needs to be.
             const up_to_range_len = byte_start;
             const to_insert_len = to_insert_bytes.len;
             // Tcl ranges are inclusive, so `- 1` is needed.
@@ -437,9 +488,12 @@ pub fn stringReplace(str: *Handle, start: *Handle, end: *Handle, to_insert: ?Han
             const new_str = newStringToFill(up_to_range_len + to_insert_len + after_range_len);
             const new_bytes = Heap.getStringMut(new_str) catch |err| {
                 switch (err) {
-                    // empty strings aren't mutable, so we'll just return the empty string
-                    Error.NotMutable => return new_str,
-                    Error.OutOfMemory => return err,
+                    error.NotMutable => {
+                        // Empty strings aren't mutable, so we'll just return the empty string.
+                        assert(new_str.peek().str == Heap.Object.empty_string);
+                        break :blk new_str;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
                 }
             };
 
@@ -447,31 +501,37 @@ pub fn stringReplace(str: *Handle, start: *Handle, end: *Handle, to_insert: ?Han
             @memcpy(new_bytes[up_to_range_len..][0..to_insert_len], to_insert_bytes);
             @memcpy(new_bytes[(up_to_range_len + to_insert_len)..], bytes[(byte_end + 1)..]);
 
-            return new_str;
+            break :blk new_str;
         } else {
             // Figure out how long the new string needs to be.
             const up_to_range_len = byte_start;
             // Tcl ranges are inclusive, so `- 1` is needed.
             const after_range_len = bytes.len - byte_end - 1;
 
-            const new_str = newStringToFill(up_to_range_len + after_range_len);
+            const new_str = try newStringToFill(up_to_range_len + after_range_len);
             const new_bytes = Heap.getStringMut(new_str) catch |err| {
                 switch (err) {
-                    // empty strings aren't mutable, so we'll just return the empty string
-                    Error.NotMutable => return new_str,
-                    Error.OutOfMemory => return err,
+                    error.NotMutable => {
+                        // Empty strings aren't mutable, so we'll just return the empty string.
+                        assert(new_str.peek().str == Heap.Object.empty_string);
+                        break :blk new_str;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
                 }
             };
 
             @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
             @memcpy(new_bytes[up_to_range_len..], bytes[(byte_end + 1)..]);
 
-            return new_str;
+            break :blk new_str;
         }
-    } else {
-        // Invalid range, so we'll just pass through the string.
-        return try newStringWithCodepointLen(bytes, codepoint_len);
-    }
+    };
+
+    return .{
+        .new_start = new_start,
+        .new_end = new_end,
+        .replaced = replaced,
+    };
 }
 
 /// Upper/lower/title case conversion.
@@ -503,15 +563,16 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
         }
 
         const new_str = try newStringToFill(new_len);
-        const new_bytes = try Heap.getStringMut(new_str) catch |err| {
-            switch (err) {
-                // empty strings aren't mutable, so we'll just return the empty string
-                Error.NotMutable => return new_str,
-                Error.OutOfMemory => return err,
-            }
+        errdefer new_str.decrRefCount();
+        const new_bytes = try Heap.getStringMut(new_str) catch |err| switch (err) {
+            error.NotMutable => {
+                // Empty strings aren't mutable, so we'll just return the empty string.
+                assert(new_str.peek().str == Heap.Object.empty_string);
+                return new_str;
+            },
         };
 
-        // Now go through and write all the bytes
+        // Now go through and write all the bytes.
         iter = stringutil.Iterator.init(bytes);
         var written: usize = 0;
         is_first_char = true;
@@ -536,12 +597,12 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
     } else {
         const new_len = bytes.len;
         const new_str = try newStringToFill(new_len);
-        const new_bytes = try Heap.getStringMut(new_str) catch |err| {
-            switch (err) {
-                // Empty strings aren't mutable, so we'll just return the empty string.
-                Error.NotMutable => return new_str,
-                Error.OutOfMemory => return err,
-            }
+        const new_bytes = try Heap.getStringMut(new_str) catch |err| switch (err) {
+            // Empty strings aren't mutable, so we'll just return the empty string.
+            error.NotMutable => {
+                assert(new_str.peek().str == Heap.Object.empty_string);
+                return new_str;
+            },
         };
 
         for (bytes, new_bytes) |old_char, *new_char| {
@@ -570,7 +631,7 @@ pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     }
 }
 
-/// Creates a new string if there was anything to trim.
+/// Creates a new string if there was anything to trim, else passes `str` through.
 pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try Heap.getString(str);
     const trim_chars_bytes = try Heap.getString(trim_chars);
@@ -584,7 +645,7 @@ pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     }
 }
 
-/// Creates a new string if there was anything to trim.
+/// Creates a new string if there was anything to trim, else passes `str` through.
 pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try Heap.getString(str);
     const trim_chars_bytes = try Heap.getString(trim_chars);
@@ -639,20 +700,24 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
         pub const map = (EnumMapping(T){}).map;
         pub const names = enumNames(T);
 
-        pub fn get(det: ?*ErrorDetails, value: *Handle) !T {
+        pub fn get(det: ?*ErrorDetails, provided_handle: Handle) !struct { new_handle: Handle, value: T } {
+            const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
+            errdefer if (new_handle) |val| val.decrRefCount();
+            const handle = new_handle orelse provided_handle;
+
             // TODO PERF we can optimize this by shimmering the value to an "enum" type,
             // where the enum type has a u48 storing the hash of enum_name and a u16 for
             // which variant it is, by index.
-            const bytes = try Heap.getString(value.*);
+            const bytes = try Heap.getString(handle);
             const variant = map.get(bytes);
-            if (variant) |unwrapped| {
-                return unwrapped;
+            if (variant) |val| {
+                return val;
             } else {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(Heap.local_heap, "bad {s} \"{f}\": must be {s}", .{ enum_name, value.*, names }),
+                    .message = try newStringFmt(Heap.local_heap, "bad {s} \"{f}\": must be {s}", .{ enum_name, handle, names }),
                 };
 
-                return Error.BadEnumVariant;
+                return error.BadEnumVariant;
             }
         }
     };
@@ -666,8 +731,8 @@ test "tcl enum" {
     try testing.expectEqualSlices(u8, "foo, bar, baz", names);
 }
 
-/// Runs a string check based on requested class.
-pub fn stringIs(det: ?*ErrorDetails, str: *Handle, class_to_check: *Handle, strict: bool) !bool {
+/// Runs a string check based on requested class. `class_to_check` must be shimmerable.
+pub fn stringIs(det: ?*ErrorDetails, str: Handle, class_to_check: Handle, strict: bool) !struct { new_class_to_check: Handle, passes: bool } {
     const Class = TclEnum(enum {
         integer,
         alpha,
@@ -686,39 +751,46 @@ pub fn stringIs(det: ?*ErrorDetails, str: *Handle, class_to_check: *Handle, stri
         boolean,
     }, "class");
 
-    const class = try Class.get(det, class_to_check);
+    const class_result = try Class.get(det, class_to_check);
+    const class = class_result.value;
+    const new_class_to_check = class_result.new_handle;
 
     const bytes = try Heap.getString(str.*);
     if (bytes.len == 0) {
         return !strict;
     }
 
-    switch (class) {
-        .integer => {
-            _ = std.fmt.parseInt(i64, bytes, 0) catch return false;
-            return true;
+    const passes = switch (class) {
+        .integer => blk: {
+            _ = std.fmt.parseInt(i64, bytes, 0) catch break :blk false;
+            break :blk true;
         },
-        .double => {
-            _ = std.fmt.parseFloat(f64, bytes) catch return false;
-            return true;
+        .double => blk: {
+            _ = std.fmt.parseFloat(f64, bytes) catch break :blk false;
+            break :blk true;
         },
-        .boolean => {
-            _ = getBoolean(null, str) catch return false;
-            return true;
+        .boolean => blk: {
+            _ = getBoolean(null, str) catch break :blk false;
+            break :blk true;
         },
-        .alpha => return stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
-        .alnum => return stringutil.checkAllAscii(bytes, std.ascii.isAlphanumeric),
-        .ascii => return stringutil.checkAllAscii(bytes, std.ascii.isAscii),
-        .digit => return stringutil.checkAllAscii(bytes, std.ascii.isDigit),
-        .lower => return stringutil.checkAllAscii(bytes, std.ascii.isLower),
-        .upper => return stringutil.checkAllAscii(bytes, std.ascii.isUpper),
-        .space => return stringutil.checkAllAscii(bytes, std.ascii.isWhitespace),
-        .xdigit => return stringutil.checkAllAscii(bytes, stringutil.isHexDigit),
-        .control => return stringutil.checkAllAscii(bytes, std.ascii.isControl),
-        .print => return stringutil.checkAllAscii(bytes, std.ascii.isPrint),
-        .graph => return stringutil.checkAllAscii(bytes, stringutil.isGraph),
-        .punct => return stringutil.checkAllAscii(bytes, stringutil.isPunct),
-    }
+        .alpha => stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
+        .alnum => stringutil.checkAllAscii(bytes, std.ascii.isAlphanumeric),
+        .ascii => stringutil.checkAllAscii(bytes, std.ascii.isAscii),
+        .digit => stringutil.checkAllAscii(bytes, std.ascii.isDigit),
+        .lower => stringutil.checkAllAscii(bytes, std.ascii.isLower),
+        .upper => stringutil.checkAllAscii(bytes, std.ascii.isUpper),
+        .space => stringutil.checkAllAscii(bytes, std.ascii.isWhitespace),
+        .xdigit => stringutil.checkAllAscii(bytes, stringutil.isHexDigit),
+        .control => stringutil.checkAllAscii(bytes, std.ascii.isControl),
+        .print => stringutil.checkAllAscii(bytes, std.ascii.isPrint),
+        .graph => stringutil.checkAllAscii(bytes, stringutil.isGraph),
+        .punct => stringutil.checkAllAscii(bytes, stringutil.isPunct),
+    };
+
+    return .{
+        .new_class_to_check = new_class_to_check,
+        .passes = passes,
+    };
 }
 
 fn testStringIs(ta: std.mem.Allocator) !void {
@@ -735,11 +807,11 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     defer bad_class.decrRefCount();
     var det: ErrorDetails = undefined;
 
-    try testing.expectEqual(true, try stringIs(null, &str, &class, false));
-    try testing.expectEqual(false, try stringIs(null, &str2, &class, false));
-    const err = stringIs(&det, &str, &bad_class, false);
-    if (err == Error.OutOfMemory) return Error.OutOfMemory;
-    try testing.expectError(Error.BadEnumVariant, err);
+    try testing.expectEqual(true, (try stringIs(null, str, class, false)).passes);
+    try testing.expectEqual(false, (try stringIs(null, str2, class, false)).passes);
+    const err = stringIs(det, str, bad_class, false);
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    try testing.expectError(error.BadEnumVariant, err);
     try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
@@ -753,36 +825,20 @@ test "string is" {
 }
 
 pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
-    switch (err) {
-        error.CharactersAfterCloseBrace => {
-            return .{ .message = try newString(heap, "extra characters after close-brace") };
-        },
-        error.MissingCloseBrace => {
-            return .{ .message = try newString(heap, "missing close-brace") };
-        },
-        error.MissingCloseBracket => {
-            return .{ .message = try newString(heap, "unmatched \"[\"") };
-        },
-        error.MissingCloseQuote => {
-            return .{ .message = try newString(heap, "missing quote") };
-        },
-        error.TrailingBackslash => {
-            return .{ .message = try newString(heap, "no character after \\") };
-        },
-        error.DictSugarInExpression => {
-            return .{ .message = try newString(heap, "dict sugar in expression") };
-        },
-        error.FunctionMissingParentheses => {
-            return .{ .message = try newString(heap, "function missing parentheses") };
-        },
-        error.NotOperator => {
-            return .{ .message = try newString(heap, "not operator") };
-        },
-        error.NotNumber => {
-            return .{ .message = try newString(heap, "not number") };
-        },
+    const message = switch (err) {
+        error.CharactersAfterCloseBrace => try newString(heap, "extra characters after close-brace"),
+        error.MissingCloseBrace => try newString(heap, "missing close-brace"),
+        error.MissingCloseBracket => try newString(heap, "unmatched \"[\""),
+        error.MissingCloseQuote => try newString(heap, "missing quote"),
+        error.TrailingBackslash => try newString(heap, "no character after \\"),
+        error.DictSugarInExpression => try newString(heap, "dict sugar in expression"),
+        error.FunctionMissingParentheses => try newString(heap, "function missing parentheses"),
+        error.NotOperator => try newString(heap, "not operator"),
+        error.NotNumber => try newString(heap, "not number"),
         error.NotVariable => unreachable,
-    }
+    };
+
+    return .{ .message = message };
 }
 
 pub fn newListWithCapacity(capacity: u32) !Handle {
@@ -803,72 +859,63 @@ pub fn newListWithCapacity(capacity: u32) !Handle {
     return Heap.local_heap.getHandle(list_index);
 }
 
-pub fn newList(handles: []const Handle, force_dup: bool) !Handle {
+pub fn newList(handles: []const Handle) !Handle {
     const list = try newListWithCapacity(@intCast(handles.len));
     errdefer list.decrRefCount();
-    list.peek().body.list.len = @intCast(handles.len);
 
     const new_items = listItems(list);
-
     for (handles, new_items) |handle, *item| {
-        if (force_dup) {
-            item.* = try Heap.local_heap.dupSingleOrReference(handle);
-        } else {
-            item.* = try Heap.local_heap.dupOrReference(handle);
-        }
+        item.* = try Heap.local_heap.dupOrReference(handle);
     }
 
     list.peek().body.list.len = @intCast(handles.len);
     return list;
 }
 
-/// If shimmering, it creates the object in the calling heap
-pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
-    if (handle.peek().tag == .list) return;
+/// `handle` must be shimmerable. Returns a new object if the list had to move.
+pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
+    if (provided_handle.peek().tag == .list) return;
 
-    const obj = handle.peek();
-    const obj_heap = handle.getHeap();
-
-    // Optimise dict -> list for object with no string rep.
-    if (obj.tag == .dict and Heap.getStringDetails(handle.*) == .null) {
+    // Optimise dict -> list.
+    if (provided_handle.peek().tag == .dict) {
         // Only need to ensure it's shimmerable in this case, since
         // in the other case we duplicate it anyways.
-        const metadata = &obj_heap.getExtraData(obj.body.dict).dict;
-        const len = metadata.len; // copy
+        const len = dictGetMetadata(provided_handle).len;
 
-        try Heap.prepareToShimmer(handle);
+        const new_handle = try Heap.ensureMutableOrDup(provided_handle);
+        const handle = new_handle orelse provided_handle;
 
+        handle.invalidateBody();
         // Because both lists and dicts store their values directly after,
         // we can just swap out the head to convert to a list.
-        obj.* = .{
+        handle.peek().* = .{
             .str = Heap.Object.null_string,
             .tag = .list,
             .body = .{
                 .list = .{ .len = len },
             },
         };
+
+        return new_handle;
     } else {
         // No need to duplicate the handle if it can't shimmer, we have to create
         // a new object anyways.
 
         // Try to preserve information about filename / line number.
-        const source_info: ?SourceInfo = getSourceInfo(handle.*);
+        const source_info: ?SourceInfo = getSourceInfo(provided_handle);
         var file_name: ?Handle = null;
         var line_no: u32 = 1;
         if (source_info) |info| {
             line_no = info.line_no;
-
-            if (info.file_name) |unwrapped| {
-                file_name = unwrapped.borrow();
-            }
+            file_name = Handle.borrowOptional(info.file_name);
         }
-        defer if (file_name) |unwrapped| unwrapped.decrRefCount();
+        defer if (file_name) |val| val.decrRefCount();
 
-        const str = try Heap.getString(handle.*);
+        const str = try Heap.getString(provided_handle);
         var parser = Tokenizer.init(str, line_no);
 
         // Figure out how many tokens there are, so we can create the correct list size
-        // in the heap.
+        // in the heap.file_name
         var tokens: std.ArrayList(Tokenizer.Token) = .empty;
         defer tokens.deinit(Heap.local_heap.gpa);
 
@@ -889,12 +936,11 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
         }
 
         // TODO PERF: reuse the object backing if it was allocated with more than one object.
-        const new_list = try newListWithCapacity(@intCast(tokens.items.len));
-        new_list.peek().body.list.len = @intCast(tokens.items.len);
-        errdefer new_list.decrRefCount();
+        const new_handle = try newListWithCapacity(@intCast(tokens.items.len));
+        errdefer new_handle.decrRefCount();
 
         for (tokens.items, 0..) |token, i| {
-            const item = listItem(new_list, @intCast(i));
+            const item = listItem(new_handle, @intCast(i));
 
             if (token.tag == .simple_string) {
                 // Normal string, so no escaping needed.
@@ -904,18 +950,11 @@ pub fn shimmerToList(det: ?*ErrorDetails, handle: *Handle) !void {
                 try setStringFromEscaped(item, str[token.loc.start..token.loc.end]);
             }
 
-            if (source_info) |info| {
-                try setSourceInfo(item, .{
-                    .file_name = info.file_name,
-                    .line_no = token.loc.line_no,
-                });
-            }
+            try setSourceInfo(item, .{ .file_name = file_name, .line_no = token.loc.line_no });
         }
-        new_list.peek().body.list.len = @intCast(tokens.items.len);
 
-        const old_handle = handle.*;
-        handle.* = new_list;
-        old_handle.decrRefCount();
+        new_handle.peek().body.list.len = @intCast(tokens.items.len);
+        return new_handle;
     }
 }
 
@@ -968,23 +1007,21 @@ pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
     return handle.getHeap().objectSlice(handle.index + 1, handle.index + 1 + len);
 }
 
-/// Returns whether a reindex is needed.
-fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
-    const obj = handle.peek();
-
+fn setCollectionLength(provided_handle: Handle, new_len: u32) !struct { new_handle: ?Handle, reindex_needed: bool } {
     const current_len = blk: {
-        switch (obj.tag) {
-            .list => break :blk obj.body.list.len,
-            .dict => break :blk handle.getHeap().getExtraData(obj.body.dict).dict.len,
+        switch (provided_handle.peek().tag) {
+            .list => break :blk provided_handle.peek().body.list.len,
+            .dict => break :blk dictGetMetadata(provided_handle).len,
             else => unreachable,
         }
     };
 
-    if (current_len == new_len) return false;
+    // If it's the same length, no need to do anything.
+    if (current_len == new_len) return .{ .new_handle = null, .reindex_needed = false };
 
     new_collection_needed: {
-        // We can only do these quick changes if the collection is not shared.
-        if (!handle.canModify()) break :new_collection_needed;
+        // We can only do these quick changes if the collection can mutate in-place.
+        if (!provided_handle.canMutate()) break :new_collection_needed;
 
         // No need to realloc if we're shrinking.
         if (new_len < current_len) {
@@ -992,95 +1029,95 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             // split this collection and create a new one.
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItem(handle.*, @intCast(current_len - freed_count + to_free));
+                const to_free_handle = listItem(provided_handle, @intCast(current_len - freed_count + to_free));
                 if (to_free_handle.isShared()) break :new_collection_needed;
             }
 
             // Be sure to free the abandoned items when we shrink.
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItem(handle.*, @intCast(current_len - freed_count + to_free));
-                if (obj.tag == .dict and @mod(to_free, 2) == 0) {
+                const to_free_handle = listItem(provided_handle, @intCast(current_len - freed_count + to_free));
+                if (provided_handle.peek().tag == .dict and @mod(to_free, 2) == 0) {
                     // If a dict, be sure to remove the keys from the table.
-                    _ = handle.getHeap().getExtraData(obj.body.dict).dict.table.remove(to_free_handle);
+                    dictGetMetadata(provided_handle).table.remove(to_free_handle);
                 }
 
                 to_free_handle.invalidateBoth();
             }
 
-            switch (obj.tag) {
-                .list => obj.body.list.len = new_len,
-                .dict => handle.getHeap().getExtraData(obj.body.dict).dict.len = new_len,
+            switch (provided_handle.peek().tag) {
+                .list => provided_handle.peek().body.list.len = new_len,
+                .dict => dictGetMetadata(provided_handle).dict.len = new_len,
                 else => unreachable,
             }
 
-            return false;
+            return .{ .new_handle = null, .reindex_needed = false };
         } else {
             // Even if there's not enough length, there may be enough capacity.
-            const capacity = memutil.getOrderSize(handle.getMetadata().order) - 1; // -1 for list head
+            const capacity = memutil.getOrderSize(provided_handle.getMetadata().order) - 1; // -1 for list head
             if (new_len <= capacity) {
-                switch (obj.tag) {
-                    .list => obj.body.list.len = new_len,
-                    .dict => dictGetMetadata(handle.*).len = new_len,
+                switch (provided_handle.peek().tag) {
+                    .list => provided_handle.peek().body.list.len = new_len,
+                    .dict => dictGetMetadata(provided_handle).len = new_len,
                     else => unreachable,
                 }
 
-                return false;
+                return .{ .new_handle = null, .reindex_needed = false };
             }
         }
     }
 
     // We've exhausted all other options, so we'll need to make a new collection.
-    const new_handle = switch (obj.tag) {
+    const new_handle = switch (provided_handle.peek().tag) {
         .list => try newListWithCapacity(new_len),
         .dict => try newDictWithCapacity(new_len),
         else => unreachable,
     };
-    errdefer Heap.freeObject(new_handle);
+    errdefer new_handle.decrRefCount();
     const new_items = collectionItems(new_handle, new_len);
 
-    // Why `Heap.local_heap.heapId() == handle.heap`? Because we can't steal the old collection's
-    // objects if they reference another heap's strings.
-    if (handle.canModify() and Heap.local_heap.heapId() == handle.heap) {
+    // Why `Heap.local_heap.heapId() == provided_handle.heap`? Because we can't steal the old
+    // collection's objects if they reference another heap's strings.
+    if (provided_handle.canMutate() and Heap.local_heap.heapId() == provided_handle.heap) {
         var found_shared_items = false;
 
         // If the collection isn't shared, we can move the objects over without any duplication.
         for (new_items[0..current_len], 0..) |*new_item, i| {
-            const item_handle = collectionItem(handle.*, @intCast(i), current_len);
-            // However, if an item within the list was shared, we can't move it, we have to reference
+            const old_item = collectionItem(provided_handle, @intCast(i), current_len);
+            // However, if an item within the list was shared, we can't move it, we instead have to reference
             // it. (Why not use `item_handle.reference()`? Because that would create one too many references
             // as the list already has one ref count for owning the item.)
-            if (item_handle.isShared()) {
+            if (old_item.isShared()) {
                 found_shared_items = true;
                 new_item.* = .{
                     .str = Heap.Object.null_string,
                     .tag = .reference,
-                    .body = .{ .reference = item_handle },
+                    .body = .{ .reference = old_item },
                 };
             } else {
-                new_item.* = item_handle.peek().*;
-                item_handle.peek().tag = .marked;
+                new_item.* = old_item.peek().*;
+                old_item.peek().tag = .marked;
             }
         }
 
         // Free the old collection without running destructors (because the objects are
         // still in use, as we just transferred them). However, for dicts we still need
         // to free the extra data.
-        if (handle.peek().tag == .dict) {
-            const old_dict_metadata = dictGetMetadata(handle.*);
-            old_dict_metadata.table.deinit(handle.getHeap().gpa);
-            handle.getHeap().destroyExtraData(handle.peek().body.dict);
+        if (provided_handle.peek().tag == .dict) {
+            const old_dict_metadata = dictGetMetadata(provided_handle.*);
+            old_dict_metadata.table.deinit(provided_handle.getHeap().gpa);
+            provided_handle.getHeap().destroyExtraData(provided_handle.peek().body.dict);
         }
 
         if (found_shared_items) {
             // Because we found shared items, we can't free the backing directly, as that would
             // free an item that someone else is currently referencing. Instead, we'll split the
             // allocation, and free all non-marked objects.
-            handle.getHeap().splitAlloc(handle.index, 0);
+            provided_handle.getHeap().splitAlloc(provided_handle.index, 0);
 
             for (0..current_len) |i| {
                 const item_handle: Handle = .{
-                    .index = @intCast(handle.index + 1 + i),
-                    .heap = handle.heap,
+                    .index = @intCast(provided_handle.index + 1 + i),
+                    .heap = provided_handle.heap,
                 };
 
                 // Only free the backing marked items, so we don't release the backing of a shared item.
@@ -1091,9 +1128,9 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             }
 
             // Be sure to free the old head backing too.
-            Heap.freeObjectBacking(handle.*);
+            Heap.freeObjectBacking(provided_handle);
         } else {
-            Heap.freeObjectBacking(handle.*);
+            Heap.freeObjectBacking(provided_handle);
         }
 
         switch (new_handle.peek().tag) {
@@ -1101,13 +1138,11 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             .list => new_handle.peek().body.list.len = new_len,
             else => unreachable,
         }
-        handle.* = new_handle;
     } else {
         // If the collection is shared, we need to duplicate all the items.
         for (0.., new_items) |i, *new_item| {
-            new_item.* = try Heap.dupOrReference(
-                Heap.local_heap,
-                collectionItemFollowRefs(handle.*, @intCast(i), current_len),
+            new_item.* = try Heap.local_heap.dupOrReference(
+                collectionItemFollowRefs(provided_handle, @intCast(i), current_len),
             );
         }
 
@@ -1116,13 +1151,12 @@ fn setCollectionLength(handle: *Handle, new_len: u32) !bool {
             .list => new_handle.peek().body.list.len = new_len,
             else => unreachable,
         }
-        const old_handle = handle.*;
-        handle.* = new_handle;
-        old_handle.decrRefCount();
     }
 
-    if (handle.peek().tag == .dict) return true;
-    return false;
+    return .{
+        .new_handle = new_handle,
+        .reindex_needed = new_handle.peek().tag == .dict,
+    };
 }
 
 /// Assumes provided handle is a list.
@@ -1149,29 +1183,25 @@ pub fn listItems(handle: Handle) []Heap.Object {
     return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..list.body.list.len];
 }
 
-pub fn listSetItem(det: ?*ErrorDetails, handle: *Handle, index: u32, value: Handle) !void {
-    // Be sure to acquire the value first thing, so it doesn't potentially get
-    // freed as we do the following list transformations.
-    var new_value = try Heap.local_heap.dupOrReference(value);
-    errdefer new_value.deinitBodySingle(Heap.local_heap);
-
-    const length = try listLength(det, handle);
+/// Returns a new list if the list had to move.
+pub fn listSetObject(det: ?*ErrorDetails, provided_list: Handle, index: u32, value: Heap.Object) !?Handle {
+    const length = try listLength(det, provided_list);
     if (index > length) return error.OutOfBounds;
 
-    try Heap.prepareForModification(handle);
-    if (listItem(handle.*, index).isShared()) {
-        const before_dup = handle.*;
-        // We need to create a new list if one of the items is shared.
-        handle.* = try Heap.local_heap.duplicate(handle.*);
-        before_dup.decrRefCount();
-    }
+    const new_list: ?Handle = blk: {
+        if (!provided_list.canMutate() or listItem(provided_list, index).isShared()) {
+            break :blk provided_list.getHeap().duplicate(provided_list);
+        }
+    };
+    errdefer if (new_list) |val| val.decrRefCount();
+    const list = new_list orelse provided_list;
 
     // We know that this index is now safe to modify.
-    const item = listItem(handle.*, index);
+    const item = listItem(list.*, index);
     assert(!item.isShared());
 
     item.invalidateBoth();
-    item.peek().* = new_value;
+    item.peek().* = value;
 }
 
 pub fn listAppendObject(det: ?*ErrorDetails, handle: *Handle, item: Heap.Object) !u32 {
@@ -1247,7 +1277,7 @@ pub fn dictGetMetadata(dict: Handle) *Heap.ExtraData.Dictionary {
     return &dict.getHeap().getExtraData(dict.peek().body.dict).dict;
 }
 
-pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle) !void {
+pub fn shimmerToDict(det: ?*ErrorDetails, handle: *Handle, flags: struct { free_old: bool }) !void {
     if (handle.peek().tag == .dict) return;
 
     // Getting the list length will also shimmer it to a list.
@@ -1539,7 +1569,12 @@ fn dictRemoveDuplicates(handle: *Handle, to_track: ?u32) !?u32 {
 
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
 /// `value` must be in `Heap.local_heap`.
-pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handle {
+pub fn dictPutInner(dict: *Handle, key: Handle, value: Heap.Object, flags: struct {
+    free_old_dict: bool,
+    /// Whether to free the last contents of the key's value, or whether to overwrite it.
+    /// You probably want to free the last contents unless you were just tamerping with them.
+    free_old_value: bool,
+}) !Heap.Handle {
     assert(dict.peek().tag == .dict);
 
     // Make sure we borrow the key, so it doesn't get freed if the old dictionary gets freed.
@@ -1548,7 +1583,8 @@ pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handl
     // Also, make sure the key has a string representation.
     _ = try Heap.getString(key);
 
-    try Heap.prepareForModification(dict);
+    const initial_dict = dict.*;
+    try Heap.prepareForModification(dict, .{ .free_old = flags.free_old_dict });
 
     assert(dict.heap == Heap.local_heap.heapId());
     var metadata = dictGetMetadata(dict.*);
@@ -1568,16 +1604,20 @@ pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handl
                 // Looks like this dictionary value is shared, so we can't replace the value in place
                 // (else we'd smash up a value someone else is using). Instead, we'll start this whole
                 // process over with a new dictionary.
-                const before_dup = dict.*;
-                dict.* = try Heap.local_heap.duplicate(dict.*);
-                before_dup.decrRefCount();
+
+                if (initial_dict != dict.*) {
+                    // Don't accidentally leave an intermediate dict value leaking.
+                    dict.swapWithDup(.{ .free_old = true });
+                } else {
+                    dict.swapWithDup(.{ .free_old = flags.free_old_dict });
+                }
 
                 // Reload the value handle and metadata, since we have a new dict.
                 value_handle = dictItem(dict.*, existing_value);
                 metadata = dictGetMetadata(dict.*);
             }
             assert(!value_handle.isShared());
-            value_handle.invalidateBoth();
+            if (flags.free_old_value) value_handle.invalidateBoth();
             value_handle.peek().* = value;
 
             break :blk existing_value;
@@ -1632,9 +1672,18 @@ pub fn dictPutObject(dict: *Handle, key: Handle, value: Heap.Object) !Heap.Handl
     return dictItem(dict.*, value_index);
 }
 
+pub fn dictPutRecursively(det: ?*ErrorDetails, dict: *Handle, keys: []Handle, value: Heap.Object) void {
+    try shimmerToDict(det, dict);
+    assert(keys.len > 0);
+
+    if (keys.len == 1) {
+        try dictPutInner(dict, keys[0], value);
+    }
+}
+
 /// Assumes `handle` is a dict.
 pub fn dictPut(dict: *Handle, key: Handle, value: Handle) !Heap.Handle {
-    return dictPutObject(dict, key, try Heap.local_heap.dupOrReference(value));
+    return dictPutInner(dict, key, try Heap.local_heap.dupOrReference(value));
 }
 
 /// Returns true if the value was removed, or false if the value doesn't exist.
@@ -1791,7 +1840,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer dict_edge_cases.decrRefCount();
     // Try using a value as a key, and a key as the value while not shared (this is to check
     // that this handles using internal objects correctly).
-    assert(dict_edge_cases.canModify());
+    assert(dict_edge_cases.canMutate());
     _ = try dictPut(&dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 1), dictItemFollowRefs(dict_edge_cases, 2));
     try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, value1)).?));
 
@@ -2195,7 +2244,7 @@ pub fn shimmerToScript(det: ?*ErrorDetails, handle: *Handle) !void {
         .generation = script_id.generation,
     });
 
-    try Heap.prepareToShimmer(handle);
+    try Heap.prepareForShimmering(handle);
     const obj = handle.peek();
     obj.body.script = .{ .id = script_id };
     obj.tag = .script;
@@ -2300,7 +2349,7 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, handle: *Handle) !void {
     errdefer if (file_name) |val| val.decrRefCount();
     const line_no = source_info.line_no;
 
-    try Heap.prepareToShimmer(handle);
+    try Heap.prepareForShimmering(handle);
 
     // Parse all the tokens of the expr, handling any errors that come up.
     const bytes = try Heap.getString(handle.*);
@@ -2407,7 +2456,7 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
     // Fast case: if it's an int, we can get the value directly.
     if (handle.peek().tag == .integer) {
         const new_value = handle.peek().body.integer != 0;
-        try Heap.prepareToShimmer(handle);
+        try Heap.prepareForShimmering(handle);
         handle.peek().tag = .bool;
         handle.peek().body.bool = new_value;
     }
@@ -2430,7 +2479,7 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, handle: *Handle) !void {
         break :blk as_int != 0;
     };
 
-    try Heap.prepareToShimmer(handle);
+    try Heap.prepareForShimmering(handle);
     handle.peek().tag = .bool;
     handle.peek().body.bool = new_value;
 }

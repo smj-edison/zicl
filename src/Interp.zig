@@ -273,7 +273,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
         // Add variable.
         interp.heap.setTempObjectString(trimmed);
         defer interp.heap.resetTempObject();
-        const new_value = try object.dictPutObject(&interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
+        const new_value = try object.dictPutInner(&interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
@@ -283,7 +283,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
         };
     } else {
         // Add variable.
-        const new_value = try object.dictPutObject(&call_frame.variables, name, value);
+        const new_value = try object.dictPutInner(&call_frame.variables, name, value);
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
@@ -306,7 +306,7 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
 
                 const old_variables_handle = var_call_frame.variables; // Copy
                 const new_value_handle = blk: {
-                    const potentially_ref = try object.dictPutObject(&var_call_frame.variables, name, value);
+                    const potentially_ref = try object.dictPutInner(&var_call_frame.variables, name, value);
                     if (potentially_ref.peek().tag == .reference) {
                         break :blk potentially_ref.peek().body.reference;
                     } else {
@@ -1025,7 +1025,7 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Handle) 
 
     // Cache the command.
     if (command_index) |index| {
-        try Heap.prepareToShimmer(handle);
+        try Heap.prepareForShimmering(handle);
         handle.peek().tag = .command;
 
         if (current_namespace) |namespace| {
@@ -1780,7 +1780,7 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
                     args = try args_alloc.realloc(args, args.len - 1 + len);
                 }
 
-                assert(resultant_word.canModify());
+                assert(resultant_word.canMutate());
                 for (0..len) |list_idx| {
                     // Steal each object from the list.
                     args[args_written] = try Heap.steal(object.listItem(resultant_word, @intCast(list_idx)));
@@ -1917,17 +1917,17 @@ pub fn listAppend(interp: *Interp, list: *Handle, item: Handle) Interp.Error!Han
 }
 
 pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) Interp.Error!void {
-    try Heap.prepareToShimmer(name);
+    try Heap.prepareForShimmering(name);
     return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, obj);
 }
 
 pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) Interp.Error!void {
-    try Heap.prepareToShimmer(name);
+    try Heap.prepareForShimmering(name);
     return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, try Heap.local_heap.dupOrReference(handle));
 }
 
 pub fn getVariable(interp: *Interp, name: *Handle) Interp.Error!?Handle {
-    try Heap.prepareToShimmer(name);
+    try Heap.prepareForShimmering(name);
     return interp.getVariableImpl(null, name.*) catch |err| switch (err) {
         error.VariableNotFound => return null,
         else => return err,
@@ -1935,7 +1935,7 @@ pub fn getVariable(interp: *Interp, name: *Handle) Interp.Error!?Handle {
 }
 
 pub fn getVariableOrError(interp: *Interp, name: *Handle) Interp.Error!Handle {
-    try Heap.prepareToShimmer(name);
+    try Heap.prepareForShimmering(name);
     var det: object.ErrorDetails = undefined;
     return interp.wrapError(&det, interp.getVariableImpl(&det, name.*));
 }
@@ -2007,8 +2007,7 @@ pub fn putDictValue(interp: *Interp, dict: *Handle, key: Handle, value: Handle) 
 pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle, value: Handle) Interp.Error!Handle {
     assert(keys.len > 0);
     if (keys.len == 1) {
-        const new_value_handle = try interp.putDictValue(dict, keys[0], value);
-        return new_value_handle;
+        return try interp.putDictValue(dict, keys[0], value);
     }
 
     const dict_value = blk: {
@@ -2026,6 +2025,9 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
     // Note: we do not use `try` when calling `getDictValueRecursively`, because
     // `new_next_dict` may change even if `getDictValueRecursively` returns an error.
     const value_handle = interp.putDictValueRecursively(&new_dict_value, keys[1..], value);
+
+    dict.invalidateString();
+
     if (dict_value != new_dict_value) {
         assert(new_dict_value.peek().tag == .dict);
         // Why do we have `dict_value.incrRefCount()`? Because let's remember
@@ -2048,15 +2050,52 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
         new_dict_value.decrRefCount();
     }
 
-    // Because a sub-dictionary changed, we need to invalidate our current string.
-    dict.invalidateString();
-
     return value_handle;
 }
 
-// pub fn removeDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle, value: Handle) Interp.Error!Handle {
-//     assert(keys.len > 0);
-// }
+pub fn removeDictValue(interp: *Interp, dict: *Handle, key: Handle) !bool {
+    var det: object.ErrorDetails = undefined;
+    try interp.wrapError(&det, object.shimmerToDict(&det, dict));
+    return try object.dictRemove(dict, key);
+}
+
+pub fn removeDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle) Interp.Error!bool {
+    assert(keys.len > 0);
+
+    var det: object.ErrorDetails = undefined;
+    try interp.wrapError(&det, object.shimmerToDict(&det, dict));
+
+    if (keys.len == 1) {
+        return try interp.removeDictValue(dict, keys[0]);
+    }
+
+    if (try interp.getDictValue(dict, keys[0])) |next_dict| {
+        var new_next_dict = next_dict;
+        // Note: we do not use `try` when calling `removeDictValueRecursively`, because
+        // `new_next_dict` may change even if `removeDictValueRecursively` returns an error.
+        const removed = interp.removeDictValueRecursively(&new_next_dict, keys[1..]);
+
+        // // If the recursive call created a new dict but then failed, clean it up.
+        // errdefer if (next_dict_borrowed != new_next_dict) new_next_dict.decrRefCount();
+
+        if (next_dict != new_next_dict) { // COW
+            // See explanation in `putDictValueRecursively` for why we do this reference
+            // counting dance.
+            new_next_dict.incrRefCount();
+            // Recursively propagate the new dict up through the parent dicts.
+            _ = try interp.putDictValue(dict, keys[0], new_next_dict);
+            // Because our child dict changed, we need to regenerate our string.
+            dict.invalidateString();
+        } else if (try removed) {
+            dict.invalidateString();
+        }
+
+        return removed;
+    } else {
+        // Intermediate dictionary doesn't exist, so nothing to remove.
+        return false;
+    }
+}
 
 test "recursive dict keys" {
     defer Heap.testFinish();
@@ -2093,6 +2132,102 @@ test "recursive dict keys" {
 
     const value = try interp.getDictValueRecursively(&dict, &.{ key_foo, key_bar });
     try testing.expectEqualStrings("foo", try Heap.getString(value.?));
+}
+
+fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
+    defer Heap.testFinish();
+    const heap = try Heap.testStart(ta);
+    var interp = try Interp.init();
+    defer interp.deinit();
+
+    var dict = try object.newDict(heap, &.{});
+    defer dict.decrRefCount();
+    var key_foo = try object.newString(heap, "foo");
+    defer key_foo.decrRefCount();
+    var key_bar = try object.newString(heap, "bar");
+    defer key_bar.decrRefCount();
+    var key_baz = try object.newString(heap, "baz");
+    defer key_baz.decrRefCount();
+    const value_qux = try object.newString(heap, "qux");
+    defer value_qux.decrRefCount();
+
+    // Test 1: Remove a deeply nested value (3 levels).
+    _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz }, value_qux);
+    try testing.expectEqualStrings("foo {bar {baz qux}}", try Heap.getString(dict));
+    var removed: bool = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz });
+    try testing.expect(removed);
+    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+
+    // Test 2: Try to remove the same key again (should return false).
+    removed = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz });
+    try testing.expect(!removed);
+    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+
+    // Test 3: Remove a non-existent key from an existing intermediate dict.
+    removed = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar, key_foo });
+    try testing.expect(!removed);
+    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+
+    // Test 4: Remove from a non-existent intermediate dict.
+    removed = try interp.removeDictValueRecursively(&dict, &.{ key_bar, key_baz, key_foo });
+    try testing.expect(!removed);
+    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+
+    // Test 5: Single-level removal (base case).
+    removed = try interp.removeDictValueRecursively(&dict, &.{key_foo});
+    try testing.expect(removed);
+    try testing.expectEqualStrings("", try Heap.getString(dict));
+
+    // Test 6: Two-level removal.
+    _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, value_qux);
+    try testing.expectEqualStrings("foo {bar qux}", try Heap.getString(dict));
+    removed = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar });
+    try testing.expect(removed);
+    try testing.expectEqualStrings("foo {}", try Heap.getString(dict));
+
+    // Test 7: Removal when intermediate dict is shared (copy-on-write).
+    dict.decrRefCount();
+    var interm_test_dict = try object.newDict(heap, &.{});
+    _ = try interp.putDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar, key_baz }, value_qux);
+    _ = try interp.putDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar, key_foo }, value_qux);
+
+    // Borrow the intermediate dict.
+    const intermediate = (try interp.getDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar })).?.borrow();
+
+    const initial_refcount = intermediate.debugRefCount();
+    try testing.expectEqualStrings("baz qux foo qux", try Heap.getString(intermediate));
+
+    // Remove from the nested dict while it's owned elsewhere.
+    removed = try interp.removeDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar, key_baz });
+    try testing.expect(removed);
+
+    // The intermediate dict we own should be unchanged (copy-on-write).
+    try testing.expectEqualStrings("baz qux foo qux", try Heap.getString(intermediate));
+    // But the main dict should have a new copy without 'baz'.
+    const foo_bar_val = try interp.getDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar });
+    try testing.expectEqualStrings("foo qux", try Heap.getString(foo_bar_val.?));
+    // Reference count should drop by 1 since the parent no longer references it.
+    try testing.expectEqual(initial_refcount - 1, intermediate.debugRefCount());
+
+    // Done with intermediate, release it before freeing the parent dict.
+    intermediate.decrRefCount();
+
+    // Test 8: Remove multiple items from a nested dict.
+    dict.decrRefCount();
+    dict = try object.newDict(heap, &.{});
+    _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, value_qux);
+    _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_baz }, value_qux);
+    try testing.expectEqualStrings("foo {bar qux baz qux}", try Heap.getString(dict));
+    removed = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar });
+    try testing.expect(removed);
+    try testing.expectEqualStrings("foo {baz qux}", try Heap.getString(dict));
+    removed = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_baz });
+    try testing.expect(removed);
+    try testing.expectEqualStrings("foo {}", try Heap.getString(dict));
+}
+
+test "recursive dict removal" {
+    try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDictRemoval, .{});
 }
 
 pub fn nextRandomFloat(interp: *Interp) f64 {

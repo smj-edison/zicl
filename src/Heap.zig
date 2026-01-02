@@ -28,7 +28,7 @@ pub const temp_object_idx: u32 = 2;
 pub const HeapSettings = struct {
     use_vmem: bool = true,
     /// Maximum of `1 << heap_order` items.
-    object_heap_order: u6 = 24,
+    object_heap_order: u6 = 16,
     /// Maximum of `1 << heap_order` bytes for all strings.
     string_heap_order: u6 = 28,
     /// Maximum number of custom types.
@@ -671,8 +671,8 @@ pub const Handle = packed struct(u64) {
         return obj_heap.getLocalRefCount(handle.index) > 1;
     }
 
-    pub fn canModify(handle: Handle) bool {
-        // Special objects can never be modified.
+    pub fn canMutate(handle: Handle) bool {
+        // Special objects can never be mutated.
         if (handle.index < special_object_count) return false;
 
         const obj_heap = handle.getHeap();
@@ -685,10 +685,20 @@ pub const Handle = packed struct(u64) {
         if (multiple_refs) return false;
         if (metadata.order > 1) {
             const head = allocHead(handle);
-            if (head != handle) return head.canModify();
+            if (head != handle) return head.canMutate();
         }
 
         return true;
+    }
+
+    pub const SwapFlags = struct {
+        free_old: bool = true,
+    };
+
+    pub fn swapThenReleaseOld(ref: *Handle, new: Handle) !void {
+        const before_duplicating = ref.*;
+        ref.* = new;
+        before_duplicating.decrRefCount();
     }
 
     pub fn hasString(handle: Handle) bool {
@@ -756,13 +766,13 @@ pub const Handle = packed struct(u64) {
     pub fn invalidateBody(handle: Handle) void {
         assert(handle.canShimmer());
 
-        invalidateBodyUnchecked(handle);
+        invalidateBodyInner(handle);
     }
 
     pub fn invalidateString(handle: Handle) void {
-        assert(handle.canModify());
+        assert(handle.canMutate());
 
-        invalidateStringUnchecked(handle);
+        invalidateStringInner(handle);
     }
 
     pub fn decrRefCount(handle: Handle) void {
@@ -770,6 +780,9 @@ pub const Handle = packed struct(u64) {
 
         const metadata = handle.getMetadata();
         const obj_heap = handle.getHeap();
+
+        // We should never go below one for an item owned by another object.
+        assert(handle.isAllocHead() or handle.debugRefCount() > 1);
 
         if (cfg.trace_mem) last_touched = handle;
         if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
@@ -803,12 +816,12 @@ pub const Handle = packed struct(u64) {
     }
 };
 
-fn invalidateBothUnchecked(handle: Handle) void {
-    invalidateStringUnchecked(handle);
-    invalidateBodyUnchecked(handle);
+fn invalidateBothInner(handle: Handle) void {
+    invalidateStringInner(handle);
+    invalidateBodyInner(handle);
 }
 
-fn invalidateStringUnchecked(handle: Handle) void {
+fn invalidateStringInner(handle: Handle) void {
     handle.peek().deinitString(handle.getHeap());
 }
 
@@ -843,12 +856,12 @@ fn invalidateCollection(handle: Handle) void {
             .heap = handle.heap,
         };
 
-        invalidateBothUnchecked(elem_handle);
+        invalidateBothInner(elem_handle);
         if (any_elems_referenced) elem_handle.decrRefCount();
     }
 }
 
-fn invalidateBodyUnchecked(handle: Handle) void {
+fn invalidateBodyInner(handle: Handle) void {
     if (cfg.trace_mem) {
         const trace = &handle.getHeap().objects.items(.trace)[handle.index];
         trace.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, "Invalidate body", .{}) catch unreachable);
@@ -890,7 +903,7 @@ const ObjectAndMetadata = struct {
     object: Object,
     ref_count: u32,
     metadata: Metadata,
-    trace: std.debug.ConfigurableTrace(8, 8, cfg.trace_mem),
+    trace: std.debug.ConfigurableTrace(16, 16, cfg.trace_mem),
 };
 
 fn heapAlloc(self: *Heap) Allocator {
@@ -903,7 +916,7 @@ fn heapAlloc(self: *Heap) Allocator {
 
 fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
     const interned = try heap.createObject();
-    errdefer freeObjectBackingUnchecked(interned);
+    errdefer freeObjectBackingInner(interned);
     const cast_len: u26 = @intCast(str.len);
     const str_index = try heap.createString(cast_len);
     errdefer heap.freeString(str_index, cast_len);
@@ -935,7 +948,7 @@ fn createInternedStrings(heap: *Heap) !void {
             if (i < converted) {
                 const handle: Handle = @field(converted_mapping, key);
                 handle.peek().str.deinit(heap);
-                freeObjectBackingUnchecked(handle);
+                freeObjectBackingInner(handle);
             }
         }
     }
@@ -1032,16 +1045,16 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
     // null object is guaranteed to have index 0.
     const null_object = try heap.createObject();
     assert(null_object.index == null_object_idx);
-    errdefer freeObjectBackingUnchecked(null_object);
+    errdefer freeObjectBackingInner(null_object);
     // Empty object is guaranteed to have index 1.
     const empty_object = try heap.createObject();
     assert(empty_object.index == empty_object_idx);
     empty_object.peek().str = Object.empty_string;
-    errdefer freeObjectBackingUnchecked(empty_object);
+    errdefer freeObjectBackingInner(empty_object);
     // Temp object is guaranteed to have index 2.
     const temp_object = try heap.createObject();
     assert(temp_object.index == temp_object_idx);
-    errdefer freeObjectBackingUnchecked(temp_object);
+    errdefer freeObjectBackingInner(temp_object);
 
     // We need to init the temp object as well by setting its string to a long string.
     assert(try heap.setLongString(temp_object_idx, .{ .temp = "" }));
@@ -1078,21 +1091,21 @@ pub fn deinit(heap: *Heap) void {
             // freeing recursive structures. For example, if there was a list with
             // two items, we'll free the list (first free of items), then free
             // the items individually (second free)
-            invalidateBothUnchecked(heap.getHandle(@intCast(i)));
+            invalidateBothInner(heap.getHandle(@intCast(i)));
         }
     }
 
     for (special_object_count..(special_object_count + interned_string_count)) |i| {
         // Need to free these objects directly, since they're not normally allowed
-        // to be modified.
+        // to be mutated.
         const interned = heap.getHandle(@intCast(i));
         interned.peek().str.deinit(heap);
-        freeObjectBackingUnchecked(interned);
+        freeObjectBackingInner(interned);
     }
 
     // Be sure to free the specialty objects and strings.
     assert(special_object_count == 3);
-    Heap.getStringDetails(heap.tempObject()).long.freeUnchecked(heap.gpa);
+    Heap.getStringDetails(heap.tempObject()).long.freeInner(heap.gpa);
     heap.object_tracking.freeFromOwningThread(0, 0);
     heap.object_tracking.freeFromOwningThread(1, 0);
     heap.object_tracking.freeFromOwningThread(2, 0);
@@ -1159,7 +1172,8 @@ pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
     // extremely unlikely for its ref_count to reach zero.
     long_string.ref_count = std.math.maxInt(usize) / 2;
     // Reset anything that may have previously been computed.
-    long_string.utf8_length = null;
+    @atomicStore(u64, &long_string.utf8_length, std.math.maxInt(u64), .monotonic);
+    long_string.utf8_length = std.math.maxInt(u64);
     long_string.hash = null;
 
     long_string.string_type = .{
@@ -1300,7 +1314,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     return index;
 }
 
-fn freeObjectBackingUnchecked(handle: Handle) void {
+fn freeObjectBackingInner(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
 
@@ -1343,52 +1357,50 @@ pub fn freeObjectBacking(handle: Handle) void {
     if (!handle.isAllocHead()) Heap.dumpLastTouchedTrace();
     assert(handle.isAllocHead());
 
-    freeObjectBackingUnchecked(handle);
+    freeObjectBackingInner(handle);
 }
 
 pub fn freeObject(handle: Handle) void {
-    invalidateBothUnchecked(handle);
+    invalidateBothInner(handle);
 
     freeObjectBacking(handle);
 }
 
-/// If the object can't be modified, this will duplicate and release
-/// the old object.
-pub fn prepareForModification(handle: *Handle) !void {
-    if (!handle.canModify()) {
+pub fn ensureMutableOrDup(handle: Handle) !?Handle {
+    if (!handle.canMutate()) {
         // It's very sketchy to modify a collection item in place if
         // its parent is shared, so if this isn't the head this is
         // probably incorrect.
         assert(handle.isAllocHead());
-
-        const before_duplicating = handle.*;
-        handle.* = try local_heap.duplicate(handle.*);
-        before_duplicating.decrRefCount();
+        return local_heap.duplicate(handle);
     }
+}
+
+/// If the object can't shimmer, this will return a duplicate.
+pub fn ensureShimmerableOrDup(handle: Handle) !?Handle {
+    if (!handle.canShimmer()) return local_heap.duplicate(handle);
+    return null;
+}
+
+pub fn ensureSameHeapOrDup(handle: Handle) !?Handle {
+    if (handle.heap != local_heap.heapId()) return local_heap.duplicate(handle);
+    return null;
+}
+
+/// If the object can't be mutated, this will duplicate and release
+/// the old object. This will also invalidate the current string.
+pub fn prepareForMutation(handle: *Handle) !void {
+    if (ensureMutableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
 
     handle.invalidateString();
 }
 
-/// If the object can't be shimmered, this will duplicate and release
-/// the old object. This also invalidates the object's body.
-pub fn prepareToShimmer(handle: *Handle) !void {
-    if (!handle.canShimmer()) {
-        const before_duplicating = handle.*;
-        handle.* = try local_heap.duplicate(handle.*);
-        before_duplicating.decrRefCount();
-    }
+pub fn prepareForShimmering(handle: *Handle) !void {
+    if (ensureShimmerableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
 
-    // Make sure it has a string rep before invalidating it.
+    // Make sure it has a string rep before invalidating its body.
     _ = try Heap.getString(handle.*);
     handle.invalidateBody();
-}
-
-pub fn ensureSameHeap(handle: *Handle) !void {
-    if (handle.heap != local_heap.heapId()) {
-        const before_duplicating = handle.*;
-        handle.* = try local_heap.duplicate(handle.*);
-        before_duplicating.decrRefCount();
-    }
 }
 
 /// Get a string slice from heap string storage
@@ -1484,7 +1496,7 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
 ///  * This can't be used with a shared object.
 pub fn steal(handle: Handle) !Handle {
     assert(local_heap.heapId() == handle.heap);
-    assert(handle.canModify());
+    assert(handle.canMutate());
 
     const new_obj = try local_heap.createObject();
     new_obj.peek().* = handle.peek().*;
@@ -1808,11 +1820,7 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
 /// Get the string to modify (must not write any longer than current len).
 /// Not threadsafe.
 pub fn getStringMut(handle: Handle) ![:0]u8 {
-    const heap = handle.getHeap();
-    _ = try heap.getLocalString(handle.index); // generate rep
-
-    const obj = heap.getLocalObject(handle.index);
-    switch (heap.getLocalStringDetails(handle.peek().str)) {
+    switch (Heap.getStringDetails(handle.peek().str)) {
         .long => |long_str| {
             switch (long_str.string_type) {
                 .normal => |normal| return normal,
@@ -1821,8 +1829,8 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
             }
         },
         .normal => {
-            const str = obj.str.u.str;
-            return heap.getHeapString(str.index, str.index + str.len);
+            const str = handle.peek().str.u.str;
+            return handle.getHeap().getHeapString(str.index, str.index + str.len);
         },
         .null, .empty => return error.NotMutable,
     }
@@ -1888,7 +1896,7 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
 
 /// Returns whether the heap took ownership. It may copy the bytes into
 /// the heap, so it can succeed while also not taking ownership.
-pub fn setStringOwning(handle: Handle, bytes: [:0]u8) !bool {
+pub fn setStringOwning(handle: Handle, bytes: [:0]u8) error{OutOfMemory}!bool {
     const heap = handle.getHeap();
 
     if (try heap.setNormalString(handle.index, bytes)) {
@@ -1956,7 +1964,7 @@ pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allo
 }
 
 const empty_string_value = "";
-/// This returns a temporary string. Whenever the object is modified, it
+/// This returns a temporary string. Whenever the object is mutated, it
 /// may become invalid.
 fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     const obj: *Object = self.getLocalObject(index);
@@ -2045,8 +2053,12 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
     };
 
-    const took_ownership = try setStringOwning(self.getHandle(index), new_str);
-    if (!took_ownership) self.gpa.free(new_str);
+    // Ensure new_str is freed if setStringOwning fails (e.g., OOM during LongString allocation).
+    {
+        errdefer self.gpa.free(new_str);
+        const took_ownership = try setStringOwning(self.getHandle(index), new_str);
+        if (!took_ownership) self.gpa.free(new_str);
+    }
 
     // Rerun this function to figure out where the new string is
     return self.getLocalString(index);
@@ -2220,8 +2232,13 @@ pub const LongString = struct {
     };
 
     string_type: Type,
-    utf8_length: ?u64,
-    hash: ?u256 = null,
+    /// Length has not been determined if == maxInt(u64). Be sure to use
+    /// atomics!
+    utf8_length: u64 = std.math.maxInt(u64),
+    hash: struct {
+        value: ?u256,
+        mutex: memutil.Mutex,
+    },
     ref_count: usize,
 
     pub fn fromInt(int: u58) *align(align_amt) LongString {
@@ -2233,16 +2250,31 @@ pub const LongString = struct {
     }
 
     pub fn getHash(self: *align(align_amt) LongString) u256 {
-        if (self.hash) |hash| {
+        self.hash.mutex.lock();
+        defer self.hash.mutex.unlock();
+
+        if (self.hash.value) |hash| {
             return hash;
         } else {
-            var out: [32]u8 = [_]u8{0} ** 32;
+            var out: [32]u8 = @splat(0);
             std.crypto.hash.Blake3.hash(self.getString(), &out, .{});
 
             const hash: u256 = @bitCast(out);
-            self.hash = hash;
+            self.hash.value = hash;
             return hash;
         }
+    }
+
+    pub fn getUtf8Length(self: *align(align_amt) LongString) ?u64 {
+        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
+        if (value == std.math.maxInt(u64)) return null else return value;
+    }
+
+    /// Value is u64, not ?u64, since utf8 length should not ever
+    /// change (excluding LongString temp strings).
+    pub fn setUtf8Length(self: *align(align_amt) LongString, value: u64) void {
+        assert(value != std.math.maxInt(u64));
+        @atomicStore(u64, &self.utf8_length, value, .monotonic);
     }
 
     pub fn getString(self: *align(align_amt) LongString) [:0]const u8 {
@@ -2259,11 +2291,11 @@ pub const LongString = struct {
 
     pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
         if (decrRefCountOf(usize, &self.ref_count, options.threading)) {
-            self.freeUnchecked(gpa);
+            self.freeInner(gpa);
         }
     }
 
-    pub fn freeUnchecked(self: *align(align_amt) LongString, gpa: Allocator) void {
+    pub fn freeInner(self: *align(align_amt) LongString, gpa: Allocator) void {
         switch (self.string_type) {
             .normal => |string| gpa.free(string),
             .different_capacity => |info| {
