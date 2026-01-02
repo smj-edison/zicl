@@ -701,6 +701,15 @@ pub const Handle = packed struct(u64) {
         before_duplicating.decrRefCount();
     }
 
+    /// Helper to swap handle if new_handle is non-null, releasing the old one.
+    pub fn swapIfNew(ref: *Handle, new_handle: ?Handle) void {
+        if (new_handle) |new| {
+            const old = ref.*;
+            ref.* = new;
+            old.decrRefCount();
+        }
+    }
+
     pub fn hasString(handle: Handle) bool {
         return handle.peek().str != Object.null_string;
     }
@@ -1174,7 +1183,9 @@ pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
     // Reset anything that may have previously been computed.
     @atomicStore(u64, &long_string.utf8_length, std.math.maxInt(u64), .monotonic);
     long_string.utf8_length = std.math.maxInt(u64);
-    long_string.hash = null;
+    long_string.hash.mutex.lock();
+    long_string.hash.value = null;
+    long_string.hash.mutex.unlock();
 
     long_string.string_type = .{
         .temp = bytes,
@@ -1372,31 +1383,32 @@ pub fn ensureMutableOrDup(handle: Handle) !?Handle {
         // its parent is shared, so if this isn't the head this is
         // probably incorrect.
         assert(handle.isAllocHead());
-        return local_heap.duplicate(handle);
+        return try local_heap.duplicate(handle);
     }
+    return null;
 }
 
 /// If the object can't shimmer, this will return a duplicate.
 pub fn ensureShimmerableOrDup(handle: Handle) !?Handle {
-    if (!handle.canShimmer()) return local_heap.duplicate(handle);
+    if (!handle.canShimmer()) return try local_heap.duplicate(handle);
     return null;
 }
 
 pub fn ensureSameHeapOrDup(handle: Handle) !?Handle {
-    if (handle.heap != local_heap.heapId()) return local_heap.duplicate(handle);
+    if (handle.heap != local_heap.heapId()) return try local_heap.duplicate(handle);
     return null;
 }
 
 /// If the object can't be mutated, this will duplicate and release
 /// the old object. This will also invalidate the current string.
 pub fn prepareForMutation(handle: *Handle) !void {
-    if (ensureMutableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
+    if (try ensureMutableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
 
     handle.invalidateString();
 }
 
 pub fn prepareForShimmering(handle: *Handle) !void {
-    if (ensureShimmerableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
+    if (try ensureShimmerableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
 
     // Make sure it has a string rep before invalidating its body.
     _ = try Heap.getString(handle.*);
