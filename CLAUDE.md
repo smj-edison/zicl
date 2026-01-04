@@ -106,8 +106,10 @@ Objects automatically "shimmer" between types, maintaining cached representation
 4. **Shimmering Rules**:
 
     - Objects can only shimmer if not shared between threads (`canShimmer()` checks this)
-    - Use `prepareToShimmer()` to duplicate if necessary before type conversion
+    - Shimmer functions take `Handle` by value and return `!?Handle` (optional new handle if duplicated)
+    - Use `Handle.swapIfNew(new_handle)` to update handle references when shimmer returns a new handle
     - Shimmering invalidates the old body but preserves string rep when possible
+    - Helper functions: `Heap.ensureShimmerableOrDup()`, `Heap.ensureMutableOrDup()` check if duplication is needed
 
 5. **Collections (Lists/Dicts)**: Stored as contiguous object arrays. First object is head (contains metadata), subsequent objects are items. Cannot reference individual items externally (they're not ref-counted), but `borrow()` accounts for this.
 
@@ -171,11 +173,31 @@ defer list.release();
 const item = object.listItemRaw(list, 0); // Non-owning handle
 ```
 
-**Type Shimmering**:
+**Type Shimmering** (value-based API):
 
 ```zig
-try object.shimmerToList(heap, &det, &handle);
+// Shimmer functions take Handle by value and return optional new handle
+const new_handle = try object.shimmerToList(&det, handle);
+handle.swapIfNew(new_handle);  // Update if shimmer created a duplicate
 // handle is now a list type
+
+// For wrapper functions that return both new handle and value:
+const result = try object.getBoolean(&det, handle);
+handle.swapIfNew(result.new_handle);
+const value = result.value;
+```
+
+**Handle Update Pattern**:
+
+```zig
+// When a function returns !?Handle (shimmer functions):
+const new_handle = try shimmerToInteger(&det, my_handle);
+my_handle.swapIfNew(new_handle);  // Automatically releases old and swaps if needed
+
+// When a function returns struct { new_handle: ?Handle, value: T }:
+const result = try integerGet(&det, my_handle);
+my_handle.swapIfNew(result.new_handle);
+const value = result.value;
 ```
 
 **Error Handling with Details**:
@@ -225,6 +247,7 @@ Heap settings (in Heap.zig cfg):
 -   Use `defer` for immediate cleanup, `errdefer` for error-path cleanup
 
 Example pattern:
+
 ```zig
 const data = try allocator.alloc(u8, size);
 errdefer allocator.free(data);  // Free if subsequent operations fail
@@ -234,7 +257,7 @@ const result = try processData(data);  // This might fail
 
 ## Common Issues
 
-**Double Free**: If you see double-free panics, check that objects from collections (lists/dicts) aren't being released. List items are not ref-counted handles. Enable cfg.trace_mem to figure out why.
+**Double Free**: If you see double-free panics, check that objects from collections (lists/dicts) aren't being released. List items are not ref-counted handles. Enable options.trace_mem to figure out why.
 
 **Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `prepareToShimmer()` which will duplicate if needed.
 
@@ -252,6 +275,13 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 
 Recent fixes and improvements:
 
+-   **Handle Refactoring (January 2026)**: Completed major refactoring of Handle management API
+    -   Changed from pointer-based mutation (`shimmerToX(&det, &handle)`) to value-based duplication (`shimmerToX(&det, handle) -> !?Handle`)
+    -   Eliminates use-after-free (UAF) issues by returning new handles instead of mutating through pointers
+    -   All shimmer functions (`shimmerToInteger`, `shimmerToFloat`, `shimmerToList`, `shimmerToDict`, `shimmerToScript`, `shimmerToExpression`, `shimmerToBoolean`) now use value-based API
+    -   Get functions (`getScript`, `getExpression`, `getBoolean`, `integerGet`) return structs with both new handle and value
+    -   Added `Handle.swapIfNew(?Handle)` helper method to simplify handle updates
+    -   Pattern: Functions return `!?Handle` when only shimmering, or `!struct { new_handle: ?Handle, value: T }` when also extracting a value
 -   Dictionary operations: Added `dictRemove`, fixed duplicate handling
 -   Command architecture: Standardized function naming conventions
 -   Loop control: Fixed break/continue propagation with level support
@@ -306,4 +336,6 @@ Not yet implemented:
 ## Style guide
 
 -   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
--   End every comment with a period, excluding comments on the end of a line.
+-   End every comment with a period.
+-   Don't use UPPERCASE, instead use _emphasis_.
+-   If there's a short `if (optional) |val|`, use `val` as the capture name.

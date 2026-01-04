@@ -37,9 +37,6 @@ pub const HeapSettings = struct {
     max_scripts: usize = 65536,
     /// Maximum number of heaps (not necessarily initialized).
     max_heaps: usize = 128,
-    /// Whether to enable memory tracing (for debugging only, as
-    /// it leaks the strings it allocates)
-    trace_mem: bool = true,
 };
 const cfg: HeapSettings = .{};
 
@@ -663,6 +660,9 @@ pub const Handle = packed struct(u64) {
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
     }
 
+    /// Note: this has a very specific definition (is ref_count > 1 or is cross_thread).
+    /// You should probably be using `canMutate` or `canShimmer`, as they have slightly
+    /// different but important semantics.
     pub fn isShared(handle: Handle) bool {
         const obj_heap = handle.getHeap();
         const metadata = obj_heap.getLocalMetadata(handle.index);
@@ -678,9 +678,11 @@ pub const Handle = packed struct(u64) {
         const obj_heap = handle.getHeap();
         const metadata = obj_heap.getLocalMetadata(handle.index);
 
+        const mutable = metadata.mutable;
         const cross_thread = metadata.cross_thread;
         const multiple_refs = obj_heap.getLocalRefCount(handle.index) > 1;
 
+        if (!mutable) return false;
         if (cross_thread) return false;
         if (multiple_refs) return false;
         if (metadata.order > 1) {
@@ -695,10 +697,15 @@ pub const Handle = packed struct(u64) {
         free_old: bool = true,
     };
 
-    pub fn swapThenReleaseOld(ref: *Handle, new: Handle) !void {
+    pub fn swapThenReleaseOld(ref: *Handle, new: Handle) void {
         const before_duplicating = ref.*;
         ref.* = new;
         before_duplicating.decrRefCount();
+    }
+
+    pub fn swapRef(ref: *?Handle, new_handle: Handle) void {
+        if (ref.*) |*handle| handle.decrRefCount();
+        ref.* = new_handle;
     }
 
     /// Helper to swap handle if new_handle is non-null, releasing the old one.
@@ -707,6 +714,14 @@ pub const Handle = packed struct(u64) {
             const old = ref.*;
             ref.* = new;
             old.decrRefCount();
+        }
+    }
+
+    pub fn swapRefIfNew(ref: *?Handle, new_handle: ?Handle) void {
+        if (ref.*) |*handle| {
+            handle.swapIfNew(new_handle);
+        } else if (new_handle) |val| {
+            ref.* = val;
         }
     }
 
@@ -736,25 +751,18 @@ pub const Handle = packed struct(u64) {
     pub fn incrRefCount(handle: Handle) void {
         if (handle.index < special_object_count + interned_string_count) return;
         // Make sure we never try to borrow a freed object.
-        assert(handle.debugRefCount() > 0);
-        assert(handle.peek().tag != .reference);
+        handle.assert(handle.debugRefCount() > 0);
+        handle.assert(handle.peek().tag != .reference);
 
         const metadata = handle.getMetadata();
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
 
-        if (cfg.trace_mem) {
-            handle.getHeap().trace_mutex.lock();
-            defer handle.getHeap().trace_mutex.unlock();
-            handle.getHeap().objects.items(.trace)[handle.index].addAddr(
-                @returnAddress(),
-                std.fmt.allocPrint(debug_gpa, "Incr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() }) catch unreachable,
-            );
-        }
+        handle.trace("Incr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() });
     }
 
     pub fn reference(handle: Handle) Object {
         // Make sure we're never making a reference to a reference.
-        assert(handle.peek().tag != .reference);
+        handle.assert(handle.peek().tag != .reference);
         handle.incrRefCount();
 
         return .{
@@ -773,13 +781,13 @@ pub const Handle = packed struct(u64) {
     }
 
     pub fn invalidateBody(handle: Handle) void {
-        assert(handle.canShimmer());
+        handle.assert(handle.canShimmer());
 
         invalidateBodyInner(handle);
     }
 
     pub fn invalidateString(handle: Handle) void {
-        assert(handle.canMutate());
+        handle.assert(handle.canMutate());
 
         invalidateStringInner(handle);
     }
@@ -791,21 +799,14 @@ pub const Handle = packed struct(u64) {
         const obj_heap = handle.getHeap();
 
         // We should never go below one for an item owned by another object.
-        assert(handle.isAllocHead() or handle.debugRefCount() > 1);
+        if (!handle.isAllocHead()) handle.assert(handle.debugRefCount() > 1);
 
-        if (cfg.trace_mem) last_touched = handle;
+        if (options.trace_mem) last_touched = handle;
         if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
             freeObject(handle);
         }
 
-        if (cfg.trace_mem) {
-            handle.getHeap().trace_mutex.lock();
-            defer handle.getHeap().trace_mutex.unlock();
-            handle.getHeap().objects.items(.trace)[handle.index].addAddr(
-                @returnAddress(),
-                std.fmt.allocPrint(debug_gpa, "Decr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() }) catch unreachable,
-            );
-        }
+        handle.trace("Decr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() });
     }
 
     pub fn isAllocHead(handle: Handle) bool {
@@ -815,13 +816,33 @@ pub const Handle = packed struct(u64) {
     }
 
     fn allocHead(handle: Handle) Handle {
-        assert(handle.index >= special_object_count);
+        handle.assert(handle.index >= special_object_count);
 
         const order = handle.getMetadata().order;
         return .{
             .index = (handle.index >> order) << order,
             .heap = handle.heap,
         };
+    }
+
+    pub fn trace(handle: Handle, comptime fmt: []const u8, args: anytype) void {
+        if (options.trace_mem) {
+            handle.getHeap().trace_mutex.lock();
+            defer handle.getHeap().trace_mutex.unlock();
+            const trace_field = &handle.getHeap().objects.items(.trace)[handle.index];
+            trace_field.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, fmt, args) catch unreachable);
+        }
+    }
+
+    /// Helper function that dumps the object's trace if the assertion fails.
+    pub fn assert(handle: Handle, ok: bool) void {
+        if (!ok) {
+            if (options.trace_mem) {
+                last_touched = handle;
+                Heap.dumpLastTouchedTrace();
+            }
+            unreachable;
+        }
     }
 };
 
@@ -871,10 +892,7 @@ fn invalidateCollection(handle: Handle) void {
 }
 
 fn invalidateBodyInner(handle: Handle) void {
-    if (cfg.trace_mem) {
-        const trace = &handle.getHeap().objects.items(.trace)[handle.index];
-        trace.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, "Invalidate body", .{}) catch unreachable);
-    }
+    handle.trace("Invalidate body", .{});
 
     const obj_heap = handle.getHeap();
     const obj = obj_heap.getLocalObject(handle.index);
@@ -900,19 +918,22 @@ fn invalidateBodyInner(handle: Handle) void {
 
 const ObjectAndMetadata = struct {
     pub const Metadata = packed struct(u8) {
-        /// Order can be u5 instead of u6, because the heap size must be < 2^32
+        /// Order can be u5 instead of u6, because the heap size must be < 2^32.
         order: u5,
-        /// Whether this object is shared across threads
+        /// Whether this object is shared across threads.
         cross_thread: bool,
+        /// Used to indicate that an object cannot be modified, even when not shared
+        /// (currently used to prevent dictionary keys from being modified, as that
+        /// would mess up the index).
+        mutable: bool,
         /// Whether this object is currently being used (used to track double frees).
         in_use: bool,
-        _padding: u1 = 0,
     };
 
     object: Object,
     ref_count: u32,
     metadata: Metadata,
-    trace: std.debug.ConfigurableTrace(16, 16, cfg.trace_mem),
+    trace: std.debug.ConfigurableTrace(16, 16, options.trace_mem),
 };
 
 fn heapAlloc(self: *Heap) Allocator {
@@ -1216,14 +1237,10 @@ pub fn splitAlloc(self: *Heap, index: u32, new_order: u5) void {
     for (self.objects.items(.metadata)[index..][0..memutil.getOrderSize(metadata.order)], 0..) |*new_metadata, i| {
         new_metadata.order = new_order;
 
-        if (cfg.trace_mem) {
-            const trace = &self.objects.items(.trace)[index + i];
-            trace.addAddr(@returnAddress(), std.fmt.allocPrint(
-                debug_gpa,
-                "Split from index {} (order {}) to order {}",
-                .{ index, metadata.order, new_order },
-            ) catch unreachable);
-        }
+        self.getHandle(@intCast(index + i)).trace(
+            "Split from index {} (order {}) to order {}",
+            .{ index, metadata.order, new_order },
+        );
     }
 }
 
@@ -1267,26 +1284,17 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
             .order = 31,
             .cross_thread = false,
             .in_use = false,
+            .mutable = false,
         });
     }
 
-    if (cfg.trace_mem) {
-        self.objects.items(.trace)[index].addAddr(
-            @returnAddress(),
-            std.fmt.allocPrint(debug_gpa, "Alloc at index {} of order {}", .{ index, order }) catch unreachable,
-        );
-
-        if (aligned_count > 1) {
-            for ((index + 1)..end) |collection_item| {
-                self.objects.items(.trace)[collection_item].addAddr(
-                    @returnAddress(),
-                    std.fmt.allocPrint(
-                        debug_gpa,
-                        "Alloc at index {} of order {} (item of {})",
-                        .{ collection_item, order, index },
-                    ) catch unreachable,
-                );
-            }
+    self.getHandle(index).trace("Alloc at index {} of order {}", .{ index, order });
+    if (aligned_count > 1) {
+        for ((index + 1)..end) |collection_item| {
+            self.getHandle(@intCast(collection_item)).trace(
+                "Alloc at index {} of order {} (item of {})",
+                .{ collection_item, order, index },
+            );
         }
     }
 
@@ -1310,6 +1318,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     self.objects.items(.metadata)[index] = .{
         .order = order,
         .cross_thread = false,
+        .mutable = true,
         .in_use = true,
     };
 
@@ -1318,6 +1327,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         .{
             .order = order,
             .cross_thread = false,
+            .mutable = true,
             .in_use = true,
         },
     );
@@ -1329,18 +1339,8 @@ fn freeObjectBackingInner(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
 
-    if (cfg.trace_mem) {
-        obj_heap.trace_mutex.lock();
-        defer obj_heap.trace_mutex.unlock();
-        last_touched = handle;
-
-        const trace = &obj_heap.objects.items(.trace)[handle.index];
-        trace.addAddr(@returnAddress(), std.fmt.allocPrint(
-            debug_gpa,
-            "Free {} of order {}",
-            .{ handle.index, metadata.order },
-        ) catch unreachable);
-    }
+    if (options.trace_mem) last_touched = handle;
+    handle.trace("Free {} of order {}", .{ handle.index, metadata.order });
 
     if (!metadata.in_use) {
         @panic("Double free!");
@@ -1351,6 +1351,7 @@ fn freeObjectBackingInner(handle: Handle) void {
     @memset(obj_heap.objects.items(.metadata)[handle.index..][0..alloc_size], .{
         .order = 31,
         .cross_thread = false,
+        .mutable = false,
         .in_use = false,
     });
 
@@ -1364,7 +1365,7 @@ fn freeObjectBackingInner(handle: Handle) void {
 /// Does not run any destructors, frees the object directly.
 pub fn freeObjectBacking(handle: Handle) void {
     // HACK: should use a custom panic handler for this.
-    last_touched = handle;
+    if (options.trace_mem) last_touched = handle;
     if (!handle.isAllocHead()) Heap.dumpLastTouchedTrace();
     assert(handle.isAllocHead());
 
@@ -1407,12 +1408,11 @@ pub fn prepareForMutation(handle: *Handle) !void {
     handle.invalidateString();
 }
 
-pub fn prepareForShimmering(handle: *Handle) !void {
+pub fn ensureCanShimmer(handle: *Handle) !void {
     if (try ensureShimmerableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
 
-    // Make sure it has a string rep before invalidating its body.
+    // Make sure it has a string rep, in case the body is invalidated.
     _ = try Heap.getString(handle.*);
-    handle.invalidateBody();
 }
 
 /// Get a string slice from heap string storage
@@ -1832,7 +1832,7 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
 /// Get the string to modify (must not write any longer than current len).
 /// Not threadsafe.
 pub fn getStringMut(handle: Handle) ![:0]u8 {
-    switch (Heap.getStringDetails(handle.peek().str)) {
+    switch (Heap.getStringDetails(handle)) {
         .long => |long_str| {
             switch (long_str.string_type) {
                 .normal => |normal| return normal,
@@ -1893,15 +1893,8 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
         }
     };
 
-    if (cfg.trace_mem) {
-        const handle = self.getHandle(index);
-        handle.getHeap().trace_mutex.lock();
-        defer handle.getHeap().trace_mutex.unlock();
-        handle.getHeap().objects.items(.trace)[handle.index].addAddr(
-            @returnAddress(),
-            std.fmt.allocPrint(debug_gpa, "Set string to \"{f}\"", .{handle}) catch unreachable,
-        );
-    }
+    const handle = self.getHandle(index);
+    handle.trace("Set string to \"{f}\"", .{handle});
 
     return success;
 }
@@ -1960,11 +1953,7 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
 pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allocator.Error!bool {
     const long_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
     errdefer self.gpa.free(long_string);
-    long_string.* = .{
-        .string_type = string_type,
-        .ref_count = 1,
-        .utf8_length = null,
-    };
+    long_string.* = .{ .string_type = string_type };
 
     const string_header = Object.StrOrPtr{
         .u = .{ .ptr = LongString.toInt(long_string) },
@@ -2153,7 +2142,7 @@ pub fn leakCheck(heap: *Heap) !bool {
         }
     }
 
-    if (cfg.trace_mem and leaked) {
+    if (options.trace_mem and leaked) {
         std.debug.print("\n===== Leak details =====\n\n", .{});
 
         for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
@@ -2248,10 +2237,10 @@ pub const LongString = struct {
     /// atomics!
     utf8_length: u64 = std.math.maxInt(u64),
     hash: struct {
-        value: ?u256,
-        mutex: memutil.Mutex,
-    },
-    ref_count: usize,
+        value: ?u256 = null,
+        mutex: memutil.Mutex = .{},
+    } = .{},
+    ref_count: usize = 1,
 
     pub fn fromInt(int: u58) *align(align_amt) LongString {
         return @ptrFromInt(int << 6);

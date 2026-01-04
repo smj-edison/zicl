@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     // options
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
     const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse false;
+    const trace_mem = b.option(bool, "trace-mem", "Trace object memory operations") orelse (optimize == .Debug);
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -19,6 +20,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "use_utf8", use_utf8);
     options.addOption(bool, "token_debugging", token_debugging);
     options.addOption(bool, "threading", threading);
+    options.addOption(bool, "trace_mem", trace_mem);
 
     const options_mod = options.createModule();
 

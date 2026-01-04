@@ -20,12 +20,14 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    break :blk object.integerGet(null, &args[i]) catch |err| switch (err) {
+                    const int_result = object.integerGet(null, args[i]) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
                         error.OutOfMemory => return error.OutOfMemory,
                     };
+                    args[i].swapIfNew(int_result.new_handle);
+                    break :blk int_result.value;
                 }
             };
 
@@ -172,7 +174,9 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const SubcommandEnum = object.TclEnum(SubcommandName, "dict_subcommand");
 
     var det: object.ErrorDetails = undefined;
-    const subcommand: SubcommandName = try interp.wrapError(&det, SubcommandEnum.get(&det, &args[1]));
+    const enum_result = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1]));
+    args[1].swapIfNew(enum_result.new_handle);
+    const subcommand: SubcommandName = enum_result.value;
 
     switch (subcommand) {
         .get => {
@@ -205,6 +209,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             }
             interp.setResult(new_dict);
         },
+        .unset => {},
         else => unreachable,
     }
 }
@@ -384,7 +389,7 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
             return interp.wrapError(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
         };
 
-        if (val.canModify()) {
+        if (val.canMutate()) {
             // Can modify directly.
             val.invalidateBoth();
             val.peek().tag = .integer;
@@ -449,7 +454,7 @@ pub fn createProcedureCommand(
 ) !Interp.Command {
     const statics: ?Handle = blk: {
         if (statics_names) |names| {
-            try Heap.ensureSameHeap(names);
+            names.swapIfNew(try Heap.ensureSameHeapOrDup(names.*));
             const statics_count = try interp.getListLength(names);
 
             const statics_dict = try object.newDictWithCapacity(statics_count * 2);
@@ -520,7 +525,7 @@ pub fn createProcedureCommand(
             // Optional parameter.
             if (optional_values == null) {
                 // Init the optional_values list.
-                optional_values = try object.newList(&.{}, false);
+                optional_values = try object.newList(&.{});
             }
 
             if (try Heap.stringEquals(object.listItem(arg, 0), "args")) {
@@ -532,7 +537,9 @@ pub fn createProcedureCommand(
             _ = try interp.listAppend(&(optional_values.?), object.listItem(arg, 1));
             // And replace the `arg_list`'s parameter/value with just the parameter name.
             var det: object.ErrorDetails = undefined;
-            try object.listSetItem(&det, arg_list, @intCast(i), object.listItem(arg, 0));
+            var new_item = try Heap.local_heap.dupOrReference(object.listItem(arg, 0));
+            errdefer new_item.deinitBodySingle(Heap.local_heap);
+            arg_list.swapIfNew(try object.listSetObject(&det, arg_list.*, @intCast(i), new_item));
 
             optional_arity += 1;
         } else {

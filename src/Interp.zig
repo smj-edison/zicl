@@ -273,22 +273,26 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
         // Add variable.
         interp.heap.setTempObjectString(trimmed);
         defer interp.heap.resetTempObject();
-        const new_value = try object.dictPutInner(&interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
+        const put_result = try object.dictPutInner(interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
+        interp.call_frames.items[0].variables.swapIfNew(put_result.new_dict);
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
             .call_epoch = call_frame.call_epoch,
-            .index = new_value.index,
+            .index = put_result.new_value.index,
             .is_global = true,
         };
     } else {
         // Add variable.
-        const new_value = try object.dictPutInner(&call_frame.variables, name, value);
+        const put_result = try object.dictPutInner(call_frame.variables, name, value);
+        call_frame.variables.swapIfNew(put_result.new_dict);
+
+        std.debug.print("Put {f} to {any}\n", .{ name, value.str.u });
 
         name.peek().tag = .variable;
         name.peek().body.variable = .{
             .call_epoch = call_frame.call_epoch,
-            .index = new_value.index,
+            .index = put_result.new_value.index,
             .is_global = false,
         };
     }
@@ -306,12 +310,9 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
 
                 const old_variables_handle = var_call_frame.variables; // Copy
                 const new_value_handle = blk: {
-                    const potentially_ref = try object.dictPutInner(&var_call_frame.variables, name, value);
-                    if (potentially_ref.peek().tag == .reference) {
-                        break :blk potentially_ref.peek().body.reference;
-                    } else {
-                        break :blk potentially_ref;
-                    }
+                    const put_result = try object.dictPutInner(var_call_frame.variables, name, value);
+                    var_call_frame.variables.swapIfNew(put_result.new_dict);
+                    break :blk object.followIfRef(put_result.new_value);
                 };
                 // Did the dict change locations? If so, all cached lookups are now invalid.
                 const did_dict_move = old_variables_handle != var_call_frame.variables;
@@ -620,7 +621,7 @@ pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
         // Are we at the last argument? If so, is it `args`?
         if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
             // Assign remaining arguments to `args`.
-            const list = try object.newList(args[called_idx..], false);
+            const list = try object.newList(args[called_idx..]);
             defer list.decrRefCount();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
         } else if (signature_idx > signature.required_arity) {
@@ -934,11 +935,8 @@ fn interpolateTokens(
             @memcpy(new_str_mut[written..][0..value_str.len], value_str);
             written += value_str.len;
         }
-    } else |err| {
-        switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.NotMutable => unreachable,
-        }
+    } else |err| switch (err) {
+        error.NotMutable => unreachable,
     }
 
     return new_str;
@@ -1025,7 +1023,7 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, handle: *Handle) 
 
     // Cache the command.
     if (command_index) |index| {
-        try Heap.prepareForShimmering(handle);
+        try Heap.ensureCanShimmer(handle);
         handle.peek().tag = .command;
 
         if (current_namespace) |namespace| {
@@ -1148,22 +1146,26 @@ fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
         },
         .owned_handle => |string| {
             string.incrRefCount();
-            return object.getBoolean(null, string) catch |err| switch (err) {
+            const bool_result = object.getBoolean(null, string.*) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
+                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string.*});
                     return error.BadBoolean;
                 },
             };
+            string.swapIfNew(bool_result.new_handle);
+            return bool_result.value;
         },
         .stack_handle => |*string| {
-            return object.getBoolean(null, string) catch |err| switch (err) {
+            const bool_result = object.getBoolean(null, string.*) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
                     return error.BadBoolean;
                 },
             };
+            string.swapIfNew(bool_result.new_handle);
+            return bool_result.value;
         },
     }
 }
@@ -1176,24 +1178,26 @@ fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
     switch (result.*) {
         .int, .float => return result.*,
         .owned_handle => |string| {
-            const as_int = object.integerGet(null, string) catch |err| switch (err) {
+            const int_result = object.integerGet(null, string.*) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     // Try parsing it as a float.
                     return .{ .float = try interp.getFloat(string) };
                 },
             };
-            return .{ .int = as_int };
+            string.swapIfNew(int_result.new_handle);
+            return .{ .int = int_result.value };
         },
         .stack_handle => |*string| {
-            const as_int = object.integerGet(null, string) catch |err| switch (err) {
+            const int_result = object.integerGet(null, string.*) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     // Try parsing it as a float.
                     return .{ .float = try interp.getFloat(string) };
                 },
             };
-            return .{ .int = as_int };
+            string.swapIfNew(int_result.new_handle);
+            return .{ .int = int_result.value };
         },
     }
 }
@@ -1774,7 +1778,9 @@ pub fn evalObject(interp: *Interp, script: *Handle) Error!void {
             if (argument_expansion) {
                 // Argument expansion, so we'll need to shimmer the result to a list.
                 det = undefined;
-                const len = try wrapError(interp, &det, object.listLength(&det, &resultant_word));
+                const len_result = try wrapError(interp, &det, object.listLength(&det, resultant_word));
+                resultant_word.swapIfNew(len_result.new_handle);
+                const len: u32 = len_result.len;
                 // Free the list backing without running destructors, since we're going to steal the items
                 // directly from the list.
                 defer Heap.freeObjectBacking(resultant_word);
@@ -1887,10 +1893,17 @@ pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMem
     interp.wrapError(&det, object.integerOverflowError(&det, value)) catch return error.EvalError;
 }
 
-pub fn getInteger(interp: *Interp, handle: *Handle) Interp.Error!i64 {
+pub fn wrapShimmer(
+    interp: *Interp,
+    handle: *Handle,
+    to_call: fn (det: ?*object.ErrorDetails, provided_handle: Handle) object.Error!?Handle,
+) !void {
     var det: object.ErrorDetails = undefined;
-    const new_handle = try wrapError(interp, &det, object.shimmerToInteger(&det, handle.*));
-    handle.swapIfNew(new_handle);
+    handle.swapIfNew(try wrapError(interp, &det, to_call(&det, handle.*)));
+}
+
+pub fn getInteger(interp: *Interp, handle: *Handle) Interp.Error!i64 {
+    try interp.wrapShimmer(handle, object.shimmerToInteger);
     return handle.peek().body.integer;
 }
 
@@ -1900,8 +1913,7 @@ pub fn getIntegerNoShimmer(interp: *Interp, handle: Handle) Interp.Error!i64 {
 }
 
 pub fn getFloat(interp: *Interp, handle: *Handle) Interp.Error!f64 {
-    var det: object.ErrorDetails = undefined;
-    try wrapError(interp, &det, object.shimmerToFloat(&det, handle));
+    try interp.wrapShimmer(handle, object.shimmerToFloat);
     return handle.peek().body.float;
 }
 
@@ -1925,17 +1937,17 @@ pub fn listAppend(interp: *Interp, list: *Handle, item: Handle) Interp.Error!Han
 }
 
 pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) Interp.Error!void {
-    try Heap.prepareForShimmering(name);
+    try Heap.ensureCanShimmer(name);
     return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, obj);
 }
 
 pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) Interp.Error!void {
-    try Heap.prepareForShimmering(name);
+    try Heap.ensureCanShimmer(name);
     return interp.setVariableImpl(interp.currentCallFrameIndex(), name.*, try Heap.local_heap.dupOrReference(handle));
 }
 
 pub fn getVariable(interp: *Interp, name: *Handle) Interp.Error!?Handle {
-    try Heap.prepareForShimmering(name);
+    try Heap.ensureCanShimmer(name);
     return interp.getVariableImpl(null, name.*) catch |err| switch (err) {
         error.VariableNotFound => return null,
         else => return err,
@@ -1943,7 +1955,7 @@ pub fn getVariable(interp: *Interp, name: *Handle) Interp.Error!?Handle {
 }
 
 pub fn getVariableOrError(interp: *Interp, name: *Handle) Interp.Error!Handle {
-    try Heap.prepareForShimmering(name);
+    try Heap.ensureCanShimmer(name);
     var det: object.ErrorDetails = undefined;
     return interp.wrapError(&det, interp.getVariableImpl(&det, name.*));
 }
@@ -1999,7 +2011,7 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: *Handle, keys: []co
     if (keys.len == 1) {
         try interp.setResultFormatted("could not find value for key \"{f}\"", .{keys[0]});
     } else {
-        var keys_list = try object.newList(keys, false);
+        var keys_list = try object.newList(keys);
         defer keys_list.decrRefCount();
         try interp.setResultFormatted("could not find value for keys \"{f}\"", .{keys_list});
     }
@@ -2011,7 +2023,9 @@ pub fn putDictValue(interp: *Interp, dict: *Handle, key: Handle, value: Handle) 
     var det: object.ErrorDetails = undefined;
     const new_handle = try interp.wrapError(&det, object.shimmerToDict(&det, dict.*));
     dict.swapIfNew(new_handle);
-    return try object.dictPut(dict, key, value);
+    const put_result = try object.dictPut(dict.*, key, value);
+    dict.swapIfNew(put_result.new_dict);
+    return put_result.new_value;
 }
 
 /// Returns a new handle to where the value (or reference to the value) resides.
@@ -2021,14 +2035,22 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
         return try interp.putDictValue(dict, keys[0], value);
     }
 
+    var new_dict_value: ?Handle = null;
+    errdefer if (new_dict_value) |val| val.decrRefCount();
+    const existing_value = try interp.getDictValue(dict, keys[0]);
+
     const dict_value = blk: {
-        if (try interp.getDictValue(dict, keys[0])) |val| {
-            break :blk val;
+        if (existing_value) {
+            break :blk existing_value;
         } else {
             // Create dict as needed.
             const new_dict = try object.newDictWithCapacity(2);
             defer new_dict.decrRefCount();
-            break :blk object.followIfRef(try interp.putDictValue(dict, keys[0], new_dict));
+            const put_result = try object.dictPut(dict, keys[0], new_dict);
+            dict.swapIfNew(put_result.new_dict);
+
+            new_dict_value = put_result.new_value;
+            break :blk put_result.new_value;
         }
     };
 
@@ -2041,24 +2063,9 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
 
     if (dict_value != new_dict_value) {
         assert(new_dict_value.peek().tag == .dict);
-        // Why do we have `dict_value.incrRefCount()`? Because let's remember
-        // that `dict_value` is currently owned by `dict`. We put `dict_value`
-        // into `new_dict_value`, in preparation to modify it. When
-        // `new_dict_value` is changed, the old value's reference count
-        // (`dict_value`) goes down by one, and the new value's reference
-        // count (`new_dict_value`) is 1. This is normally correct, but
-        // when we call `putDictValue` it _also_ lowers the reference count
-        // of the old value, which is what `dict_value` points to! So, we
-        // released it once when swapping, and released it again when
-        // setting to a new value! To compensate for this double release,
-        // we bump the reference count by 1.
-        dict_value.incrRefCount();
         // Recursively propagate the new dict up through the parent dicts.
-        _ = try interp.putDictValue(dict, keys[0], new_dict_value);
-        // Also, we need to decrement the reference count of the new value,
-        // because it started as 1, but then was also referenced by the
-        // dictionary, so now it's at 2. We go down by one to compensate.
-        new_dict_value.decrRefCount();
+        const put_result = try object.dictPut(dict.*, keys[0], value);
+        try interp.putDictValue(dict, keys[0], new_dict_value);
     }
 
     return value_handle;
@@ -2068,7 +2075,9 @@ pub fn removeDictValue(interp: *Interp, dict: *Handle, key: Handle) !bool {
     var det: object.ErrorDetails = undefined;
     const new_handle = try interp.wrapError(&det, object.shimmerToDict(&det, dict.*));
     dict.swapIfNew(new_handle);
-    return try object.dictRemove(dict, key);
+    const remove_result = try object.dictRemove(dict.*, key);
+    dict.swapIfNew(remove_result.new_dict);
+    return remove_result.did_remove;
 }
 
 pub fn removeDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle) Interp.Error!bool {
