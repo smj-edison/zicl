@@ -2119,14 +2119,29 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
 }
 
 pub fn leakCheck(heap: *Heap) !bool {
+    return leakCheckWithMode(heap, .dot_graph);
+}
+
+pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
     // Make sure to free any parsed scripts, as they're allowed to leak (they
     // have references to heap objects, so it will cause a false positive).
     heap.clearParsedScripts();
 
-    var leaked = false;
-
     // Go through once to print the summary, then print each individual trace.
     const skip_count = special_object_count + interned_string_count;
+    for (heap.objects.items(.metadata)[skip_count..]) |metadata| {
+        if (metadata.in_use) break;
+    } else return false;
+
+    switch (mode) {
+        .normal => try leakDumpNormal(heap, skip_count),
+        .dot_graph => try leakDumpDotGraph(heap, skip_count),
+    }
+
+    return true;
+}
+
+fn leakDumpNormal(heap: *Heap, skip_count: usize) !void {
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i));
@@ -2137,12 +2152,10 @@ pub fn leakCheck(heap: *Heap) !bool {
                 handle.debugRefCount(),
                 try getString(handle),
             });
-
-            leaked = true;
         }
     }
 
-    if (options.trace_mem and leaked) {
+    if (options.trace_mem) {
         std.debug.print("\n===== Leak details =====\n\n", .{});
 
         for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
@@ -2161,8 +2174,201 @@ pub fn leakCheck(heap: *Heap) !bool {
             }
         }
     }
+}
 
-    return leaked;
+// Dot rendering is 95% LLM generated.
+fn escapeDotString(str: []const u8, writer: *std.Io.Writer) !void {
+    for (str) |c| switch (c) {
+        '"', '\\' => try writer.print("\\{c}", .{c}),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0...8, 11...12, 14...31, 127 => try writer.print("\\x{X:0>2}", .{c}),
+        else => try writer.writeByte(c),
+    };
+}
+
+fn getTagColor(tag: Tag) []const u8 {
+    return switch (tag) {
+        .list => "lightblue",
+        .dict => "lightgreen",
+        .string => "lightyellow",
+        .integer => "lightcoral",
+        .float => "lightpink",
+        .bool => "plum",
+        .reference => "orange",
+        .script => "lavender",
+        .expr => "thistle",
+        .source => "peachpuff",
+        .command, .script_command => "khaki",
+        .variable, .upvar => "lightcyan",
+        .custom_type => "tan",
+        else => "white",
+    };
+}
+
+fn renderDotNodeLabel(stderr: *std.Io.Writer, handle: Handle, index: u32, max_str_len: u32) !void {
+    const obj = handle.peek();
+    const str = try getString(handle);
+    const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
+
+    try stderr.print("idx: {} | ", .{index});
+    try stderr.print("{s} | ", .{@tagName(obj.tag)});
+    try stderr.print("rc: {} | ", .{handle.debugRefCount()});
+    try stderr.writeAll("\\\"");
+    try escapeDotString(truncated_str, stderr);
+    if (str.len > max_str_len) try stderr.writeAll("...");
+    try stderr.writeAll("\\\"");
+}
+
+fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index: u32) !void {
+    const obj = handle.peek();
+
+    // Get the allocation size to include unallocated slots in the subgraph.
+    const allocated_len = memutil.getOrderSize(handle.getMetadata().order) - 1;
+
+    // Get the actual used length for the label.
+    const used_len = if (obj.tag == .list)
+        obj.body.list.len
+    else
+        object.dictGetMetadata(handle).len;
+
+    const str = try getString(handle);
+    const max_str_len = 40;
+    const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
+
+    // Subgraph header.
+    try stderr.print("  subgraph cluster_{} {{\n", .{index});
+    try stderr.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(obj.tag), index, handle.debugRefCount(), used_len, allocated_len });
+    try escapeDotString(truncated_str, stderr);
+    if (str.len > max_str_len) try stderr.writeAll("...");
+    try stderr.writeAll("\";\n");
+    try stderr.print("    style=outlined;\n", .{});
+    try stderr.print("    fillcolor=\"{s}\";\n", .{if (obj.tag == .list) "lightblue1" else "lightgreen1"});
+    try stderr.writeAll("    node [style=filled];\n\n");
+
+    // Collection head node.
+    try stderr.print("    obj{} [label=\"{{", .{index});
+    try stderr.print("HEAD | idx: {} | ", .{index});
+    try stderr.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(obj.tag), handle.debugRefCount(), getTagColor(obj.tag) });
+
+    // Collection items (all allocated slots, including unused ones).
+    for (0..allocated_len) |offset| {
+        const item_idx = index + 1 + offset;
+        const item_handle = heap.getHandle(@intCast(item_idx));
+
+        try stderr.print("    obj{} [label=\"{{", .{item_idx});
+        try renderDotNodeLabel(stderr, item_handle, @intCast(item_idx), max_str_len);
+        try stderr.print("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.peek().tag)});
+    }
+
+    try stderr.writeAll("  }\n\n");
+}
+
+fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index: u32) !void {
+    const obj = handle.peek();
+
+    switch (obj.tag) {
+        .list => {
+            const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
+            for (0..len_including_nones) |item_idx| {
+                const item_handle = object.listItem(handle, @intCast(item_idx));
+                try stderr.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
+            }
+        },
+        .dict => {
+            const dict_metadata = object.dictGetMetadata(handle);
+            var item_idx: u32 = 0;
+            while (item_idx < dict_metadata.len) : (item_idx += 2) {
+                const key_handle = object.dictItem(handle, item_idx);
+                const val_handle = object.dictItem(handle, item_idx + 1);
+
+                try stderr.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
+                try stderr.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
+            }
+        },
+        .reference => {
+            const ref_handle = obj.body.reference;
+            try stderr.print("  obj{} -> obj{} [label=\"ref\", color=red, style=dashed];\n", .{ index, ref_handle.index });
+        },
+        .source => {
+            if (obj.body.source.file_name_obj != 0) {
+                try stderr.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, obj.body.source.file_name_obj });
+            }
+        },
+        .dict_subst => {
+            try stderr.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_subst.var_name_index });
+            try stderr.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_subst.dict_value_index });
+        },
+        .command => {
+            if (!obj.body.command.in_global_namespace) {
+                const extra_data = heap.getExtraData(obj.body.command.u.other_namespace).command;
+                try stderr.print("  obj{} -> obj{} [label=\"ns\"];\n", .{ index, extra_data.namespace });
+            }
+        },
+        .upvar => {
+            const upvar = &heap.getExtraData(obj.body.upvar).upvar;
+            switch (upvar.name) {
+                .normal => |var_name| {
+                    try stderr.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, var_name });
+                },
+                .dict_sugar => |dict_names| {
+                    try stderr.print("  obj{} -> obj{} [label=\"dict\"];\n", .{ index, dict_names.dict_name_index });
+                    try stderr.print("  obj{} -> obj{} [label=\"key\"];\n", .{ index, dict_names.dict_key_index });
+                },
+            }
+        },
+        else => {},
+    }
+}
+
+fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
+    std.debug.print("digraph LeakGraph {{\n", .{});
+    std.debug.print("  rankdir=LR;\n", .{});
+    std.debug.print("  node [shape=record];\n", .{});
+    std.debug.print("  compound=true;\n\n", .{});
+
+    var buf: [1]u8 = @splat(0);
+    var stderr = std.debug.lockStderrWriter(&buf);
+    defer std.debug.unlockStdErr();
+
+    // First pass: output collections as subgraphs with their items grouped.
+    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+        if (!metadata.in_use) continue;
+
+        const handle = heap.getHandle(@intCast(i));
+        const obj = handle.peek();
+
+        if (obj.tag == .list or obj.tag == .dict) {
+            try renderCollectionSubgraph(heap, stderr, handle, @intCast(i));
+        }
+    }
+
+    // Second pass: output standalone nodes (not part of any collection).
+    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+        if (!metadata.in_use) continue;
+
+        const handle = heap.getHandle(@intCast(i));
+        const obj = handle.peek();
+
+        // Skip collections (already output as subgraphs) and collection items.
+        if (obj.tag == .list or obj.tag == .dict) continue;
+        if (!handle.isAllocHead()) continue;
+
+        try stderr.print("  obj{} [label=\"{{", .{i});
+        try renderDotNodeLabel(stderr, handle, @intCast(i), 60);
+        try stderr.print("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(obj.tag)});
+    }
+
+    try stderr.writeAll("\n");
+
+    // Third pass: output all edges.
+    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+        if (!metadata.in_use) continue;
+        try renderObjectEdges(heap, stderr, heap.getHandle(@intCast(i)), @intCast(i));
+    }
+
+    try stderr.print("}}\n", .{});
 }
 
 pub fn dumpLastTouchedTrace() void {
