@@ -2012,14 +2012,6 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             break :blk try custom_types.items[custom_type.type_id].get_string(self, obj);
         },
         .reference => {
-            if (builtin.mode == .Debug and state.running_leak_check) {
-                break :blk try std.fmt.allocPrintSentinel(
-                    self.gpa,
-                    "<reference: index: {}, heap: {}>",
-                    .{ obj.body.reference.index, obj.body.reference.heap },
-                    0,
-                );
-            }
             // Intentionally return early, since we should always use
             // the reference's string, not our own.
             return getString(obj.body.reference);
@@ -2118,6 +2110,357 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     return finished_str[0..(written - 1) :0];
 }
 
+const StringDetails = union(enum) {
+    null: void,
+    empty: void,
+    normal: [:0]u8,
+    long: *align(LongString.align_amt) LongString,
+};
+
+pub fn getStringDetails(handle: Handle) StringDetails {
+    return handle.getHeap().getLocalStringDetails(handle.peek().str);
+}
+
+fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
+    // Normal string or long string?
+    if (str_or_ptr.is_ptr) {
+        // Convert to LongString ptr (guaranteed to be non-null).
+        return .{
+            .long = LongString.fromInt(str_or_ptr.u.ptr),
+        };
+    } else {
+        const str = str_or_ptr.u.str;
+        if (str.index == null_string) {
+            return .null;
+        } else if (str.index == empty_string) {
+            return .empty;
+        } else {
+            return .{
+                .normal = heap.getHeapString(str.index, str.index + str.len),
+            };
+        }
+    }
+}
+
+pub const LongString = struct {
+    /// At what point should we switch to using a long string?
+    /// Whenever the string length >= split_point
+    pub const split_point = 100_000;
+    pub const align_amt = 128;
+    pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
+
+    /// Long strings are special in that they can have
+    /// extended properties (mmaping is in the plans,
+    /// for example). Since it has special properties,
+    /// we have to track them so it can be freed correctly.
+    pub const Type = union(enum) {
+        normal: [:0]u8,
+        /// A temporary string has its bytes managed by someone else,
+        /// so when this LongString is freed, we won't free the string.
+        temp: [:0]const u8,
+        /// If the string was allocated with a different capacity
+        /// than its current reported length, set this field
+        different_capacity: struct {
+            string: [:0]u8,
+            original_capacity: u64,
+        },
+    };
+
+    string_type: Type,
+    /// Length has not been determined if == maxInt(u64). Be sure to use
+    /// atomics!
+    utf8_length: u64 = std.math.maxInt(u64),
+    hash: struct {
+        value: ?u256 = null,
+        mutex: memutil.Mutex = .{},
+    } = .{},
+    ref_count: usize = 1,
+
+    pub fn fromInt(int: u58) *align(align_amt) LongString {
+        return @ptrFromInt(int << 6);
+    }
+
+    pub fn toInt(ptr: *align(align_amt) LongString) u58 {
+        return @intCast(@intFromPtr(ptr) >> 6);
+    }
+
+    pub fn getHash(self: *align(align_amt) LongString) u256 {
+        self.hash.mutex.lock();
+        defer self.hash.mutex.unlock();
+
+        if (self.hash.value) |hash| {
+            return hash;
+        } else {
+            var out: [32]u8 = @splat(0);
+            std.crypto.hash.Blake3.hash(self.getString(), &out, .{});
+
+            const hash: u256 = @bitCast(out);
+            self.hash.value = hash;
+            return hash;
+        }
+    }
+
+    pub fn getUtf8Length(self: *align(align_amt) LongString) ?u64 {
+        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
+        if (value == std.math.maxInt(u64)) return null else return value;
+    }
+
+    /// Value is u64, not ?u64, since utf8 length should not ever
+    /// change (excluding LongString temp strings).
+    pub fn setUtf8Length(self: *align(align_amt) LongString, value: u64) void {
+        assert(value != std.math.maxInt(u64));
+        @atomicStore(u64, &self.utf8_length, value, .monotonic);
+    }
+
+    pub fn getString(self: *align(align_amt) LongString) [:0]const u8 {
+        switch (self.string_type) {
+            .normal => |string| return string,
+            .temp => |temp| return temp,
+            .different_capacity => |info| return info.string,
+        }
+    }
+
+    pub fn incrRefCount(self: *align(align_amt) LongString) void {
+        incrRefCountOf(usize, &self.ref_count, options.threading);
+    }
+
+    pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
+        if (decrRefCountOf(usize, &self.ref_count, options.threading)) {
+            self.freeInner(gpa);
+        }
+    }
+
+    pub fn freeInner(self: *align(align_amt) LongString, gpa: Allocator) void {
+        switch (self.string_type) {
+            .normal => |string| gpa.free(string),
+            .different_capacity => |info| {
+                gpa.free(info.string.ptr[0..info.original_capacity :0]);
+            },
+            .temp => {
+                // We don't want to free the string, as it's managed by someone else.
+            },
+        }
+
+        gpa.destroy(self);
+    }
+};
+
+pub fn createExtraData(self: *Heap) !ExtraDataIndex {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    const new_index = try self.extra.create(self.heapAlloc());
+    if (new_index >= object_heap_max_count) return error.OutOfMemory;
+
+    return @enumFromInt(new_index);
+}
+
+pub fn getExtraData(self: *Heap, index: ExtraDataIndex) *ExtraData {
+    return &self.extra.items[@intFromEnum(index)];
+}
+
+pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    self.extra.destroy(@intFromEnum(index));
+}
+
+pub fn initGlobals(gpa: Allocator) !void {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    state.gpa = gpa;
+    custom_types = try .initWithCapacity(gpa, if (options.threading) cfg.max_custom_types else 32);
+    errdefer custom_types.deinit(gpa);
+
+    script_metadata = try .initWithCapacity(gpa, if (options.threading) cfg.max_scripts else 32);
+    errdefer script_metadata.deinit(gpa);
+
+    // Create null script. TODO do we need a null script?
+    assert(try script_metadata.create(gpa) == 0);
+    state.initialized = true;
+}
+
+pub fn initHeap(gpa: Allocator) !void {
+    const slot_index = blk: {
+        state.mutex.lock();
+        defer state.mutex.unlock();
+
+        assert(state.initialized);
+
+        const heap_index = state.next_open_heap;
+        state.next_open_heap += 1;
+
+        break :blk heap_index;
+    };
+    errdefer {
+        // Roll back heap index if it failed to initialize correctly.
+        state.mutex.lock();
+        state.next_open_heap -= 1;
+        state.mutex.unlock();
+    }
+
+    if (slot_index < cfg.max_heaps) {
+        const new_heap = &heaps[slot_index];
+        try new_heap.init(gpa);
+        local_heap = new_heap;
+    } else {
+        return error.OutOfMemory;
+    }
+}
+
+pub fn deinitAll() void {
+    state.mutex.lock();
+    const heap_count = state.next_open_heap;
+    state.next_open_heap = 0;
+    state.mutex.unlock();
+
+    // Deinit heaps without holding the mutex, as they may lock.
+    for (heaps[0..heap_count]) |*heap| {
+        heap.deinit();
+    }
+
+    // Deinit global state.
+    state.mutex.lock();
+    if (state.initialized) {
+        script_metadata.deinit(state.gpa);
+        custom_types.deinit(state.gpa);
+        state.initialized = false;
+    }
+    state.mutex.unlock();
+}
+
+pub fn createCustomType(custom_type: CustomType) ?*CustomType {
+    state.mutex.lock();
+    const slot_index = try state.custom_types.create(state.gpa);
+    state.mutex.unlock();
+
+    if (slot_index < cfg.max_custom_types) {
+        state.custom_types.items[slot_index] = custom_type;
+        return &state.custom_types.items[slot_index];
+    } else {
+        return null;
+    }
+}
+
+test "object duplication" {
+    const ta = std.testing.allocator;
+    defer Heap.testFinish();
+    var heap = try Heap.testStart(ta);
+
+    // Number object
+    const obj = try heap.createObject();
+    defer obj.decrRefCount();
+    var ref = obj.peek();
+    ref.tag = .integer;
+    ref.body.integer = 10;
+
+    const new_obj = try heap.duplicate(obj);
+    const new_ref = new_obj.peek();
+    defer new_obj.decrRefCount();
+
+    try expectEqual(.integer, new_ref.tag);
+    try expectEqual(10, new_ref.body.integer);
+
+    // try borrowing
+    new_obj.incrRefCount();
+    try expectEqual(2, new_obj.debugRefCount());
+
+    new_obj.decrRefCount();
+    try expectEqual(1, heap.objects.get(new_obj.index).ref_count);
+}
+
+test "get string" {
+    const ta = std.testing.allocator;
+    defer Heap.testFinish();
+    var heap = try Heap.testStart(ta);
+
+    const obj = try heap.createObject();
+    defer obj.decrRefCount();
+    var ref = obj.peek();
+    ref.tag = .integer;
+    ref.body.integer = 10;
+
+    try expectEqualSlices(u8, "10", try getString(obj));
+}
+
+/// Atomically adds, if multithreading is enabled. Returns value before adding.
+pub fn atomicIncr(comptime T: type, ptr: *T) T {
+    if (options.threading) {
+        return @atomicRmw(T, ptr, .Add, 1, .monotonic);
+    } else {
+        const before = ptr.*;
+        ptr.* += 1;
+        return before;
+    }
+}
+
+pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) void {
+    if (is_atomic) {
+        _ = @atomicRmw(T, ref, .Add, 1, .monotonic);
+    } else {
+        ref.* += 1;
+    }
+}
+
+/// Returns true if count has reached zero. Multithreaded safe.
+pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
+    var after_sub: T = undefined;
+    if (is_atomic) {
+        const before_sub = @atomicRmw(T, ref, .Sub, 1, .release);
+        after_sub = before_sub - 1;
+
+        if (after_sub == 0) {
+            _ = @atomicLoad(T, ref, .acquire);
+        }
+    } else {
+        // HACK: once I figure out how to register a panic handler I don't need this.
+        if (ref.* == 0) dumpLastTouchedTrace();
+        ref.* -= 1;
+        after_sub = ref.*;
+    }
+
+    return after_sub == 0;
+}
+
+pub fn testStart(gpa: Allocator) !*Heap {
+    try initGlobals(gpa);
+    try initHeap(gpa);
+
+    return local_heap;
+}
+
+pub fn leakCheckAll() void {
+    state.mutex.lock();
+    state.running_leak_check = true;
+    const heap_count = state.next_open_heap;
+    state.mutex.unlock();
+
+    var leaked = false;
+    for (heaps[0..heap_count]) |*heap| {
+        if (heap.leakCheck() catch false) {
+            leaked = true;
+        }
+    }
+
+    state.mutex.lock();
+    // Make sure that all the global script ids were freed.
+    if (script_metadata.count > 1) {
+        leaked = true;
+        std.debug.print("Script IDs leaked!\n", .{});
+        script_metadata.dumpLeaked(state.gpa, "ID: {}, contents: {}\n") catch unreachable;
+    }
+
+    state.running_leak_check = false;
+    state.mutex.unlock();
+}
+
+pub fn testFinish() void {
+    Heap.leakCheckAll();
+    Heap.deinitAll();
+}
+
 pub fn leakCheck(heap: *Heap) !bool {
     return leakCheckWithMode(heap, .dot_graph);
 }
@@ -2135,7 +2478,10 @@ pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
 
     switch (mode) {
         .normal => try leakDumpNormal(heap, skip_count),
-        .dot_graph => try leakDumpDotGraph(heap, skip_count),
+        .dot_graph => {
+            try leakDumpNormal(heap, skip_count);
+            try leakDumpDotGraph(heap, skip_count);
+        },
     }
 
     return true;
@@ -2380,355 +2726,4 @@ pub fn dumpLastTouchedTrace() void {
     } else {
         std.debug.print("No last leaked object\n", .{});
     }
-}
-
-const StringDetails = union(enum) {
-    null: void,
-    empty: void,
-    normal: [:0]u8,
-    long: *align(LongString.align_amt) LongString,
-};
-
-pub fn getStringDetails(handle: Handle) StringDetails {
-    return handle.getHeap().getLocalStringDetails(handle.peek().str);
-}
-
-fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
-    // Normal string or long string?
-    if (str_or_ptr.is_ptr) {
-        // Convert to LongString ptr (guaranteed to be non-null).
-        return .{
-            .long = LongString.fromInt(str_or_ptr.u.ptr),
-        };
-    } else {
-        const str = str_or_ptr.u.str;
-        if (str.index == null_string) {
-            return .null;
-        } else if (str.index == empty_string) {
-            return .empty;
-        } else {
-            return .{
-                .normal = heap.getHeapString(str.index, str.index + str.len),
-            };
-        }
-    }
-}
-
-pub const LongString = struct {
-    /// At what point should we switch to using a long string?
-    /// Whenever the string length >= split_point
-    pub const split_point = 100_000;
-    pub const align_amt = 128;
-    pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
-
-    /// Long strings are special in that they can have
-    /// extended properties (mmaping is in the plans,
-    /// for example). Since it has special properties,
-    /// we have to track them so it can be freed correctly.
-    pub const Type = union(enum) {
-        normal: [:0]u8,
-        /// A temporary string has its bytes managed by someone else,
-        /// so when this LongString is freed, we won't free the string.
-        temp: [:0]const u8,
-        /// If the string was allocated with a different capacity
-        /// than its current reported length, set this field
-        different_capacity: struct {
-            string: [:0]u8,
-            original_capacity: u64,
-        },
-    };
-
-    string_type: Type,
-    /// Length has not been determined if == maxInt(u64). Be sure to use
-    /// atomics!
-    utf8_length: u64 = std.math.maxInt(u64),
-    hash: struct {
-        value: ?u256 = null,
-        mutex: memutil.Mutex = .{},
-    } = .{},
-    ref_count: usize = 1,
-
-    pub fn fromInt(int: u58) *align(align_amt) LongString {
-        return @ptrFromInt(int << 6);
-    }
-
-    pub fn toInt(ptr: *align(align_amt) LongString) u58 {
-        return @intCast(@intFromPtr(ptr) >> 6);
-    }
-
-    pub fn getHash(self: *align(align_amt) LongString) u256 {
-        self.hash.mutex.lock();
-        defer self.hash.mutex.unlock();
-
-        if (self.hash.value) |hash| {
-            return hash;
-        } else {
-            var out: [32]u8 = @splat(0);
-            std.crypto.hash.Blake3.hash(self.getString(), &out, .{});
-
-            const hash: u256 = @bitCast(out);
-            self.hash.value = hash;
-            return hash;
-        }
-    }
-
-    pub fn getUtf8Length(self: *align(align_amt) LongString) ?u64 {
-        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
-        if (value == std.math.maxInt(u64)) return null else return value;
-    }
-
-    /// Value is u64, not ?u64, since utf8 length should not ever
-    /// change (excluding LongString temp strings).
-    pub fn setUtf8Length(self: *align(align_amt) LongString, value: u64) void {
-        assert(value != std.math.maxInt(u64));
-        @atomicStore(u64, &self.utf8_length, value, .monotonic);
-    }
-
-    pub fn getString(self: *align(align_amt) LongString) [:0]const u8 {
-        switch (self.string_type) {
-            .normal => |string| return string,
-            .temp => |temp| return temp,
-            .different_capacity => |info| return info.string,
-        }
-    }
-
-    pub fn incrRefCount(self: *align(align_amt) LongString) void {
-        incrRefCountOf(usize, &self.ref_count, options.threading);
-    }
-
-    pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
-        if (decrRefCountOf(usize, &self.ref_count, options.threading)) {
-            self.freeInner(gpa);
-        }
-    }
-
-    pub fn freeInner(self: *align(align_amt) LongString, gpa: Allocator) void {
-        switch (self.string_type) {
-            .normal => |string| gpa.free(string),
-            .different_capacity => |info| {
-                gpa.free(info.string.ptr[0..info.original_capacity :0]);
-            },
-            .temp => {
-                // We don't want to free the string, as it's managed by someone else.
-            },
-        }
-
-        gpa.destroy(self);
-    }
-};
-
-pub fn createExtraData(self: *Heap) !ExtraDataIndex {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
-
-    const new_index = try self.extra.create(self.heapAlloc());
-    if (new_index >= object_heap_max_count) return error.OutOfMemory;
-
-    return @enumFromInt(new_index);
-}
-
-pub fn getExtraData(self: *Heap, index: ExtraDataIndex) *ExtraData {
-    return &self.extra.items[@intFromEnum(index)];
-}
-
-pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
-
-    self.extra.destroy(@intFromEnum(index));
-}
-
-pub fn initGlobals(gpa: Allocator) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
-    state.gpa = gpa;
-    custom_types = try .initWithCapacity(gpa, if (options.threading) cfg.max_custom_types else 32);
-    errdefer custom_types.deinit(gpa);
-
-    script_metadata = try .initWithCapacity(gpa, if (options.threading) cfg.max_scripts else 32);
-    errdefer script_metadata.deinit(gpa);
-
-    // Create null script. TODO do we need a null script?
-    assert(try script_metadata.create(gpa) == 0);
-    state.initialized = true;
-}
-
-pub fn initHeap(gpa: Allocator) !void {
-    const slot_index = blk: {
-        state.mutex.lock();
-        defer state.mutex.unlock();
-
-        assert(state.initialized);
-
-        const heap_index = state.next_open_heap;
-        state.next_open_heap += 1;
-
-        break :blk heap_index;
-    };
-    errdefer {
-        // Roll back heap index if it failed to initialize correctly.
-        state.mutex.lock();
-        state.next_open_heap -= 1;
-        state.mutex.unlock();
-    }
-
-    if (slot_index < cfg.max_heaps) {
-        const new_heap = &heaps[slot_index];
-        try new_heap.init(gpa);
-        local_heap = new_heap;
-    } else {
-        return error.OutOfMemory;
-    }
-}
-
-pub fn leakCheckAll() void {
-    state.mutex.lock();
-    state.running_leak_check = true;
-    const heap_count = state.next_open_heap;
-    state.mutex.unlock();
-
-    var leaked = false;
-    for (heaps[0..heap_count]) |*heap| {
-        if (heap.leakCheck() catch false) {
-            leaked = true;
-        }
-    }
-
-    state.mutex.lock();
-    // Make sure that all the global script ids were freed.
-    if (script_metadata.count > 1) {
-        leaked = true;
-        std.debug.print("Script IDs leaked!\n", .{});
-        script_metadata.dumpLeaked(state.gpa, "ID: {}, contents: {}\n") catch unreachable;
-    }
-
-    state.running_leak_check = false;
-    state.mutex.unlock();
-}
-
-pub fn deinitAll() void {
-    state.mutex.lock();
-    const heap_count = state.next_open_heap;
-    state.next_open_heap = 0;
-    state.mutex.unlock();
-
-    // Deinit heaps without holding the mutex, as they may lock.
-    for (heaps[0..heap_count]) |*heap| {
-        heap.deinit();
-    }
-
-    // Deinit global state.
-    state.mutex.lock();
-    if (state.initialized) {
-        script_metadata.deinit(state.gpa);
-        custom_types.deinit(state.gpa);
-        state.initialized = false;
-    }
-    state.mutex.unlock();
-}
-
-pub fn testStart(gpa: Allocator) !*Heap {
-    try initGlobals(gpa);
-    try initHeap(gpa);
-
-    return local_heap;
-}
-
-pub fn testFinish() void {
-    Heap.leakCheckAll();
-    Heap.deinitAll();
-}
-
-pub fn createCustomType(custom_type: CustomType) ?*CustomType {
-    state.mutex.lock();
-    const slot_index = try state.custom_types.create(state.gpa);
-    state.mutex.unlock();
-
-    if (slot_index < cfg.max_custom_types) {
-        state.custom_types.items[slot_index] = custom_type;
-        return &state.custom_types.items[slot_index];
-    } else {
-        return null;
-    }
-}
-
-test "object duplication" {
-    const ta = std.testing.allocator;
-    defer Heap.testFinish();
-    var heap = try Heap.testStart(ta);
-
-    // Number object
-    const obj = try heap.createObject();
-    defer obj.decrRefCount();
-    var ref = obj.peek();
-    ref.tag = .integer;
-    ref.body.integer = 10;
-
-    const new_obj = try heap.duplicate(obj);
-    const new_ref = new_obj.peek();
-    defer new_obj.decrRefCount();
-
-    try expectEqual(.integer, new_ref.tag);
-    try expectEqual(10, new_ref.body.integer);
-
-    // try borrowing
-    new_obj.incrRefCount();
-    try expectEqual(2, new_obj.debugRefCount());
-
-    new_obj.decrRefCount();
-    try expectEqual(1, heap.objects.get(new_obj.index).ref_count);
-}
-
-test "get string" {
-    const ta = std.testing.allocator;
-    defer Heap.testFinish();
-    var heap = try Heap.testStart(ta);
-
-    const obj = try heap.createObject();
-    defer obj.decrRefCount();
-    var ref = obj.peek();
-    ref.tag = .integer;
-    ref.body.integer = 10;
-
-    try expectEqualSlices(u8, "10", try getString(obj));
-}
-
-/// Atomically adds, if multithreading is enabled. Returns value before adding.
-pub fn atomicIncr(comptime T: type, ptr: *T) T {
-    if (options.threading) {
-        return @atomicRmw(T, ptr, .Add, 1, .monotonic);
-    } else {
-        const before = ptr.*;
-        ptr.* += 1;
-        return before;
-    }
-}
-
-pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) void {
-    if (is_atomic) {
-        _ = @atomicRmw(T, ref, .Add, 1, .monotonic);
-    } else {
-        ref.* += 1;
-    }
-}
-
-/// Returns true if count has reached zero. Multithreaded safe.
-pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
-    var after_sub: T = undefined;
-    if (is_atomic) {
-        const before_sub = @atomicRmw(T, ref, .Sub, 1, .release);
-        after_sub = before_sub - 1;
-
-        if (after_sub == 0) {
-            _ = @atomicLoad(T, ref, .acquire);
-        }
-    } else {
-        // HACK: once I figure out how to register a panic handler I don't need this.
-        if (ref.* == 0) dumpLastTouchedTrace();
-        ref.* -= 1;
-        after_sub = ref.*;
-    }
-
-    return after_sub == 0;
 }
