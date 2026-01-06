@@ -398,9 +398,7 @@ pub const Object = packed struct(u128) {
             },
             .source => {
                 const source = obj.body.source;
-                if (source.file_name_obj != 0) {
-                    heap.getHandle(source.file_name_obj).decrRefCount();
-                }
+                if (source.file_name_obj.toNullable(heap).toHandle()) |val| val.decrRefCount();
             },
             .command => {
                 const command = obj.body.command;
@@ -497,7 +495,7 @@ pub const Body = packed union {
     },
     source: packed struct {
         /// Pointer to an object in the same heap that contains the file name.
-        file_name_obj: u32,
+        file_name_obj: NullableIndex,
         line_no: u32,
     },
     list: packed struct {
@@ -631,8 +629,74 @@ pub const CustomType = struct {
     make_immutable: *const fn (heap: *Heap, obj: *Object) Allocator.Error!void,
 };
 
-pub const Handle = packed struct(u64) {
-    index: u32,
+const HeapIndex = u32;
+const HandleBacking = u64;
+
+pub const NullableIndex = enum(HeapIndex) {
+    null = 0,
+    _,
+
+    pub fn toNullable(index: NullableIndex, heap: *Heap) NullableHandle {
+        if (index == .null) return .null;
+        const unwrapped_index: HeapIndex = @intFromEnum(index);
+        return heap.getHandle(unwrapped_index).toNullable();
+    }
+
+    pub fn getIndex(index: NullableIndex) ?HeapIndex {
+        if (index != .null) {
+            return @intFromEnum(index);
+        } else return null;
+    }
+};
+
+pub const NullableHandle = enum(HandleBacking) {
+    null = 0,
+    _,
+
+    pub fn toHandle(nullable: NullableHandle) ?Handle {
+        if (nullable != .null) {
+            return @bitCast(@as(HandleBacking, @intFromEnum(nullable)));
+        } else return null;
+    }
+
+    pub fn getIndex(nullable: NullableHandle) NullableIndex {
+        if (nullable.toHandle()) |val| {
+            return @enumFromInt(val.index);
+        } else return .null;
+    }
+
+    pub fn toHandleRef(nullable: *NullableHandle) ?*Handle {
+        if (nullable.* != .null) {
+            return @as(*Handle, @ptrCast(nullable));
+        } else return null;
+    }
+
+    pub fn swapRef(ref: *NullableHandle, new_handle: Handle) void {
+        if (ref.toHandle()) |handle| {
+            handle.decrRefCount();
+        }
+        ref.* = @enumFromInt(@as(HandleBacking, @bitCast(new_handle)));
+    }
+
+    pub fn swapRefIfNew(ref: *NullableHandle, new_handle: NullableHandle) void {
+        if (new_handle != .null) {
+            if (ref.toHandle()) |val| val.decrRefCount();
+            ref.* = new_handle;
+        }
+    }
+
+    pub fn swapWithNull(ref: *NullableHandle) void {
+        if (ref.toHandle()) |val| val.decrRefCount();
+        ref.* = .null;
+    }
+
+    pub fn orElse(ref: NullableHandle, other: Handle) Handle {
+        return ref.toHandle() orelse other;
+    }
+};
+
+pub const Handle = packed struct(HandleBacking) {
+    index: HeapIndex,
     heap: HeapId,
     _padding: u16 = 0,
 
@@ -650,6 +714,17 @@ pub const Handle = packed struct(u64) {
 
     pub fn getHeap(handle: Handle) *Heap {
         return &heaps[handle.heap];
+    }
+
+    pub fn toNullable(handle: Handle) NullableHandle {
+        return @enumFromInt(@as(HandleBacking, @bitCast(handle)));
+    }
+
+    pub fn prepareToShimmer(handle: Handle) !void {
+        handle.assert(handle.canShimmer());
+        // Make sure the object has a string rep before we free its body.
+        _ = try Heap.getString(handle);
+        handle.invalidateBody();
     }
 
     pub fn canShimmer(handle: Handle) bool {
@@ -703,25 +778,12 @@ pub const Handle = packed struct(u64) {
         before_duplicating.decrRefCount();
     }
 
-    pub fn swapRef(ref: *?Handle, new_handle: Handle) void {
-        if (ref.*) |*handle| handle.decrRefCount();
-        ref.* = new_handle;
-    }
-
     /// Helper to swap handle if new_handle is non-null, releasing the old one.
     pub fn swapIfNew(ref: *Handle, new_handle: ?Handle) void {
         if (new_handle) |new| {
             const old = ref.*;
             ref.* = new;
             old.decrRefCount();
-        }
-    }
-
-    pub fn swapRefIfNew(ref: *?Handle, new_handle: ?Handle) void {
-        if (ref.*) |*handle| {
-            handle.swapIfNew(new_handle);
-        } else if (new_handle) |val| {
-            ref.* = val;
         }
     }
 
@@ -760,10 +822,9 @@ pub const Handle = packed struct(u64) {
         handle.trace("Incr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() });
     }
 
-    pub fn reference(handle: Handle) Object {
+    pub fn referenceTakeOwnership(handle: Handle) Object {
         // Make sure we're never making a reference to a reference.
         handle.assert(handle.peek().tag != .reference);
-        handle.incrRefCount();
 
         return .{
             // References are guaranteed to always have a null representation.
@@ -773,6 +834,11 @@ pub const Handle = packed struct(u64) {
                 .reference = handle,
             },
         };
+    }
+
+    pub fn reference(handle: Handle) Object {
+        handle.incrRefCount();
+        return handle.referenceTakeOwnership();
     }
 
     pub fn invalidateBoth(handle: Handle) void {
@@ -1164,13 +1230,6 @@ pub inline fn heapId(self: *Heap) HeapId {
     return @intCast(self - &heaps);
 }
 
-pub fn nullObject(self: *Heap) Handle {
-    return .{
-        .index = null_object_idx,
-        .heap = self.heapId(),
-    };
-}
-
 pub fn emptyObject(self: *Heap) Handle {
     return .{
         .index = empty_object_idx,
@@ -1378,41 +1437,27 @@ pub fn freeObject(handle: Handle) void {
     freeObjectBacking(handle);
 }
 
-pub fn ensureMutableOrDup(handle: Handle) !?Handle {
+pub fn ensureMutableOrDup(handle: Handle, new_handle: *NullableHandle) !void {
     if (!handle.canMutate()) {
         // It's very sketchy to modify a collection item in place if
         // its parent is shared, so if this isn't the head this is
         // probably incorrect.
         assert(handle.isAllocHead());
-        return try local_heap.duplicate(handle);
+        new_handle.swapRef(try Heap.duplicate(local_heap, handle));
     }
-    return null;
 }
 
 /// If the object can't shimmer, this will return a duplicate.
-pub fn ensureShimmerableOrDup(handle: Handle) !?Handle {
-    if (!handle.canShimmer()) return try local_heap.duplicate(handle);
-    return null;
+pub fn ensureShimmerableOrDup(handle: Handle, new_handle: *NullableHandle) !void {
+    if (!handle.canShimmer()) {
+        new_handle.swapRef(try Heap.duplicate(local_heap, handle));
+    }
 }
 
-pub fn ensureSameHeapOrDup(handle: Handle) !?Handle {
-    if (handle.heap != local_heap.heapId()) return try local_heap.duplicate(handle);
-    return null;
-}
-
-/// If the object can't be mutated, this will duplicate and release
-/// the old object. This will also invalidate the current string.
-pub fn prepareForMutation(handle: *Handle) !void {
-    if (try ensureMutableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
-
-    handle.invalidateString();
-}
-
-pub fn ensureCanShimmer(handle: *Handle) !void {
-    if (try ensureShimmerableOrDup(handle.*)) |dup| handle.swapThenReleaseOld(dup);
-
-    // Make sure it has a string rep, in case the body is invalidated.
-    _ = try Heap.getString(handle.*);
+pub fn ensureSameHeapOrDup(handle: Handle, new_handle: *NullableHandle) !void {
+    if (handle.heap != local_heap.heapId()) {
+        new_handle.swapRef(try local_heap.duplicate(handle));
+    }
 }
 
 /// Get a string slice from heap string storage
@@ -1603,19 +1648,17 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .source => {
             const source = src.body.source;
 
-            const file_name_handle = blk: {
-                if (source.file_name_obj == 0) {
-                    break :blk dest_heap.nullObject();
-                } else {
+            const file_name_handle: NullableHandle = blk: {
+                if (source.file_name_obj.toNullable(handle.getHeap()).toHandle()) |file_name| {
                     // Better make sure it's in our heap.
-                    if (handle.heap != dest_heap.heapId()) {
-                        break :blk try dest_heap.duplicate(dest_heap.getHandle(source.file_name_obj));
+                    if (file_name.heap != dest_heap.heapId()) {
+                        const duped = try dest_heap.duplicate(file_name);
+                        break :blk duped.toNullable();
                     } else {
-                        const to_break = dest_heap.getHandle(source.file_name_obj);
-                        to_break.incrRefCount();
-                        break :blk to_break;
+                        const to_break = file_name.borrow();
+                        break :blk to_break.toNullable();
                     }
-                }
+                } else break :blk .null;
             };
 
             return .{
@@ -1623,7 +1666,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 .tag = .source,
                 .body = .{
                     .source = .{
-                        .file_name_obj = file_name_handle.index,
+                        .file_name_obj = file_name_handle.getIndex(),
                         .line_no = source.line_no,
                     },
                 },
@@ -2638,8 +2681,8 @@ fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index:
             try stderr.print("  obj{} -> obj{} [label=\"ref\", color=red, style=dashed];\n", .{ index, ref_handle.index });
         },
         .source => {
-            if (obj.body.source.file_name_obj != 0) {
-                try stderr.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, obj.body.source.file_name_obj });
+            if (obj.body.source.file_name_obj.getIndex()) |file_name_index| {
+                try stderr.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name_index });
             }
         },
         .dict_subst => {

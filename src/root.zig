@@ -17,7 +17,7 @@ pub fn main() !void {
 
 pub const panic = std.debug.FullPanic(panicAndPrintTraces);
 fn panicAndPrintTraces(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    Heap.printLastTouchedTrace();
+    Heap.dumpLastTouchedTrace();
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 

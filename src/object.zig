@@ -7,9 +7,10 @@ const options = @import("options");
 const stringutil = @import("stringutil.zig");
 const expr_parse = @import("expr_parse.zig");
 const memutil = @import("memutil.zig");
-const Heap = @import("Heap.zig");
 const Tokenizer = @import("Tokenizer.zig");
+const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
+const NullableHandle = Heap.NullableHandle;
 
 pub const Error = std.mem.Allocator.Error || error{
     BadIndex,
@@ -23,6 +24,7 @@ pub const Error = std.mem.Allocator.Error || error{
     NegativeDenominator,
     BadFloat,
     ParseError,
+    MissingDictKey,
 };
 
 pub const ErrorDetails = struct {
@@ -30,17 +32,15 @@ pub const ErrorDetails = struct {
     index: ?u32 = null,
 };
 
-/// If the object changed locations, return the new object handle.
-pub fn shimmerToString(provided_handle: Handle) !?Handle {
-    if (provided_handle.peek().tag == .string) return null;
+/// If the object changed locations, `new_handle` will be non-null.
+pub fn shimmerToString(provided_handle: Handle, new_handle: *NullableHandle) !void {
+    if (provided_handle.peek().tag == .string) return;
+    errdefer new_handle.swapWithNull();
 
-    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
-    errdefer if (new_handle) |val| val.decrRefCount();
-    const handle = new_handle orelse provided_handle;
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
 
-    _ = try Heap.getString(provided_handle); // Ensure string representation
-
-    handle.invalidateBody();
+    try handle.prepareToShimmer();
     handle.peek().tag = .string;
     handle.peek().body = .{
         .string = .{
@@ -49,14 +49,13 @@ pub fn shimmerToString(provided_handle: Handle) !?Handle {
             .length_determined = false,
         },
     };
-
-    return new_handle;
 }
 
-pub fn getCodepointLength(provided_handle: Handle) !struct { new_handle: ?Handle, len: usize } {
-    const new_handle: ?Handle = try shimmerToString(provided_handle);
-    errdefer if (new_handle) |val| val.decrRefCount();
-    const handle = new_handle orelse provided_handle;
+pub fn getCodepointLength(provided_handle: Handle, new_handle: *NullableHandle) !usize {
+    errdefer new_handle.swapWithNull();
+
+    try shimmerToString(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
 
     assert(handle.peek().tag == .string);
 
@@ -68,8 +67,8 @@ pub fn getCodepointLength(provided_handle: Handle) !struct { new_handle: ?Handle
 
             // String length hasn't been computed yet, so compute now.
             const utf8_length = stringutil.codepointLength(long_str.getString());
-            long_str.setUtf8Length(utf8_length); // Cache utf8 length
-            return .{ .new_handle = new_handle, .len = utf8_length };
+            long_str.setUtf8Length(utf8_length); // Cache utf8 length.
+            return utf8_length;
         },
         .normal => {
             if (handle.peek().body.string.length_determined) {
@@ -78,13 +77,13 @@ pub fn getCodepointLength(provided_handle: Handle) !struct { new_handle: ?Handle
                 const bytes = try Heap.getString(handle);
                 const utf8_length = stringutil.codepointLength(bytes);
                 handle.peek().body.string = .{
-                    .utf8_length = utf8_length, // Cache utf8 length
+                    .utf8_length = utf8_length, // Cache utf8 length.
                     .length_determined = true,
                 };
-                return .{ .new_handle = new_handle, .len = utf8_length };
+                return utf8_length;
             }
         },
-        .empty => return .{ .new_handle = new_handle, .len = 0 },
+        .empty => 0,
         .null => unreachable,
     }
 }
@@ -95,7 +94,10 @@ pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
     errdefer handle.decrRefCount();
 
     try Heap.setString(handle, bytes);
-    assert(try shimmerToString(handle) == null);
+    var new_handle: NullableHandle = .null;
+    try shimmerToString(handle, &new_handle);
+    assert(new_handle == .null);
+
     return handle;
 }
 
@@ -257,26 +259,25 @@ pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     }
 }
 
-/// If the object changed locations, return the new object handle.
-pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
-    if (provided_handle.peek().tag == .integer) return null;
+/// If the object changed locations, new_handle will be non-null.
+pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !void {
+    if (provided_handle.peek().tag == .integer) return;
+    errdefer new_handle.swapWithNull();
 
-    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
-    const handle = new_handle orelse provided_handle;
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
 
     const value: i64 = try integerGetNoShimmer(det, handle);
 
-    handle.invalidateBody();
+    try handle.prepareToShimmer();
     handle.peek().tag = .integer;
     handle.peek().body.integer = value;
-
-    return new_handle;
 }
 
-pub fn integerGet(det: ?*ErrorDetails, provided_handle: Handle) !struct { new_handle: ?Handle, value: i64 } {
-    const new_handle = try shimmerToInteger(det, provided_handle);
-    const handle = new_handle orelse provided_handle;
-    return .{ .new_handle = new_handle, .value = handle.peek().body.integer };
+pub fn integerGet(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !i64 {
+    try shimmerToInteger(det, provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
+    return handle.peek().body.integer;
 }
 
 // Float related functions.
@@ -303,19 +304,17 @@ pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     }
 }
 
-pub fn shimmerToFloat(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
+pub fn shimmerToFloat(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !void {
     if (provided_handle.peek().tag == .float) return null;
+    errdefer new_handle.swapWithNull();
 
-    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
-    const handle = new_handle orelse provided_handle;
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
 
     const value = try floatGetNoShimmer(det, handle);
-
-    handle.invalidateBody();
+    handle.prepareToShimmer();
     handle.peek().tag = .float;
     handle.peek().body.float = value;
-
-    return new_handle;
 }
 
 ///////////////////////////////
@@ -359,11 +358,12 @@ fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
 }
 
 /// Shimmers to an index representation.
-pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
+pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !void {
     if (provided_handle.peek().tag == .index) return null;
+    errdefer new_handle.swapWithNull();
 
-    const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
-    const handle = new_handle orelse provided_handle;
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
 
     const bytes = try Heap.getString(handle);
 
@@ -386,14 +386,14 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
         }
     };
 
-    handle.invalidateBody();
+    handle.prepareToShimmer();
     handle.peek().tag = .index;
     handle.peek().index = index;
 
     return new_handle;
 }
 
-pub fn getIndex(det: ?*ErrorDetails, handle: Handle) !struct { new_handle: ?Handle, index: Heap.ListIndex } {
+pub fn getIndex(det: ?*ErrorDetails, handle: Handle, new_handle: *NullableHandle) !Heap.ListIndex {
     // Fast case: if it's an integer or float, we can quickly cast it (don't
     // shimmer though, as it'll probably still be used for its original purpose)
     if (handle.peek().tag == .integer) {
@@ -412,28 +412,29 @@ pub fn getIndex(det: ?*ErrorDetails, handle: Handle) !struct { new_handle: ?Hand
         return .{ .u = .{ .index = @intFromFloat(float) }, .is_end = false };
     }
 
-    const new_handle = try shimmerToIndex(det, handle);
-    return .{ .new_handle = new_handle, .index = handle.peek().body.index };
+    errdefer new_handle.swapWithNull();
+    try shimmerToIndex(det, handle, new_handle);
+
+    return new_handle.orElse(handle).peek().body.index;
 }
 
 /// Creates a substring of the passed in string. Used in `[string range]`.
-pub fn stringRange(det: ?*ErrorDetails, str: Handle, start: Handle, end: Handle) !struct {
-    substring: Handle,
-    new_start: ?Handle,
-    new_end: ?Handle,
-} {
+pub fn stringRange(
+    det: ?*ErrorDetails,
+    str: Handle,
+    start: Handle,
+    new_start: *NullableHandle,
+    end: Handle,
+    new_end: *NullableHandle,
+) !Handle {
+    errdefer new_start.swapWithNull();
+    errdefer new_end.swapWithNull();
+
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str);
 
-    const start_result = try getIndex(det, start);
-    const new_start = start_result.new_handle;
-    errdefer new_start.decrRefCount();
-    const start_index = start_result.index;
-
-    const end_result = try getIndex(det, end);
-    const new_end = end_result.new_handle;
-    errdefer new_end.decrRefCount();
-    const end_index = end_result.index;
+    const start_index = try getIndex(det, start, new_start);
+    const end_index = try getIndex(det, end, new_end);
 
     const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
 
@@ -441,34 +442,30 @@ pub fn stringRange(det: ?*ErrorDetails, str: Handle, start: Handle, end: Handle)
     const byte_start = stringutil.cpIndex(bytes, range.start);
     const byte_end = stringutil.cpIndex(bytes, range.end);
 
-    return .{
-        .substring = try newStringWithCodepointLen(
-            bytes[byte_start..byte_end],
-            range.end - range.start,
-        ),
-        .new_start = new_start,
-        .new_end = new_end,
-    };
+    return try newStringWithCodepointLen(
+        bytes[byte_start..byte_end],
+        range.end - range.start,
+    );
 }
 
 /// Removes from `start` to `end`, optionally inserting `to_insert`.
-pub fn stringReplace(det: ?*ErrorDetails, str: Handle, start: Handle, end: Handle, to_insert: ?Handle) !struct {
-    replaced: Handle,
-    new_start: ?Handle,
-    new_end: ?Handle,
-} {
+pub fn stringReplace(
+    det: ?*ErrorDetails,
+    str: Handle,
+    start: Handle,
+    new_start: *NullableHandle,
+    end: Handle,
+    new_end: *NullableHandle,
+    to_insert: NullableHandle,
+) Handle {
+    errdefer new_start.swapWithNull();
+    errdefer new_end.swapWithNull();
+
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str.*);
 
-    const start_result = try getIndex(det, start);
-    const new_start = start_result.new_handle;
-    errdefer if (new_start) |val| val.decrRefCount();
-    const start_index = start_result.index;
-
-    const end_result = try getIndex(det, end);
-    const new_end = end_result.new_handle;
-    errdefer if (new_end) |val| val.decrRefCount();
-    const end_index = end_result.index;
+    const start_index = try getIndex(det, start, new_start);
+    const end_index = try getIndex(det, end, new_end);
 
     const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
 
@@ -701,10 +698,10 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
         pub const map = (EnumMapping(T){}).map;
         pub const names = enumNames(T);
 
-        pub fn get(det: ?*ErrorDetails, provided_handle: Handle) !struct { new_handle: ?Handle, value: T } {
-            const new_handle: ?Handle = try Heap.ensureShimmerableOrDup(provided_handle);
-            errdefer if (new_handle) |val| val.decrRefCount();
-            const handle = new_handle orelse provided_handle;
+        pub fn get(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !T {
+            errdefer new_handle.swapWithNull();
+            try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+            const handle = new_handle.orElse(provided_handle);
 
             // TODO PERF we can optimize this by shimmering the value to an "enum" type,
             // where the enum type has a u48 storing the hash of enum_name and a u16 for
@@ -712,7 +709,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
             const bytes = try Heap.getString(handle);
             const variant = map.get(bytes);
             if (variant) |val| {
-                return .{ .new_handle = new_handle, .value = val };
+                return val;
             } else {
                 if (det) |details| details.* = .{
                     .message = try newStringFmt(Heap.local_heap, "bad {s} \"{f}\": must be {s}", .{ enum_name, handle, names }),
@@ -733,7 +730,13 @@ test "tcl enum" {
 }
 
 /// Runs a string check based on requested class. `class_to_check` must be shimmerable.
-pub fn stringIs(det: ?*ErrorDetails, str: Handle, class_to_check: Handle, strict: bool) !struct { new_class_to_check: ?Handle, passes: bool } {
+pub fn stringIs(
+    det: ?*ErrorDetails,
+    str: Handle,
+    class_to_check: Handle,
+    new_class_to_check: *NullableHandle,
+    strict: bool,
+) !bool {
     const Class = TclEnum(enum {
         integer,
         alpha,
@@ -752,26 +755,23 @@ pub fn stringIs(det: ?*ErrorDetails, str: Handle, class_to_check: Handle, strict
         boolean,
     }, "class");
 
-    const class_result = try Class.get(det, class_to_check);
-    const class = class_result.value;
-    const new_class_to_check = class_result.new_handle;
+    errdefer new_class_to_check.swapWithNull();
+    const class = try Class.get(det, class_to_check, new_class_to_check);
 
     const bytes = try Heap.getString(str);
-    if (bytes.len == 0) {
-        return .{ .new_class_to_check = new_class_to_check, .passes = !strict };
-    }
+    if (bytes.len == 0) return !strict;
 
-    const passes = switch (class) {
+    return switch (class) {
         .integer => blk: {
-            _ = std.fmt.parseInt(i64, bytes, 0) catch break :blk false;
+            _ = integerGetNoShimmer(null, str) catch break :blk false;
             break :blk true;
         },
         .double => blk: {
-            _ = std.fmt.parseFloat(f64, bytes) catch break :blk false;
+            _ = floatGetNoShimmer(null, str) catch break :blk false;
             break :blk true;
         },
         .boolean => blk: {
-            _ = getBoolean(null, str) catch break :blk false;
+            _ = getBoolean(null, str, new_class_to_check) catch break :blk false;
             break :blk true;
         },
         .alpha => stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
@@ -786,11 +786,6 @@ pub fn stringIs(det: ?*ErrorDetails, str: Handle, class_to_check: Handle, strict
         .print => stringutil.checkAllAscii(bytes, std.ascii.isPrint),
         .graph => stringutil.checkAllAscii(bytes, stringutil.isGraph),
         .punct => stringutil.checkAllAscii(bytes, stringutil.isPunct),
-    };
-
-    return .{
-        .new_class_to_check = new_class_to_check,
-        .passes = passes,
     };
 }
 
@@ -808,9 +803,11 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     defer bad_class.decrRefCount();
     var det: ErrorDetails = undefined;
 
-    try testing.expectEqual(true, (try stringIs(null, str, class, false)).passes);
-    try testing.expectEqual(false, (try stringIs(null, str2, class, false)).passes);
-    const err = stringIs(&det, str, bad_class, false);
+    var new_class: Heap.NullableHandle = .null;
+    defer if (new_class.toHandle()) |val| val.decrRefCount();
+    try testing.expectEqual(true, try stringIs(null, str, class, &new_class, false));
+    try testing.expectEqual(false, try stringIs(null, str2, class, &new_class, false));
+    const err = stringIs(&det, str, bad_class, &new_class, false);
     if (err == error.OutOfMemory) return error.OutOfMemory;
     try testing.expectError(error.BadEnumVariant, err);
     try testing.expectEqualStrings(
@@ -1643,7 +1640,7 @@ const DictAndValueResult = struct { new_dict: ?Handle, new_value: Heap.Handle };
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
 /// `value` must be in `Heap.local_heap`.
 pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !DictAndValueResult {
-    assert(provided_dict.peek().tag == .dict);
+    provided_dict.assert(provided_dict.peek().tag == .dict);
 
     var value_taken = false;
     errdefer if (!value_taken) {
@@ -1746,12 +1743,118 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
     return .{ .new_dict = new_dict, .new_value = dictItem(dict, value_index) };
 }
 
-pub fn dictPutRecursively(det: ?*ErrorDetails, dict: *Handle, keys: []Handle, value: Heap.Object) void {
-    try shimmerToDict(det, dict);
+pub fn dictPutRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle, value: Heap.Object) !DictAndValueResult {
+    var new_dict = try shimmerToDict(det, provided_dict);
+    errdefer if (new_dict) |val| val.decrRefCount();
     assert(keys.len > 0);
 
     if (keys.len == 1) {
-        try dictPutInner(dict, keys[0], value);
+        const put_result = try dictPutInner(new_dict orelse provided_dict, keys[0], value);
+        Handle.swapRefIfNew(&new_dict, put_result.new_dict);
+        return .{ .new_dict = new_dict, .new_value = put_result.new_value };
+    }
+
+    // Find/create the child dict.
+    const child_dict = blk: {
+        if (try dictLookupFollowRefs(new_dict orelse provided_dict, keys[0])) |existing_dict| {
+            break :blk existing_dict;
+        } else {
+            // Create a new child dictionary.
+            const new_child_dict = try newDictWithCapacity(2);
+
+            const put_result = try dictPutInner(
+                new_dict orelse provided_dict,
+                keys[0],
+                new_child_dict.referenceTakeOwnership(),
+            );
+            Handle.swapRefIfNew(&new_dict, put_result.new_dict);
+            break :blk put_result.new_value;
+        }
+    };
+
+    const child_put_result = try dictPutRecursively(det, child_dict, keys[1..], value);
+    if (child_put_result.new_dict) |new_child| {
+        errdefer new_child.decrRefCount();
+
+        // The child dict changed, so we need to update ours.
+        const put_result = try dictPutInner(
+            new_dict orelse provided_dict,
+            keys[0],
+            new_child.referenceTakeOwnership(),
+        );
+        Handle.swapRefIfNew(&new_dict, put_result.new_dict);
+    }
+
+    (new_dict orelse provided_dict).invalidateString();
+
+    return .{ .new_dict = new_dict, .new_value = child_put_result.new_value };
+}
+
+pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle) !DictAndRemovedResult {
+    var new_dict = try shimmerToDict(det, provided_dict);
+    errdefer if (new_dict) |val| val.decrRefCount();
+    assert(keys.len > 0);
+
+    if (keys.len == 1) {
+        const remove_result = try dictRemove(new_dict orelse provided_dict, keys[0]);
+        Handle.swapRefIfNew(&new_dict, remove_result.new_dict);
+        return .{ .new_dict = new_dict, .did_remove = remove_result.did_remove };
+    }
+
+    // Find the child dict.
+    if (try dictLookupFollowRefs(new_dict orelse provided_dict, keys[0])) |child_dict| {
+        const child_remove_result = try dictRemove(child_dict, keys[0]);
+        if (child_remove_result.new_dict) |new_child| {
+            errdefer new_child.decrRefCount();
+            // The child dict changed, so we need to update ours.
+            const put_result = try dictPutInner(
+                new_dict orelse provided_dict,
+                keys[0],
+                new_child.referenceTakeOwnership(),
+            );
+            Handle.swapRefIfNew(&new_dict, put_result.new_dict);
+        }
+
+        (new_dict orelse provided_dict).invalidateString();
+
+        return .{ .new_dict = new_dict, .did_remove = child_remove_result.did_remove };
+    } else {
+        if (det) |details| details.* = .{
+            .message = try newStringFmt(
+                Heap.local_heap,
+                "key \"{f}\" not known in dictionary \"{f}\"",
+                .{ keys[0], provided_dict },
+            ),
+        };
+        return error.MissingDictKey;
+    }
+}
+
+pub const DictAndValueLookupResult = struct { new_dict: ?Handle, value: ?Handle };
+pub fn dictLookupRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle) !DictAndValueLookupResult {
+    var new_dict = try shimmerToDict(det, provided_dict);
+    errdefer if (new_dict) |val| val.decrRefCount();
+
+    if (keys.len == 0) return .{ .new_dict = new_dict, .value = new_dict orelse provided_dict };
+    if (keys.len == 1) {
+        return .{ .new_dict = new_dict, .value = dictLookupFollowRefs(new_dict orelse provided_dict, keys[0]) };
+    }
+
+    if (dictLookupFollowRefs(new_dict orelse provided_dict, keys[0])) |child_dict| {
+        const child_result = try dictLookupRecursively(det, child_dict, keys[1..]);
+        if (child_result.new_dict) |new_child| {
+            errdefer new_child.decrRefCount();
+            // The child dict changed, propagate back up.
+            const put_result = try dictPutInner(
+                new_dict orelse provided_dict,
+                keys[0],
+                new_child.referenceTakeOwnership(),
+            );
+            Handle.swapRefIfNew(&new_dict, put_result.new_dict);
+        }
+        return .{ .new_dict = new_dict, .value = child_result.value };
+    } else {
+        return .{ .new_dict = new_dict, .value = null };
     }
 }
 
@@ -1760,8 +1863,9 @@ pub fn dictPut(dict: Handle, key: Handle, value: Handle) !DictAndValueResult {
     return dictPutInner(dict, key, try Heap.local_heap.dupOrReference(value));
 }
 
+const DictAndRemovedResult = struct { new_dict: ?Handle, did_remove: bool };
 /// Returns true if the value was removed, or false if the value doesn't exist.
-pub fn dictRemove(provided_dict: Handle, key: Handle) !struct { new_dict: ?Handle, did_remove: bool } {
+pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     assert(provided_dict.peek().tag == .dict);
 
     const key_bytes = try Heap.getString(key);
@@ -2558,21 +2662,21 @@ test "expressions" {
     try testing.checkAllAllocationFailures(testing.allocator, testExpressions, .{});
 }
 
-pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
-    if (provided_handle.peek().tag == .bool) return null;
+pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !void {
+    if (provided_handle.peek().tag == .bool) return;
+    errdefer new_handle.swapWithNull();
 
     // Fast case: if it's an int, we can get the value directly.
     if (provided_handle.peek().tag == .integer) {
         const new_value = provided_handle.peek().body.integer != 0;
 
-        const new_handle = try Heap.ensureShimmerableOrDup(provided_handle);
-        errdefer if (new_handle) |val| val.decrRefCount();
-        const handle = new_handle orelse provided_handle;
+        try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+        const handle = new_handle.orElse(provided_handle);
 
-        handle.invalidateBody();
+        try handle.prepareToShimmer();
         handle.peek().tag = .bool;
         handle.peek().body.bool = new_value;
-        return new_handle;
+        return;
     }
 
     const Mapping = std.StaticStringMap(bool).initComptime(Tokenizer.boolean_mapping);
@@ -2593,19 +2697,15 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle) !?Handle {
         break :blk as_int != 0;
     };
 
-    const new_handle = try Heap.ensureShimmerableOrDup(provided_handle);
-    errdefer if (new_handle) |val| val.decrRefCount();
-    const handle = new_handle orelse provided_handle;
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
 
-    handle.invalidateBody();
+    try handle.prepareToShimmer();
     handle.peek().tag = .bool;
     handle.peek().body.bool = new_value;
-
-    return new_handle;
 }
 
-pub fn getBoolean(det: ?*ErrorDetails, provided_handle: Handle) !struct { new_handle: ?Handle, value: bool } {
-    const new_handle = try shimmerToBoolean(det, provided_handle);
-    const handle = new_handle orelse provided_handle;
-    return .{ .new_handle = new_handle, .value = handle.peek().body.bool };
+pub fn getBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *NullableHandle) !bool {
+    try shimmerToBoolean(det, provided_handle, new_handle);
+    return new_handle.orElse(provided_handle).peek().body.bool;
 }
