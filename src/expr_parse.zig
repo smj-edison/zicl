@@ -6,6 +6,7 @@ const Tokenizer = @import("Tokenizer.zig");
 // Used to store parsed strings.
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
+const NullableHandle = Heap.NullableHandle;
 const object = @import("object.zig");
 const Token = Tokenizer.Token;
 
@@ -182,7 +183,7 @@ pub const Parse = struct {
     gpa: std.mem.Allocator,
     heap: *Heap,
     source: []const u8,
-    source_file_name: ?Handle,
+    source_file_name: NullableHandle,
     tokens: Tokens,
     nodes: std.MultiArrayList(Node),
     err: ?Error,
@@ -545,7 +546,7 @@ pub const Parse = struct {
     }
 
     /// Does not borrow source_file_name.
-    pub fn init(heap: *Heap, source_file_name: ?Handle, source: []const u8, tokens: Tokens) Parse {
+    pub fn init(heap: *Heap, source_file_name: NullableHandle, source: []const u8, tokens: Tokens) Parse {
         return .{
             .gpa = heap.gpa,
             .heap = heap,

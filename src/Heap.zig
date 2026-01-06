@@ -263,7 +263,7 @@ pub const ParsedScript = struct {
     /// Tokens array.
     tags: std.ArrayList(Tokenizer.Token.Tag),
     /// File name.
-    file_name_obj: ?Handle,
+    file_name_obj: NullableHandle,
     /// Line number of the first line.
     first_line: u32,
 
@@ -287,7 +287,7 @@ pub const ParsedScript = struct {
     }
 
     pub fn deinit(parsed: *ParsedScript, script_heap: *Heap) void {
-        if (parsed.file_name_obj) |file_name| file_name.decrRefCount();
+        if (parsed.file_name_obj.toHandle()) |file_name| file_name.decrRefCount();
         parsed.tags.deinit(script_heap.gpa);
         parsed.values.decrRefCount();
     }
@@ -693,6 +693,11 @@ pub const NullableHandle = enum(HandleBacking) {
     pub fn orElse(ref: NullableHandle, other: Handle) Handle {
         return ref.toHandle() orelse other;
     }
+
+    pub fn borrowNullable(ref: NullableHandle) NullableHandle {
+        if (ref.toHandle()) |val| val.incrRefCount();
+        return ref;
+    }
 };
 
 pub const Handle = packed struct(HandleBacking) {
@@ -772,15 +777,21 @@ pub const Handle = packed struct(HandleBacking) {
         free_old: bool = true,
     };
 
-    pub fn swapThenReleaseOld(ref: *Handle, new: Handle) void {
+    pub fn swap(ref: *Handle, new: Handle) void {
         const before_duplicating = ref.*;
         ref.* = new;
         before_duplicating.decrRefCount();
     }
 
+    /// If `nullable` is non-null, it will transfer ownership to `ref` and be set to null.
+    pub fn swapWithNullable(ref: *Handle, nullable: *NullableHandle) void {
+        if (nullable.toHandle()) |handle| ref.swap(handle);
+        nullable.* = .null;
+    }
+
     /// Helper to swap handle if new_handle is non-null, releasing the old one.
-    pub fn swapIfNew(ref: *Handle, new_handle: ?Handle) void {
-        if (new_handle) |new| {
+    pub fn swapIfNew(ref: *Handle, new_handle: NullableHandle) void {
+        if (new_handle.toHandle()) |new| {
             const old = ref.*;
             ref.* = new;
             old.decrRefCount();
