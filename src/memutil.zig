@@ -627,3 +627,12 @@ test "indexed memory pool" {
     try testing.expectEqual(0, pool.create(ta));
     try testing.expectEqual(1, pool.create(ta));
 }
+
+pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !void {
+    if (actual_error_union) |_| {} else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    }
+
+    try testing.expectError(expected_error, actual_error_union);
+}

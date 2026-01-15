@@ -5,3 +5,4 @@ zig-out
 graph.svg
 perf.data
 per.data.old
+scratch

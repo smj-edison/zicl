@@ -105,7 +105,7 @@ const StringTracker = memutil.BuddyUnmanaged(.{
 });
 const StringList = std.ArrayList(u8);
 
-const ExtraDataPool = memutil.IndexedMemoryPool(ExtraData, cfg.use_vmem);
+const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, cfg.use_vmem);
 const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
 const ParsedExpressions = std.AutoHashMapUnmanaged(u32, struct { expr: ParsedExpression, generation: u32 });
 
@@ -263,7 +263,7 @@ pub const ParsedScript = struct {
     /// Tokens array.
     tags: std.ArrayList(Tokenizer.Token.Tag),
     /// File name.
-    file_name_obj: NullableHandle,
+    file_name_obj: OptionalHandle,
     /// Line number of the first line.
     first_line: u32,
 
@@ -335,6 +335,14 @@ pub const Object = packed struct(u128) {
                 .null, .empty => {},
             }
         }
+
+        pub fn format(self: StrOrPtr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            if (self.is_ptr) {
+                try writer.print(".{{ .ptr = {*} }}", .{LongString.fromInt(self.u.ptr)});
+            } else {
+                try writer.print("{}", .{self.u.str});
+            }
+        }
     };
 
     // Make sure this stays in sync with Head fields.
@@ -398,7 +406,7 @@ pub const Object = packed struct(u128) {
             },
             .source => {
                 const source = obj.body.source;
-                if (source.file_name_obj.toNullable(heap).toHandle()) |val| val.decrRefCount();
+                if (source.file_name_obj.toOptional(heap).toHandle()) |val| val.decrRefCount();
             },
             .command => {
                 const command = obj.body.command;
@@ -429,6 +437,7 @@ pub const Object = packed struct(u128) {
             .script_command,
             .marked,
             .variable,
+            .invalid,
             => {},
             .dict, .list => unreachable,
         }
@@ -436,10 +445,44 @@ pub const Object = packed struct(u128) {
         obj.body = undefined;
         obj.tag = .none;
     }
+
+    pub fn format(self: Object, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print(
+            ".{{ .str = {f}, .body = .{{ .{s}",
+            .{ self.str, @tagName(self.tag) },
+        );
+        switch (self.tag) {
+            .invalid,
+            .none,
+            .marked,
+            => {},
+            .index => try writer.print(" = {}", .{self.body.index}),
+            .integer => try writer.print(" = {}", .{self.body.integer}),
+            .float => try writer.print(" = {}", .{self.body.float}),
+            .bool => try writer.print(" = {}", .{self.body.bool}),
+            .string => try writer.print(" = {}", .{self.body.string}),
+            .source => try writer.print(" = {}", .{self.body.source}),
+            .list => try writer.print(" = {}", .{self.body.list}),
+            .dict => try writer.print(" = {}", .{self.body.dict}),
+            .dict_subst => try writer.print(" = {}", .{self.body.dict_subst}),
+            .command => try writer.print(" = {}", .{self.body.command}),
+            .script_command => try writer.print(" = {}", .{self.body.script_command}),
+            .script => try writer.print(" = {}", .{self.body.script}),
+            .expr => try writer.print(" = {}", .{self.body.expr}),
+            .reference => try writer.print(" = {any}", .{self.body.reference}),
+            .variable => try writer.print(" = {}", .{self.body.variable}),
+            .upvar => try writer.print(" = {}", .{self.body.upvar}),
+            .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
+        }
+        try writer.writeAll(" } }");
+    }
 };
 
 pub const Tag = enum(u5) {
+    // Set this if an object's contents are no longer usable.
+    invalid,
     none,
+    marked,
     index,
     integer,
     float,
@@ -457,7 +500,6 @@ pub const Tag = enum(u5) {
     variable,
     upvar,
     custom_type,
-    marked,
 };
 
 pub const IndexError = error{BadIndex};
@@ -483,7 +525,10 @@ pub const ListIndex = packed struct {
 };
 
 pub const Body = packed union {
+    invalid: void,
     none: void,
+    /// Used internally in places where a value needs to be temporarily marked.
+    marked: void,
     /// List index
     index: ListIndex,
     integer: i64,
@@ -495,7 +540,7 @@ pub const Body = packed union {
     },
     source: packed struct {
         /// Pointer to an object in the same heap that contains the file name.
-        file_name_obj: NullableIndex,
+        file_name_obj: OptionalIndex,
         line_no: u32,
     },
     list: packed struct {
@@ -505,7 +550,12 @@ pub const Body = packed union {
     /// Keys and values alternate. Allows for duplicate keys when shimmering
     /// from a list, but duplicates will be removed when any writing operation
     /// happens.
-    dict: ExtraDataIndex,
+    dict: packed struct {
+        /// Length of dictionaries' backing list, including potential duplicated
+        /// keys when shimmering from list.
+        len: u32,
+        extra_data: ExtraData,
+    },
     /// Both objects must be in the same heap.
     dict_subst: packed struct {
         var_name_index: u32,
@@ -518,7 +568,7 @@ pub const Body = packed union {
             global_namespace: packed struct {
                 command_index: u32,
             },
-            other_namespace: ExtraDataIndex,
+            other_namespace: ExtraData,
         },
     },
     /// Information about a command.
@@ -541,13 +591,11 @@ pub const Body = packed union {
         /// Whether the variable is global, e.g. prefixed with ::
         is_global: bool,
     },
-    upvar: ExtraDataIndex,
+    upvar: ExtraData,
     custom_type: packed struct {
         type_id: u32,
-        index: ExtraDataIndex,
+        index: ExtraData,
     },
-    /// Used internally in places where a value needs to be temporarily marked.
-    marked: void,
 };
 
 comptime {
@@ -563,13 +611,12 @@ comptime {
     }
 }
 
-pub const ExtraDataIndex = enum(u32) { _ };
+pub const ExtraData = enum(u32) { _ };
+
 /// Extra data, for when you can't store enough in the main object.
-pub const ExtraData = union {
+pub const ExtraDataValue = union {
     pub const Dictionary = struct {
-        /// Caller needs to ensure that any string this is called with
-        /// is valid, as hash map methods don't return errors.
-        table: std.HashMapUnmanaged(Handle, u32, struct {
+        pub const Table = std.HashMapUnmanaged(Handle, u32, struct {
             pub fn hash(ctx: @This(), key: Handle) u64 {
                 _ = ctx;
 
@@ -582,10 +629,11 @@ pub const ExtraData = union {
 
                 return checkIfEqual(a, b) catch unreachable;
             }
-        }, 80),
-        /// Length of dictionaries' backing list, including potential duplicated
-        /// keys when shimmering from list.
-        len: u32,
+        }, 80);
+
+        /// Caller needs to ensure that any string this is called with
+        /// is valid, as hash map methods don't return errors.
+        table: ?Table,
     };
 
     /// This does not store the key/value pairs directly, instead it
@@ -632,69 +680,69 @@ pub const CustomType = struct {
 const HeapIndex = u32;
 const HandleBacking = u64;
 
-pub const NullableIndex = enum(HeapIndex) {
+pub const OptionalIndex = enum(HeapIndex) {
     null = 0,
     _,
 
-    pub fn toNullable(index: NullableIndex, heap: *Heap) NullableHandle {
-        if (index == .null) return .null;
+    pub fn toOptional(index: OptionalIndex, heap: *Heap) OptionalHandle {
+        if (index == .null) return .none;
         const unwrapped_index: HeapIndex = @intFromEnum(index);
-        return heap.getHandle(unwrapped_index).toNullable();
+        return heap.getHandle(unwrapped_index).toOptional();
     }
 
-    pub fn getIndex(index: NullableIndex) ?HeapIndex {
+    pub fn getIndex(index: OptionalIndex) ?HeapIndex {
         if (index != .null) {
             return @intFromEnum(index);
         } else return null;
     }
 };
 
-pub const NullableHandle = enum(HandleBacking) {
-    null = 0,
+pub const OptionalHandle = enum(HandleBacking) {
+    none = 0,
     _,
 
-    pub fn toHandle(nullable: NullableHandle) ?Handle {
-        if (nullable != .null) {
-            return @bitCast(@as(HandleBacking, @intFromEnum(nullable)));
+    pub fn toHandle(optional: OptionalHandle) ?Handle {
+        if (optional != .none) {
+            return @bitCast(@as(HandleBacking, @intFromEnum(optional)));
         } else return null;
     }
 
-    pub fn getIndex(nullable: NullableHandle) NullableIndex {
-        if (nullable.toHandle()) |val| {
+    pub fn getIndex(optional: OptionalHandle) OptionalIndex {
+        if (optional.toHandle()) |val| {
             return @enumFromInt(val.index);
         } else return .null;
     }
 
-    pub fn toHandleRef(nullable: *NullableHandle) ?*Handle {
-        if (nullable.* != .null) {
-            return @as(*Handle, @ptrCast(nullable));
+    pub fn toHandleRef(optional: *OptionalHandle) ?*Handle {
+        if (optional.* != .none) {
+            return @as(*Handle, @ptrCast(optional));
         } else return null;
     }
 
-    pub fn swapRef(ref: *NullableHandle, new_handle: Handle) void {
+    pub fn swapRef(ref: *OptionalHandle, new_handle: Handle) void {
         if (ref.toHandle()) |handle| {
             handle.decrRefCount();
         }
         ref.* = @enumFromInt(@as(HandleBacking, @bitCast(new_handle)));
     }
 
-    pub fn swapRefIfNew(ref: *NullableHandle, new_handle: NullableHandle) void {
-        if (new_handle != .null) {
+    pub fn swapRefIfNew(ref: *OptionalHandle, new_handle: OptionalHandle) void {
+        if (new_handle != .none) {
             if (ref.toHandle()) |val| val.decrRefCount();
             ref.* = new_handle;
         }
     }
 
-    pub fn swapWithNull(ref: *NullableHandle) void {
+    pub fn swapWithNull(ref: *OptionalHandle) void {
         if (ref.toHandle()) |val| val.decrRefCount();
-        ref.* = .null;
+        ref.* = .none;
     }
 
-    pub fn orElse(ref: NullableHandle, other: Handle) Handle {
+    pub fn orElse(ref: OptionalHandle, other: Handle) Handle {
         return ref.toHandle() orelse other;
     }
 
-    pub fn borrowNullable(ref: NullableHandle) NullableHandle {
+    pub fn borrowOptional(ref: OptionalHandle) OptionalHandle {
         if (ref.toHandle()) |val| val.incrRefCount();
         return ref;
     }
@@ -721,7 +769,7 @@ pub const Handle = packed struct(HandleBacking) {
         return &heaps[handle.heap];
     }
 
-    pub fn toNullable(handle: Handle) NullableHandle {
+    pub fn toOptional(handle: Handle) OptionalHandle {
         return @enumFromInt(@as(HandleBacking, @bitCast(handle)));
     }
 
@@ -783,14 +831,15 @@ pub const Handle = packed struct(HandleBacking) {
         before_duplicating.decrRefCount();
     }
 
-    /// If `nullable` is non-null, it will transfer ownership to `ref` and be set to null.
-    pub fn swapWithNullable(ref: *Handle, nullable: *NullableHandle) void {
-        if (nullable.toHandle()) |handle| ref.swap(handle);
-        nullable.* = .null;
+    /// If `optional` is non-null, it will transfer ownership to `ref` and be set to null.
+    pub fn swapAndClear(ref: *Handle, optional: *OptionalHandle) void {
+        if (optional.toHandle()) |handle| ref.swap(handle);
+        optional.* = .none;
     }
 
-    /// Helper to swap handle if new_handle is non-null, releasing the old one.
-    pub fn swapIfNew(ref: *Handle, new_handle: NullableHandle) void {
+    /// Helper to swap handle if `new_handle` is non-null, releasing the old value of
+    /// `ref` in the process.
+    pub fn swapIfNew(ref: *Handle, new_handle: OptionalHandle) void {
         if (new_handle.toHandle()) |new| {
             const old = ref.*;
             ref.* = new;
@@ -799,7 +848,7 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn hasString(handle: Handle) bool {
-        return handle.peek().str != Object.null_string;
+        return handle.peek().tag == .reference or handle.peek().str != Object.null_string;
     }
 
     pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
@@ -813,11 +862,6 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn borrow(handle: Handle) Handle {
         handle.incrRefCount();
-        return handle;
-    }
-
-    pub fn borrowOptional(handle: ?Handle) ?Handle {
-        if (handle) |val| val.incrRefCount();
         return handle;
     }
 
@@ -876,14 +920,20 @@ pub const Handle = packed struct(HandleBacking) {
         const obj_heap = handle.getHeap();
 
         // We should never go below one for an item owned by another object.
-        if (!handle.isAllocHead()) handle.assert(handle.debugRefCount() > 1);
+        if (!handle.isAllocHead()) {
+            if (handle.getMetadata().in_use) {
+                handle.assert(handle.debugRefCount() > 1);
+            } else {
+                // If it's not in use, we want to fall through to the UAF panic.
+            }
+        }
+
+        handle.trace("Decr ref count of index {} (now {})", .{ handle.index, @as(i64, handle.debugRefCount()) - 1 });
 
         if (options.trace_mem) last_touched = handle;
         if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
             freeObject(handle);
         }
-
-        handle.trace("Decr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() });
     }
 
     pub fn isAllocHead(handle: Handle) bool {
@@ -907,7 +957,7 @@ pub const Handle = packed struct(HandleBacking) {
             handle.getHeap().trace_mutex.lock();
             defer handle.getHeap().trace_mutex.unlock();
             const trace_field = &handle.getHeap().objects.items(.trace)[handle.index];
-            trace_field.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, fmt, args) catch unreachable);
+            trace_field.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, "\n" ++ fmt, args) catch unreachable);
         }
     }
 
@@ -979,12 +1029,11 @@ fn invalidateBodyInner(handle: Handle) void {
             invalidateCollection(handle);
         },
         .dict => {
-            const dict_metadata = &obj_heap.getExtraData(obj.body.dict).dict;
-
             invalidateCollection(handle);
 
-            dict_metadata.table.deinit(obj_heap.gpa);
-            obj_heap.destroyExtraData(obj.body.dict);
+            const dict_metadata = object.dictGetMetadata(handle);
+            if (dict_metadata.table) |*table| table.deinit(obj_heap.gpa);
+            obj_heap.destroyExtraData(obj.body.dict.extra_data);
         },
         else => obj.deinitBodySingle(obj_heap),
     }
@@ -1358,12 +1407,12 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         });
     }
 
-    self.getHandle(index).trace("Alloc at index {} of order {}", .{ index, order });
+    self.getHandle(index).trace("Alloc at index {} of order {} with ref count 1", .{ index, order });
     if (aligned_count > 1) {
         for ((index + 1)..end) |collection_item| {
             self.getHandle(@intCast(collection_item)).trace(
-                "Alloc at index {} of order {} (item of {})",
-                .{ collection_item, order, index },
+                "Item {} allocated while allocating at {} of order {} with ref count 1",
+                .{ collection_item, index, order },
             );
         }
     }
@@ -1411,6 +1460,9 @@ fn freeObjectBackingInner(handle: Handle) void {
 
     if (options.trace_mem) last_touched = handle;
     handle.trace("Free {} of order {}", .{ handle.index, metadata.order });
+    for ((handle.index + 1)..(handle.index + memutil.getOrderSize(metadata.order))) |index| {
+        obj_heap.getHandle(@intCast(index)).trace("Item {} freed while freeing {} of order {}", .{ index, handle.index, metadata.order });
+    }
 
     if (!metadata.in_use) {
         @panic("Double free!");
@@ -1448,7 +1500,7 @@ pub fn freeObject(handle: Handle) void {
     freeObjectBacking(handle);
 }
 
-pub fn ensureMutableOrDup(handle: Handle, new_handle: *NullableHandle) !void {
+pub fn ensureMutableOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
     if (!handle.canMutate()) {
         // It's very sketchy to modify a collection item in place if
         // its parent is shared, so if this isn't the head this is
@@ -1459,13 +1511,13 @@ pub fn ensureMutableOrDup(handle: Handle, new_handle: *NullableHandle) !void {
 }
 
 /// If the object can't shimmer, this will return a duplicate.
-pub fn ensureShimmerableOrDup(handle: Handle, new_handle: *NullableHandle) !void {
+pub fn ensureShimmerableOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
     if (!handle.canShimmer()) {
         new_handle.swapRef(try Heap.duplicate(local_heap, handle));
     }
 }
 
-pub fn ensureSameHeapOrDup(handle: Handle, new_handle: *NullableHandle) !void {
+pub fn ensureSameHeapOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
     if (handle.heap != local_heap.heapId()) {
         new_handle.swapRef(try local_heap.duplicate(handle));
     }
@@ -1659,17 +1711,17 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .source => {
             const source = src.body.source;
 
-            const file_name_handle: NullableHandle = blk: {
-                if (source.file_name_obj.toNullable(handle.getHeap()).toHandle()) |file_name| {
+            const file_name_handle: OptionalHandle = blk: {
+                if (source.file_name_obj.toOptional(handle.getHeap()).toHandle()) |file_name| {
                     // Better make sure it's in our heap.
                     if (file_name.heap != dest_heap.heapId()) {
                         const duped = try dest_heap.duplicate(file_name);
-                        break :blk duped.toNullable();
+                        break :blk duped.toOptional();
                     } else {
                         const to_break = file_name.borrow();
-                        break :blk to_break.toNullable();
+                        break :blk to_break.toOptional();
                     }
-                } else break :blk .null;
+                } else break :blk .none;
             };
 
             return .{
@@ -1719,6 +1771,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .list, .dict => {
             return error.MultiItemObject;
         },
+        .invalid => @panic("Tried to duplicate an invalid object."),
     }
 }
 
@@ -1770,14 +1823,14 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
             return dest_heap.getHandle(new_list_idx);
         },
         .dict => {
-            const old_head = dest_heap.getExtraData(src.body.dict).dict;
+            const old_len = src.body.dict.len;
             const old_start = handle.index + 1;
 
-            const new_dict_idx = try dest_heap.createObjects(1 + old_head.len);
+            const new_dict_idx = try dest_heap.createObjects(1 + old_len);
             errdefer dest_heap.getHandle(new_dict_idx).decrRefCount();
             const new_head = dest_heap.getHandle(new_dict_idx);
             const new_start = new_dict_idx + 1;
-            const new_items = dest_heap.objectSlice(new_start, new_start + old_head.len);
+            const new_items = dest_heap.objectSlice(new_start, new_start + old_len);
 
             // Duplicate head of dict.
             {
@@ -1789,12 +1842,13 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
                 new_head.peek().* = .{
                     .str = new_str,
                     .tag = .dict,
-                    .body = .{
-                        .dict = extra_data,
-                    },
+                    .body = .{ .dict = .{
+                        .extra_data = extra_data,
+                        .len = old_len,
+                    } },
                 };
                 dest_heap.getExtraData(extra_data).* = .{
-                    .dict = .{ .table = .empty, .len = 0 },
+                    .dict = .{ .table = null },
                 };
             }
 
@@ -1809,10 +1863,6 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
                     error.MultiItemObject => unreachable,
                 };
             }
-
-            const dict_metadata = object.dictGetMetadata(new_head);
-            dict_metadata.len = old_head.len;
-            try object.dictReindex(dest_heap.getHandle(new_dict_idx), null);
 
             return dest_heap.getHandle(new_dict_idx);
         },
@@ -2058,8 +2108,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             break :blk try getListString(self, index + 1, list.len);
         },
         .dict => {
-            const dict = &self.getExtraData(obj.body.dict).dict;
-            break :blk try getListString(self, index + 1, dict.len);
+            break :blk try getListString(self, index + 1, obj.body.dict.len);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
@@ -2088,6 +2137,15 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 last_touched = self.getHandle(index);
                 Heap.dumpLastTouchedTrace();
                 @panic("Tried to generate a string for .none");
+            }
+        },
+        .invalid => {
+            if (builtin.mode == .Debug and state.running_leak_check) {
+                break :blk try std.fmt.allocPrintSentinel(self.gpa, "<invalid>", .{}, 0);
+            } else {
+                last_touched = self.getHandle(index);
+                Heap.dumpLastTouchedTrace();
+                @panic("Tried to generate a string for .invalid");
             }
         },
         .marked => {
@@ -2299,7 +2357,7 @@ pub const LongString = struct {
     }
 };
 
-pub fn createExtraData(self: *Heap) !ExtraDataIndex {
+pub fn createExtraData(self: *Heap) !ExtraData {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
@@ -2309,11 +2367,11 @@ pub fn createExtraData(self: *Heap) !ExtraDataIndex {
     return @enumFromInt(new_index);
 }
 
-pub fn getExtraData(self: *Heap, index: ExtraDataIndex) *ExtraData {
+pub fn getExtraData(self: *Heap, index: ExtraData) *ExtraDataValue {
     return &self.extra.items[@intFromEnum(index)];
 }
 
-pub fn destroyExtraData(self: *Heap, index: ExtraDataIndex) void {
+pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
@@ -2531,9 +2589,9 @@ pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
     } else return false;
 
     switch (mode) {
-        .normal => try leakDumpNormal(heap, skip_count),
+        .normal => leakDumpNormal(heap, skip_count),
         .dot_graph => {
-            try leakDumpNormal(heap, skip_count);
+            leakDumpNormal(heap, skip_count);
             try leakDumpDotGraph(heap, skip_count);
         },
     }
@@ -2541,16 +2599,20 @@ pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
     return true;
 }
 
-fn leakDumpNormal(heap: *Heap, skip_count: usize) !void {
+fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i));
+            if (i == 40) {
+                std.debug.print("object: {f}\n", .{handle.peek()});
+                std.debug.print("next object: {f}\n", .{heap.getHandle(@intCast(i + 1)).peek()});
+            }
             std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
                 handle.peek().tag,
                 i,
                 handle.getMetadata().order,
                 handle.debugRefCount(),
-                try getString(handle),
+                getString(handle) catch "oom",
             });
         }
     }
@@ -2565,7 +2627,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) !void {
                     handle.peek().tag,
                     i,
                     handle.debugRefCount(),
-                    try getString(handle),
+                    getString(handle) catch "oom",
                 });
 
                 const trace = heap.objects.get(i).trace;
@@ -2574,6 +2636,8 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) !void {
             }
         }
     }
+
+    std.debug.print("Leak dump normal 3\n", .{});
 }
 
 // Dot rendering is 95% LLM generated.
@@ -2609,7 +2673,7 @@ fn getTagColor(tag: Tag) []const u8 {
 
 fn renderDotNodeLabel(stderr: *std.Io.Writer, handle: Handle, index: u32, max_str_len: u32) !void {
     const obj = handle.peek();
-    const str = try getString(handle);
+    const str = getString(handle) catch "oom";
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
     try stderr.print("idx: {} | ", .{index});
@@ -2628,12 +2692,13 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
     const allocated_len = memutil.getOrderSize(handle.getMetadata().order) - 1;
 
     // Get the actual used length for the label.
-    const used_len = if (obj.tag == .list)
-        obj.body.list.len
-    else
-        object.dictGetMetadata(handle).len;
+    const used_len = switch (obj.tag) {
+        .list => obj.body.list.len,
+        .dict => obj.body.dict.len,
+        else => unreachable,
+    };
 
-    const str = try getString(handle);
+    const str = getString(handle) catch "oom";
     const max_str_len = 40;
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
@@ -2677,9 +2742,8 @@ fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index:
             }
         },
         .dict => {
-            const dict_metadata = object.dictGetMetadata(handle);
             var item_idx: u32 = 0;
-            while (item_idx < dict_metadata.len) : (item_idx += 2) {
+            while (item_idx < obj.body.dict.len) : (item_idx += 2) {
                 const key_handle = object.dictItem(handle, item_idx);
                 const val_handle = object.dictItem(handle, item_idx + 1);
 

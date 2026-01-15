@@ -80,9 +80,9 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         return error.EvalError;
     }
 
-    var namespace: ?Handle = null;
+    var namespace: Heap.OptionalHandle = .null;
     if (lambda_len == 3) {
-        namespace = object.listItemFollowRefs(args[1], 2);
+        namespace = object.listItemFollowRefs(args[1], 2).toOptional();
     }
 
     const arg_list = object.listItemFollowRefs(args[1], 0);
@@ -450,7 +450,7 @@ pub fn createProcedureCommand(
     arg_list: *Handle,
     statics_names: ?*Handle,
     body: *Handle,
-    namespace: ?Handle,
+    namespace: Heap.OptionalHandle,
 ) !Interp.Command {
     const statics: ?Handle = blk: {
         if (statics_names) |names| {
@@ -559,7 +559,7 @@ pub fn createProcedureCommand(
     }
 
     return .{
-        .namespace = Handle.borrowOptional(namespace),
+        .namespace = namespace.borrowOptional(),
         .call_info = .{ .tcl = .{
             .signature = .{
                 .args = arg_list.borrow(),
@@ -591,7 +591,7 @@ pub fn procCmd(interp: *Interp, args: []Handle) !void {
     const proc_namespace = try object.newString(interp.heap, name_parts.namespace);
     defer proc_namespace.decrRefCount();
 
-    var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace) catch |err| switch (err) {
+    var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace.toOptional()) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.EvalError,
     };

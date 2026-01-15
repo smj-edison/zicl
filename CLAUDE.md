@@ -57,7 +57,7 @@ zig build -Dtoken-debugging=true
 -   Objects can dynamically convert between types (string → list → dict, etc.)
 -   Maintains string representation alongside typed representation when beneficial
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
--   Dictionary operations: `dictGet`, `dictGetDefault`, `dictSet`, `dictPut`, `dictRemove`, `dictRemoveDuplicates`, `dictReindex`
+-   Dictionary operations: `dictPut`, `dictPutRecursively`, `dictRemove`, `dictRemoveRecursively`, `dictLookupRecursively`, `dictLookupFollowRefs`, `dictReindex`
 -   Supports recursive key lookups for nested dictionaries
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
@@ -93,25 +93,109 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
 1. **Handles vs Objects**: Handles are lightweight references (64 bits) to objects in a heap. Objects live in the heap's object storage.
 
-2. **Reference Counting**: Handles can be ref-counted (sharable) or non-ref-counted (e.g., list items). Use `heap.borrow()` and `handle.release()`.
+2. **OptionalHandle**: A special enum type that can be `.null` or contain a `Handle`. Used as an output parameter in shimmer functions to indicate whether duplication occurred.
 
-3. **Ownership Patterns**:
+3. **Reference Counting**: Handles can be ref-counted (sharable) or non-ref-counted (e.g., list items).
+
+4. **Ownership Patterns**:
 
     - Functions that allocate return owned handles (caller must release)
-    - `borrow()` increases ref count (may duplicate if the handle being borrowed isn't ref counted)
+    - `borrow()` increases ref count and returns the handle
     - `duplicate()` creates shallow copies
-    - `steal()` transfers ownership without copying (internal use)
-    - `release()` decrements ref count, but only if the handle is ref counted in the first place.
+    - `decrRefCount()` decrements ref count and frees if zero (use in `defer` for cleanup)
 
-4. **Shimmering Rules**:
+5. **Handle Helper Functions** (prefer these over manual operations):
+
+    **Reference Counting:**
+
+    - `handle.borrow()` - Increment ref count and return handle (for creating owned references)
+    - `OptionalHandle.borrowOptional()` - Borrow optional handle if it has a value, else a nop.
+    - `handle.decrRefCount()` - Decrement ref count, free if zero (use in `defer` for cleanup)
+    - `handle.incrRefCount()` - Increment ref count (rarely needed directly)
+    - `handle.debugRefCount()` - Get current ref count (debugging only)
+
+    **OptionalHandle Operations:**
+
+    - `OptionalHandle.orElse(handle)` - Return contained handle if non-null, else fallback
+    - `OptionalHandle.toHandle()` - Convert to `?Handle`
+    - `OptionalHandle.swapWithNull()` - Decrement ref count and set to null (use in `errdefer`)
+    - `OptionalHandle.swapRef(handle)` - Swap and decref old value
+    - `OptionalHandle.swapRefIfNew(optional)` - Conditionally swap if non-null
+    - `Handle.toOptional()` - Convert Handle to OptionalHandle
+
+    **Handle Swapping** (for updating handle references):
+
+    - `handle.swapIfNew(optional_handle)` - Update handle if optional is non-null, releasing old
+    - `handle.swap(new_handle)` - Always swap and release old
+    - `handle.swapAndClear(&optional_handle)` - Transfer ownership from optional and clear it
+
+    **Querying Handle State:**
+
+    - `handle.peek()` - Get pointer to Object (does NOT increase ref count)
+    - `handle.getHeap()` - Get the heap this handle belongs to
+    - `handle.canShimmer()` - Check if can change type (not shared, not special)
+    - `handle.canMutate()` - Check if can modify in-place (exclusive ownership)
+    - `handle.isShared()` - Check if ref_count > 1 or cross-thread
+    - `handle.hasString()` - Check if has string representation cached
+    - `handle.getMetadata()` - Get object metadata (order, mutable flag, etc.)
+
+    **Shimmering Helpers:**
+
+    - `handle.prepareToShimmer()` - Ensure string rep exists, invalidate body (requires canShimmer)
+
+    **Invalidation** (low-level, rarely used directly):
+
+    - `handle.invalidateBody()` - Clear body (called by prepareToShimmer)
+    - `handle.invalidateString()` - Clear string rep when mutating
+    - `handle.invalidateBoth()` - Clear both body and string
+
+    **Creating References:**
+
+    - `handle.reference()` - Create reference object, incrementing ref count
+    - `handle.referenceTakeOwnership()` - Create reference object without incrementing ref count
+
+    **Other Handle Operations:**
+
+    - `handle.isAllocHead()` - Check if this is the allocation head for multi-object allocation
+
+    **Heap-Level Helpers:**
+
+    - `heap.duplicate(handle)` - Deep copy to same or different heap
+    - `Heap.ensureShimmerableOrDup(handle, *OptionalHandle)` - Duplicates if can't shimmer (output parameter)
+    - `Heap.ensureMutableOrDup(handle, *OptionalHandle)` - Duplicates if can't mutate (output parameter)
+    - `Heap.ensureSameHeapOrDup(handle, *OptionalHandle)` - Duplicates if different heap (output parameter)
+    - `Heap.getString(handle)` - Get string representation (may allocate)
+    - `Heap.setString(handle, bytes)` - Set string representation
+    - `Heap.checkIfEqual(a, b)` - Deep equality check
+
+    **Special Object Access:**
+
+    - `heap.nullObject()` - Get the null object handle
+    - `heap.emptyObject()` - Get empty object handle
+    - `heap.tempObject()` - Get temporary object handle
+
+    **Debugging:**
+
+    - `handle.trace(fmt, args)` - Add trace entry (if trace_mem enabled)
+    - `handle.assert(condition)` - Assert with automatic trace dump on failure
+
+6. **Shimmering Rules**:
 
     - Objects can only shimmer if not shared between threads (`canShimmer()` checks this)
-    - Shimmer functions take `Handle` by value and return `!?Handle` (optional new handle if duplicated)
-    - Use `Handle.swapIfNew(new_handle)` to update handle references when shimmer returns a new handle
+    - Shimmer functions take `provided_handle: Handle` and output parameter `new_handle: *OptionalHandle`
+    - If duplication occurs, `new_handle` will be non-null
+    - Always use `errdefer new_handle.swapWithNull()` at the start of shimmer functions
+    - Use `new_handle.orElse(provided_handle)` to get the actual handle to work with
+    - Caller uses `handle.swapIfNew(new_handle)` to update their handle reference
     - Shimmering invalidates the old body but preserves string rep when possible
-    - Helper functions: `Heap.ensureShimmerableOrDup()`, `Heap.ensureMutableOrDup()` check if duplication is needed
 
-5. **Collections (Lists/Dicts)**: Stored as contiguous object arrays. First object is head (contains metadata), subsequent objects are items. Cannot reference individual items externally (they're not ref-counted), but `borrow()` accounts for this.
+7. **Collections (Lists/Dicts)**:
+    - Stored as contiguous object arrays allocated via the buddy allocator
+    - First object is head (contains metadata), subsequent objects are items
+    - Each item has its own ref count and CAN be borrowed individually with `handle.borrow()`
+    - When the collection is freed, if any items are shared (ref count > 1), the buddy allocator automatically splits the multi-object block into individual allocations
+    - Shared items survive the collection being freed because they have independent ref counts
+    - Non-shared items are freed along with the collection head
 
 ### Script Execution Model
 
@@ -162,42 +246,47 @@ Helper functions available:
 
 ```zig
 const str = try object.newString(heap, "hello");
-defer str.release();
+defer str.decrRefCount();
 ```
 
 **Working with Lists**:
 
 ```zig
-const list = try object.listNew(heap, &.{item1, item2});
-defer list.release();
-const item = object.listItemRaw(list, 0); // Non-owning handle
+const list = try object.newList(&.{item1, item2});
+defer list.decrRefCount();
+const item = object.listItem(list, 0); // Non-owning handle
 ```
 
-**Type Shimmering** (value-based API):
+**Type Shimmering** (output parameter API):
 
 ```zig
-// Shimmer functions take Handle by value and return optional new handle
-const new_handle = try object.shimmerToList(&det, handle);
+// Shimmer functions take Handle by value and *OptionalHandle output parameter.
+var det: object.ErrorDetails = undefined;
+var new_handle: OptionalHandle = .null;
+try object.shimmerToList(&det, handle, &new_handle);
 handle.swapIfNew(new_handle);  // Update if shimmer created a duplicate
 // handle is now a list type
 
-// For wrapper functions that return both new handle and value:
-const result = try object.getBoolean(&det, handle);
-handle.swapIfNew(result.new_handle);
-const value = result.value;
+// Pattern inside shimmer functions:
+pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
+    if (provided_handle.peek().tag == .integer) return;
+    errdefer new_handle.swapWithNull();
+
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
+
+    // ... shimmer logic ...
+}
 ```
 
-**Handle Update Pattern**:
+**Get Functions** (shimmer + extract value):
 
 ```zig
-// When a function returns !?Handle (shimmer functions):
-const new_handle = try shimmerToInteger(&det, my_handle);
-my_handle.swapIfNew(new_handle);  // Automatically releases old and swaps if needed
-
-// When a function returns struct { new_handle: ?Handle, value: T }:
-const result = try integerGet(&det, my_handle);
-my_handle.swapIfNew(result.new_handle);
-const value = result.value;
+// Get functions that shimmer and return a value.
+var new_handle: OptionalHandle = .null;
+const value = try object.integerGet(&det, my_handle, &new_handle);
+my_handle.swapIfNew(new_handle);
+// my_handle is now an integer type, value contains the i64
 ```
 
 **Error Handling with Details**:
@@ -257,9 +346,9 @@ const result = try processData(data);  // This might fail
 
 ## Common Issues
 
-**Double Free**: If you see double-free panics, check that objects from collections (lists/dicts) aren't being released. List items are not ref-counted handles. Enable options.trace_mem to figure out why.
+**Double Free**: If you see double-free panics, check the memory trace. With the splitting allocator design, collection items CAN be borrowed and ref-counted individually. However, you should only call `decrRefCount()` on items you explicitly borrowed. Enable `options.trace_mem` to dump the full allocation/deallocation trace.
 
-**Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `prepareToShimmer()` which will duplicate if needed.
+**Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `Heap.ensureShimmerableOrDup()` to automatically duplicate if the handle cannot shimmer.
 
 **OOM in Tests**: Use `testing.checkAllAllocationFailures()` wrapper to test all OOM code paths. All tests should pass without leaks even when allocations fail at any point.
 
@@ -275,13 +364,16 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 
 Recent fixes and improvements:
 
--   **Handle Refactoring (January 2026)**: Completed major refactoring of Handle management API
-    -   Changed from pointer-based mutation (`shimmerToX(&det, &handle)`) to value-based duplication (`shimmerToX(&det, handle) -> !?Handle`)
-    -   Eliminates use-after-free (UAF) issues by returning new handles instead of mutating through pointers
-    -   All shimmer functions (`shimmerToInteger`, `shimmerToFloat`, `shimmerToList`, `shimmerToDict`, `shimmerToScript`, `shimmerToExpression`, `shimmerToBoolean`) now use value-based API
-    -   Get functions (`getScript`, `getExpression`, `getBoolean`, `integerGet`) return structs with both new handle and value
-    -   Added `Handle.swapIfNew(?Handle)` helper method to simplify handle updates
-    -   Pattern: Functions return `!?Handle` when only shimmering, or `!struct { new_handle: ?Handle, value: T }` when also extracting a value
+-   **Handle Refactoring (January 2026)**: Major refactoring of Handle management API (in progress, ~80% complete)
+    -   Changed from pointer-based mutation (`shimmerToX(&det, &handle)`) to output parameter pattern
+    -   Introduced `OptionalHandle` type for optional handle returns
+    -   New signature: `shimmerToX(det, provided_handle, new_handle: *OptionalHandle) !void`
+    -   Eliminates use-after-free (UAF) issues by never mutating handles through pointers
+    -   All shimmer functions use output parameter API
+    -   Get functions (e.g., `integerGet`) take same parameters and return the value directly
+    -   Added helper methods: `OptionalHandle.orElse()`, `OptionalHandle.swapWithNull()`, `Handle.swapIfNew()`
+    -   Standard pattern: `errdefer new_handle.swapWithNull()` at function start
+    -   Caller pattern: `handle.swapIfNew(new_handle)` to update handle references
 -   Dictionary operations: Added `dictRemove`, fixed duplicate handling
 -   Command architecture: Standardized function naming conventions
 -   Loop control: Fixed break/continue propagation with level support
@@ -338,4 +430,4 @@ Not yet implemented:
 -   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
 -   End every comment with a period.
 -   Don't use UPPERCASE, instead use _emphasis_.
--   If there's a short `if (optional) |val|`, use `val` as the capture name.
+-   If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.
