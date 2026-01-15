@@ -4,7 +4,7 @@ const assert = std.debug.assert;
 
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
-const object = @import("object.zig");
+const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
 fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
@@ -20,7 +20,7 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    const int_result = object.integerGet(null, args[i]) catch |err| switch (err) {
+                    const int_result = objutil.integerGet(null, args[i]) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
@@ -62,7 +62,7 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
         };
     }
 
-    interp.setResultOwning(try object.newFloat(interp.heap, result));
+    interp.setResultOwning(try objutil.newFloat(interp.heap, result));
 }
 
 pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -82,11 +82,11 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     var namespace: Heap.OptionalHandle = .null;
     if (lambda_len == 3) {
-        namespace = object.listItemFollowRefs(args[1], 2).toOptional();
+        namespace = objutil.listItemFollowRefs(args[1], 2).toOptional();
     }
 
-    const arg_list = object.listItemFollowRefs(args[1], 0);
-    const body = object.listItemFollowRefs(args[1], 1);
+    const arg_list = objutil.listItemFollowRefs(args[1], 0);
+    const body = objutil.listItemFollowRefs(args[1], 1);
 
     var new_arg_list = arg_list.borrow();
     defer new_arg_list.decrRefCount();
@@ -171,9 +171,9 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         replace,
         update,
     };
-    const SubcommandEnum = object.TclEnum(SubcommandName, "dict_subcommand");
+    const SubcommandEnum = objutil.TclEnum(SubcommandName, "dict_subcommand");
 
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
     const enum_result = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1]));
     args[1].swapIfNew(enum_result.new_handle);
     const subcommand: SubcommandName = enum_result.value;
@@ -194,7 +194,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 if (try interp.getVariable(&args[2])) |val| {
                     break :blk val;
                 } else {
-                    const new_variable_dict = try object.newDictWithCapacity(2);
+                    const new_variable_dict = try objutil.newDictWithCapacity(2);
                     defer new_variable_dict.decrRefCount();
                     try interp.setVariableTo(&args[2], new_variable_dict);
                     break :blk (try interp.getVariable(&args[2])).?;
@@ -385,8 +385,8 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
     if (try interp.getVariable(&args[1])) |val| {
         const contents = try interp.getIntegerNoShimmer(val);
         const new_contents = std.math.add(i64, contents, increment_by) catch {
-            var det: object.ErrorDetails = undefined;
-            return interp.wrapError(&det, object.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
+            var det: objutil.ErrorDetails = undefined;
+            return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
         };
 
         if (val.canMutate()) {
@@ -457,13 +457,13 @@ pub fn createProcedureCommand(
             names.swapIfNew(try Heap.ensureSameHeapOrDup(names.*));
             const statics_count = try interp.getListLength(names);
 
-            const statics_dict = try object.newDictWithCapacity(statics_count * 2);
-            object.dictGetMetadata(statics_dict).len = statics_count * 2;
-            const dict_items = object.dictItems(statics_dict);
+            const statics_dict = try objutil.newDictWithCapacity(statics_count * 2);
+            objutil.dictGetMetadata(statics_dict).len = statics_count * 2;
+            const dict_items = objutil.dictItems(statics_dict);
             errdefer statics_dict.decrRefCount();
 
             for (0..statics_count) |i| {
-                const static_name = object.listItem(names.*, @intCast(i));
+                const static_name = objutil.listItem(names.*, @intCast(i));
                 if (interp.getVariableImpl(null, static_name)) |static_value| {
                     const dict_name_str = try Heap.duplicateObjString(Heap.local_heap, static_name);
                     errdefer dict_name_str.deinit(Heap.local_heap);
@@ -484,7 +484,7 @@ pub fn createProcedureCommand(
                 }
             }
 
-            try object.dictReindex(statics_dict, null);
+            try objutil.dictReindex(statics_dict, null);
 
             break :blk statics_dict;
         } else {
@@ -511,7 +511,7 @@ pub fn createProcedureCommand(
             return error.ParameterAfterArgs;
         }
 
-        var arg = object.listItem(arg_list.*, @intCast(i)).borrow();
+        var arg = objutil.listItem(arg_list.*, @intCast(i)).borrow();
         defer arg.decrRefCount();
         const arg_len = try interp.getListLength(&arg);
 
@@ -525,21 +525,21 @@ pub fn createProcedureCommand(
             // Optional parameter.
             if (optional_values == null) {
                 // Init the optional_values list.
-                optional_values = try object.newList(&.{});
+                optional_values = try objutil.newList(&.{});
             }
 
-            if (try Heap.stringEquals(object.listItem(arg, 0), "args")) {
+            if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
                 try interp.setResultString("'args' must be a required parameter");
                 return error.ArgsWasOptional;
             }
 
             // Append value to optional values.
-            _ = try interp.listAppend(&(optional_values.?), object.listItem(arg, 1));
+            _ = try interp.listAppend(&(optional_values.?), objutil.listItem(arg, 1));
             // And replace the `arg_list`'s parameter/value with just the parameter name.
-            var det: object.ErrorDetails = undefined;
-            var new_item = try Heap.local_heap.dupOrReference(object.listItem(arg, 0));
+            var det: objutil.ErrorDetails = undefined;
+            var new_item = try Heap.local_heap.dupOrReference(objutil.listItem(arg, 0));
             errdefer new_item.deinitBodySingle(Heap.local_heap);
-            arg_list.swapIfNew(try object.listSetObject(&det, arg_list.*, @intCast(i), new_item));
+            arg_list.swapIfNew(try objutil.listSetObject(&det, arg_list.*, @intCast(i), new_item));
 
             optional_arity += 1;
         } else {
@@ -550,7 +550,7 @@ pub fn createProcedureCommand(
                 return error.RequiredParameterAfterOptionalParameter;
             }
 
-            const arg_name = try Heap.getString(object.listItem(arg, 0));
+            const arg_name = try Heap.getString(objutil.listItem(arg, 0));
             if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
 
             // Required parameter.
@@ -588,7 +588,7 @@ pub fn procCmd(interp: *Interp, args: []Handle) !void {
     const name_parts = namespaceSplit(qualified_name);
 
     // The procedure's namespace may not be the same as the current namespace.
-    const proc_namespace = try object.newString(interp.heap, name_parts.namespace);
+    const proc_namespace = try objutil.newString(interp.heap, name_parts.namespace);
     defer proc_namespace.decrRefCount();
 
     var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace.toOptional()) catch |err| switch (err) {
@@ -630,7 +630,7 @@ pub fn testFinish(interp: *Interp) void {
 }
 
 fn testRunScript(interp: *Interp, script: []const u8) !Handle {
-    var script_handle = try object.newString(interp.heap, script);
+    var script_handle = try objutil.newString(interp.heap, script);
     defer script_handle.decrRefCount();
     try interp.evalObject(&script_handle);
     return interp.result;
@@ -644,7 +644,7 @@ test "commands" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
-    var script = try object.newString(interp.heap,
+    var script = try objutil.newString(interp.heap,
         \\ dict set x a 10
         \\ puts [dict get $x a 5]
     );

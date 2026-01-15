@@ -7,7 +7,7 @@ const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
-const object = @import("object.zig");
+const objutil = @import("objutil.zig");
 const Token = Tokenizer.Token;
 
 const TokenIndex = u32;
@@ -359,7 +359,7 @@ pub const Parse = struct {
             },
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
+                const handle = try objutil.newString(p.heap, p.source[loc.start..loc.end]);
                 errdefer handle.decrRefCount();
 
                 return try p.addNode(.{
@@ -371,7 +371,7 @@ pub const Parse = struct {
                 const loc = p.tokenLoc(p.nextToken());
                 const handle = try p.heap.createObject();
                 errdefer handle.decrRefCount();
-                try object.setStringFromEscaped(handle, p.source[loc.start..loc.end]);
+                try objutil.setStringFromEscaped(handle, p.source[loc.start..loc.end]);
 
                 return try p.addNode(.{
                     .tag = .string,
@@ -380,11 +380,11 @@ pub const Parse = struct {
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                const command_handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
+                const command_handle = try objutil.newString(p.heap, p.source[loc.start..loc.end]);
                 errdefer command_handle.decrRefCount();
 
                 // Be sure to save the source info.
-                try object.setSourceInfo(command_handle, .{
+                try objutil.setSourceInfo(command_handle, .{
                     .file_name = p.source_file_name,
                     .line_no = loc.line_no,
                 });
@@ -400,7 +400,7 @@ pub const Parse = struct {
             .keyword_true,
             => {
                 const loc = p.tokenLoc(p.nextToken());
-                var string_handle = try object.newString(p.heap, p.source[loc.start..loc.end]);
+                var string_handle = try objutil.newString(p.heap, p.source[loc.start..loc.end]);
                 errdefer string_handle.decrRefCount();
 
                 return try p.addNode(.{

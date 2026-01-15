@@ -6,7 +6,7 @@ const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
-const object = @import("object.zig");
+const objutil = @import("objutil.zig");
 const memutil = @import("memutil.zig");
 const expr_parse = @import("expr_parse.zig");
 
@@ -82,7 +82,7 @@ fn wrapErrorDetailsReturnType(ResultType: type) type {
 }
 /// Used to convert from an object error to an interpreter error (e.g. putting
 /// it in the interpreter result, instead of det)
-pub fn wrapError(interp: *Interp, det: *object.ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
+pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
     if (comptime std.meta.activeTag(@typeInfo(@TypeOf(result))) == .error_set) {
         if (result == error.OutOfMemory) {
             return error.OutOfMemory;
@@ -103,9 +103,9 @@ pub fn wrapError(interp: *Interp, det: *object.ErrorDetails, result: anytype) wr
     }
 }
 
-fn variableNotFoundError(det: ?*object.ErrorDetails, var_name: []const u8) !void {
+fn variableNotFoundError(det: ?*objutil.ErrorDetails, var_name: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try object.newStringFmt(Heap.local_heap, "can't read \"{s}\": no such variable", .{var_name}),
+        .message = try objutil.newStringFmt(Heap.local_heap, "can't read \"{s}\": no such variable", .{var_name}),
     };
 
     return error.VariableNotFound;
@@ -141,7 +141,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
             defer interp.heap.resetTempObject();
             // Can't fail since we know a string exists for it (the string in question is the temp object
             // we just initialized).
-            var_value = object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable;
+            var_value = objutil.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable;
         }
 
         // Global scope doesn't have statics.
@@ -154,7 +154,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
         // Check the variables dictionary.
         interp.heap.setTempObjectString(var_name);
         // Can't fail since we know a string exists for it (the temp string we just set).
-        var_value = object.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable;
+        var_value = objutil.dictLookupFollowRefs(var_dict, interp.heap.tempObject()) catch unreachable;
         interp.heap.resetTempObject();
 
         if (var_value == null) {
@@ -163,7 +163,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
                 interp.heap.setTempObjectString(var_name);
                 defer interp.heap.resetTempObject();
                 // Can't fail since we know a string exists for it (the temp string we just set).
-                var_value = object.dictLookupFollowRefs(dict, interp.heap.tempObject()) catch unreachable;
+                var_value = objutil.dictLookupFollowRefs(dict, interp.heap.tempObject()) catch unreachable;
             }
         }
     }
@@ -182,7 +182,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: [:0]const u8)
 
 /// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name, so it can shimmer in place.
-fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
+fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
     name.assert(name.getHeap() == interp.heap and name.canShimmer());
 
     const var_name = try Heap.getString(name);
@@ -204,7 +204,7 @@ fn reshimmerToVariable(interp: *Interp, det: ?*object.ErrorDetails, call_frame_i
 
 /// Ensures that this is a valid variable, dict sugar, or upvar. If not, it'll shimmer it to whichever one applies.
 /// Must be called with a heap-native variable name.
-fn ensureValidVariableType(interp: *Interp, det: ?*object.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
+fn ensureValidVariableType(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx: u32, name: Handle) !void {
     const call_frame = interp.call_frames.items[call_frame_idx];
 
     const name_obj = name.peek();
@@ -279,7 +279,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
         const value_location = blk: {
             interp.heap.setTempObjectString(trimmed);
             defer interp.heap.resetTempObject();
-            const put_result = try object.dictPutInner(interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
+            const put_result = try objutil.dictPutInner(interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
             interp.call_frames.items[0].variables.swapIfNew(put_result.new_dict);
             break :blk put_result.new_value;
         };
@@ -293,7 +293,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
         };
     } else {
         // Add variable.
-        const put_result = try object.dictPutInner(call_frame.variables, name, value);
+        const put_result = try objutil.dictPutInner(call_frame.variables, name, value);
         call_frame.variables.swapIfNew(put_result.new_dict);
 
         name.peek().tag = .variable;
@@ -317,9 +317,9 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
 
                 const old_variables_handle = var_call_frame.variables; // Copy
                 const new_value_handle = blk: {
-                    const put_result = try object.dictPutInner(var_call_frame.variables, name, value);
+                    const put_result = try objutil.dictPutInner(var_call_frame.variables, name, value);
                     var_call_frame.variables.swapIfNew(put_result.new_dict);
-                    break :blk object.followIfRef(put_result.new_value);
+                    break :blk objutil.followIfRef(put_result.new_value);
                 };
                 // Did the dict change locations? If so, all cached lookups are now invalid.
                 const did_dict_move = old_variables_handle != var_call_frame.variables;
@@ -383,7 +383,7 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
 }
 
 /// Resolves to the variable's value. Must be called with a heap-native name.
-pub fn getVariableImpl(interp: *Interp, det: ?*object.ErrorDetails, name: Handle) !Handle {
+pub fn getVariableImpl(interp: *Interp, det: ?*objutil.ErrorDetails, name: Handle) !Handle {
     if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
     try interp.ensureValidVariableType(det, interp.currentCallFrameIndex(), name);
@@ -412,9 +412,9 @@ fn testVariables(ta: std.mem.Allocator) !void {
     defer interp.deinit();
 
     try testing.expectEqual(null, interp.resolveVariable(0, "foo"));
-    var foo = try object.newString(heap, "foo");
+    var foo = try objutil.newString(heap, "foo");
     defer foo.decrRefCount();
-    const value = try object.newString(heap, "value");
+    const value = try objutil.newString(heap, "value");
     defer value.decrRefCount();
     foo.swapIfNew(try interp.setVariableTo(foo, value));
 
@@ -521,10 +521,10 @@ pub const Command = struct {
         switch (command.call_info) {
             .tcl => |call_info| {
                 const args_list = call_info.signature.args;
-                const args_len = object.listLengthRaw(args_list);
+                const args_len = objutil.listLengthRaw(args_list);
 
                 for (0..args_len) |i| {
-                    const arg = object.listItem(args_list, @intCast(i));
+                    const arg = objutil.listItem(args_list, @intCast(i));
 
                     aw.writer.writeAll(" ") catch return error.OutOfMemory;
 
@@ -534,7 +534,7 @@ pub const Command = struct {
                     } else {
                         // If this argument is a list, it means that it has a default value.
                         if (arg.peek().tag == .list) {
-                            assert(object.listLengthRaw(arg) == 2);
+                            assert(objutil.listLengthRaw(arg) == 2);
 
                             aw.writer.print("?{s}?", .{try Heap.getString(arg)}) catch return error.OutOfMemory;
                         } else {
@@ -560,9 +560,9 @@ pub const Command = struct {
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(Command);
 
-fn wrongArgumentCountError(det: ?*object.ErrorDetails, command_usage: []const u8) !void {
+fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try object.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
+        .message = try objutil.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
     };
 
     return Error.WrongUsage;
@@ -598,7 +598,7 @@ pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
         const command_name = try Heap.getString(args[0]);
         const command_usage = try command.getUsageInfo(scratch, command_name);
         defer scratch.free(command_usage);
-        var det: object.ErrorDetails = undefined;
+        var det: objutil.ErrorDetails = undefined;
         return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
     }
 
@@ -618,15 +618,15 @@ pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
     var called_idx: usize = 1;
     // Where we are in the signature.
     var signature_idx: u32 = 0;
-    const signature_len = object.listLengthRaw(signature.args);
+    const signature_len = objutil.listLengthRaw(signature.args);
 
     while (signature_idx < signature_len) : (signature_idx += 1) {
-        const var_name = object.listItem(signature.args, signature_idx);
+        const var_name = objutil.listItem(signature.args, signature_idx);
 
         // Are we at the last argument? If so, is it `args`?
         if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
             // Assign remaining arguments to `args`.
-            const list = try object.newList(args[called_idx..]);
+            const list = try objutil.newList(args[called_idx..]);
             defer list.decrRefCount();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
         } else if (signature_idx > signature.required_arity) {
@@ -638,7 +638,7 @@ pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
-                const default_value = object.listItem(signature.optional_values.?, signature_idx - signature.required_arity);
+                const default_value = objutil.listItem(signature.optional_values.?, signature_idx - signature.required_arity);
                 try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(default_value));
             }
         } else {
@@ -677,7 +677,7 @@ fn callNative(interp: *Interp, command: *Command, args: []Handle) !void {
     const command_name = try Heap.getString(args[0]);
     const command_usage = try command.getUsageInfo(scratch, command_name);
     defer scratch.free(command_usage);
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
     return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
 }
 
@@ -703,19 +703,19 @@ pub fn setResultOwning(interp: *Interp, handle: Handle) void {
 }
 
 pub fn setResultInteger(interp: *Interp, value: i64) !void {
-    interp.setResultOwning(try object.newInteger(interp.heap, value));
+    interp.setResultOwning(try objutil.newInteger(interp.heap, value));
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.freeLastResult();
-    const bytes_handle = try object.newString(interp.heap, bytes);
+    const bytes_handle = try objutil.newString(interp.heap, bytes);
 
     setResult(interp, bytes_handle);
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
     interp.freeLastResult();
-    const fmt_handle = try object.newStringFmt(interp.heap, fmt, args);
+    const fmt_handle = try objutil.newStringFmt(interp.heap, fmt, args);
 
     setResult(interp, fmt_handle);
 }
@@ -788,7 +788,7 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: ProcedureSignature) !u32 {
     if (interp.namespace) |val| val.incrRefCount();
     errdefer if (interp.namespace) |ns| ns.decrRefCount();
-    const vars_handle = try object.newDict(interp.heap, &.{});
+    const vars_handle = try objutil.newDict(interp.heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = try signature.borrow();
     errdefer borrowed_signature.deinit();
@@ -829,7 +829,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
             return value.borrow();
         },
         .variable_subst => {
-            var det: object.ErrorDetails = undefined;
+            var det: objutil.ErrorDetails = undefined;
             const var_target = try interp.wrapError(&det, interp.getVariableImpl(&det, value));
             return var_target.borrow();
         },
@@ -880,7 +880,7 @@ fn interpolateTokens(
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len), 0..) |tag, value_index, i| {
-        if (interp.substituteOneToken(tag, object.dictItemFollowRefs(value_list, @intCast(value_index)))) |new_value| {
+        if (interp.substituteOneToken(tag, objutil.dictItemFollowRefs(value_list, @intCast(value_index)))) |new_value| {
             new_values[i] = new_value;
         } else |err| {
             // Due to the error, we're actually going to return early, after we take care
@@ -927,7 +927,7 @@ fn interpolateTokens(
         new_str_len += (try Heap.getString(new_value)).len;
     }
 
-    const new_str = try object.newStringToFill(interp.heap, new_str_len);
+    const new_str = try objutil.newStringToFill(interp.heap, new_str_len);
     errdefer new_str.decrRefCount();
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
@@ -960,7 +960,7 @@ pub fn qualifyName(arena: std.mem.Allocator, namespace: ?Handle, name: []const u
 
 /// This function returns the command that's found based on the string contents of `handle`.
 /// This also specializes the object to contain a cached lookup for the command.
-pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !*Command {
+pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !*Command {
     errdefer new_handle.swapWithNull();
 
     early_exit: {
@@ -1071,14 +1071,14 @@ pub fn getCommand(interp: *Interp, det: ?*object.ErrorDetails, provided_handle: 
     } else {
         // If it was null, we better error.
         if (det) |details| details.* = .{
-            .message = try object.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
+            .message = try objutil.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
         };
         return error.CommandNotFound;
     }
 }
 
 fn invokeCommand(interp: *Interp, args: []Handle) !void {
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
 
     var new_command: OptionalHandle = .none;
     const command = getCommand(interp, &det, args[0], &new_command) catch |err| switch (err) {
@@ -1162,7 +1162,7 @@ fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
         .owned_handle => |string| {
             string.incrRefCount();
             var new_handle: OptionalHandle = .none;
-            const bool_result = object.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
+            const bool_result = objutil.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string.*});
@@ -1174,7 +1174,7 @@ fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
         },
         .stack_handle => |*string| {
             var new_handle: OptionalHandle = .none;
-            const bool_result = object.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
+            const bool_result = objutil.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
@@ -1196,7 +1196,7 @@ fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
         .int, .float => return result.*,
         .owned_handle => |string| {
             var new_handle: OptionalHandle = .none;
-            const int_result = object.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
+            const int_result = objutil.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     // Try parsing it as a float.
@@ -1211,7 +1211,7 @@ fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
         },
         .stack_handle => |*string| {
             var new_handle: OptionalHandle = .none;
-            const int_result = object.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
+            const int_result = objutil.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     // Try parsing it as a float.
@@ -1230,17 +1230,17 @@ fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
 const division_by_zero_message = "division by zero";
 const negative_denom_message = "negative denominator";
 fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
     return switch (oper) {
         .mul => blk: {
             break :blk std.math.mul(i64, lhs, rhs) catch {
                 const rendered = std.math.mulWide(i64, lhs, rhs);
-                return interp.wrapError(&det, object.integerOverflowErrorWithWide(&det, rendered));
+                return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, rendered));
             };
         },
         .div => std.math.divFloor(i64, lhs, rhs) catch |err| switch (err) {
             error.Overflow => {
-                return interp.wrapError(&det, object.integerOverflowError(&det, null));
+                return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
             },
             error.DivisionByZero => {
                 try interp.setResultString(division_by_zero_message);
@@ -1257,8 +1257,8 @@ fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i6
                 return error.DivisionByZero;
             },
         },
-        .sub => std.math.sub(i64, lhs, rhs) catch return interp.wrapError(&det, object.integerOverflowError(&det, null)),
-        .add => std.math.add(i64, lhs, rhs) catch return interp.wrapError(&det, object.integerOverflowError(&det, null)),
+        .sub => std.math.sub(i64, lhs, rhs) catch return interp.wrapError(&det, objutil.integerOverflowError(&det, null)),
+        .add => std.math.add(i64, lhs, rhs) catch return interp.wrapError(&det, objutil.integerOverflowError(&det, null)),
         .shiftl => blk: {
             const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
             break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) << rhs_constrained));
@@ -1288,7 +1288,7 @@ fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i6
         .bool_or => @intFromBool((lhs != 0) or (rhs != 0)),
         .pow => std.math.powi(i64, lhs, rhs) catch {
             // Report overflow for both underflow and overflow. Maybe I should report both?
-            return interp.wrapError(&det, object.integerOverflowError(&det, null));
+            return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
         },
         else => unreachable,
     };
@@ -1358,8 +1358,8 @@ const ExprResult = union(enum) {
 
     pub fn toObject(result: ExprResult, interp: *Interp) !Handle {
         switch (result) {
-            .int => |int| return try object.newInteger(interp.heap, int),
-            .float => |float| return try object.newFloat(interp.heap, float),
+            .int => |int| return try objutil.newInteger(interp.heap, int),
+            .float => |float| return try objutil.newFloat(interp.heap, float),
             .owned_handle => |handle| return handle.borrow(),
             .stack_handle => |handle| return handle,
         }
@@ -1588,8 +1588,8 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             switch (value) {
                 .int => |int| {
                     if (@abs(int) > std.math.maxInt(i64)) {
-                        var det: object.ErrorDetails = undefined;
-                        return interp.wrapError(&det, object.integerOverflowErrorWithWide(&det, @abs(int)));
+                        var det: objutil.ErrorDetails = undefined;
+                        return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, @abs(int)));
                     } else {
                         return .{ .int = @intCast(@abs(int)) };
                     }
@@ -1728,8 +1728,8 @@ pub fn evalExpression(interp: *Interp, handle: Handle, new_handle: *OptionalHand
     errdefer new_handle.swapWithNull();
 
     // Try to get the expression, parsing if necessary.
-    var det: object.ErrorDetails = undefined;
-    const expr = try interp.wrapError(&det, object.getExpression(&det, handle, new_handle));
+    var det: objutil.ErrorDetails = undefined;
+    const expr = try interp.wrapError(&det, objutil.getExpression(&det, handle, new_handle));
 
     return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -1753,7 +1753,7 @@ test "eval expression" {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var expr = try object.newString(heap, "5 + 10");
+    var expr = try objutil.newString(heap, "5 + 10");
     defer expr.decrRefCount();
     var new_expr: OptionalHandle = .none;
     const result = try interp.evalExpression(expr, &new_expr);
@@ -1765,8 +1765,8 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
     errdefer new_script.swapWithNull();
 
     // Try to get the script, parsing if necessary.
-    var det: object.ErrorDetails = undefined;
-    const parsed = try interp.wrapError(&det, object.getScript(&det, script, new_script));
+    var det: objutil.ErrorDetails = undefined;
+    const parsed = try interp.wrapError(&det, objutil.getScript(&det, script, new_script));
     // Don't evaluate empty scripts.
     if (parsed.tags.items.len <= 1) return;
 
@@ -1791,7 +1791,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
     var command_token_i: u32 = 0;
 
     const tags = parsed.tags.items;
-    const values = object.listItems(parsed.values);
+    const values = objutil.listItems(parsed.values);
     // Loop through the script's commands.
     while (command_token_i < tags.len) {
         // First token of the line is always .script_command.
@@ -1819,7 +1819,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
             var resultant_word: Handle = blk: {
                 if (word_parts == 1) {
                     // Simple one-to-one substitution, so an easy case.
-                    break :blk try interp.substituteOneToken(tags[word_token_i], object.listItem(parsed.values, word_token_i));
+                    break :blk try interp.substituteOneToken(tags[word_token_i], objutil.listItem(parsed.values, word_token_i));
                 } else {
                     // Helper function that'll interpolate all the word parts and merge them into a string.
                     break :blk try interp.interpolateTokens(tags[word_token_i..][0..word_parts], parsed.values, word_token_i, word_parts, false);
@@ -1830,7 +1830,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
                 // Argument expansion, so we'll need to shimmer the result to a list.
                 det = undefined;
                 var new_list: OptionalHandle = .none;
-                const len = try wrapError(interp, &det, object.listLength(&det, resultant_word, &new_list));
+                const len = try wrapError(interp, &det, objutil.listLength(&det, resultant_word, &new_list));
                 resultant_word.swapIfNew(new_list);
                 // Free the list backing without running destructors, since we're going to steal the items
                 // directly from the list.
@@ -1844,7 +1844,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
                 assert(resultant_word.canMutate());
                 for (0..len) |list_idx| {
                     // Steal each object from the list.
-                    args[args_written] = try Heap.steal(object.listItem(resultant_word, @intCast(list_idx)));
+                    args[args_written] = try Heap.steal(objutil.listItem(resultant_word, @intCast(list_idx)));
                     args_written += 1;
                 }
             } else {
@@ -1942,52 +1942,52 @@ pub fn deinit(interp: *Interp) void {
 
 // Export various utility functions with a nicer interface.
 pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMemory, EvalError } {
-    var det: object.ErrorDetails = undefined;
-    interp.wrapError(&det, object.integerOverflowError(&det, value)) catch return error.EvalError;
+    var det: objutil.ErrorDetails = undefined;
+    interp.wrapError(&det, objutil.integerOverflowError(&det, value)) catch return error.EvalError;
 }
 
 pub fn wrapShimmer(
     interp: *Interp,
     handle: *Handle,
-    to_call: fn (det: ?*object.ErrorDetails, provided_handle: Handle) object.Error!?Handle,
+    to_call: fn (det: ?*objutil.ErrorDetails, provided_handle: Handle) objutil.Error!?Handle,
 ) !void {
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
     handle.swapIfNew(try wrapError(interp, &det, to_call(&det, handle.*)));
 }
 
 pub fn getInteger(interp: *Interp, handle: Handle, new_handle: *OptionalHandle) !i64 {
-    var det: object.ErrorDetails = undefined;
-    try interp.wrapError(&det, object.shimmerToInteger(&det, handle, new_handle));
+    var det: objutil.ErrorDetails = undefined;
+    try interp.wrapError(&det, objutil.shimmerToInteger(&det, handle, new_handle));
     return new_handle.orElse(handle).peek().body.integer;
 }
 
 pub fn getIntegerNoShimmer(interp: *Interp, handle: Handle) Interp.Error!i64 {
-    var det: object.ErrorDetails = undefined;
-    return interp.wrapError(&det, object.integerGetNoShimmer(&det, handle));
+    var det: objutil.ErrorDetails = undefined;
+    return interp.wrapError(&det, objutil.integerGetNoShimmer(&det, handle));
 }
 
 pub fn getFloat(interp: *Interp, handle: Handle, new_handle: *OptionalHandle) !f64 {
-    var det: object.ErrorDetails = undefined;
-    try interp.wrapError(&det, object.shimmerToFloat(&det, handle, new_handle));
+    var det: objutil.ErrorDetails = undefined;
+    try interp.wrapError(&det, objutil.shimmerToFloat(&det, handle, new_handle));
     const value_handle = new_handle.orElse(handle);
     return value_handle.peek().body.float;
 }
 
 pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
-    var det: object.ErrorDetails = undefined;
-    return wrapError(interp, &det, object.floatGetNoShimmer(&det, handle));
+    var det: objutil.ErrorDetails = undefined;
+    return wrapError(interp, &det, objutil.floatGetNoShimmer(&det, handle));
 }
 
 pub fn getListLength(interp: *Interp, handle: Handle) !struct { new_handle: ?Handle, value: u32 } {
-    var det: object.ErrorDetails = undefined;
-    const new_handle = try wrapError(interp, &det, object.shimmerToList(&det, handle));
+    var det: objutil.ErrorDetails = undefined;
+    const new_handle = try wrapError(interp, &det, objutil.shimmerToList(&det, handle));
     const value_handle = new_handle orelse handle;
     return .{ .new_handle = new_handle, .value = value_handle.peek().body.list.len };
 }
 
 pub fn listAppend(interp: *Interp, list: Handle, item: Handle) !struct { new_handle: ?Handle, value: Handle } {
-    var det: object.ErrorDetails = undefined;
-    const result = try wrapError(interp, &det, object.listAppend(&det, list, item));
+    var det: objutil.ErrorDetails = undefined;
+    const result = try wrapError(interp, &det, objutil.listAppend(&det, list, item));
     return .{ .new_handle = result.new_handle, .value = result.value_handle };
 }
 
@@ -2025,7 +2025,7 @@ pub fn getVariable(interp: *Interp, provided_name: Handle, new_name: *OptionalHa
 pub fn getVariableOrError(interp: *Interp, name: Handle, new_name: *OptionalHandle) !Handle {
     errdefer new_name.swapWithNull();
     try Heap.ensureShimmerableOrDup(name, new_name);
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
     return try interp.wrapError(&det, interp.getVariableImpl(&det, new_name.orElse(name)));
 }
 
@@ -2033,9 +2033,9 @@ pub fn getDictValue(interp: *Interp, dict: Handle, key: Handle) Interp.Error!str
     new_dict: ?Handle,
     value: ?Handle,
 } {
-    var det: object.ErrorDetails = undefined;
-    const new_dict = try interp.wrapError(&det, object.shimmerToDict(&det, dict));
-    return .{ .new_dict = new_dict, .value = object.dictLookupFollowRefs(new_dict orelse dict, key) };
+    var det: objutil.ErrorDetails = undefined;
+    const new_dict = try interp.wrapError(&det, objutil.shimmerToDict(&det, dict));
+    return .{ .new_dict = new_dict, .value = objutil.dictLookupFollowRefs(new_dict orelse dict, key) };
 }
 
 pub fn getDictValueOrError(interp: *Interp, dict: Handle, key: Handle) Interp.Error!struct {
@@ -2052,8 +2052,8 @@ pub fn getDictValueOrError(interp: *Interp, dict: Handle, key: Handle) Interp.Er
 }
 
 pub fn getDictValueRecursively(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, keys: []const Handle) Interp.Error!OptionalHandle {
-    var det: object.ErrorDetails = undefined;
-    const result = try interp.wrapError(&det, object.dictLookupRecursively(&det, dict, keys));
+    var det: objutil.ErrorDetails = undefined;
+    const result = try interp.wrapError(&det, objutil.dictLookupRecursively(&det, dict, keys));
     new_dict.swapRefIfNew(result.new_dict);
     return result.value;
 }
@@ -2066,7 +2066,7 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: Handle, new_dict: *
     if (keys.len == 1) {
         try interp.setResultFormatted("could not find value for key \"{f}\"", .{keys[0]});
     } else {
-        var keys_list = try object.newList(keys);
+        var keys_list = try objutil.newList(keys);
         defer keys_list.decrRefCount();
         try interp.setResultFormatted("could not find value for keys \"{f}\"", .{keys_list});
     }
@@ -2077,10 +2077,10 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: Handle, new_dict: *
 pub fn putDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, key: Handle, value: Handle) Interp.Error!Handle {
     errdefer new_dict.swapWithNull();
 
-    var det: object.ErrorDetails = undefined;
-    try interp.wrapError(&det, object.shimmerToDict(&det, dict));
+    var det: objutil.ErrorDetails = undefined;
+    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict));
 
-    const put_result = try object.dictPut(new_dict.orElse(dict), key, value);
+    const put_result = try objutil.dictPut(new_dict.orElse(dict), key, value);
     new_dict.swapRefIfNew(put_result.new_dict);
 
     return put_result.new_value;
@@ -2088,11 +2088,11 @@ pub fn putDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, ke
 
 /// Returns a new handle to where the value (or reference to the value) resides.
 pub fn putDictValueRecursively(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, keys: []const Handle, value: Handle) Interp.Error!Handle {
-    var det: object.ErrorDetails = undefined;
+    var det: objutil.ErrorDetails = undefined;
     var new_obj = try interp.heap.dupOrReference(value);
     const put_result = try interp.wrapError(
         &det,
-        object.dictPutRecursively(&det, dict, keys, &new_obj),
+        objutil.dictPutRecursively(&det, dict, keys, &new_obj),
     );
     new_dict.swapRefIfNew(put_result.new_dict);
     return put_result.new_value;
@@ -2102,17 +2102,17 @@ pub fn putDictValueRecursively(interp: *Interp, dict: Handle, new_dict: *Optiona
 pub fn removeDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, key: Handle) !bool {
     errdefer new_dict.swapWithNull();
 
-    var det: object.ErrorDetails = undefined;
-    try interp.wrapError(&det, object.shimmerToDict(&det, dict, new_dict));
+    var det: objutil.ErrorDetails = undefined;
+    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict, new_dict));
 
-    const remove_result = try object.dictRemove(new_dict orelse dict, key);
+    const remove_result = try objutil.dictRemove(new_dict orelse dict, key);
     Handle.swapRefIfNew(&new_dict, remove_result.new_dict);
     return .{ .new_dict = new_dict, .did_remove = remove_result.did_remove };
 }
 
 pub fn removeDictValueRecursively(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, keys: []const Handle) Interp.Error!bool {
-    var det: object.ErrorDetails = undefined;
-    const put_result = try interp.wrapError(&det, object.dictRemoveRecursively(&det, dict, keys));
+    var det: objutil.ErrorDetails = undefined;
+    const put_result = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, dict, keys));
     new_dict.swapRefIfNew(put_result.new_dict);
     return put_result.did_remove;
 }
@@ -2123,15 +2123,15 @@ test "recursive dict keys" {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var dict = try object.newDict(heap, &.{});
+    var dict = try objutil.newDict(heap, &.{});
     defer dict.decrRefCount();
-    var key_foo = try object.newString(heap, "foo");
+    var key_foo = try objutil.newString(heap, "foo");
     defer key_foo.decrRefCount();
-    var key_bar = try object.newString(heap, "bar");
+    var key_bar = try objutil.newString(heap, "bar");
     defer key_bar.decrRefCount();
-    var key_baz = try object.newString(heap, "baz");
+    var key_baz = try objutil.newString(heap, "baz");
     defer key_baz.decrRefCount();
-    const value_qux = try object.newString(heap, "qux");
+    const value_qux = try objutil.newString(heap, "qux");
     defer value_qux.decrRefCount();
 
     var new_dict: OptionalHandle = .none;
@@ -2151,7 +2151,7 @@ test "recursive dict keys" {
     try testing.expectEqual(1, to_take.debugRefCount());
 
     // Let's try some very cursed aliasing.
-    _ = try interp.putDictValueRecursively(dict, &new_dict, &.{ key_foo, key_bar }, object.dictItem(dict, 0));
+    _ = try interp.putDictValueRecursively(dict, &new_dict, &.{ key_foo, key_bar }, objutil.dictItem(dict, 0));
     dict.swapAndClear(&new_dict);
     try testing.expectEqualStrings("foo {bar foo}", try Heap.getString(dict));
 
@@ -2166,15 +2166,15 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var dict = try object.newDict(heap, &.{});
+    var dict = try objutil.newDict(heap, &.{});
     defer dict.decrRefCount();
-    var key_foo = try object.newString(heap, "foo");
+    var key_foo = try objutil.newString(heap, "foo");
     defer key_foo.decrRefCount();
-    var key_bar = try object.newString(heap, "bar");
+    var key_bar = try objutil.newString(heap, "bar");
     defer key_bar.decrRefCount();
-    var key_baz = try object.newString(heap, "baz");
+    var key_baz = try objutil.newString(heap, "baz");
     defer key_baz.decrRefCount();
-    const value_qux = try object.newString(heap, "qux");
+    const value_qux = try objutil.newString(heap, "qux");
     defer value_qux.decrRefCount();
 
     var new_dict: OptionalHandle = .none;
@@ -2226,7 +2226,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("foo {}", try Heap.getString(dict));
 
     // Test 7: Removal when intermediate dict is shared (copy-on-write).
-    var interm_test_dict = try object.newDict(heap, &.{});
+    var interm_test_dict = try objutil.newDict(heap, &.{});
     defer interm_test_dict.decrRefCount();
     _ = try interp.putDictValueRecursively(interm_test_dict, &new_dict, &.{ key_foo, key_bar, key_baz }, value_qux);
     interm_test_dict.swapAndClear(&new_dict);
@@ -2257,7 +2257,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqual(initial_refcount - 1, intermediate.debugRefCount());
 
     // Test 8: Remove multiple items from a nested dict.
-    dict.swap(try object.newDict(heap, &.{}));
+    dict.swap(try objutil.newDict(heap, &.{}));
     _ = try interp.putDictValueRecursively(dict, &new_dict, &.{ key_foo, key_bar }, value_qux);
     dict.swapAndClear(&new_dict);
     _ = try interp.putDictValueRecursively(dict, &new_dict, &.{ key_foo, key_baz }, value_qux);

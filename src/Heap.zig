@@ -13,7 +13,7 @@ const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const expr_parse = @import("expr_parse.zig");
-const object = @import("object.zig");
+const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
 // These numbers are final, and can be depended on to be their current values
@@ -271,7 +271,7 @@ pub const ParsedScript = struct {
         const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
 
         var line: u64 = 0;
-        for (script.tags.items, object.listItems(script.values), 0..) |token, value, i| {
+        for (script.tags.items, objutil.listItems(script.values), 0..) |token, value, i| {
             switch (token) {
                 .start_of_command => {
                     line = value.body.script_command.line;
@@ -279,7 +279,7 @@ pub const ParsedScript = struct {
                 },
                 .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
-                    const item = object.listItem(script.values, @intCast(i));
+                    const item = objutil.listItem(script.values, @intCast(i));
                     std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), getString(item) catch "<oom string>" });
                 },
             }
@@ -1031,7 +1031,7 @@ fn invalidateBodyInner(handle: Handle) void {
         .dict => {
             invalidateCollection(handle);
 
-            const dict_metadata = object.dictGetMetadata(handle);
+            const dict_metadata = objutil.dictGetMetadata(handle);
             if (dict_metadata.table) |*table| table.deinit(obj_heap.gpa);
             obj_heap.destroyExtraData(obj.body.dict.extra_data);
         },
@@ -2737,15 +2737,15 @@ fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index:
         .list => {
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
-                const item_handle = object.listItem(handle, @intCast(item_idx));
+                const item_handle = objutil.listItem(handle, @intCast(item_idx));
                 try stderr.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
             }
         },
         .dict => {
             var item_idx: u32 = 0;
             while (item_idx < obj.body.dict.len) : (item_idx += 2) {
-                const key_handle = object.dictItem(handle, item_idx);
-                const val_handle = object.dictItem(handle, item_idx + 1);
+                const key_handle = objutil.dictItem(handle, item_idx);
+                const val_handle = objutil.dictItem(handle, item_idx + 1);
 
                 try stderr.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
                 try stderr.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });

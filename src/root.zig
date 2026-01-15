@@ -25,7 +25,7 @@ test {
     // @import("std").testing.refAllDecls(@This());
     _ = @import("stringutil.zig");
     _ = @import("Tokenizer.zig");
-    _ = @import("object.zig");
+    _ = @import("objutil.zig");
     _ = @import("Heap.zig");
     _ = @import("Interp.zig");
     _ = @import("commands.zig");
