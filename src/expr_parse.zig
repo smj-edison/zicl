@@ -874,7 +874,7 @@ test "expr parsing" {
 fn testExprParse(heap: *Heap, expr: []const u8, comptime expected_tree: []const u8) !void {
     var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
     defer tokens.deinit(testing.allocator);
-    var parser = Parse.init(heap, heap.emptyObject(), expr, tokens.slice());
+    var parser = Parse.init(heap, .none, expr, tokens.slice());
     defer parser.deinit();
     const root_node = (parser.parseExpr() catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
 
@@ -888,7 +888,7 @@ fn testExprParse(heap: *Heap, expr: []const u8, comptime expected_tree: []const 
 fn testExprParseError(heap: *Heap, expr: []const u8, expected_error: Parse.Error.Tag, message: ?[]const u8) !void {
     var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
     defer tokens.deinit(testing.allocator);
-    var parser = Parse.init(heap, heap.emptyObject(), expr, tokens.slice());
+    var parser = Parse.init(heap, .none, expr, tokens.slice());
     defer parser.deinit();
 
     try testing.expectError(error.ParseError, parser.parseExpr());

@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
+const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
@@ -20,14 +21,15 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    const int_result = objutil.integerGet(null, args[i]) catch |err| switch (err) {
+                    var new_ref: OptionalHandle = .none;
+                    const res = objutil.integerGet(null, args[i], &new_ref) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
                         error.OutOfMemory => return error.OutOfMemory,
                     };
-                    args[i].swapIfNew(int_result.new_handle);
-                    break :blk int_result.value;
+                    args[i].swapIfNew(new_ref);
+                    break :blk res;
                 }
             };
 
@@ -80,7 +82,7 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         return error.EvalError;
     }
 
-    var namespace: Heap.OptionalHandle = .null;
+    var namespace: Heap.OptionalHandle = .none;
     if (lambda_len == 3) {
         namespace = objutil.listItemFollowRefs(args[1], 2).toOptional();
     }
@@ -174,16 +176,16 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const SubcommandEnum = objutil.TclEnum(SubcommandName, "dict_subcommand");
 
     var det: objutil.ErrorDetails = undefined;
-    const enum_result = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1]));
-    args[1].swapIfNew(enum_result.new_handle);
-    const subcommand: SubcommandName = enum_result.value;
+    var new_enum: OptionalHandle = .none;
+    const subcommand: SubcommandName = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1], &new_enum));
+    args[1].swapIfNew(new_enum);
 
     switch (subcommand) {
         .get => {
             interp.setResult(try interp.getDictValueRecursivelyOrError(&args[2], args[3..]));
         },
         .getdef => {
-            if (try interp.getDictValueRecursively(&args[2], args[3..(args.len - 1)])) |val| {
+            if ((try interp.getDictValueRecursively(&args[2], args[3..(args.len - 1)])).toHandle()) |val| {
                 interp.setResult(val);
             } else {
                 interp.setResult(args[args.len - 1]);
@@ -191,13 +193,13 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         },
         .set => {
             const dict = blk: {
-                if (try interp.getVariable(&args[2])) |val| {
+                if ((try interp.getVariable(&args[2])).toHandle()) |val| {
                     break :blk val;
                 } else {
                     const new_variable_dict = try objutil.newDictWithCapacity(2);
                     defer new_variable_dict.decrRefCount();
                     try interp.setVariableTo(&args[2], new_variable_dict);
-                    break :blk (try interp.getVariable(&args[2])).?;
+                    break :blk (try interp.getVariable(&args[2])).toHandle().?;
                 }
             };
             var new_dict = dict;
@@ -232,8 +234,8 @@ test "dict commands" {
     );
 }
 
-pub fn expr(interp: *Interp, args: []Handle) Interp.Error!void {
-    const result = try (try interp.evalExpression(&args[1])).toObject(interp);
+pub fn exprCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const result = try (try interp.evalExpressionInPlace(&args[1])).toObject(interp);
     defer result.decrRefCount();
     interp.setResult(result);
 }
@@ -262,12 +264,12 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
 
 pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     // Do the initialization.
-    try interp.evalObject(&args[1]);
+    try interp.evalObjectInPlace(&args[1]);
 
     // Check condition.
     while (try interp.getBoolFromExpression(&args[2])) {
         // Evaluate body.
-        switch (try propagateLoopControl(interp, interp.evalObject(&args[4]))) {
+        switch (try propagateLoopControl(interp, interp.evalObjectInPlace(&args[4]))) {
             .@"break" => {
                 break;
             },
@@ -280,7 +282,7 @@ pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         }
 
         // Run increment.
-        try interp.evalObject(&args[3]);
+        try interp.evalObjectInPlace(&args[3]);
     }
 
     interp.setEmptyResult();
@@ -339,7 +341,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         // Check condition.
         if (try interp.getBoolFromExpression(&remaining_args[0])) {
             // Evaluate true branch.
-            try interp.evalObject(&remaining_args[1]);
+            try interp.evalObjectInPlace(&remaining_args[1]);
             return;
         }
 
@@ -357,7 +359,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             // There should only be one more argument, since there shouldn't
             // be anything after "else".
             if (remaining_args.len > 2) return error.WrongUsage;
-            try interp.evalObject(&remaining_args[1]);
+            try interp.evalObjectInPlace(&remaining_args[1]);
             return;
         }
 
@@ -382,7 +384,7 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
         increment_by = try interp.getInteger(&args[2]);
     }
 
-    if (try interp.getVariable(&args[1])) |val| {
+    if ((try interp.getVariable(&args[1])).toHandle()) |val| {
         const contents = try interp.getIntegerNoShimmer(val);
         const new_contents = std.math.add(i64, contents, increment_by) catch {
             var det: objutil.ErrorDetails = undefined;
@@ -401,7 +403,7 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
                 .tag = .integer,
                 .body = .{ .integer = new_contents },
             });
-            interp.setResult((interp.getVariable(&args[1]) catch unreachable).?);
+            interp.setResult((interp.getVariable(&args[1]) catch unreachable).toHandle().?);
         }
     } else {
         try interp.setVariableToObject(&args[1], .{
@@ -409,7 +411,7 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
             .tag = .integer,
             .body = .{ .integer = increment_by },
         });
-        interp.setResult((try interp.getVariable(&args[1])).?);
+        interp.setResult((try interp.getVariable(&args[1])).toHandle().?);
     }
 }
 
@@ -454,11 +456,11 @@ pub fn createProcedureCommand(
 ) !Interp.Command {
     const statics: ?Handle = blk: {
         if (statics_names) |names| {
-            names.swapIfNew(try Heap.ensureSameHeapOrDup(names.*));
+            try interp.ensureShimmerable(names);
             const statics_count = try interp.getListLength(names);
 
             const statics_dict = try objutil.newDictWithCapacity(statics_count * 2);
-            objutil.dictGetMetadata(statics_dict).len = statics_count * 2;
+            statics_dict.peek().body.dict.len = statics_count * 2;
             const dict_items = objutil.dictItems(statics_dict);
             errdefer statics_dict.decrRefCount();
 
@@ -483,8 +485,6 @@ pub fn createProcedureCommand(
                     else => return err,
                 }
             }
-
-            try objutil.dictReindex(statics_dict, null);
 
             break :blk statics_dict;
         } else {
@@ -537,9 +537,10 @@ pub fn createProcedureCommand(
             _ = try interp.listAppend(&(optional_values.?), objutil.listItem(arg, 1));
             // And replace the `arg_list`'s parameter/value with just the parameter name.
             var det: objutil.ErrorDetails = undefined;
-            var new_item = try Heap.local_heap.dupOrReference(objutil.listItem(arg, 0));
-            errdefer new_item.deinitBodySingle(Heap.local_heap);
-            arg_list.swapIfNew(try objutil.listSetObject(&det, arg_list.*, @intCast(i), new_item));
+            const new_item = try Heap.local_heap.dupOrReference(objutil.listItem(arg, 0));
+            var new_arg_list: OptionalHandle = .none;
+            try objutil.listSetObject(&det, arg_list.*, &new_arg_list, @intCast(i), new_item);
+            arg_list.swapIfNew(new_arg_list);
 
             optional_arity += 1;
         } else {
@@ -606,7 +607,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
-    try interp.registerCommand("expr", .{ .to_call = expr, .description = "expression", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("expr", .{ .to_call = exprCmd, .description = "expression", .min_arity = 1, .max_arity = 1 });
     try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
@@ -632,7 +633,7 @@ pub fn testFinish(interp: *Interp) void {
 fn testRunScript(interp: *Interp, script: []const u8) !Handle {
     var script_handle = try objutil.newString(interp.heap, script);
     defer script_handle.decrRefCount();
-    try interp.evalObject(&script_handle);
+    try interp.evalObjectInPlace(&script_handle);
     return interp.result;
 }
 
@@ -649,5 +650,5 @@ test "commands" {
         \\ puts [dict get $x a 5]
     );
     defer script.decrRefCount();
-    interp.evalObject(&script) catch {};
+    interp.evalObjectInPlace(&script) catch {};
 }

@@ -733,7 +733,7 @@ pub const OptionalHandle = enum(HandleBacking) {
         }
     }
 
-    pub fn swapWithNull(ref: *OptionalHandle) void {
+    pub fn swapWithNone(ref: *OptionalHandle) void {
         if (ref.toHandle()) |val| val.decrRefCount();
         ref.* = .none;
     }
@@ -771,6 +771,10 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn toOptional(handle: Handle) OptionalHandle {
         return @enumFromInt(@as(HandleBacking, @bitCast(handle)));
+    }
+
+    pub fn toOptionalRef(ref: *Handle) *OptionalHandle {
+        return @ptrCast(ref);
     }
 
     pub fn prepareToShimmer(handle: Handle) !void {
