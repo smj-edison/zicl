@@ -202,14 +202,23 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                     break :blk (try interp.getVariable(&args[2])).toHandle().?;
                 }
             };
-            var new_dict = dict;
-            _ = try interp.putDictValueRecursively(&new_dict, args[3..(args.len - 1)], args[args.len - 1]);
-            if (new_dict != dict) {
-                dict.incrRefCount();
+
+            det = undefined;
+            const put_result: objutil.DictAndValueResult = try interp.wrapError(&det, objutil.dictPutRecursively(
+                &det,
+                dict,
+                args[3..(args.len - 1)],
+                try interp.heap.dupOrReference(args[args.len - 1]),
+            ));
+
+            if (put_result.new_dict.toHandle()) |new_dict| {
+                defer new_dict.decrRefCount();
                 try interp.setVariableTo(&args[2], new_dict);
-                new_dict.decrRefCount();
+                // TODO probably can do this faster than looking back up every time.
+                interp.setResult((try interp.getVariable(&args[2])).toHandle().?);
+            } else {
+                interp.setResult(dict);
             }
-            interp.setResult(new_dict);
         },
         .unset => {},
         else => unreachable,

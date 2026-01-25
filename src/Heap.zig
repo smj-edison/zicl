@@ -777,6 +777,7 @@ pub const Handle = packed struct(HandleBacking) {
         return @ptrCast(ref);
     }
 
+    /// Must be shimmerable.
     pub fn prepareToShimmer(handle: Handle) !void {
         handle.assert(handle.canShimmer());
         // Make sure the object has a string rep before we free its body.
@@ -983,6 +984,12 @@ fn invalidateBothInner(handle: Handle) void {
 }
 
 fn invalidateStringInner(handle: Handle) void {
+    switch (Heap.getStringDetails(handle)) {
+        .null => handle.trace("Invalidate string (was null)", .{}),
+        .empty => handle.trace("Invalidate string (was empty)", .{}),
+        .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
+        .long => |long_str| handle.trace("Invalidate string (was {s})", .{long_str.getString()}),
+    }
     handle.peek().deinitString(handle.getHeap());
 }
 
@@ -1017,18 +1024,22 @@ fn invalidateCollection(handle: Handle) void {
             .heap = handle.heap,
         };
 
-        invalidateBothInner(elem_handle);
-        if (any_elems_referenced) elem_handle.decrRefCount();
+        if (!any_elems_referenced) {
+            // Case 1: this dictionary owns all items, so we can free all items.
+            invalidateBothInner(elem_handle);
+        } else {
+            // Case 2: there were shared items in the dictionary, so all the items
+            // were split into individual items. We need to decrement the dictionary's
+            // ownership of every item.
+            elem_handle.decrRefCount();
+        }
     }
 }
 
 fn invalidateBodyInner(handle: Handle) void {
     handle.trace("Invalidate body", .{});
 
-    const obj_heap = handle.getHeap();
-    const obj = obj_heap.getLocalObject(handle.index);
-
-    switch (obj.tag) {
+    switch (handle.peek().tag) {
         .list => {
             invalidateCollection(handle);
         },
@@ -1036,14 +1047,14 @@ fn invalidateBodyInner(handle: Handle) void {
             invalidateCollection(handle);
 
             const dict_metadata = objutil.dictGetMetadata(handle);
-            if (dict_metadata.table) |*table| table.deinit(obj_heap.gpa);
-            obj_heap.destroyExtraData(obj.body.dict.extra_data);
+            if (dict_metadata.table) |*table| table.deinit(handle.getHeap().gpa);
+            handle.getHeap().destroyExtraData(handle.peek().body.dict.extra_data);
         },
-        else => obj.deinitBodySingle(obj_heap),
+        else => handle.peek().deinitBodySingle(handle.getHeap()),
     }
 
-    obj.body = undefined;
-    obj.tag = .none;
+    handle.peek().body = undefined;
+    handle.peek().tag = .invalid;
 }
 
 const ObjectAndMetadata = struct {

@@ -891,16 +891,20 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
             key.getMetadata().mutable = true;
         }
 
-        try handle.prepareToShimmer();
         // Because both lists and dicts store their values directly after,
-        // we can just swap out the head to convert to a list.
-        handle.peek().* = .{
-            .str = Heap.Object.null_string,
-            .tag = .list,
-            .body = .{
-                .list = .{ .len = len },
-            },
-        };
+        // we can just swap out the head to convert to a list. Don't call
+        // `prepareToShimmer` because that would invalidate the dict items,
+        // but we want to reuse them as list items.
+        _ = try Heap.getString(handle);
+
+        // Clean up dict-specific resources (table and extra_data).
+        const heap = handle.getHeap();
+        const dict_metadata = dictGetMetadata(handle);
+        if (dict_metadata.table) |*table| table.deinit(heap.gpa);
+        heap.destroyExtraData(handle.peek().body.dict.extra_data);
+
+        handle.peek().tag = .list;
+        handle.peek().body = .{ .list = .{ .len = len } };
 
         return;
     } else {
@@ -1372,8 +1376,10 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     }
 
     // Because both lists and dicts store their values directly after,
-    // we can just swap out the head to convert to a dict.
-    try shimmerable.prepareToShimmer();
+    // we can just swap out the head to convert to a dict. Don't call
+    // `prepareToShimmer` because that would invalidate the list items,
+    // but we want to reuse them as dict key/value pairs.
+    _ = try Heap.getString(shimmerable);
     shimmerable.peek().tag = .dict;
     shimmerable.peek().body.dict = .{
         .extra_data = metadata_index,
@@ -1596,7 +1602,7 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
     return to_track_new_location;
 }
 
-const DictAndValueResult = struct { new_dict: OptionalHandle, new_value: Heap.Handle };
+pub const DictAndValueResult = struct { new_dict: OptionalHandle, new_value: Heap.Handle };
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
 /// `value` must be in `Heap.local_heap`.
 pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !DictAndValueResult {

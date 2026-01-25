@@ -332,8 +332,7 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
 
                 variable.* = .{
                     .call_epoch = var_call_frame.call_epoch,
-                    // The cached index is relative to the variables dict.
-                    .index = new_value_handle.index - var_call_frame.variables.index,
+                    .index = new_value_handle.index,
                     .is_global = variable.is_global,
                 };
             },
@@ -1787,7 +1786,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
         var args_written: usize = 0;
         var args = try args_alloc.alloc(Handle, command_info.arg_count);
         defer args_alloc.free(args);
-        defer for (args) |arg| arg.decrRefCount();
+        defer for (args[0..args_written]) |arg| arg.decrRefCount();
 
         // Populate the arguments by looping through each word of the command and
         // substituting.
