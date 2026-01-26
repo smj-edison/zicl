@@ -203,13 +203,11 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 }
             };
 
-            det = undefined;
-            const put_result: objutil.DictAndValueResult = try interp.wrapError(&det, objutil.dictPutRecursively(
+            const new_value = try interp.heap.dupOrReference(args[args.len - 1]);
+            const put_result = try interp.wrapError(
                 &det,
-                dict,
-                args[3..(args.len - 1)],
-                try interp.heap.dupOrReference(args[args.len - 1]),
-            ));
+                objutil.dictPutRecursively(&det, dict, args[3..(args.len - 1)], new_value),
+            );
 
             if (put_result.new_dict.toHandle()) |new_dict| {
                 defer new_dict.decrRefCount();

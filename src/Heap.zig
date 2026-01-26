@@ -74,8 +74,8 @@ const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
 gpa: Allocator,
 
-/// Used whenever an allocation or free is happening.
-mem_mgmt_mutex: memutil.Mutex = .{},
+/// Used to create and destroy extra data.
+extra_data_muta: memutil.Mutex = .{},
 /// Used for locking when adding trace info.
 trace_mutex: memutil.Mutex = .{},
 
@@ -274,8 +274,8 @@ pub const ParsedScript = struct {
         for (script.tags.items, objutil.listItems(script.values), 0..) |token, value, i| {
             switch (token) {
                 .start_of_command => {
-                    line = value.body.script_command.line;
-                    std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.script_command });
+                    line = value.body.parsed_script_command.line;
+                    std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.parsed_script_command });
                 },
                 .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
@@ -320,6 +320,8 @@ pub const Object = packed struct(u128) {
                 len: u26,
             },
             /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
+            /// TODO when/if aligned pointers in packed structs become a thing, switch
+            /// over to that system.
             ptr: u58,
         },
         is_ptr: bool,
@@ -428,15 +430,18 @@ pub const Object = packed struct(u128) {
                     },
                 }
             },
+            .local_variable => {
+                const variable = obj.body.local_variable;
+                heap.destroyExtraData(variable.extra_data);
+            },
             .dict_subst => @panic("Need to free any references"),
             .none,
             .index,
             .integer,
             .float,
             .bool,
-            .script_command,
+            .parsed_script_command,
             .marked,
-            .variable,
             .invalid,
             => {},
             .dict, .list => unreachable,
@@ -466,11 +471,11 @@ pub const Object = packed struct(u128) {
             .dict => try writer.print(" = {}", .{self.body.dict}),
             .dict_subst => try writer.print(" = {}", .{self.body.dict_subst}),
             .command => try writer.print(" = {}", .{self.body.command}),
-            .script_command => try writer.print(" = {}", .{self.body.script_command}),
+            .parsed_script_command => try writer.print(" = {}", .{self.body.parsed_script_command}),
             .script => try writer.print(" = {}", .{self.body.script}),
             .expr => try writer.print(" = {}", .{self.body.expr}),
             .reference => try writer.print(" = {any}", .{self.body.reference}),
-            .variable => try writer.print(" = {}", .{self.body.variable}),
+            .local_variable => try writer.print(" = {}", .{self.body.local_variable}),
             .upvar => try writer.print(" = {}", .{self.body.upvar}),
             .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
         }
@@ -479,9 +484,9 @@ pub const Object = packed struct(u128) {
 };
 
 pub const Tag = enum(u5) {
-    // Set this if an object's contents are no longer usable.
-    invalid,
     none,
+    /// Set this if an object's contents are no longer usable.
+    invalid,
     marked,
     index,
     integer,
@@ -492,12 +497,14 @@ pub const Tag = enum(u5) {
     list,
     dict,
     dict_subst,
-    command,
-    script_command,
+    native_command,
+    closure,
+    parsed_script_command,
     script,
     expr,
     reference,
-    variable,
+    local_variable,
+    lexical_variable,
     upvar,
     custom_type,
 };
@@ -525,8 +532,8 @@ pub const ListIndex = packed struct {
 };
 
 pub const Body = packed union {
-    invalid: void,
     none: void,
+    invalid: void,
     /// Used internally in places where a value needs to be temporarily marked.
     marked: void,
     /// List index
@@ -561,18 +568,16 @@ pub const Body = packed union {
         var_name_index: u32,
         dict_value_index: u32,
     },
-    command: packed struct {
-        procedure_epoch: u31,
-        in_global_namespace: bool,
-        u: packed union {
-            global_namespace: packed struct {
-                command_index: u32,
-            },
-            other_namespace: ExtraData,
-        },
+    native_command: packed struct {
+        native_command_epoch: u32,
+        command_index: u32,
     },
-    /// Information about a command.
-    script_command: packed struct {
+    closure: packed struct {
+        script: ScriptId,
+        extra_data: ExtraData,
+    },
+    /// Information about a parsed command.
+    parsed_script_command: packed struct {
         line: u32,
         arg_count: u32,
     },
@@ -583,18 +588,29 @@ pub const Body = packed union {
         id: ScriptId,
     },
     reference: Handle,
-    variable: packed struct {
-        index: u32,
+    local_variable: packed struct {
         /// Used to invalidate `index`'s cached value, if it doesn't match
         /// the current call frame's epoch.
-        call_epoch: u31,
-        /// Whether the variable is global, e.g. prefixed with ::
-        is_global: bool,
+        call_epoch: u32,
+        cached_index: u32,
     },
-    upvar: ExtraData,
+    /// Value from lexical scope lookup. In zicl, parent scopes are immutable,
+    /// so we can outright borrow this value.
+    lexical_variable: packed struct {
+        /// Used to invalidate the cached value, if it doesn't match
+        /// the current call frame's epoch. The only thing that can
+        /// invalidate a lexical lookup is shadowing it with a local
+        /// variable.
+        call_epoch: u32,
+        extra_data: ExtraData,
+    },
+    upvar: packed struct {
+        call_epoch: u32,
+        extra_data: ExtraData,
+    },
     custom_type: packed struct {
         type_id: u32,
-        index: ExtraData,
+        extra_data: ExtraData,
     },
 };
 
@@ -634,37 +650,81 @@ pub const ExtraDataValue = union {
         /// Caller needs to ensure that any string this is called with
         /// is valid, as hash map methods don't return errors.
         table: ?Table,
+
+        /// Used during variable lookup to walk the parent scopes. References
+        /// the dict if present.
+        parent_link: OptionalHandle,
     };
 
     /// This does not store the key/value pairs directly, instead it
-    /// is an mapping of key to value index.
+    /// is a mapping of key to value index.
     dict: Dictionary,
-    upvar: struct {
-        call_frame_idx: u32,
-        call_frame_epoch: u31,
-        /// Cached index of the target object. Contains the null object if the variable
-        /// doesn't exist.
-        index: u32,
-        name: union(enum) {
-            /// An object containing the name of the variable in the variable's scope.
-            normal: u32,
-            dict_sugar: struct {
-                /// _Non_-cached index of the dictionary name ("foo" of `foo(bar)`).
-                dict_name_index: u32,
-                /// _Non_-cached index of the dictionary key ("bar" of `foo(bar)`).
-                dict_key_index: u32,
-            },
-        },
+    lexical_variable: struct {
+        /// Borrows the value it references.
+        ref: Handle,
     },
+    upvar: struct {
+        /// The name handle, always evaluated in the linked frame.
+        linked_variable_name: u32,
+        linked_frame_index: u32,
+    },
+    closure: ClosureSignature,
     custom_type: struct {
         first_ptr: *anyopaque,
         second_ptr: *anyopaque,
     },
-    /// Spillover for when command isn't in the global namespace.
-    command: struct {
-        namespace: u32,
-        command_index: u32,
+};
+
+pub const VariableValue = union(enum) {
+    local_variable: struct {
+        target: Handle,
     },
+    /// Variable in a parent scope. Immutable.
+    lexical_variable: struct {
+        target: Handle,
+    },
+};
+
+pub const ClosureSignature = struct {
+    /// Handle to the argument list of the procedure.
+    args: Handle,
+    /// Handle to the ScriptId object.
+    body: Handle,
+    /// Handle to the closure's scope (linked dictionary).
+    scope: OptionalHandle,
+    /// Required number of arguments.
+    required_arity: u32,
+    /// Optional number of arguments.
+    optional_arity: u32,
+    /// Default values of optional arguments, if any.
+    optional_values: OptionalHandle,
+    /// Whether `args` is provided as an argument name. `args`, if present, is always
+    /// the last argument name.
+    has_args_parameter: bool,
+
+    pub fn borrow(sign: ClosureSignature) !ClosureSignature {
+        sign.args.incrRefCount();
+        sign.body.incrRefCount();
+        sign.scope.borrowOptional();
+        sign.optional_values.borrowOptional();
+
+        return .{
+            .args = sign.args,
+            .body = sign.body,
+            .scope = sign.scope,
+            .required_arity = sign.required_arity,
+            .optional_arity = sign.optional_arity,
+            .optional_values = sign.optional_values,
+            .has_args_parameter = sign.has_args_parameter,
+        };
+    }
+
+    pub fn deinit(sign: ClosureSignature) void {
+        sign.args.decrRefCount();
+        sign.body.decrRefCount();
+        sign.scope.decrOptional();
+        sign.optional_values.decrOptional();
+    }
 };
 
 pub const CustomType = struct {
@@ -745,6 +805,10 @@ pub const OptionalHandle = enum(HandleBacking) {
     pub fn borrowOptional(ref: OptionalHandle) OptionalHandle {
         if (ref.toHandle()) |val| val.incrRefCount();
         return ref;
+    }
+
+    pub fn decrOptional(ref: OptionalHandle) void {
+        if (ref.toHandle()) |val| val.decrRefCount();
     }
 };
 
@@ -1698,7 +1762,7 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
 pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
-        .none, .index, .integer, .float, .string, .bool, .script_command, .marked => {
+        .none, .index, .integer, .float, .string, .bool, .parsed_script_command, .marked => {
             return .{
                 .str = try dest_heap.duplicateObjString(handle),
                 .tag = src.tag,
@@ -1766,7 +1830,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = try dest_heap.createExtraData(),
+                        .extra_data = try dest_heap.createExtraData(),
                         .type_id = custom_type.type_id,
                     },
                 },
@@ -1775,7 +1839,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             return new_object;
         },
-        .dict_subst, .variable, .upvar, .command => {
+        .dict_subst, .local_variable, .upvar, .command => {
             // Variable lookup is not stable between threads.
             return .{
                 .str = try dest_heap.duplicateObjString(handle),
@@ -2123,7 +2187,8 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             break :blk try getListString(self, index + 1, list.len);
         },
         .dict => {
-            break :blk try getListString(self, index + 1, obj.body.dict.len);
+            @panic("Need to follow dict links when building dict");
+            // break :blk try getListString(self, index + 1, obj.body.dict.len);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
@@ -2134,9 +2199,9 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             // the reference's string, not our own.
             return getString(obj.body.reference);
         },
-        .script_command => {
+        .parsed_script_command => {
             if (builtin.mode == .Debug and state.running_leak_check) {
-                const script_command = obj.body.script_command;
+                const script_command = obj.body.parsed_script_command;
                 break :blk try std.fmt.allocPrintSentinel(
                     self.gpa,
                     "<script command: args: {}, line: {}>",
@@ -2168,7 +2233,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 break :blk try std.fmt.allocPrintSentinel(self.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
-        .string, .source, .script, .expr, .dict_subst, .variable, .upvar, .command => {
+        .string, .source, .script, .expr, .dict_subst, .local_variable, .upvar, .command => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     };
@@ -2373,8 +2438,8 @@ pub const LongString = struct {
 };
 
 pub fn createExtraData(self: *Heap) !ExtraData {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
+    self.extra_data_muta.lock();
+    defer self.extra_data_muta.unlock();
 
     const new_index = try self.extra.create(self.heapAlloc());
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
@@ -2387,8 +2452,18 @@ pub fn getExtraData(self: *Heap, index: ExtraData) *ExtraDataValue {
 }
 
 pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
-    self.mem_mgmt_mutex.lock();
-    defer self.mem_mgmt_mutex.unlock();
+    // TODO should probably take care of deleting the contained data
+    // here instead of scattering it all over the codebase.
+
+    switch (self.getExtraData(index)) {
+        .lexical_variable => |lexical_var| {
+            lexical_var.ref.decrRefCount();
+        },
+        else => @panic("Need to implement cleanup and remove cleanup from other parts of code"),
+    }
+
+    self.extra_data_muta.lock();
+    defer self.extra_data_muta.unlock();
 
     self.extra.destroy(@intFromEnum(index));
 }
@@ -2679,8 +2754,8 @@ fn getTagColor(tag: Tag) []const u8 {
         .script => "lavender",
         .expr => "thistle",
         .source => "peachpuff",
-        .command, .script_command => "khaki",
-        .variable, .upvar => "lightcyan",
+        .command, .parsed_script_command => "khaki",
+        .local_variable, .upvar => "lightcyan",
         .custom_type => "tan",
         else => "white",
     };

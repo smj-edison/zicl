@@ -1376,10 +1376,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     }
 
     // Because both lists and dicts store their values directly after,
-    // we can just swap out the head to convert to a dict. Don't call
-    // `prepareToShimmer` because that would invalidate the list items,
-    // but we want to reuse them as dict key/value pairs.
-    _ = try Heap.getString(shimmerable);
+    // we can just swap out the head to convert to a dict.
     shimmerable.peek().tag = .dict;
     shimmerable.peek().body.dict = .{
         .extra_data = metadata_index,
@@ -1473,6 +1470,25 @@ pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!Option
     if (table.get(key)) |value_offset| {
         return dictItemFollowRefs(dict, value_offset).toOptional();
     } else return .none;
+}
+
+pub fn dictLookupFollowLinks(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
+    dict.assert(dict.peek().tag == .dict);
+    // Make sure key has a string representation, as table.get isn't allowed to fail.
+    _ = try Heap.getString(key);
+
+    const table = try dictGetTable(dict);
+    if (table.get(key)) |value_offset| {
+        return dictItemFollowRefs(dict, value_offset).toOptional();
+    } else {
+        if (dictGetMetadata(dict).parent_link.toHandle()) |parent_link| {
+            // Check the parent link.
+            return dictLookupFollowLinks(parent_link, key);
+        } else {
+            // Nothing found, even after checking parent links.
+            return .none;
+        }
+    }
 }
 
 fn dictHasDuplicatesRaw(dict: Handle) !bool {
@@ -2273,9 +2289,9 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var first_append_result: OptionalHandle = .none;
     _ = try listAppendObject(det, new_token_values, &first_append_result, .{
         .str = Heap.Object.null_string,
-        .tag = .script_command,
+        .tag = .parsed_script_command,
         .body = .{
-            .script_command = .{
+            .parsed_script_command = .{
                 .line = source_info.line_no,
                 .arg_count = 0, // Set later.
             },
@@ -2308,7 +2324,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         // word_token_count counts all tokens except those (well, and it doesn't count .word_separator,
         // but that's ruled out at the beginning when we skipped leading separators).
         if (arg_token_count == 0) {
-            listItems(new_token_values)[script_command_idx].body.script_command.arg_count = command_arg_count;
+            listItems(new_token_values)[script_command_idx].body.parsed_script_command.arg_count = command_arg_count;
 
             if (tokens.items[i].tag == .end_of_file) {
                 break; // Don't append a .script_command for EOF
@@ -2322,8 +2338,8 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             var append_result: OptionalHandle = .none;
             const index = try listAppendObject(det, new_token_values, &append_result, .{
                 .str = Heap.Object.null_string,
-                .tag = .script_command,
-                .body = .{ .script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
+                .tag = .parsed_script_command,
+                .body = .{ .parsed_script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
             });
             new_token_values.swapIfNew(append_result);
             script_command_idx = index;
@@ -2441,15 +2457,15 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
 
     // set x 5
     try testing.expectEqual(.start_of_command, tokens[0]);
-    try testing.expectEqual(1, values[0].body.script_command.line);
-    try testing.expectEqual(3, values[0].body.script_command.arg_count);
+    try testing.expectEqual(1, values[0].body.parsed_script_command.line);
+    try testing.expectEqual(3, values[0].body.parsed_script_command.arg_count);
     try expectEqualToken(&parsed, 1, .simple_string, "set");
     try expectEqualToken(&parsed, 2, .simple_string, "x");
     try expectEqualToken(&parsed, 3, .simple_string, "5");
 
     try testing.expectEqual(.start_of_command, tokens[4]);
-    try testing.expectEqual(2, values[4].body.script_command.line);
-    try testing.expectEqual(3, values[4].body.script_command.arg_count);
+    try testing.expectEqual(2, values[4].body.parsed_script_command.line);
+    try testing.expectEqual(3, values[4].body.parsed_script_command.arg_count);
     try expectEqualToken(&parsed, 5, .simple_string, "set");
     try expectEqualToken(&parsed, 6, .simple_string, "y");
     try testing.expectEqual(.start_of_word, tokens[7]);
