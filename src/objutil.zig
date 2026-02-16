@@ -899,8 +899,6 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
 
         // Clean up dict-specific resources (table and extra_data).
         const heap = handle.getHeap();
-        const dict_metadata = dictGetMetadata(handle);
-        if (dict_metadata.table) |*table| table.deinit(heap.gpa);
         heap.destroyExtraData(handle.peek().body.dict.extra_data);
 
         handle.peek().tag = .list;
@@ -1428,9 +1426,10 @@ pub fn newDictWithCapacity(len: u32) !Handle {
     const dict_metadata = try Heap.local_heap.createExtraData();
     errdefer Heap.local_heap.destroyExtraData(dict_metadata);
 
-    Heap.local_heap.getExtraData(dict_metadata).* = .{
-        .dict = .{ .table = null },
-    };
+    Heap.local_heap.getExtraData(dict_metadata).* = .{ .dict = .{
+        .table = null,
+        .parent_link = .none,
+    } };
 
     const dict_head = Heap.local_heap.getLocalObject(dict_index);
     dict_head.* = .{

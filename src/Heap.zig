@@ -138,6 +138,24 @@ pub const ScriptId = packed struct(u64) {
         };
     }
 
+    pub fn borrow(script: ScriptId) ScriptId {
+        const current_generation = @atomicLoad(u32, &script_metadata.items[script.index].generation, .monotonic);
+        assert(script.generation == current_generation);
+
+        incrRefCountOf(u32, &script_metadata.items[script.index].ref_count, options.threading);
+
+        return script;
+    }
+
+    pub fn release(script: ScriptId) void {
+        const current_generation = @atomicLoad(u32, &script_metadata.items[script.index].generation, .monotonic);
+        assert(script.generation == current_generation);
+
+        if (decrRefCountOf(u32, &script_metadata.items[script.index].ref_count, options.threading)) {
+            script.retire();
+        }
+    }
+
     pub fn retire(id: ScriptId) void {
         state.mutex.lock();
         defer state.mutex.unlock();
@@ -396,45 +414,31 @@ pub const Object = packed struct(u128) {
             },
             .script => {
                 const script = obj.body.script;
-                if (decrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, options.threading)) {
-                    script.id.retire();
-                }
+                script.id.release();
             },
             .expr => {
                 const expr = obj.body.expr;
-                if (decrRefCountOf(u32, &script_metadata.items[expr.id.index].ref_count, options.threading)) {
-                    expr.id.retire();
-                }
+                expr.id.release();
             },
             .source => {
                 const source = obj.body.source;
                 if (source.file_name_obj.toOptional(heap).toHandle()) |val| val.decrRefCount();
             },
-            .command => {
-                const command = obj.body.command;
-                if (!command.in_global_namespace) {
-                    const extra_data = heap.getExtraData(command.u.other_namespace).command;
-                    heap.getHandle(extra_data.namespace).decrRefCount();
-                    heap.destroyExtraData(command.u.other_namespace);
-                }
+            .cached_lexical_var => {
+                heap.destroyExtraData(obj.body.cached_lexical_var.extra_data);
             },
-            .upvar => {
-                const upvar = &heap.getExtraData(obj.body.upvar).upvar;
-                switch (upvar.name) {
-                    .normal => |var_name| {
-                        heap.getHandle(var_name).decrRefCount();
-                    },
-                    .dict_sugar => |dict_names| {
-                        heap.getHandle(dict_names.dict_name_index).decrRefCount();
-                        heap.getHandle(dict_names.dict_key_index).decrRefCount();
-                    },
-                }
+            .upvar_link => {
+                const upvar_link = obj.body.upvar_link;
+                heap.getHandle(upvar_link.linked_name).decrRefCount();
             },
-            .local_variable => {
-                const variable = obj.body.local_variable;
-                heap.destroyExtraData(variable.extra_data);
+            .dict_sugar => {
+                const dict_sugar = obj.body.dict_sugar;
+                heap.getHandle(dict_sugar.var_name_index).decrRefCount();
+                heap.getHandle(dict_sugar.dict_value_index).decrRefCount();
             },
-            .dict_subst => @panic("Need to free any references"),
+            .closure => {
+                heap.destroyExtraData(obj.body.closure.extra_data);
+            },
             .none,
             .index,
             .integer,
@@ -443,6 +447,8 @@ pub const Object = packed struct(u128) {
             .parsed_script_command,
             .marked,
             .invalid,
+            .native_command,
+            .cached_local_var,
             => {},
             .dict, .list => unreachable,
         }
@@ -469,14 +475,16 @@ pub const Object = packed struct(u128) {
             .source => try writer.print(" = {}", .{self.body.source}),
             .list => try writer.print(" = {}", .{self.body.list}),
             .dict => try writer.print(" = {}", .{self.body.dict}),
-            .dict_subst => try writer.print(" = {}", .{self.body.dict_subst}),
-            .command => try writer.print(" = {}", .{self.body.command}),
+            .dict_sugar => try writer.print(" = {}", .{self.body.dict_sugar}),
+            .native_command => try writer.print(" = {}", .{self.body.native_command}),
+            .closure => try writer.print(" = {}", .{self.body.closure}),
             .parsed_script_command => try writer.print(" = {}", .{self.body.parsed_script_command}),
             .script => try writer.print(" = {}", .{self.body.script}),
             .expr => try writer.print(" = {}", .{self.body.expr}),
             .reference => try writer.print(" = {any}", .{self.body.reference}),
-            .local_variable => try writer.print(" = {}", .{self.body.local_variable}),
-            .upvar => try writer.print(" = {}", .{self.body.upvar}),
+            .cached_local_var => try writer.print(" = {}", .{self.body.cached_local_var}),
+            .cached_lexical_var => try writer.print(" = {}", .{self.body.cached_lexical_var}),
+            .upvar_link => try writer.print(" = {}", .{self.body.upvar_link}),
             .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
         }
         try writer.writeAll(" } }");
@@ -496,16 +504,16 @@ pub const Tag = enum(u5) {
     source,
     list,
     dict,
-    dict_subst,
+    dict_sugar,
     native_command,
     closure,
     parsed_script_command,
     script,
     expr,
     reference,
-    local_variable,
-    lexical_variable,
-    upvar,
+    cached_local_var,
+    cached_lexical_var,
+    upvar_link,
     custom_type,
 };
 
@@ -563,8 +571,8 @@ pub const Body = packed union {
         len: u32,
         extra_data: ExtraData,
     },
-    /// Both objects must be in the same heap.
-    dict_subst: packed struct {
+    /// Both objects must be in the object's heap.
+    dict_sugar: packed struct {
         var_name_index: u32,
         dict_value_index: u32,
     },
@@ -573,7 +581,6 @@ pub const Body = packed union {
         command_index: u32,
     },
     closure: packed struct {
-        script: ScriptId,
         extra_data: ExtraData,
     },
     /// Information about a parsed command.
@@ -588,15 +595,15 @@ pub const Body = packed union {
         id: ScriptId,
     },
     reference: Handle,
-    local_variable: packed struct {
+    cached_local_var: packed struct {
         /// Used to invalidate `index`'s cached value, if it doesn't match
         /// the current call frame's epoch.
         call_epoch: u32,
-        cached_index: u32,
+        cached_index: HeapIndex,
     },
     /// Value from lexical scope lookup. In zicl, parent scopes are immutable,
     /// so we can outright borrow this value.
-    lexical_variable: packed struct {
+    cached_lexical_var: packed struct {
         /// Used to invalidate the cached value, if it doesn't match
         /// the current call frame's epoch. The only thing that can
         /// invalidate a lexical lookup is shadowing it with a local
@@ -604,9 +611,13 @@ pub const Body = packed union {
         call_epoch: u32,
         extra_data: ExtraData,
     },
-    upvar: packed struct {
-        call_epoch: u32,
-        extra_data: ExtraData,
+    upvar_link: packed struct {
+        /// The call frame this linked variable lives in.
+        call_frame: u32,
+        /// An object containing the name of the variable in the linked
+        /// scope. Whenever someone shimmers this to a variable, they should
+        /// always do it in `call_frame`.
+        linked_name: HeapIndex,
     },
     custom_type: packed struct {
         type_id: u32,
@@ -630,7 +641,7 @@ comptime {
 pub const ExtraData = enum(u32) { _ };
 
 /// Extra data, for when you can't store enough in the main object.
-pub const ExtraDataValue = union {
+pub const ExtraDataValue = union(enum) {
     pub const Dictionary = struct {
         pub const Table = std.HashMapUnmanaged(Handle, u32, struct {
             pub fn hash(ctx: @This(), key: Handle) u64 {
@@ -663,12 +674,10 @@ pub const ExtraDataValue = union {
         /// Borrows the value it references.
         ref: Handle,
     },
-    upvar: struct {
-        /// The name handle, always evaluated in the linked frame.
-        linked_variable_name: u32,
-        linked_frame_index: u32,
+    closure: struct {
+        script: ScriptId,
+        signature: ClosureSignature,
     },
-    closure: ClosureSignature,
     custom_type: struct {
         first_ptr: *anyopaque,
         second_ptr: *anyopaque,
@@ -702,19 +711,14 @@ pub const ClosureSignature = struct {
     /// the last argument name.
     has_args_parameter: bool,
 
-    pub fn borrow(sign: ClosureSignature) !ClosureSignature {
-        sign.args.incrRefCount();
-        sign.body.incrRefCount();
-        sign.scope.borrowOptional();
-        sign.optional_values.borrowOptional();
-
+    pub fn borrow(sign: ClosureSignature) ClosureSignature {
         return .{
-            .args = sign.args,
-            .body = sign.body,
-            .scope = sign.scope,
+            .args = sign.args.borrow(),
+            .body = sign.body.borrow(),
+            .scope = sign.scope.borrowOptional(),
             .required_arity = sign.required_arity,
             .optional_arity = sign.optional_arity,
-            .optional_values = sign.optional_values,
+            .optional_values = sign.optional_values.borrowOptional(),
             .has_args_parameter = sign.has_args_parameter,
         };
     }
@@ -1110,8 +1114,6 @@ fn invalidateBodyInner(handle: Handle) void {
         .dict => {
             invalidateCollection(handle);
 
-            const dict_metadata = objutil.dictGetMetadata(handle);
-            if (dict_metadata.table) |*table| table.deinit(handle.getHeap().gpa);
             handle.getHeap().destroyExtraData(handle.peek().body.dict.extra_data);
         },
         else => handle.peek().deinitBodySingle(handle.getHeap()),
@@ -1839,7 +1841,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             return new_object;
         },
-        .dict_subst, .local_variable, .upvar, .command => {
+        .dict_sugar, .cached_local_var, .cached_lexical_var, .native_command => {
             // Variable lookup is not stable between threads.
             return .{
                 .str = try dest_heap.duplicateObjString(handle),
@@ -1850,17 +1852,34 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .list, .dict => {
             return error.MultiItemObject;
         },
+        .closure => {
+            const closure = handle.getHeap().getExtraData(src.body.closure.extra_data).closure;
+            const new_extra_data = try dest_heap.createExtraData();
+            errdefer dest_heap.destroyExtraData(new_extra_data);
+
+            dest_heap.getExtraData(new_extra_data).* = .{ .closure = .{
+                .script = closure.script.borrow(),
+                .signature = closure.signature.borrow(),
+            } };
+
+            return .{
+                .str = try dest_heap.duplicateObjString(handle),
+                .tag = .closure,
+                .body = .{ .closure = .{ .extra_data = new_extra_data } },
+            };
+        },
+        .upvar_link => @panic("Cannot duplicate an upvar"),
         .invalid => @panic("Tried to duplicate an invalid object."),
     }
 }
 
-pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
-    const src = handle.peek();
+pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle {
+    const src = src_handle.peek();
 
     switch (src.tag) {
         .list => {
             const old_body = src.body.list;
-            const old_start = handle.index + 1;
+            const old_start = src_handle.index + 1;
 
             const new_list_idx = try dest_heap.createObjects(1 + old_body.len);
             errdefer {
@@ -1869,10 +1888,10 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
                 for (0..old_body.len) |i| {
                     freeObject(.{
                         .index = @intCast(new_list_idx + 1 + i),
-                        .heap = handle.heap,
+                        .heap = src_handle.heap,
                     });
                 }
-                freeObject(.{ .index = new_list_idx, .heap = handle.heap });
+                freeObject(.{ .index = new_list_idx, .heap = src_handle.heap });
             }
             const new_head: *Object = dest_heap.getLocalObject(new_list_idx);
             const new_start = new_list_idx + 1;
@@ -1880,7 +1899,7 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
 
             // Duplicate head of list
             new_head.* = .{
-                .str = try dest_heap.duplicateObjString(handle),
+                .str = try dest_heap.duplicateObjString(src_handle),
                 .tag = .list,
                 .body = .{
                     .list = .{ .len = old_body.len },
@@ -1890,7 +1909,7 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
             // Duplicate items of list
             for (new_items, 0..) |*new_item, i| {
                 new_item.* = dest_heap.duplicateSingle(.{
-                    .heap = handle.heap,
+                    .heap = src_handle.heap,
                     .index = @intCast(old_start + i),
                 }) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -1903,7 +1922,8 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
         },
         .dict => {
             const old_len = src.body.dict.len;
-            const old_start = handle.index + 1;
+            const old_start = src_handle.index + 1;
+            const old_metadata = objutil.dictGetMetadata(src_handle);
 
             const new_dict_idx = try dest_heap.createObjects(1 + old_len);
             errdefer dest_heap.getHandle(new_dict_idx).decrRefCount();
@@ -1913,29 +1933,30 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
 
             // Duplicate head of dict.
             {
-                const new_str = try dest_heap.duplicateObjString(handle);
+                const new_str = try dest_heap.duplicateObjString(src_handle);
                 errdefer new_str.deinit(dest_heap);
-                const extra_data = try dest_heap.createExtraData();
-                errdefer dest_heap.destroyExtraData(extra_data);
+                const new_extra_data = try dest_heap.createExtraData();
+                errdefer dest_heap.destroyExtraData(new_extra_data);
 
                 new_head.peek().* = .{
                     .str = new_str,
                     .tag = .dict,
                     .body = .{ .dict = .{
-                        .extra_data = extra_data,
+                        .extra_data = new_extra_data,
                         .len = old_len,
                     } },
                 };
-                dest_heap.getExtraData(extra_data).* = .{
-                    .dict = .{ .table = null },
-                };
+                dest_heap.getExtraData(new_extra_data).* = .{ .dict = .{
+                    .table = null,
+                    .parent_link = old_metadata.parent_link.borrowOptional(),
+                } };
             }
 
             // Duplicate items of dict
             for (new_items, 0..) |*new_item, i| {
                 new_item.* = dest_heap.duplicateSingle(.{
                     .index = @intCast(old_start + i),
-                    .heap = handle.heap,
+                    .heap = src_handle.heap,
                 }) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     // Dicts can't contain multi item objects.
@@ -1947,7 +1968,7 @@ pub fn duplicate(dest_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
         },
         else => {
             const new_object = try dest_heap.createObject();
-            new_object.peek().* = dest_heap.duplicateSingle(handle) catch |e| switch (e) {
+            new_object.peek().* = dest_heap.duplicateSingle(src_handle) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // We already checked if it was a multi-item object (i.e. a list)
                 error.MultiItemObject => unreachable,
@@ -2233,7 +2254,21 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
                 break :blk try std.fmt.allocPrintSentinel(self.gpa, "<marked>", .{}, 0);
             } else @panic("Tried to generate a string for .marked");
         },
-        .string, .source, .script, .expr, .dict_subst, .local_variable, .upvar, .command => {
+        .upvar_link => {
+            if (builtin.mode == .Debug and state.running_leak_check) {
+                break :blk try std.fmt.allocPrintSentinel(self.gpa, "<upvar_link>", .{}, 0);
+            } else @panic("Tried to generate a string for .upvar_link");
+        },
+        .string,
+        .source,
+        .script,
+        .expr,
+        .dict_sugar,
+        .cached_local_var,
+        .cached_lexical_var,
+        .native_command,
+        .closure,
+        => {
             std.debug.panic("{} should always have a string representation", .{obj.tag});
         },
     };
@@ -2452,19 +2487,27 @@ pub fn getExtraData(self: *Heap, index: ExtraData) *ExtraDataValue {
 }
 
 pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
-    // TODO should probably take care of deleting the contained data
-    // here instead of scattering it all over the codebase.
-
-    switch (self.getExtraData(index)) {
+    switch (self.getExtraData(index).*) {
         .lexical_variable => |lexical_var| {
             lexical_var.ref.decrRefCount();
         },
-        else => @panic("Need to implement cleanup and remove cleanup from other parts of code"),
+        .dict => |*dict| {
+            dict.parent_link.decrOptional();
+            if (dict.table) |*table| table.deinit(self.gpa);
+        },
+        .closure => |*closure| {
+            closure.signature.deinit();
+            closure.script.release();
+        },
+        .custom_type => {
+            @panic("Need to clean up custom type");
+        },
     }
 
     self.extra_data_muta.lock();
     defer self.extra_data_muta.unlock();
 
+    self.getExtraData(index).* = undefined;
     self.extra.destroy(@intFromEnum(index));
 }
 
@@ -2751,11 +2794,10 @@ fn getTagColor(tag: Tag) []const u8 {
         .float => "lightpink",
         .bool => "plum",
         .reference => "orange",
-        .script => "lavender",
-        .expr => "thistle",
+        .script, .expr => "lavender",
         .source => "peachpuff",
-        .command, .parsed_script_command => "khaki",
-        .local_variable, .upvar => "lightcyan",
+        .parsed_script_command => "khaki",
+        .cached_local_var, .cached_lexical_var => "lightcyan",
         .custom_type => "tan",
         else => "white",
     };
@@ -2820,7 +2862,7 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
     try stderr.writeAll("  }\n\n");
 }
 
-fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index: u32) !void {
+fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32) !void {
     const obj = handle.peek();
 
     switch (obj.tag) {
@@ -2828,7 +2870,7 @@ fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index:
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
                 const item_handle = objutil.listItem(handle, @intCast(item_idx));
-                try stderr.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
+                try w.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
             }
         },
         .dict => {
@@ -2837,40 +2879,36 @@ fn renderObjectEdges(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index:
                 const key_handle = objutil.dictItem(handle, item_idx);
                 const val_handle = objutil.dictItem(handle, item_idx + 1);
 
-                try stderr.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
-                try stderr.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
+                try w.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
+                try w.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
             }
         },
         .reference => {
             const ref_handle = obj.body.reference;
-            try stderr.print("  obj{} -> obj{} [label=\"ref\", color=red, style=dashed];\n", .{ index, ref_handle.index });
+            try w.print("  obj{} -> obj{} [label=\"ref\", color=red];\n", .{ index, ref_handle.index });
         },
         .source => {
             if (obj.body.source.file_name_obj.getIndex()) |file_name_index| {
-                try stderr.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name_index });
+                try w.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name_index });
             }
         },
-        .dict_subst => {
-            try stderr.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_subst.var_name_index });
-            try stderr.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_subst.dict_value_index });
+        .cached_local_var => {
+            try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
         },
-        .command => {
-            if (!obj.body.command.in_global_namespace) {
-                const extra_data = heap.getExtraData(obj.body.command.u.other_namespace).command;
-                try stderr.print("  obj{} -> obj{} [label=\"ns\"];\n", .{ index, extra_data.namespace });
-            }
+        .cached_lexical_var => {
+            const lexical_variable = heap.getExtraData(obj.body.cached_lexical_var.extra_data).lexical_variable;
+            try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, lexical_variable.ref.index });
         },
-        .upvar => {
-            const upvar = &heap.getExtraData(obj.body.upvar).upvar;
-            switch (upvar.name) {
-                .normal => |var_name| {
-                    try stderr.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, var_name });
-                },
-                .dict_sugar => |dict_names| {
-                    try stderr.print("  obj{} -> obj{} [label=\"dict\"];\n", .{ index, dict_names.dict_name_index });
-                    try stderr.print("  obj{} -> obj{} [label=\"key\"];\n", .{ index, dict_names.dict_key_index });
-                },
-            }
+        .dict_sugar => {
+            try w.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.var_name_index });
+            try w.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.dict_value_index });
+        },
+        .upvar_link => {
+            const upvar_link = obj.body.upvar_link;
+            try w.print(
+                "  obj{} -> obj{} [label=\"linked_name\"];\n",
+                .{ index, upvar_link.linked_name },
+            );
         },
         else => {},
     }

@@ -33,7 +33,6 @@ call_frames: std.ArrayList(CallFrame),
 current_call_epoch: u31,
 current_procedure_epoch: u31,
 commands: CommandHashTable,
-namespace: ?Handle,
 
 evaluating_safe_expr: bool,
 eval_depth: usize,
@@ -54,7 +53,7 @@ return_propagate: struct {
 prng: std.Random.DefaultPrng,
 
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) c_int;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
 
 pub const Error = std.mem.Allocator.Error || error{
     EvaluatingSafeExpression,
@@ -64,6 +63,9 @@ pub const Error = std.mem.Allocator.Error || error{
     Signal,
     PropagateResult,
     VariableNotFound,
+    VariableAlreadyExists,
+    DictSugarInUpvarName,
+    CircularUpvar,
     CommandNotFound,
     InfiniteRecursion,
     WrongUsage,
@@ -126,11 +128,12 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: Handle) !?Hea
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
     if (scope.toHandle()) |dict| {
-        // Can't fail since we know a string exists for it (the temp string we just set).
         const in_linked_scope = try objutil.dictLookupFollowLinks(dict, var_name);
-        return .{ .lexical_variable = .{
-            .target = in_linked_scope,
-        } };
+        if (in_linked_scope.toHandle()) |val| {
+            return .{ .lexical_variable = .{
+                .target = val,
+            } };
+        }
     }
 
     return null;
@@ -143,14 +146,14 @@ fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_fr
     name.assert(name.canShimmer());
 
     const var_name = try Heap.getString(name);
-    const call_frame = interp.call_frames.items[var_call_frame];
+    const call_frame = &interp.call_frames.items[var_call_frame];
 
     if (try interp.resolveVariable(var_call_frame, name)) |var_value| {
         switch (var_value) {
             .local_variable => |local_var| {
                 try name.prepareToShimmer();
-                name.peek().tag = .local_variable;
-                name.peek().body.local_variable = .{
+                name.peek().tag = .cached_local_var;
+                name.peek().body.cached_local_var = .{
                     .call_epoch = call_frame.call_epoch,
                     .cached_index = local_var.target.index,
                 };
@@ -163,14 +166,14 @@ fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_fr
                 } };
 
                 try name.prepareToShimmer();
-                name.peek().tag = .local_variable;
-                name.peek().body.lexical_variable = .{
+                name.peek().tag = .cached_lexical_var;
+                name.peek().body.cached_lexical_var = .{
                     .call_epoch = call_frame.call_epoch,
                     .extra_data = extra_data,
                 };
             },
         }
-    } else  {
+    } else {
         return variableNotFoundError(det, var_name);
     }
 }
@@ -180,222 +183,115 @@ fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_fr
 fn ensureValidVariableType(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_frame: u32, name: Handle) !void {
     const call_frame = interp.call_frames.items[var_call_frame];
 
-    const bytes = try Heap.getString(name);
-
     switch (name.peek().tag) {
-        .local_variable => {
-            // Fast case: if we're in the same epoch as last time,
-            // we don't need to do anything.
-            if (name.peek().body.local_variable.call_epoch == call_frame.call_epoch) {
+        .cached_local_var => {
+            // Fast case: if we're in the same epoch as last time, so we don't
+            // need to do anything.
+            if (name.peek().body.cached_local_var.call_epoch == call_frame.call_epoch) {
                 return;
             } else {
                 // Need to re-resolve the variable in the current call frame.
-                // `name` be valid after this function completes.
+                // `name` will be valid after this function completes.
                 try interp.reshimmerToVariable(det, var_call_frame, name);
                 return;
             }
         },
-        .lexical_variable => {
-            // Fast case: if we're in the same epoch as last time,
-            // we don't need to do anything.
-            if (name.peek().body.local_variable.call_epoch == call_frame.call_epoch) {
+        .cached_lexical_var => {
+            // Fast case: if we're in the same epoch as last time, we don't need
+            // to do anything.
+            if (name.peek().body.cached_lexical_var.call_epoch == call_frame.call_epoch) {
                 return;
             } else {
                 // Since this is a lexical value lookup, and the lexical scopes are immutable,
                 // the only case where this lookup becomes invalid is if it were shadowed by
                 // a local variable.
-                if (try objutil.dictLookupFollowRefs(call_frame.variables, name)) |_| {
+                if ((try objutil.dictLookupFollowRefs(call_frame.variables, name)).toHandle()) |_| {
                     // Shadowed, so we need to look up again.
                     try interp.reshimmerToVariable(det, var_call_frame, name);
                     return;
                 } else {
-                    // Wasn't shadowed, so be sure to update the epoch.
-                    name.peek().body.local_variable.call_epoch = call_frame.call_epoch;
+                    // Wasn't shadowed, so be sure to update its epoch so we don't do
+                    // this expensive lookup again.
+                    name.peek().body.cached_lexical_var.call_epoch = call_frame.call_epoch;
                     return;
                 }
             }
         },
-        .upvar => {
-            // Fast case: if we're in the same epoch as last time,  we don't need to do
-            // anything. When the linked variable name is resolved, it'll do its own
-            // cache check. The cache checks recursively propagate up any upvars.
-            if (name.peek().body.local_variable.call_epoch == call_frame.call_epoch) {
-                return;
-            } else {
-                // Table has been invalidated, so 
-            }
+        .dict_sugar => {
+            @panic("Dict sugar not implemented yet");
         },
-        .dict_subst => {},
-        else => {},
+        else => {
+            // Fall through.
+        },
     }
 
-    if (name.peek().tag == .local_variable) {
-        
-    } else if (name.peek().tag == .upvar) {
-        const upvar = &name.getHeap().getExtraData(name.peek().body.upvar).upvar;
+    // We don't know whether this is a normal variable or dict sugar yet.
+    const var_name = try Heap.getString(name);
 
-        // Fast case is same as for .variable.
-        if (upvar.current_scope.call_frame_epoch == call_frame.call_epoch) {
-            return;
-        } else {
-            // Need to look this back up.
-            switch (upvar.linked_scope.name) {
-                .dict_sugar => {
-                    @panic("Dict sugar not implemented yet");
-                },
-                .normal => |linked_name_index| {
-                    // `name` is the name handle of the variable in the upvar's scope, but we want the name
-                    // handle of the variable in the original scope. Case in point: if we ran `upvar upper here`,
-                    // `name` would contain "here", while `linked_name_index` would contain "upper".
-                    const var_name_in_linked_scope = interp.heap.getHandle(linked_name_index);
-                    if (interp.getVariableImpl(null, var_name_in_linked_scope)) |value| {
-                        upvar.cached_lookup = value;
-                    }
-                    const result = interp.ensureValidVariableType(null, upvar.linked_scope.call_frame_index, var_name_in_linked_scope);
-
-                    if (result) {
-                        switch (var_name_in_linked_scope.peek().tag) {
-                            .local_variable => {
-                                var_name_in_linked_scope.peek().body.local_variable.
-                            }
-                        }
-                    }
-
-                    upvar.cached_lookup = 
-
-                    // Be sure to look it up in the upvar's call frame.
-                    if (interp.resolveVariable(upvar.call_frame_index, original_name)) |upvar_target| {
-                        upvar.cached_lookup = upvar_target;
-                        return;
-                    } else {
-                        return variableNotFoundError(det, bytes);
-                    }
-                },
-            }
-        }
-    } else if (name_obj.tag == .dict_subst) {
+    // Does it end with ')' and have '(' at some point in the name?
+    if (var_name.len >= 2 and var_name[var_name.len - 1] == ')' and std.mem.indexOfScalar(u8, var_name, '(') != null) {
         @panic("Dict sugar not implemented yet");
+        // name_obj.tag = .dict_subst;
     } else {
-        // We don't know whether this is a normal variable or dict sugar yet.
-        const var_name = try Heap.getString(name);
-        if (var_name.len >= 2 and var_name[0] == '(' and var_name[var_name.len - 1] == ')') {
-            @panic("Dict sugar not implemented yet");
-            // name_obj.tag = .dict_subst;
-        } else {
-            try interp.reshimmerToVariable(det, var_call_frame, name);
-        }
+        try interp.reshimmerToVariable(det, var_call_frame, name);
     }
 }
 
 // Must be called with a heap-native variable name.
 fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
-    assert(name.getHeap() == interp.heap and name.canShimmer());
+    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.canShimmer());
 
     const call_frame = &interp.call_frames.items[call_frame_idx];
-    const name_bytes = try Heap.getString(name);
+    call_frame.call_epoch = interp.nextCallEpoch();
 
-    if (name_bytes.len >= 2 and name_bytes[0] == ':' and name_bytes[1] == ':') {
-        var trimmed = name_bytes;
-        // Trim all preceding colons to match tcl behavior.
-        while (trimmed[0] == ':') trimmed = trimmed[1..];
+    // Add variable.
+    const put_result = try objutil.dictPutInner(call_frame.variables, name, value);
+    call_frame.variables.swapIfNew(put_result.new_dict);
 
-        // Add variable.
-        const value_location = blk: {
-            interp.heap.setTempObjectString(trimmed);
-            defer interp.heap.resetTempObject();
-            const put_result = try objutil.dictPutInner(interp.call_frames.items[0].variables, interp.heap.tempObject(), value);
-            interp.call_frames.items[0].variables.swapIfNew(put_result.new_dict);
-            break :blk put_result.new_value;
-        };
-
-        try name.prepareToShimmer();
-        name.peek().tag = .local_variable;
-        name.peek().body.local_variable = .{
-            .call_epoch = call_frame.call_epoch,
-            .index = value_location.index,
-            .is_global = true,
-        };
-    } else {
-        // Add variable.
-        const put_result = try objutil.dictPutInner(call_frame.variables, name, value);
-        call_frame.variables.swapIfNew(put_result.new_dict);
-
-        name.peek().tag = .local_variable;
-        name.peek().body.local_variable = .{
-            .call_epoch = call_frame.call_epoch,
-            .index = put_result.new_value.index,
-            .is_global = false,
-        };
-    }
+    try name.prepareToShimmer();
+    name.peek().tag = .cached_local_var;
+    name.peek().body.cached_local_var = .{
+        .call_epoch = call_frame.call_epoch,
+        .cached_index = put_result.new_value.index,
+    };
 }
 
 /// Must be called with a heap-native name. Always takes ownership of `value`, even in error cases.
-fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
+pub fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
+    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.canShimmer());
+
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
         switch (name.peek().tag) {
-            .dict_subst => @panic("Dict sugar not implemented"),
-            .local_variable => {
-                const variable = &name.peek().body.local_variable;
-                const var_call_frame_idx = if (variable.is_global) 0 else call_frame_idx;
-                var var_call_frame = &interp.call_frames.items[var_call_frame_idx];
+            .dict_sugar => @panic("Dict sugar not implemented"),
+            .cached_local_var => {
+                const cached_var = &name.peek().body.cached_local_var;
+                const var_value = interp.heap.getHandle(cached_var.cached_index);
+                if (var_value.peek().tag == .upvar_link) {
+                    const upvar_link = var_value.peek().body.upvar_link;
+                    // Set the value through the linked name in the linked frame.
+                    try interp.setVariableImpl(upvar_link.call_frame, interp.heap.getHandle(upvar_link.linked_name), value);
+                    return;
+                }
 
-                const old_variables_handle = var_call_frame.variables; // Copy
-                const new_value_handle = blk: {
-                    const put_result = try objutil.dictPutInner(var_call_frame.variables, name, value);
-                    var_call_frame.variables.swapIfNew(put_result.new_dict);
-                    break :blk objutil.followIfRef(put_result.new_value);
-                };
-                // Did the dict change locations? If so, all cached lookups are now invalid.
-                const did_dict_move = old_variables_handle != var_call_frame.variables;
-                // Even if the dict didn't move, the variable may have. If so, we still
-                // need to bump the epoch.
-                const did_variable_move = variable.index != new_value_handle.index;
-                if (did_dict_move or did_variable_move) {
+                const var_call_frame = &interp.call_frames.items[call_frame_idx];
+
+                const put_result = try objutil.dictPutInner(var_call_frame.variables, name, value);
+                if (put_result.new_dict.toHandle()) |new_dict| {
+                    // Did the dict change locations? If so, all cached lookups are now invalid.
+                    var_call_frame.variables.swap(new_dict);
                     var_call_frame.call_epoch = interp.nextCallEpoch();
                 }
 
-                variable.* = .{
+                cached_var.* = .{
                     .call_epoch = var_call_frame.call_epoch,
-                    .index = new_value_handle.index,
-                    .is_global = variable.is_global,
+                    .cached_index = objutil.followIfRef(put_result.new_value).index,
                 };
             },
-            .upvar => {
-                const upvar = &interp.heap.getExtraData(name.peek().body.upvar).upvar;
-
-                switch (upvar.name) {
-                    .dict_sugar => @panic("Dict sugar not implemented"),
-                    .normal => |upvar_name_idx| {
-                        const name_handle = interp.heap.getHandle(upvar_name_idx);
-
-                        if (upvar.index == Heap.null_object_idx) {
-                            // The upvar doesn't target anything, which means we need to create a variable
-                            // in its target's scope.
-                            try interp.createVariable(upvar.call_frame_index, name_handle, value);
-                            assert(name_handle.peek().tag == .local_variable);
-                            const variable = name_handle.peek().body.local_variable;
-
-                            upvar.* = .{
-                                .call_frame_epoch = variable.call_epoch,
-                                .call_frame_index = upvar.call_frame_index,
-                                .index = variable.index,
-                                .name = .{ .normal = upvar_name_idx },
-                            };
-                        } else {
-                            // Normal case: upvar has a target.
-                            try interp.setVariableImpl(upvar.call_frame_index, name_handle, value);
-                            assert(name_handle.peek().tag == .local_variable);
-                            const variable = name_handle.peek().body.local_variable;
-
-                            upvar.* = .{
-                                .call_frame_epoch = variable.call_epoch,
-                                .call_frame_index = upvar.call_frame_index,
-                                .index = variable.index,
-                                .name = .{ .normal = upvar_name_idx },
-                            };
-                        }
-                    },
-                }
+            .cached_lexical_var => {
+                // We can't mutate a lexical var, so we instead shadow it in the local scope.
+                try createVariable(interp, call_frame_idx, name, value);
             },
             else => unreachable,
         }
@@ -405,23 +301,123 @@ fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: He
     }
 }
 
+pub fn setVariableLinkImpl(
+    interp: *Interp,
+    det: ?*objutil.ErrorDetails,
+    call_frame_idx: u32,
+    name: Handle,
+    target_call_frame_idx: u32,
+    target_name: Handle,
+) !void {
+    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.canShimmer());
+
+    const name_bytes = try Heap.getString(name);
+    const target_name_bytes = try Heap.getString(target_name);
+
+    if (interp.ensureValidVariableType(null, call_frame_idx, name)) |_| {
+        // Variable already exists.
+        if (det) |details| details.* = .{
+            .message = try objutil.newStringFmt(interp.heap, "variable \"{s}\" already exists", .{name_bytes}),
+        };
+
+        return error.VariableAlreadyExists;
+    } else |err| switch (err) {
+        error.VariableNotFound => {
+            // Fall through.
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    }
+
+    if (name.peek().tag == .dict_sugar) {
+        if (det) |details| details.* = .{
+            .message = try objutil.newString(interp.heap, "cannot create an upvar name that has dict sugar"),
+        };
+        return error.DictSugarInUpvarName;
+    }
+
+    // Check for cycles (only possible with `upvar 0`).
+    if (call_frame_idx == target_call_frame_idx) {
+        // Traverse the upvar chain until either we reach the end of the chain
+        // or we find ourselves.
+        var obj_currently_checking = target_name;
+        while (true) {
+            if (try Heap.checkIfEqual(name, obj_currently_checking)) {
+                // We'd create a circular reference at this point, since
+                // we managed to find ourselves when traversing the upvar
+                // chain. Obviously, we can't let this happen.
+                if (det) |details| details.* = .{
+                    .message = try objutil.newString(interp.heap, "can't upvar from variable to itself"),
+                };
+                return error.CircularUpvar;
+            }
+
+            const var_exists = interp.ensureValidVariableType(null, target_call_frame_idx, obj_currently_checking);
+            if (var_exists) |_| {
+                // Can't use `getVariableImpl` here, as it follows upvars.
+                if (obj_currently_checking.peek().tag == .cached_local_var) {
+                    const index = obj_currently_checking.peek().body.cached_local_var.cached_index;
+                    const var_val = obj_currently_checking.getHeap().getHandle(index);
+                    // Need to check the next link in this upvar chain to see if
+                    // it has a cycle.
+                    if (var_val.peek().body.upvar_link.call_frame != call_frame_idx) {
+                        // Next upvar is higher than the current call frame, so it's
+                        // impossible that it loops back here.
+                        break;
+                    } else {
+                        const upvar_link = var_val.peek().body.upvar_link;
+                        obj_currently_checking = var_val.getHeap().getHandle(upvar_link.linked_name);
+                    }
+                } else {
+                    break;
+                }
+            } else |err| switch (err) {
+                error.VariableNotFound => {
+                    // If the target var doesn't exist, then of course the var name != nothing,
+                    // so it's not equal to itself.
+                    break;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            }
+        }
+
+        const target_name_duped = try objutil.newString(interp.heap, target_name_bytes);
+
+        try interp.setVariableImpl(call_frame_idx, name, .{
+            .str = Heap.Object.null_string,
+            .tag = .upvar_link,
+            .body = .{ .upvar_link = .{
+                .call_frame = target_call_frame_idx,
+                .linked_name = target_name_duped.index,
+            } },
+        });
+    }
+}
+
 /// Resolves to the variable's value. Must be called with a heap-native name.
-pub fn getVariableImpl(interp: *Interp, det: ?*objutil.ErrorDetails, name: Handle) !Handle {
+pub fn getVariableImpl(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !Handle {
     if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
-    try interp.ensureValidVariableType(det, interp.currentCallFrameIndex(), name);
+    try interp.ensureValidVariableType(det, call_frame, name);
 
     const name_obj = name.peek();
     const name_heap = name.getHeap();
 
     switch (name_obj.tag) {
-        .local_variable => {
-            return name_heap.getHandle(name_obj.body.local_variable.index);
+        .cached_local_var => {
+            const resolved = name_heap.getHandle(name_obj.body.cached_local_var.cached_index);
+            if (resolved.peek().tag == .upvar_link) {
+                const upvar_link = resolved.peek().body.upvar_link;
+                const linked_name = resolved.getHeap().getHandle(upvar_link.linked_name);
+                return try interp.getVariableImpl(det, upvar_link.call_frame, linked_name);
+            }
+            return resolved;
         },
-        .upvar => {
-            return name_heap.getHandle(name_heap.getExtraData(name_obj.body.upvar).upvar.index);
+        .cached_lexical_var => {
+            const extra_data = name_heap.getExtraData(name_obj.body.cached_lexical_var.extra_data);
+            return extra_data.lexical_variable.ref;
         },
-        .dict_subst => {
+        .dict_sugar => {
             @panic("Dict sugar not implemented");
         },
         else => unreachable,
@@ -434,19 +430,62 @@ fn testVariables(ta: std.mem.Allocator) !void {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    try testing.expectEqual(null, interp.resolveVariable(0, "foo"));
-    var foo = try objutil.newString(heap, "foo");
-    defer foo.decrRefCount();
-    const value = try objutil.newString(heap, "value");
-    defer value.decrRefCount();
-    try interp.setVariableTo(&foo, value);
+    var str_foo = try objutil.newString(heap, "foo");
+    defer str_foo.decrRefCount();
 
-    const lookup_value = interp.resolveVariable(0, "foo").?.target_index;
-    try testing.expectEqualStrings("value", try Heap.getString(Heap.local_heap.getHandle(lookup_value)));
+    // Make sure it doesn't resolve to anything.
+    try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
+
+    const str_value = try objutil.newString(heap, "value");
+    defer str_value.decrRefCount();
+    try interp.setVariableTo(&str_foo, str_value);
+
+    const cached_lookup_value = (try interp.resolveVariable(0, str_foo)).?.local_variable.target;
+    try testing.expectEqualStrings("value", try Heap.getString(cached_lookup_value));
+    // Also try resolving the value from a new string.
+    var str2_foo = try objutil.newString(heap, "foo");
+    defer str2_foo.decrRefCount();
+    const lookup_value = (try interp.resolveVariable(0, str2_foo)).?.local_variable.target;
+    try testing.expectEqualStrings("value", try Heap.getString(lookup_value));
 }
 
 test "variables" {
     try testing.checkAllAllocationFailures(testing.allocator, testVariables, .{});
+}
+
+fn testVariableLink(ta: std.mem.Allocator) !void {
+    defer Heap.testFinish();
+    const heap = try Heap.testStart(ta);
+    var interp = try Interp.init();
+    defer interp.deinit();
+
+    // Create a variable `foo` containing `value`, then upvar `bar` to `foo`.
+    var str_foo = try objutil.newString(heap, "foo");
+    defer str_foo.decrRefCount();
+
+    try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
+    const str_value = try objutil.newString(heap, "value");
+    defer str_value.decrRefCount();
+    try interp.setVariableTo(&str_foo, str_value);
+
+    var str_bar = try objutil.newString(heap, "bar");
+    defer str_bar.decrRefCount();
+    try interp.setVariableLinkImpl(null, 0, str_bar, 0, str_foo);
+
+    // Make sure we can get the value of `foo` through `bar`.
+    var lookup_value = try interp.getVariableImpl(null, 0, str_bar);
+    try testing.expectEqualStrings("value", try Heap.getString(lookup_value));
+
+    // Modify `foo` through `bar`.
+    const str_new_value = try objutil.newString(heap, "new value");
+    defer str_new_value.decrRefCount();
+    try interp.setVariableImpl(0, str_bar, str_new_value.reference());
+    lookup_value = try interp.getVariableImpl(null, 0, str_foo);
+    try testing.expectEqualStrings("new value", try Heap.getString(lookup_value));
+}
+
+test "variable link" {
+    try testing.checkAllAllocationFailures(testing.allocator, testVariableLink, .{});
 }
 
 pub const Command = struct {
@@ -469,7 +508,6 @@ pub const Command = struct {
         multiple_of: c_int = -1,
     };
 
-    namespace: OptionalHandle,
     call_info: union(enum) {
         native: NativeCommand,
         c: CCommand,
@@ -703,7 +741,7 @@ const CallFrame = struct {
         for (0..pairs) |i| {
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
             // Make sure there's no upvars.
-            if (value.peek().tag == .upvar) break;
+            if (value.peek().tag == .upvar_link) break;
         } else {
             // No upvars found, so we can just borrow the variables.
             return frame.variables.borrow();
@@ -715,6 +753,10 @@ const CallFrame = struct {
         for (0..pairs) |i| {
             const key = objutil.dictItem(frame.variables, i * 2);
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
+
+            _ = new_dict;
+            _ = key;
+            _ = value;
 
             @panic("Need to figure this out");
         }
@@ -751,12 +793,10 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentCallFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: ProcedureSignature) !u32 {
-    if (interp.namespace) |val| val.incrRefCount();
-    errdefer if (interp.namespace) |ns| ns.decrRefCount();
+fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.ClosureSignature) !u32 {
     const vars_handle = try objutil.newDict(interp.heap, &.{});
     errdefer vars_handle.decrRefCount();
-    const borrowed_signature = try signature.borrow();
+    const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
@@ -766,7 +806,6 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Proce
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
         .level = level,
-        .namespace = interp.namespace,
         .signature = borrowed_signature,
         // TODO PERF recycle variable hash table if possible.
         .variables = vars_handle,
@@ -1856,7 +1895,6 @@ pub fn init() !Interp {
         .current_call_epoch = 0,
         .current_procedure_epoch = 0,
         .commands = .empty,
-        .namespace = null,
         .evaluating_safe_expr = false,
         .eval_depth = 0,
         .max_eval_depth = 100_000,
@@ -1869,11 +1907,11 @@ pub fn init() !Interp {
     _ = try new_interp.pushCallFrame(null, &.{}, .{
         .args = Heap.local_heap.emptyObject(),
         .body = Heap.local_heap.emptyObject(),
-        .has_args_parameter = false,
-        .optional_arity = 0,
-        .optional_values = null,
+        .scope = .none,
         .required_arity = 0,
-        .statics = null,
+        .optional_arity = 0,
+        .optional_values = .none,
+        .has_args_parameter = false,
     });
 
     return new_interp;
@@ -1881,15 +1919,10 @@ pub fn init() !Interp {
 
 pub fn deinit(interp: *Interp) void {
     interp.result.decrRefCount();
-    var iter = interp.commands.iterator();
-    while (iter.next()) |*entry| {
-        interp.gpa.free(entry.key_ptr.*);
-        entry.value_ptr.deinit();
-    }
     interp.commands.deinit(interp.gpa);
 
     // Deinit all frames.
-    for (interp.call_frames.items) |frame| {
+    for (interp.call_frames.items) |*frame| {
         frame.deinit();
     }
     interp.call_frames.deinit(interp.gpa);
