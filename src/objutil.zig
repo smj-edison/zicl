@@ -175,14 +175,14 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
 
 pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
     // Unescaped will be equal or shorter than escaped version.
-    const unescaped = try handle.getHeap().gpa.allocSentinel(u8, escaped.len, 0);
-    errdefer handle.getHeap().gpa.free(unescaped);
+    const unescaped = try Heap.global_gpa.allocSentinel(u8, escaped.len, 0);
+    errdefer Heap.global_gpa.free(unescaped);
     const written = stringutil.removeEscaping(escaped, unescaped);
     unescaped[written] = 0; // null terminator
 
     const did_set = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
     if (did_set) {
-        handle.getHeap().gpa.free(unescaped);
+        Heap.global_gpa.free(unescaped);
     } else {
         // Too large for normal string, so we'll try setting as a long string.
         const did_take = try handle.getHeap().setLongString(
@@ -192,7 +192,7 @@ pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
                 .original_capacity = unescaped.len,
             } },
         );
-        if (!did_take) handle.getHeap().gpa.free(unescaped);
+        if (!did_take) Heap.global_gpa.free(unescaped);
     }
 }
 
@@ -925,7 +925,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
         // Figure out how many tokens there are, so we can create the correct list size
         // in the heap.file_name
         var tokens: std.ArrayList(Tokenizer.Token) = .empty;
-        defer tokens.deinit(Heap.local_Heap.global_gpa);
+        defer tokens.deinit(Heap.global_gpa);
 
         while (true) {
             const next_token = parser.nextListToken() catch |err| {
@@ -934,7 +934,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
             };
             switch (next_token.tag) {
                 .simple_string, .escaped_string => {
-                    try tokens.append(Heap.local_Heap.global_gpa, next_token);
+                    try tokens.append(Heap.global_gpa, next_token);
                 },
                 .end_of_file => break,
                 else => {
@@ -1302,14 +1302,14 @@ pub fn dictGetTable(dict: Handle) !*DictTable {
 
     // Table didn't exist, so we need to generate it.
     var new_table: DictTable = .empty;
-    errdefer new_table.deinit(dict.getHeap().gpa);
+    errdefer new_table.deinit(Heap.global_gpa);
 
     // Populate the new table.
     const dict_len = dict.peek().body.dict.len;
     var pair: u32 = 0;
     while (pair < dict_len) : (pair += 2) {
         const key = collectionItem(dict, pair, dict_len);
-        try new_table.put(dict.getHeap().gpa, key, pair + 1);
+        try new_table.put(Heap.global_gpa, key, pair + 1);
     }
 
     metadata.table = new_table;
@@ -1325,7 +1325,7 @@ pub fn dictInvalidateTable(dict: Handle) void {
     assert(dict.peek().tag == .dict);
     assert(dict.canShimmer());
     if (dict.getDictExtraData().table) |*table| {
-        table.deinit(dict.getHeap().gpa);
+        table.deinit(Heap.global_gpa);
         dict.getDictExtraData().table = null;
     }
 }
@@ -1687,7 +1687,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
             } else {
                 const original_len = dict.peek().body.dict.len;
                 const new_length = original_len + 2;
-                try table.ensureTotalCapacity(dict.getHeap().gpa, new_length / 2);
+                try table.ensureTotalCapacity(Heap.global_gpa, new_length / 2);
 
                 // Key doesn't exist, so append both key and value.
                 const len_before_resize = dict.peek().body.dict.len;
@@ -2154,7 +2154,7 @@ pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
         const extra_data = try Heap.local_heap.createExtraData();
 
         handle.getHeap().getExtraData(extra_data).* = .{ .source = .{
-            .file_name = source_info.file_name,
+            .file_name = source_info.file_name.borrowOptional(),
             .line_no = source_info.line_no,
             .parsed = .{ .value = undefined },
         } };
@@ -2217,8 +2217,8 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var parser = Tokenizer.init(bytes, source_info.line_no);
 
     // Set up tokens list (to be added to).
-    var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.local_Heap.global_gpa, bytes.len / 8);
-    defer tokens.deinit(Heap.local_Heap.global_gpa);
+    var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.global_gpa, bytes.len / 8);
+    defer tokens.deinit(Heap.global_gpa);
 
     // Used to ignore the first token if it's .command_separator (effectively
     // trimming any starting whitespace)
@@ -2229,7 +2229,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         if (next_token) |token| {
             switch (token.tag) {
                 .command_separator, .word_separator => {
-                    if (!is_trimming_start) try tokens.append(Heap.local_Heap.global_gpa, token);
+                    if (!is_trimming_start) try tokens.append(Heap.global_gpa, token);
                 },
                 .end_of_file => {
                     // Be sure to trim the ending spacing.
@@ -2240,12 +2240,12 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                             break;
                         }
                     }
-                    try tokens.append(Heap.local_Heap.global_gpa, token);
+                    try tokens.append(Heap.global_gpa, token);
                     break;
                 },
                 else => {
                     is_trimming_start = false;
-                    try tokens.append(Heap.local_Heap.global_gpa, token);
+                    try tokens.append(Heap.global_gpa, token);
                 },
             }
         } else |err| {
@@ -2279,11 +2279,11 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var new_token_values = try newListWithCapacity(new_token_capacity);
     errdefer new_token_values.decrRefCount();
 
-    var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.local_Heap.global_gpa, new_token_capacity);
-    errdefer new_token_tags.deinit(Heap.local_Heap.global_gpa);
+    var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.global_gpa, new_token_capacity);
+    errdefer new_token_tags.deinit(Heap.global_gpa);
 
     // Be sure to append the first .script_command token.
-    try new_token_tags.append(Heap.local_Heap.global_gpa, .start_of_command);
+    try new_token_tags.append(Heap.global_gpa, .start_of_command);
     var first_append_result: OptionalHandle = .none;
     _ = try listAppendObject(det, new_token_values, &first_append_result, .{
         .str = Heap.Object.null_string,
@@ -2332,7 +2332,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
             // Start a new command.
             command_arg_count = 0;
-            try new_token_tags.append(Heap.local_Heap.global_gpa, .start_of_command);
+            try new_token_tags.append(Heap.global_gpa, .start_of_command);
             var append_result: OptionalHandle = .none;
             const index = try listAppendObject(det, new_token_values, &append_result, .{
                 .str = Heap.Object.null_string,
@@ -2348,9 +2348,9 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         // Append the start of the word (only if necessary).
         if (found_expansion or arg_token_count > 1) {
             if (found_expansion) {
-                try new_token_tags.append(Heap.local_Heap.global_gpa, .argument_expansion);
+                try new_token_tags.append(Heap.global_gpa, .argument_expansion);
             } else {
-                try new_token_tags.append(Heap.local_Heap.global_gpa, .start_of_word);
+                try new_token_tags.append(Heap.global_gpa, .start_of_word);
             }
 
             var append_result: OptionalHandle = .none;
@@ -2374,7 +2374,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                 switch (token.tag) {
                     .argument_expansion => break :blk null,
                     .escaped_string => {
-                        try new_token_tags.append(Heap.local_Heap.global_gpa, .simple_string);
+                        try new_token_tags.append(Heap.global_gpa, .simple_string);
                         var append_result: OptionalHandle = .none;
                         const str_idx = try listAppendObject(
                             det,
@@ -2390,7 +2390,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                         break :blk item_handle;
                     },
                     else => {
-                        try new_token_tags.append(Heap.local_Heap.global_gpa, token.tag);
+                        try new_token_tags.append(Heap.global_gpa, token.tag);
                         var append_result: OptionalHandle = .none;
                         const str_idx = try listAppendObject(
                             det,
@@ -2448,7 +2448,7 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
     );
     defer script1.decrRefCount();
     var parsed = try parseScript(null, script1);
-    defer parsed.deinit(heap);
+    defer parsed.deinit();
 
     const tokens = parsed.tags.items;
     const values = listItems(parsed.values);
@@ -2558,7 +2558,7 @@ pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle:
         } else {
             // Wrong generation, so free the old one before overwriting (later in code).
             var script_as_mut = existing_script.script;
-            script_as_mut.deinit(Heap.local_heap);
+            script_as_mut.deinit();
             // Be sure to remove it, in case we hit an error before we have the chance
             // to overwrite it.
             _ = Heap.local_heap.parsed_scripts.remove(script_id.index);
@@ -2571,9 +2571,9 @@ pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle:
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ParseError,
     };
-    errdefer parsed.deinit(Heap.local_heap);
+    errdefer parsed.deinit();
 
-    try Heap.local_heap.parsed_scripts.put(Heap.local_Heap.global_gpa, script_id.index, .{
+    try Heap.local_heap.parsed_scripts.put(Heap.global_gpa, script_id.index, .{
         .script = parsed,
         .generation = script_id.generation,
     });
@@ -2696,7 +2696,7 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
         } else {
             // Wrong generation, so free the old one before overwriting (later in code).
             var expr_as_mut = existing_expr.expr;
-            expr_as_mut.deinit(Heap.local_Heap.global_gpa);
+            expr_as_mut.deinit();
             // Be sure to remove it, in case we hit an error before we have the chance
             // to overwrite it.
             _ = Heap.local_heap.parsed_scripts.remove(expr_id.index);
@@ -2714,11 +2714,11 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
     const bytes = try provided_handle.getString();
     var tokenizer = Tokenizer.init(bytes, line_no);
     var tokens = std.MultiArrayList(Tokenizer.Token).empty;
-    defer tokens.deinit(Heap.local_Heap.global_gpa);
+    defer tokens.deinit(Heap.global_gpa);
     while (true) {
         const next_token = tokenizer.nextExpressionToken();
         if (next_token) |token| {
-            try tokens.append(Heap.local_Heap.global_gpa, token);
+            try tokens.append(Heap.global_gpa, token);
             if (token.tag == .end_of_file) break;
         } else |err| if (det) |details| {
             details.* = try convertTokenizerError(Heap.local_heap, err);
@@ -2748,12 +2748,12 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
                 error.OutOfMemory => return error.OutOfMemory,
                 error.ParseError => {
                     if (det) |details| {
-                        var aw = std.Io.Writer.Allocating.init(Heap.local_Heap.global_gpa);
+                        var aw = std.Io.Writer.Allocating.init(Heap.global_gpa);
                         errdefer aw.deinit();
                         const err_details = parser.err.?;
                         parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
                         const rendered_error = try aw.toOwnedSlice();
-                        defer Heap.local_Heap.global_gpa.free(rendered_error);
+                        defer Heap.global_gpa.free(rendered_error);
                         const err_on_heap = try newString(Heap.local_heap, rendered_error);
                         errdefer err_on_heap.decrRefCount();
 
@@ -2767,9 +2767,9 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
             }
         }
     };
-    errdefer parsed.deinit(Heap.local_Heap.global_gpa);
+    errdefer parsed.deinit();
 
-    try Heap.local_heap.parsed_exprs.put(Heap.local_Heap.global_gpa, expr_id.index, .{
+    try Heap.local_heap.parsed_exprs.put(Heap.global_gpa, expr_id.index, .{
         .expr = parsed,
         .generation = expr_id.generation,
     });
