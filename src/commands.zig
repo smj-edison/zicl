@@ -102,7 +102,7 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     // Create a new arg array with a dummy arg[0] for error messages (as the command name
     // is the first argument).
-    var sf = std.heap.stackFallback(32, interp.gpa);
+    var sf = std.heap.stackFallback(32, Heap.global_gpa);
     const stack_alloc = sf.get();
 
     // 1 (the first argument, "apply lambdaProc") + args.len - 2 (skip "apply" and the lambda).
@@ -233,7 +233,7 @@ test "dict commands" {
     ));
     try testing.expectEqualStrings(
         \\Missing value to go with key when converting "10" to a dictionary.
-    , try Heap.getString(interp.result));
+    , try interp.result.getString());
 
     try testExpectScriptResult(&interp, "qux",
         \\ dict set foo bar baz qux
@@ -324,16 +324,16 @@ test "loop commands" {
 /// [puts]
 pub fn putsCmd(interp: *Interp, args: []Handle) !void {
     if (args.len == 3) {
-        const first_arg_str = try Heap.getString(args[1]);
+        const first_arg_str = try args[1].getString();
         if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
             try interp.setResultString("The second argument must be -nonewline");
             return Interp.Error.EvalError;
         } else {
-            const to_print = try Heap.getString(args[2]);
+            const to_print = try args[2].getString();
             std.debug.print("{s}", .{to_print});
         }
     } else {
-        const to_print = try Heap.getString(args[1]);
+        const to_print = try args[1].getString();
         std.debug.print("{s}\n", .{to_print});
     }
 }
@@ -558,7 +558,7 @@ pub fn createProcedureCommand(
                 return error.RequiredParameterAfterOptionalParameter;
             }
 
-            const arg_name = try Heap.getString(objutil.listItem(arg, 0));
+            const arg_name = try objutil.listItem(arg, 0).getString();
             if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
 
             // Required parameter.
@@ -584,13 +584,13 @@ pub fn createProcedureCommand(
 
 /// [proc]
 pub fn procCmd(interp: *Interp, args: []Handle) !void {
-    const proc_name = try Heap.getString(args[1]);
+    const proc_name = try args[1].getString();
     const arg_list = &args[2];
     const statics = if (args.len == 5) &args[3] else null;
     const body = if (args.len == 5) &args[4] else &args[3];
 
-    const qualified = try Interp.qualifyName(interp.gpa, interp.namespace, proc_name);
-    defer if (qualified) |val| interp.gpa.free(val);
+    const qualified = try Interp.qualifyName(Heap.global_gpa, interp.namespace, proc_name);
+    defer if (qualified) |val| Heap.global_gpa.free(val);
     const qualified_name = qualified orelse proc_name;
 
     const name_parts = namespaceSplit(qualified_name);
@@ -604,7 +604,7 @@ pub fn procCmd(interp: *Interp, args: []Handle) !void {
         else => return error.EvalError,
     };
     errdefer command.deinit();
-    try interp.createCommand(try interp.gpa.dupe(u8, proc_name), command);
+    try interp.createCommand(try Heap.global_gpa.dupe(u8, proc_name), command);
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
@@ -645,7 +645,7 @@ fn testRunScript(interp: *Interp, script: []const u8) !Handle {
 }
 
 fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
-    try testing.expectEqualStrings(expected, try Heap.getString(try testRunScript(interp, script)));
+    try testing.expectEqualStrings(expected, try try testRunScript(interp, script).getString());
 }
 
 test "commands" {

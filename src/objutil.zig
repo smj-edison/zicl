@@ -74,7 +74,7 @@ pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) 
             if (handle.peek().body.string.length_determined) {
                 return handle.peek().body.string.utf8_length;
             } else {
-                const bytes = try Heap.getString(handle);
+                const bytes = try handle.getString();
                 const utf8_length = stringutil.codepointLength(bytes);
                 handle.peek().body.string = .{
                     .utf8_length = utf8_length, // Cache utf8 length.
@@ -133,8 +133,8 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
         };
     } else {
         // Create new string.
-        const new_str = try heap.gpa.allocSentinel(u8, len, 0);
-        errdefer heap.gpa.free(new_str);
+        const new_str = try Heap.global_gpa.allocSentinel(u8, len, 0);
+        errdefer Heap.global_gpa.free(new_str);
         @memset(new_str, 0);
         const did_take = try heap.setLongString(handle.index, .{ .normal = new_str });
         assert(did_take);
@@ -197,15 +197,15 @@ pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
 }
 
 pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !bool {
-    const pattern_str = try Heap.getString(pattern);
-    const to_check_str = try Heap.getString(to_check);
+    const pattern_str = try pattern.getString();
+    const to_check_str = try to_check.getString();
 
     return stringutil.globMatch(pattern_str, to_check_str, case_insensitive);
 }
 
 pub fn compare(a: Handle, b: Handle, case_insensitive: bool) !std.math.Order {
-    const a_str = try Heap.getString(a);
-    const b_str = try Heap.getString(b);
+    const a_str = try a.getString();
+    const b_str = try b.getString();
 
     return stringutil.compare(a_str, b_str, case_insensitive);
 }
@@ -243,7 +243,7 @@ pub fn integerOverflowErrorWithWide(det: ?*ErrorDetails, value: i128) error{ Out
 pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     if (handle.peek().tag == .integer) return handle.peek().body.integer;
 
-    const bytes = try Heap.getString(handle);
+    const bytes = try handle.getString();
     if (std.fmt.parseInt(i64, bytes, 10)) |integer| {
         return integer;
     } else |err| switch (err) {
@@ -291,7 +291,7 @@ pub fn newFloat(heap: *Heap, value: f64) !Handle {
 pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     if (handle.peek().tag == .float) return handle.peek().body.float;
 
-    const bytes = try Heap.getString(handle);
+    const bytes = try handle.getString();
     if (std.fmt.parseFloat(f64, bytes)) |float| {
         return float;
     } else |err| switch (err) {
@@ -365,7 +365,7 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle, new_handle: 
     try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
     const handle = new_handle.orElse(provided_handle);
 
-    const bytes = try Heap.getString(handle);
+    const bytes = try handle.getString();
 
     const index: Heap.ListIndex = blk: {
         // Does it start with "end"? If so, it might be end+5, or end-2, etc
@@ -431,7 +431,7 @@ pub fn stringRange(
     errdefer new_end.swapWithNone();
 
     const codepoint_len = try getCodepointLength(str);
-    const bytes = Heap.getString(str);
+    const bytes = str.getString();
 
     const start_index = try getIndex(det, start, new_start);
     const end_index = try getIndex(det, end, new_end);
@@ -462,7 +462,7 @@ pub fn stringReplace(
     errdefer new_end.swapWithNone();
 
     const codepoint_len = try getCodepointLength(str);
-    const bytes = Heap.getString(str.*);
+    const bytes = str.*.getString();
 
     const start_index = try getIndex(det, start, new_start);
     const end_index = try getIndex(det, end, new_end);
@@ -475,7 +475,7 @@ pub fn stringReplace(
     const replaced: Handle = blk: {
         // Is there anything to insert?
         if (to_insert) |val| {
-            const to_insert_bytes = try Heap.getString(val);
+            const to_insert_bytes = try val.getString();
 
             // Figure out how long the new string needs to be.
             const up_to_range_len = byte_start;
@@ -534,7 +534,7 @@ pub fn stringReplace(
 
 /// Upper/lower/title case conversion.
 pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Handle {
-    const bytes = try Heap.getString(str);
+    const bytes = try str.getString();
 
     if (options.use_utf8) {
         // Go through once to calculate the length
@@ -617,8 +617,8 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
 
 /// Creates a new string if there was anything to trim.
 pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
-    const bytes = try Heap.getString(str);
-    const trim_chars_bytes = try Heap.getString(trim_chars);
+    const bytes = try str.getString();
+    const trim_chars_bytes = try trim_chars.getString();
 
     const start = stringutil.trimLeft(bytes, trim_chars_bytes);
 
@@ -631,8 +631,8 @@ pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
 
 /// Creates a new string if there was anything to trim, else passes `str` through.
 pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
-    const bytes = try Heap.getString(str);
-    const trim_chars_bytes = try Heap.getString(trim_chars);
+    const bytes = try str.getString();
+    const trim_chars_bytes = try trim_chars.getString();
 
     const end = stringutil.trimRight(bytes, trim_chars_bytes);
 
@@ -645,8 +645,8 @@ pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
 
 /// Creates a new string if there was anything to trim, else passes `str` through.
 pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
-    const bytes = try Heap.getString(str);
-    const trim_chars_bytes = try Heap.getString(trim_chars);
+    const bytes = try str.getString();
+    const trim_chars_bytes = try trim_chars.getString();
 
     const start = stringutil.trimLeft(bytes, trim_chars_bytes);
     const end = stringutil.trimRight(bytes, trim_chars_bytes);
@@ -706,7 +706,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
             // TODO PERF we can optimize this by shimmering the value to an "enum" type,
             // where the enum type has a u48 storing the hash of enum_name and a u16 for
             // which variant it is, by index.
-            const bytes = try Heap.getString(handle);
+            const bytes = try handle.getString();
             const variant = map.get(bytes);
             if (variant) |val| {
                 return val;
@@ -758,7 +758,7 @@ pub fn stringIs(
     errdefer new_class_to_check.swapWithNone();
     const class = try Class.get(det, class_to_check, new_class_to_check);
 
-    const bytes = try Heap.getString(str);
+    const bytes = try str.getString();
     if (bytes.len == 0) return !strict;
 
     return switch (class) {
@@ -813,7 +813,7 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
-        try Heap.getString(det.message),
+        try det.message.getString(),
     );
     det.message.decrRefCount();
 }
@@ -895,7 +895,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
         // we can just swap out the head to convert to a list. Don't call
         // `prepareToShimmer` because that would invalidate the dict items,
         // but we want to reuse them as list items.
-        _ = try Heap.getString(handle);
+        _ = try handle.getString();
 
         // Clean up dict-specific resources (table and extra_data).
         const heap = handle.getHeap();
@@ -919,13 +919,13 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
         }
         file_name.swapWithNone();
 
-        const str = try Heap.getString(provided_handle);
+        const str = try provided_handle.getString();
         var parser = Tokenizer.init(str, line_no);
 
         // Figure out how many tokens there are, so we can create the correct list size
         // in the heap.file_name
         var tokens: std.ArrayList(Tokenizer.Token) = .empty;
-        defer tokens.deinit(Heap.local_heap.gpa);
+        defer tokens.deinit(Heap.local_Heap.global_gpa);
 
         while (true) {
             const next_token = parser.nextListToken() catch |err| {
@@ -934,7 +934,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
             };
             switch (next_token.tag) {
                 .simple_string, .escaped_string => {
-                    try tokens.append(Heap.local_heap.gpa, next_token);
+                    try tokens.append(Heap.local_Heap.global_gpa, next_token);
                 },
                 .end_of_file => break,
                 else => {
@@ -1048,7 +1048,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
                 const to_free_handle = collectionItem(provided_handle, @intCast(current_len - freed_count + to_free), current_len);
                 // If a dict, be sure to remove the keys from the table.
                 if (provided_handle.peek().tag == .dict and @mod(to_free, 2) == 0) {
-                    if (dictGetMetadata(provided_handle).table) |*table| {
+                    if (provided_handle.getDictExtraData().table) |*table| {
                         _ = table.remove(to_free_handle);
                     }
                     // Also mark keys as mutable again.
@@ -1265,7 +1265,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     // The object should have been copied when being moved into the list
     try testing.expect(obj1.peek() != &items[0]);
     // But it should have an identical string
-    try testing.expectEqualStrings("object 1", try Heap.getString(listItem(list1, 0)));
+    try testing.expectEqualStrings("object 1", try listItem(list1, 0).getString());
 
     const to_append = try newString(heap, "appended item");
     defer to_append.decrRefCount();
@@ -1273,7 +1273,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     var new_list: OptionalHandle = .none;
     _ = try listAppend(&det, list1, &new_list, to_append);
     list1.swapAndClear(&new_list);
-    try testing.expectEqualStrings("appended item", try Heap.getString(listItem(list1, 2)));
+    try testing.expectEqualStrings("appended item", try listItem(list1, 2).getString());
 
     var string_list = try newString(heap,
         \\item1 {item 2} item\ 3
@@ -1283,27 +1283,22 @@ fn testLists(ta: std.mem.Allocator) !void {
     try shimmerToList(&det, string_list, &new_list);
     try testing.expect(string_list != new_list.toHandle());
     string_list.swapAndClear(&new_list);
-    try testing.expectEqualStrings("item1", try Heap.getString(listItem(string_list, 0)));
-    try testing.expectEqualStrings("item 2", try Heap.getString(listItem(string_list, 1)));
-    try testing.expectEqualStrings("item 3", try Heap.getString(listItem(string_list, 2)));
+    try testing.expectEqualStrings("item1", try listItem(string_list, 0).getString());
+    try testing.expectEqualStrings("item 2", try listItem(string_list, 1).getString());
+    try testing.expectEqualStrings("item 3", try listItem(string_list, 2).getString());
 }
 
 test "lists" {
     try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
 }
 
-pub fn dictGetMetadata(dict: Handle) *Heap.ExtraDataValue.Dictionary {
-    assert(dict.peek().tag == .dict);
-    return &dict.getHeap().getExtraData(dict.peek().body.dict.extra_data).dict;
-}
-
 const DictTable = Heap.ExtraDataValue.Dictionary.Table;
 pub fn dictGetTable(dict: Handle) !*DictTable {
-    // FIXME this doesn't use atomics to set the table currently.
-    dict.assert(!dict.getMetadata().cross_thread);
-
-    const metadata = dictGetMetadata(dict);
+    const metadata = dict.getDictExtraData();
     if (metadata.table) |*table| return table;
+
+    // FIXME make sure that the dict has a table before sending between threads.
+    dict.assert(!dict.getMetadata().cross_thread);
 
     // Table didn't exist, so we need to generate it.
     var new_table: DictTable = .empty;
@@ -1323,15 +1318,15 @@ pub fn dictGetTable(dict: Handle) !*DictTable {
 }
 
 pub fn dictMaybeGetTable(dict: Handle) ?*DictTable {
-    if (dictGetMetadata(dict).table) |*table| return table else return null;
+    if (dict.getDictExtraData().table) |*table| return table else return null;
 }
 
 pub fn dictInvalidateTable(dict: Handle) void {
     assert(dict.peek().tag == .dict);
     assert(dict.canShimmer());
-    if (dictGetMetadata(dict).table) |*table| {
+    if (dict.getDictExtraData().table) |*table| {
         table.deinit(dict.getHeap().gpa);
-        dictGetMetadata(dict).table = null;
+        dict.getDictExtraData().table = null;
     }
 }
 
@@ -1361,7 +1356,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     errdefer handle_heap.destroyExtraData(metadata_index);
 
     const metadata = handle_heap.getExtraData(metadata_index);
-    metadata.* = .{ .dict = .{ .table = null } };
+    metadata.* = .{ .dict = .{ .table = null, .parent_link = .none } };
 
     // Make sure to mark all the keys as immutable, so they never change.
     // If they could change, they'd make the table invalid, and there's
@@ -1463,7 +1458,7 @@ pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
 pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
     dict.assert(dict.peek().tag == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
-    _ = try Heap.getString(key);
+    _ = try key.getString();
 
     const table = try dictGetTable(dict);
     if (table.get(key)) |value_offset| {
@@ -1474,13 +1469,13 @@ pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!Option
 pub fn dictLookupFollowLinks(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
     dict.assert(dict.peek().tag == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
-    _ = try Heap.getString(key);
+    _ = try key.getString();
 
     const table = try dictGetTable(dict);
     if (table.get(key)) |value_offset| {
         return dictItemFollowRefs(dict, value_offset).toOptional();
     } else {
-        if (dictGetMetadata(dict).parent_link.toHandle()) |parent_link| {
+        if (dict.getDictExtraData().parent_link.toHandle()) |parent_link| {
             // Check the parent link.
             return dictLookupFollowLinks(parent_link, key);
         } else {
@@ -1515,7 +1510,7 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
 
     try Heap.ensureMutableOrDup(provided_dict, new_dict);
     const dict_before_shared_check = new_dict.orElse(provided_dict);
-    var metadata = dictGetMetadata(dict_before_shared_check);
+    var metadata = dict_before_shared_check.getDictExtraData();
 
     // Check if any items are shared.
     for (0..original_len) |i| {
@@ -1524,7 +1519,7 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
             const duplicated = try Heap.local_heap.duplicate(dict_before_shared_check);
             // Free the previous new_handle if it exists, since we have a newer one.
             new_dict.swapRef(duplicated);
-            metadata = dictGetMetadata(duplicated); // Need to reload metadata.
+            metadata = duplicated.getDictExtraData(); // Need to reload metadata.
             break;
         }
     }
@@ -1649,7 +1644,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
             errdefer value_mut.deinitSingle(Heap.local_heap);
 
             // Make sure the key has a string representation.
-            _ = try Heap.getString(key);
+            _ = try key.getString();
             // Also make sure we can mutate the dict.
             var new_dict: OptionalHandle = .none;
             try Heap.ensureMutableOrDup(provided_dict, &new_dict);
@@ -1671,15 +1666,17 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                 var value_handle = dictItem(dict, existing_value_index);
                 if (value_handle.isShared()) {
                     // Looks like this dictionary value is shared, so we can't replace the value in place
-                    // (else we'd smash up a value someone else is using). Instead, we'll start this whole
-                    // process over with a new dictionary.
+                    // (else we'd smash up a value someone else is using). Instead, we'll use a new dict
+                    // which, due to duplication, must have non-shared elements.
                     new_dict.swapRef(try Heap.duplicate(dict.getHeap(), dict));
                 }
 
                 value_handle.assert(value_handle.getHeap() == Heap.local_heap);
                 const old_value = value_handle.peek().*; // Copy.
+
                 // We can't fail at this point, so we don't need to worry about
                 // `value` being freed after assignment.
+                errdefer comptime unreachable;
                 value_handle.peek().* = value;
 
                 break :next_state .{ .changed_value = .{
@@ -1725,7 +1722,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                 }
 
                 // Make sure the key has a string rep.
-                _ = try Heap.getString(new_key_handle);
+                _ = try new_key_handle.getString();
 
                 // Only put the key in the table if the table exists. It'll be discovered
                 // when the table is generated if not.
@@ -1936,7 +1933,7 @@ const DictAndRemovedResult = struct { new_dict: OptionalHandle, did_remove: bool
 pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     assert(provided_dict.peek().tag == .dict);
 
-    const key_bytes = try Heap.getString(key);
+    const key_bytes = try key.getString();
 
     var new_dict: OptionalHandle = .none;
     errdefer new_dict.swapWithNone();
@@ -1950,7 +1947,7 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     // key(s), while `metadata.table.get` only returns the last key).
     var first_key_index: u32 = 0;
     while (first_key_index < dict_len) : (first_key_index += 2) {
-        const key_checking = try Heap.getString(dictItem(dict, first_key_index));
+        const key_checking = try dictItem(dict, first_key_index).getString();
         if (std.mem.eql(u8, key_bytes, key_checking)) {
             break; // Found our key.
         }
@@ -1981,7 +1978,7 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     // string rep to start with. If not, we'll safely propagate the OOM.
     var item_index: u32 = 0;
     while (item_index < dict_len) : (item_index += 2) {
-        _ = try Heap.getString(dictItem(dict, item_index));
+        _ = try dictItem(dict, item_index).getString();
     }
 
     // This is the start of mutation. From here on there's no going back.
@@ -1997,7 +1994,7 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
         assert(!key_handle.isShared());
         assert(!value_handle.isShared());
         // We checked that all our keys have strings earlier.
-        const key_checking = Heap.getString(dictItem(dict, item_index)) catch unreachable;
+        const key_checking = dictItem(dict, item_index).getString() catch unreachable;
         if (std.mem.eql(u8, key_bytes, key_checking)) {
             key_handle.getMetadata().mutable = true; // Make mutable before invalidating.
             key_handle.invalidateBoth();
@@ -2049,7 +2046,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const bad_key = try newString(heap, "bogus");
     defer bad_key.decrRefCount();
 
-    try testing.expectEqualStrings("1", try Heap.getString((try dictLookupFollowRefs(dict1, good_key)).toHandle().?));
+    try testing.expectEqualStrings("1", try (try dictLookupFollowRefs(dict1, good_key)).toHandle().?.getString());
     try testing.expectEqual(.none, try dictLookupFollowRefs(dict1, bad_key));
 
     // Dict with duplicate entries testing.
@@ -2063,7 +2060,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     try testing.expectEqual(3, dup_len);
     // When a duplicate key is queried, it should point to the last corrisponding value.
-    try testing.expectEqualStrings("15", try Heap.getString((try dictLookupFollowRefs(dict_with_duplicates, key_foo)).toHandle().?));
+    try testing.expectEqualStrings("15", try (try dictLookupFollowRefs(dict_with_duplicates, key_foo)).toHandle().?.getString());
 
     _ = try dictRemoveDuplicates(dict_with_duplicates, &new_dict, null);
     dict_with_duplicates.swapAndClear(&new_dict);
@@ -2085,7 +2082,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     put_result = try dictPut(dict_for_put, key3, value3);
     dict_for_put.swapIfNew(put_result.new_dict);
     try testing.expectEqual(3, dictPairLengthRaw(dict_for_put));
-    try testing.expectEqualStrings("3", try Heap.getString((try dictLookupFollowRefs(dict_for_put, key3)).toHandle().?));
+    try testing.expectEqualStrings("3", try (try dictLookupFollowRefs(dict_for_put, key3)).toHandle().?.getString());
 
     // Dict remove testing.
     var dict_for_remove = try newDict(heap, &.{ key_foo, value1, key_bar, value2, key_foo, value3 });
@@ -2093,7 +2090,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const remove_result = try dictRemove(dict_for_remove, key_foo);
     dict_for_remove.swapIfNew(remove_result.new_dict);
     try testing.expectEqual(true, remove_result.did_remove);
-    try testing.expectEqualStrings("bar 2", try Heap.getString(dict_for_remove));
+    try testing.expectEqualStrings("bar 2", try dict_for_remove.getString());
 
     // Test dict edge cases.
     var dict_edge_cases = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
@@ -2104,17 +2101,17 @@ fn testDicts(ta: std.mem.Allocator) !void {
     assert(dict_edge_cases.canMutate());
     put_result = try dictPut(dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 1), dictItemFollowRefs(dict_edge_cases, 2));
     dict_edge_cases.swapIfNew(put_result.new_dict);
-    try testing.expectEqualStrings("bar", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, value1)).toHandle().?));
+    try testing.expectEqualStrings("bar", try (try dictLookupFollowRefs(dict_edge_cases, value1)).toHandle().?.getString());
 
     // Try aliasing a key by using it as key and value.
     put_result = try dictPut(dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 0), dictItemFollowRefs(dict_edge_cases, 0));
     dict_edge_cases.swapIfNew(put_result.new_dict);
-    try testing.expectEqualStrings("foo", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, key_foo)).toHandle().?));
+    try testing.expectEqualStrings("foo", try (try dictLookupFollowRefs(dict_edge_cases, key_foo)).toHandle().?.getString());
 
     // Try aliasing a value by using it as key and value.
     put_result = try dictPut(dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 3), dictItemFollowRefs(dict_edge_cases, 3));
     dict_edge_cases.swapIfNew(put_result.new_dict);
-    try testing.expectEqualStrings("2", try Heap.getString((try dictLookupFollowRefs(dict_edge_cases, value2)).toHandle().?));
+    try testing.expectEqualStrings("2", try (try dictLookupFollowRefs(dict_edge_cases, value2)).toHandle().?.getString());
 }
 
 test "dicts" {
@@ -2126,44 +2123,46 @@ pub const SourceInfo = struct {
     line_no: u32,
 };
 
-/// .file_name will become invalid if the file name object's string becomes invalid.
-/// Does not borrow the file_name object, so be sure to borrow shimmering the handle.
+/// `SourceInfo` does not contain a borrowed value from `handle`, it's
+/// a temporary reference.
 pub fn getSourceInfo(handle: Handle) ?SourceInfo {
     const obj = handle.peek();
     if (obj.tag != .source) return null;
 
-    const file_name = obj.body.source.file_name_obj.toOptional(handle.getHeap());
+    const extra_data = handle.getSourceExtraData();
 
     return .{
-        .file_name = file_name,
-        .line_no = obj.body.source.line_no,
+        .file_name = extra_data.file_name,
+        .line_no = extra_data.line_no,
     };
 }
 
-/// `handle` must be able to shimmer.
+/// Assumes `handle` can shimmer.
 pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
-    assert(handle.canShimmer());
+    handle.assert(handle.canShimmer());
 
-    const ref = handle.peek();
-    ref.tag = .source;
-    ref.body.source.line_no = source_info.line_no;
+    // Check if it already has extra data. If so, we'll modify the existing
+    // extra data in place.
+    if (handle.peek().tag == .source) {
+        const extra_data_value = handle.getSourceExtraData();
 
-    if (source_info.file_name.toHandle()) |file_name| {
-        var same_heap_file_name = file_name;
-
-        if (same_heap_file_name.heap != handle.heap) {
-            same_heap_file_name = try Heap.local_heap.duplicate(same_heap_file_name);
-        } else {
-            // Make sure to increment the ref count.
-            same_heap_file_name.incrRefCount();
-        }
-
-        // This should be true, as Heap.ensureShimmerable will make sure it's in our heap.
-        assert(handle.heap == same_heap_file_name.heap);
-
-        ref.body.source.file_name_obj = same_heap_file_name.toOptional().getIndex();
+        extra_data_value.file_name.decrOptional();
+        extra_data_value.file_name = source_info.file_name.borrowOptional();
+        extra_data_value.line_no = source_info.line_no;
     } else {
-        ref.body.source.file_name_obj = .null;
+        assert(handle.getHeap() == Heap.local_heap);
+        const extra_data = try Heap.local_heap.createExtraData();
+
+        handle.getHeap().getExtraData(extra_data).* = .{ .source = .{
+            .file_name = source_info.file_name,
+            .line_no = source_info.line_no,
+            .parsed = .{ .value = undefined },
+        } };
+        errdefer handle.getHeap().destroyExtraData(extra_data);
+
+        try handle.prepareToShimmer();
+        handle.peek().tag = .source;
+        handle.peek().body.source = .{ .extra_data = extra_data };
     }
 }
 
@@ -2182,10 +2181,10 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     // Verify the object has the source tag
     const ref = obj.peek();
     try testing.expectEqual(.source, ref.tag);
-    try testing.expectEqual(@as(u32, 42), ref.body.source.line_no);
+    try testing.expectEqual(@as(u32, 42), obj.getSourceExtraData().line_no);
 
     const info = getSourceInfo(obj);
-    try testing.expectEqualSlices(u8, "test_file.tcl", try Heap.getString(info.?.file_name.toHandle().?));
+    try testing.expectEqualSlices(u8, "test_file.tcl", try obj.getSourceExtraData().file_name.toHandle().?.getString());
     try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
     const obj2 = try newString(heap, "hello");
@@ -2204,7 +2203,7 @@ var next_script_id = 1;
 ////////////////////////////////
 //  Script related functions  //
 
-/// Not threadsafe.
+/// Not threadsafe (though this will use `handle` correctly if it's from another thread).
 pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Get source info, or use defaults.
     const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else .{
@@ -2214,12 +2213,12 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     // Parse all the tokens of the script, handling any errors that come up.
 
-    const bytes = try Heap.getString(handle);
+    const bytes = try handle.getString();
     var parser = Tokenizer.init(bytes, source_info.line_no);
 
     // Set up tokens list (to be added to).
-    var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.local_heap.gpa, bytes.len / 8);
-    defer tokens.deinit(Heap.local_heap.gpa);
+    var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.local_Heap.global_gpa, bytes.len / 8);
+    defer tokens.deinit(Heap.local_Heap.global_gpa);
 
     // Used to ignore the first token if it's .command_separator (effectively
     // trimming any starting whitespace)
@@ -2230,7 +2229,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         if (next_token) |token| {
             switch (token.tag) {
                 .command_separator, .word_separator => {
-                    if (!is_trimming_start) try tokens.append(Heap.local_heap.gpa, token);
+                    if (!is_trimming_start) try tokens.append(Heap.local_Heap.global_gpa, token);
                 },
                 .end_of_file => {
                     // Be sure to trim the ending spacing.
@@ -2241,12 +2240,12 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                             break;
                         }
                     }
-                    try tokens.append(Heap.local_heap.gpa, token);
+                    try tokens.append(Heap.local_Heap.global_gpa, token);
                     break;
                 },
                 else => {
                     is_trimming_start = false;
-                    try tokens.append(Heap.local_heap.gpa, token);
+                    try tokens.append(Heap.local_Heap.global_gpa, token);
                 },
             }
         } else |err| {
@@ -2280,11 +2279,11 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var new_token_values = try newListWithCapacity(new_token_capacity);
     errdefer new_token_values.decrRefCount();
 
-    var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.local_heap.gpa, new_token_capacity);
-    errdefer new_token_tags.deinit(Heap.local_heap.gpa);
+    var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.local_Heap.global_gpa, new_token_capacity);
+    errdefer new_token_tags.deinit(Heap.local_Heap.global_gpa);
 
     // Be sure to append the first .script_command token.
-    try new_token_tags.append(Heap.local_heap.gpa, .start_of_command);
+    try new_token_tags.append(Heap.local_Heap.global_gpa, .start_of_command);
     var first_append_result: OptionalHandle = .none;
     _ = try listAppendObject(det, new_token_values, &first_append_result, .{
         .str = Heap.Object.null_string,
@@ -2333,7 +2332,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
             // Start a new command.
             command_arg_count = 0;
-            try new_token_tags.append(Heap.local_heap.gpa, .start_of_command);
+            try new_token_tags.append(Heap.local_Heap.global_gpa, .start_of_command);
             var append_result: OptionalHandle = .none;
             const index = try listAppendObject(det, new_token_values, &append_result, .{
                 .str = Heap.Object.null_string,
@@ -2349,9 +2348,9 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         // Append the start of the word (only if necessary).
         if (found_expansion or arg_token_count > 1) {
             if (found_expansion) {
-                try new_token_tags.append(Heap.local_heap.gpa, .argument_expansion);
+                try new_token_tags.append(Heap.local_Heap.global_gpa, .argument_expansion);
             } else {
-                try new_token_tags.append(Heap.local_heap.gpa, .start_of_word);
+                try new_token_tags.append(Heap.local_Heap.global_gpa, .start_of_word);
             }
 
             var append_result: OptionalHandle = .none;
@@ -2375,7 +2374,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                 switch (token.tag) {
                     .argument_expansion => break :blk null,
                     .escaped_string => {
-                        try new_token_tags.append(Heap.local_heap.gpa, .simple_string);
+                        try new_token_tags.append(Heap.local_Heap.global_gpa, .simple_string);
                         var append_result: OptionalHandle = .none;
                         const str_idx = try listAppendObject(
                             det,
@@ -2391,7 +2390,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                         break :blk item_handle;
                     },
                     else => {
-                        try new_token_tags.append(Heap.local_heap.gpa, token.tag);
+                        try new_token_tags.append(Heap.local_Heap.global_gpa, token.tag);
                         var append_result: OptionalHandle = .none;
                         const str_idx = try listAppendObject(
                             det,
@@ -2477,22 +2476,79 @@ test "script parsing" {
     try testing.checkAllAllocationFailures(testing.allocator, testScriptParsing, .{});
 }
 
+/// If the source doesn't already have a ScriptId, this will try to assign one.
+/// Will return error.CouldNotAssign if another thread parsed it as something
+/// that's not `script_type`.
+pub fn assignScriptId(handle: Handle, script_type: enum { script, expr }) !Heap.ScriptId {
+    if (handle.peek().tag == .source) {
+        const extra_data = handle.getSourceExtraData();
+        const parsed = &extra_data.parsed;
+        const state = parsed.state.load(.acquire);
+
+        if (state == .parsed) {
+            switch (parsed.value) {
+                .script => |script_id| {
+                    if (script_type == .script) return script_id;
+                },
+                .expr => |expr_id| {
+                    if (script_type == .expr) return expr_id;
+                },
+                else => {}, // Fall through.
+            }
+        } else {
+            // It doesn't have a script id currently, so we'll try to set one for it.
+            {
+                parsed.slow_path_mutex.lock();
+                defer parsed.slow_path_mutex.unlock();
+
+                // Need to check if it's still not parsed, since we're in a multithreaded context.
+                if (parsed.state.load(.acquire) == .not_parsed) {
+                    const new_id = try Heap.ScriptId.next();
+                    switch (script_type) {
+                        .script => parsed.value = .{ .script = new_id },
+                        .expr => parsed.value = .{ .expr = new_id },
+                    }
+                    parsed.state.store(.parsed, .release);
+                    return new_id;
+                }
+            }
+
+            // If we reached here, it means another thread won. If the other thread parsed
+            // this as a script, then we'll return the new script id. If it parsed it as
+            // something else (like an expr or native call) then fall through, since
+            // we'll need to duplicate the script in that case.
+            assert(parsed.state.load(.acquire) == .parsed);
+            switch (parsed.value) {
+                .script => |script_id| {
+                    if (script_type == .script) return script_id;
+                },
+                .expr => |expr_id| {
+                    if (script_type == .script) return expr_id;
+                },
+                else => {}, // Fall through.
+            }
+        }
+    }
+
+    return error.CouldNotAssign;
+}
+
 pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
     errdefer new_handle.swapWithNone();
 
     // Figure out whether the provided object already has a script id, or if we need to
     // generate a new one.
-    const script_info = blk: {
-        if (provided_handle.peek().tag == .script) {
-            const script = provided_handle.peek().body.script;
-            break :blk .{ script.id, false };
-        } else {
-            break :blk .{ try Heap.ScriptId.next(), true };
-        }
+    const script_id, const set_new_script_id = blk: {
+        const script_id = assignScriptId(provided_handle, .script) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CouldNotAssign => {
+                break :blk .{ try Heap.ScriptId.next(), true };
+            },
+        };
+
+        break :blk .{ script_id, false };
     };
-    const script_id = script_info.@"0";
-    const using_new_id = script_info.@"1";
-    errdefer if (using_new_id) script_id.retire();
+    errdefer if (set_new_script_id) script_id.retire();
 
     if (Heap.local_heap.parsed_scripts.get(script_id.index)) |existing_script| {
         if (existing_script.generation == script_id.generation) {
@@ -2511,24 +2567,41 @@ pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle:
         // We don't have this script in our heap, so keep going to generate it.
     }
 
-    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-    const handle = new_handle.orElse(provided_handle);
-
-    var parsed = parseScript(det, handle) catch |err| switch (err) {
+    var parsed = parseScript(det, provided_handle) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ParseError,
     };
     errdefer parsed.deinit(Heap.local_heap);
 
-    try Heap.local_heap.parsed_scripts.put(Heap.local_heap.gpa, script_id.index, .{
+    try Heap.local_heap.parsed_scripts.put(Heap.local_Heap.global_gpa, script_id.index, .{
         .script = parsed,
         .generation = script_id.generation,
     });
 
-    try handle.prepareToShimmer();
-    const obj = handle.peek();
-    obj.body.script = .{ .id = script_id };
-    obj.tag = .script;
+    if (set_new_script_id) {
+        // Only set the new script id if we need to (the earlier code can set
+        // the script id most of the time, this is for edge cases).
+        try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+        const handle = new_handle.orElse(provided_handle);
+
+        const extra_data = try Heap.local_heap.createExtraData();
+        errdefer Heap.local_heap.destroyExtraData(extra_data);
+
+        const source_info = getSourceInfo(provided_handle);
+        Heap.local_heap.getExtraData(extra_data).* = .{ .source = .{
+            .file_name = if (source_info) |val| val.file_name.borrowOptional() else .none,
+            .line_no = if (source_info) |val| val.line_no else 1,
+            .parsed = .{
+                .state = .init(.parsed),
+                .value = .{ .script = script_id },
+            },
+        } };
+
+        try handle.prepareToShimmer();
+        const obj = handle.peek();
+        obj.body = .{ .source = .{ .extra_data = extra_data } };
+        obj.tag = .source;
+    }
 
     return;
 }
@@ -2536,9 +2609,8 @@ pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle:
 pub fn getScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !Heap.ParsedScript {
     try shimmerToScript(det, provided_handle, new_handle);
     const handle = new_handle.orElse(provided_handle);
-    assert(handle.peek().tag == .script);
+    const script_id = handle.getSourceExtraData().getScriptId();
 
-    const script_id = handle.peek().body.script.id;
     const script_and_generation = Heap.local_heap.parsed_scripts.get(script_id.index).?;
     assert(script_and_generation.generation == script_id.generation);
 
@@ -2559,7 +2631,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
         var parse_result: OptionalHandle = .none;
         const parsed_script = try getScript(null, old_script, &parse_result);
         old_script.swapIfNew(parse_result);
-        const script1_id = old_script.peek().body.script.id;
+        const script1_id = old_script.getSourceExtraData().getScriptId();
         try testing.expectEqualSlices(Tokenizer.Token.Tag, &[_]Tokenizer.Token.Tag{
             .start_of_command,
             .simple_string,
@@ -2582,7 +2654,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     var parse_result: OptionalHandle = .none;
     try shimmerToScript(null, new_script, &parse_result);
     new_script.swapIfNew(parse_result);
-    const new_script_id = new_script.peek().body.script.id;
+    const new_script_id = new_script.getSourceExtraData().getScriptId();
 
     // Make sure the new script recycles the old script's index.
     try testing.expectEqual(old_script_id.index, new_script_id.index);
@@ -2595,26 +2667,25 @@ test "script shimmering" {
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer.Token.Tag, value: []const u8) !void {
     try testing.expectEqual(tag, script.tags.items[index]);
-    try testing.expectEqualStrings(value, try Heap.getString(listItem(script.values, index)));
+    try testing.expectEqualStrings(value, try listItem(script.values, index).getString());
 }
 
 pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
     errdefer new_handle.swapWithNone();
 
-    // Figure out whether the provided object already has a script id, or if we need to
+    // Figure out whether the provided object already has a expr id, or if we need to
     // generate a new one.
-    const expr_info = blk: {
-        if (provided_handle.peek().tag == .expr) {
-            const expr = provided_handle.peek().body.expr;
-            // We didn't create a new script id here.
-            break :blk .{ expr.id, false };
-        } else {
-            break :blk .{ try Heap.ScriptId.next(), true };
-        }
+    const expr_id, const set_new_expr_id = blk: {
+        const expr_id = assignScriptId(provided_handle, .expr) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CouldNotAssign => {
+                break :blk .{ try Heap.ScriptId.next(), true };
+            },
+        };
+
+        break :blk .{ expr_id, false };
     };
-    const expr_id = expr_info.@"0";
-    const using_new_id = expr_info.@"1";
-    errdefer if (using_new_id) expr_id.retire();
+    errdefer if (set_new_expr_id) expr_id.retire();
 
     // Check if this expression is already parsed in this heap.
     if (Heap.local_heap.parsed_exprs.get(expr_id.index)) |existing_expr| {
@@ -2625,7 +2696,7 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
         } else {
             // Wrong generation, so free the old one before overwriting (later in code).
             var expr_as_mut = existing_expr.expr;
-            expr_as_mut.deinit(Heap.local_heap.gpa);
+            expr_as_mut.deinit(Heap.local_Heap.global_gpa);
             // Be sure to remove it, in case we hit an error before we have the chance
             // to overwrite it.
             _ = Heap.local_heap.parsed_scripts.remove(expr_id.index);
@@ -2639,18 +2710,15 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
     errdefer file_name.swapWithNone();
     const line_no = source_info.line_no;
 
-    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-    const handle = new_handle.orElse(provided_handle);
-
     // Parse all the tokens of the expr, handling any errors that come up.
-    const bytes = try Heap.getString(handle);
+    const bytes = try provided_handle.getString();
     var tokenizer = Tokenizer.init(bytes, line_no);
     var tokens = std.MultiArrayList(Tokenizer.Token).empty;
-    defer tokens.deinit(Heap.local_heap.gpa);
+    defer tokens.deinit(Heap.local_Heap.global_gpa);
     while (true) {
         const next_token = tokenizer.nextExpressionToken();
         if (next_token) |token| {
-            try tokens.append(Heap.local_heap.gpa, token);
+            try tokens.append(Heap.local_Heap.global_gpa, token);
             if (token.tag == .end_of_file) break;
         } else |err| if (det) |details| {
             details.* = try convertTokenizerError(Heap.local_heap, err);
@@ -2680,12 +2748,12 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
                 error.OutOfMemory => return error.OutOfMemory,
                 error.ParseError => {
                     if (det) |details| {
-                        var aw = std.Io.Writer.Allocating.init(Heap.local_heap.gpa);
+                        var aw = std.Io.Writer.Allocating.init(Heap.local_Heap.global_gpa);
                         errdefer aw.deinit();
                         const err_details = parser.err.?;
                         parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
                         const rendered_error = try aw.toOwnedSlice();
-                        defer Heap.local_heap.gpa.free(rendered_error);
+                        defer Heap.local_Heap.global_gpa.free(rendered_error);
                         const err_on_heap = try newString(Heap.local_heap, rendered_error);
                         errdefer err_on_heap.decrRefCount();
 
@@ -2699,18 +2767,34 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
             }
         }
     };
-    errdefer parsed.deinit(Heap.local_heap.gpa);
+    errdefer parsed.deinit(Heap.local_Heap.global_gpa);
 
-    try Heap.local_heap.parsed_exprs.put(Heap.local_heap.gpa, expr_id.index, .{
+    try Heap.local_heap.parsed_exprs.put(Heap.local_Heap.global_gpa, expr_id.index, .{
         .expr = parsed,
         .generation = expr_id.generation,
     });
 
-    try handle.prepareToShimmer();
-    handle.peek().tag = .expr;
-    handle.peek().body = .{
-        .expr = .{ .id = expr_id },
-    };
+    if (set_new_expr_id) {
+        try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+        const handle = new_handle.orElse(provided_handle);
+
+        const extra_data = try Heap.local_heap.createExtraData();
+        errdefer Heap.local_heap.destroyExtraData(extra_data);
+
+        Heap.local_heap.getExtraData(extra_data).* = .{ .source = .{
+            .file_name = source_info.file_name.borrowOptional(),
+            .line_no = source_info.line_no,
+            .parsed = .{
+                .state = .init(.parsed),
+                .value = .{ .expr = expr_id },
+            },
+        } };
+
+        try handle.prepareToShimmer();
+        const obj = handle.peek();
+        obj.tag = .source;
+        obj.body = .{ .source = .{ .extra_data = extra_data } };
+    }
 
     return;
 }
@@ -2739,7 +2823,7 @@ fn testExpressions(ta: std.mem.Allocator) !void {
     try shimmerToExpression(null, expr1, &new_expr);
     expr1.swapIfNew(new_expr);
 
-    const expr_id = expr1.peek().body.expr.id;
+    const expr_id = expr1.getSourceExtraData().getExprId();
     const parsed = heap.parsed_exprs.get(expr_id.index).?;
 
     try testing.expectEqual(.add, parsed.expr.nodes.get(@intFromEnum(parsed.expr.root_node)).tag);
@@ -2768,7 +2852,7 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle
 
     const Mapping = std.StaticStringMap(bool).initComptime(Tokenizer.boolean_mapping);
 
-    const bytes = try Heap.getString(provided_handle);
+    const bytes = try provided_handle.getString();
     const new_value = Mapping.get(bytes) orelse blk: {
         // It might be an integer, so be sure to try parsing it as an int before giving up.
         const as_int = integerGetNoShimmer(null, provided_handle) catch |err| switch (err) {

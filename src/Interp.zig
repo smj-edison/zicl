@@ -28,11 +28,12 @@ eval_frames: std.ArrayList(EvalFrame),
 /// jump back.
 call_frames: std.ArrayList(CallFrame),
 /// Used to invalidate cached variable lookups. Will overflow, but
-/// when it overflows it'll scan through the heap and invalidate all
-/// variables.
-current_call_epoch: u31,
-current_procedure_epoch: u31,
-commands: CommandHashTable,
+/// when it overflows the interpreter will scan through the heap and
+/// invalidate all variables.
+current_call_epoch: u32,
+/// Used to invalidate cached procedures.
+global_procedure_epoch: u32,
+global_commands: CommandHashTable,
 
 evaluating_safe_expr: bool,
 eval_depth: usize,
@@ -145,7 +146,7 @@ fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_fr
     name.assert(name.getHeap() == interp.heap);
     name.assert(name.canShimmer());
 
-    const var_name = try Heap.getString(name);
+    const var_name = try name.getString();
     const call_frame = &interp.call_frames.items[var_call_frame];
 
     if (try interp.resolveVariable(var_call_frame, name)) |var_value| {
@@ -226,7 +227,7 @@ fn ensureValidVariableType(interp: *Interp, det: ?*objutil.ErrorDetails, var_cal
     }
 
     // We don't know whether this is a normal variable or dict sugar yet.
-    const var_name = try Heap.getString(name);
+    const var_name = try name.getString();
 
     // Does it end with ')' and have '(' at some point in the name?
     if (var_name.len >= 2 and var_name[var_name.len - 1] == ')' and std.mem.indexOfScalar(u8, var_name, '(') != null) {
@@ -312,8 +313,8 @@ pub fn setVariableLinkImpl(
     name.assert(name.getHeap() == interp.heap);
     name.assert(name.canShimmer());
 
-    const name_bytes = try Heap.getString(name);
-    const target_name_bytes = try Heap.getString(target_name);
+    const name_bytes = try name.getString();
+    const target_name_bytes = try target_name.getString();
 
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) |_| {
         // Variable already exists.
@@ -395,7 +396,7 @@ pub fn setVariableLinkImpl(
 }
 
 /// Resolves to the variable's value. Must be called with a heap-native name.
-pub fn getVariableImpl(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !Handle {
+pub fn getVariableInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !Handle {
     if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
 
     try interp.ensureValidVariableType(det, call_frame, name);
@@ -407,9 +408,10 @@ pub fn getVariableImpl(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame:
         .cached_local_var => {
             const resolved = name_heap.getHandle(name_obj.body.cached_local_var.cached_index);
             if (resolved.peek().tag == .upvar_link) {
+                // Recursively follow upvar.
                 const upvar_link = resolved.peek().body.upvar_link;
                 const linked_name = resolved.getHeap().getHandle(upvar_link.linked_name);
-                return try interp.getVariableImpl(det, upvar_link.call_frame, linked_name);
+                return try interp.getVariableInner(det, upvar_link.call_frame, linked_name);
             }
             return resolved;
         },
@@ -441,12 +443,12 @@ fn testVariables(ta: std.mem.Allocator) !void {
     try interp.setVariableTo(&str_foo, str_value);
 
     const cached_lookup_value = (try interp.resolveVariable(0, str_foo)).?.local_variable.target;
-    try testing.expectEqualStrings("value", try Heap.getString(cached_lookup_value));
+    try testing.expectEqualStrings("value", try cached_lookup_value.getString());
     // Also try resolving the value from a new string.
     var str2_foo = try objutil.newString(heap, "foo");
     defer str2_foo.decrRefCount();
     const lookup_value = (try interp.resolveVariable(0, str2_foo)).?.local_variable.target;
-    try testing.expectEqualStrings("value", try Heap.getString(lookup_value));
+    try testing.expectEqualStrings("value", try lookup_value.getString());
 }
 
 test "variables" {
@@ -473,23 +475,23 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
     try interp.setVariableLinkImpl(null, 0, str_bar, 0, str_foo);
 
     // Make sure we can get the value of `foo` through `bar`.
-    var lookup_value = try interp.getVariableImpl(null, 0, str_bar);
-    try testing.expectEqualStrings("value", try Heap.getString(lookup_value));
+    var lookup_value = try interp.getVariableInner(null, 0, str_bar);
+    try testing.expectEqualStrings("value", try lookup_value.getString());
 
     // Modify `foo` through `bar`.
     const str_new_value = try objutil.newString(heap, "new value");
     defer str_new_value.decrRefCount();
     try interp.setVariableImpl(0, str_bar, str_new_value.reference());
-    lookup_value = try interp.getVariableImpl(null, 0, str_foo);
-    try testing.expectEqualStrings("new value", try Heap.getString(lookup_value));
+    lookup_value = try interp.getVariableInner(null, 0, str_foo);
+    try testing.expectEqualStrings("new value", try lookup_value.getString());
 }
 
 test "variable link" {
     try testing.checkAllAllocationFailures(testing.allocator, testVariableLink, .{});
 }
 
-pub const Command = struct {
-    pub const NativeCommand = struct {
+pub const NativeCommand = struct {
+    pub const ZigCommand = struct {
         to_call: *const CommandFn,
         description: ?[]const u8 = "",
         min_arity: usize = 0,
@@ -509,21 +511,21 @@ pub const Command = struct {
     };
 
     call_info: union(enum) {
-        native: NativeCommand,
+        zig: ZigCommand,
         c: CCommand,
     },
 
     /// Returns a string containing all the usage information. Allocates the string
-    /// onto the arena. Produces something like `cmd ...`, or `cmd arg1 arg2 ?arg3?`
-    pub fn getUsageInfo(command: *Command, arena: std.mem.Allocator, command_name: []const u8) ![]const u8 {
-        var aw = std.Io.Writer.Allocating.init(arena);
+    /// onto `gpa`. Produces something like `cmd ...`, or `cmd arg1 arg2 ?arg3?`
+    pub fn getUsageInfo(command: *NativeCommand, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
+        var aw = std.Io.Writer.Allocating.init(gpa);
         defer aw.deinit();
 
         // Write command name.
         aw.writer.writeAll(command_name) catch return error.OutOfMemory;
 
         switch (command.call_info) {
-            .native => |call_info| {
+            .zig => |call_info| {
                 if (call_info.description) |description| {
                     aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
                 } else {
@@ -543,7 +545,7 @@ pub const Command = struct {
     }
 };
 
-pub const CommandHashTable = std.StringArrayHashMapUnmanaged(Command);
+pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 
 fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
@@ -553,35 +555,73 @@ fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u
     return Error.WrongUsage;
 }
 
-/// Takes ownership of name.
-pub fn createCommand(interp: *Interp, name: []const u8, command: Command) !void {
-    // TODO make sure to check interp->local if we end up needing it in our impl
-    var old_command = try interp.commands.fetchPut(interp.gpa, name, command);
-    if (old_command) |*val| val.value.deinit();
+/// `name` should be a static variable guaranteed to exist as long as the
+/// interpreter exists.
+pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeCommand.ZigCommand) !void {
+    try interp.global_commands.put(Heap.global_gpa, name, .{
+        .call_info = .{ .zig = call_info },
+    });
 
     // FIXME need to handle this if it wraps around.
-    interp.current_procedure_epoch += 1;
+    interp.global_procedure_epoch += 1;
 }
 
-pub fn registerCommand(interp: *Interp, name: []const u8, details: Command.NativeCommand) !void {
-    const name_duped = try interp.gpa.dupe(u8, name);
-    errdefer interp.gpa.free(name_duped);
-    try interp.commands.put(interp.gpa, name_duped, .{ .namespace = .none, .call_info = .{ .native = details } });
+/// Must already be a closure.
+pub fn getClosureUsageInfo(interp: *Interp, gpa: std.mem.Allocator, closure: Handle, command_name: []const u8) ![]const u8 {
+    closure.assert(closure.peek().tag == .source);
+    const source_data = interp.heap.getExtraData(closure.peek().body.source).source;
+    closure.assert(source_data.parsed.state.load(.acquire) == .closure);
+    const signature = source_data.parsed.value.closure.signature;
+
+    var aw = std.Io.Writer.Allocating.init(gpa);
+    defer aw.deinit();
+    aw.writer.writeAll(command_name) catch return error.OutOfMemory;
+
+    const args_list = signature.args;
+    const args_len = objutil.listLengthRaw(args_list);
+
+    for (0..args_len) |i| {
+        const arg = objutil.listItem(args_list, @intCast(i));
+
+        aw.writer.writeAll(" ") catch return error.OutOfMemory;
+
+        if (i == args_len - 1 and signature.has_args_parameter) {
+            // Handle `args` paramater.
+            aw.writer.writeAll("?arg ...?") catch return error.OutOfMemory;
+        } else {
+            // If this argument is a list, it means that it has a default value.
+            if (arg.peek().tag == .list) {
+                assert(objutil.listLengthRaw(arg) == 2);
+
+                aw.writer.print("?{s}?", .{try arg.getString()}) catch return error.OutOfMemory;
+            } else {
+                aw.writer.writeAll(try arg.getString()) catch return error.OutOfMemory;
+            }
+        }
+    }
+
+    return aw.toOwnedSlice();
 }
 
-pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
-    const signature = &command.call_info.tcl.signature;
+/// Must be called with a closure.
+pub fn callClosure(interp: *Interp, closure: Handle, args: []Handle) !void {
+    closure.assert(closure.peek().tag == .source);
+    const source_data = interp.heap.getExtraData(closure.peek().body.source).source;
+    closure.assert(source_data.parsed.state.load(.acquire) == .closure);
+    const signature = source_data.parsed.value.closure.signature;
+
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
-    if (arg_count < signature.required_arity or
-        (!signature.has_args_parameter and arg_count > signature.required_arity + signature.optional_arity))
-    {
+    const too_few_arguments = arg_count < signature.required_arity;
+    const has_args = signature.has_args_parameter;
+    const too_many_arguments = !has_args and arg_count > signature.required_arity + signature.optional_arity;
+    if (too_few_arguments or too_many_arguments) {
         // Wrong argument count, error accordingly.
-        var sf = std.heap.stackFallback(64, interp.gpa);
+        var sf = std.heap.stackFallback(64, Heap.global_gpa);
         const scratch = sf.get();
-        const command_name = try Heap.getString(args[0]);
-        const command_usage = try command.getUsageInfo(scratch, command_name);
+        const command_name = try args[0].getString();
+        const command_usage = try signature.getUsageInfo(scratch, command_name);
         defer scratch.free(command_usage);
         var det: objutil.ErrorDetails = undefined;
         return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
@@ -597,7 +637,7 @@ pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
     const call_frame_idx = try interp.pushCallFrame(parent_idx, args, signature.*);
     defer interp.call_frames.pop().?.deinit();
 
-    // Populate call frame.
+    // Next, we'll populate the call frame.
 
     // Where we are in the arguments that this was called with.
     var called_idx: usize = 1;
@@ -636,11 +676,11 @@ pub fn callProcedure(interp: *Interp, command: *Command, args: []Handle) !void {
 
     var new_body: OptionalHandle = .none;
     try interp.evalObject(signature.body, &new_body);
-    signature.body.swapIfNew(new_body);
+    assert(new_body == .none);
 }
 
-fn callNative(interp: *Interp, command: *Command, args: []Handle) !void {
-    const signature = command.call_info.native;
+fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
+    const signature = command.call_info.zig;
 
     const arg_count = args.len - 1;
     wrong_arg_count: {
@@ -653,13 +693,13 @@ fn callNative(interp: *Interp, command: *Command, args: []Handle) !void {
             if (@mod(arg_count, multiple_of) != 0) break :wrong_arg_count;
         }
 
-        try command.call_info.native.to_call(interp, args);
+        try command.call_info.zig.to_call(interp, args);
         return;
     }
 
-    var sf = std.heap.stackFallback(64, interp.gpa);
+    var sf = std.heap.stackFallback(64, Heap.global_gpa);
     const scratch = sf.get();
-    const command_name = try Heap.getString(args[0]);
+    const command_name = try args[0].getString();
     const command_usage = try command.getUsageInfo(scratch, command_name);
     defer scratch.free(command_usage);
     var det: objutil.ErrorDetails = undefined;
@@ -672,6 +712,7 @@ pub fn evalList(interp: *Interp, list: Handle) !void {
 
     @panic("unimplemented");
 }
+
 fn freeLastResult(interp: *Interp) void {
     interp.result.decrRefCount();
     interp.result = interp.heap.emptyObject();
@@ -735,12 +776,12 @@ const CallFrame = struct {
     }
 
     /// Returns a dict containing this call frame's variables.
-    pub fn captureScope(frame: *CallFrame) !Handle {
+    pub fn captureScope(frame: *CallFrame, interp: *Interp) !Handle {
         const pairs = objutil.dictPairLengthRaw(frame.variables);
 
+        // Make sure there's no upvars.
         for (0..pairs) |i| {
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
-            // Make sure there's no upvars.
             if (value.peek().tag == .upvar_link) break;
         } else {
             // No upvars found, so we can just borrow the variables.
@@ -754,11 +795,20 @@ const CallFrame = struct {
             const key = objutil.dictItem(frame.variables, i * 2);
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
 
-            _ = new_dict;
-            _ = key;
-            _ = value;
-
-            @panic("Need to figure this out");
+            if (value.peek().tag == .upvar_link) {
+                const upvar_link = value.peek().body.upvar_link;
+                if (interp.getVariableInner(null, upvar_link.call_frame, upvar_link.linked_name)) |upvar_val| {
+                    try objutil.dictPut(new_dict, key, upvar_val);
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.VariableNotFound => {
+                        // Don't put anything in the dictionary if the upvar
+                        // doesn't point at anything.
+                    },
+                }
+            } else {
+                try objutil.dictPut(new_dict, key, value);
+            }
         }
     }
 };
@@ -801,7 +851,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
-    try interp.call_frames.append(interp.gpa, .{
+    try interp.call_frames.append(Heap.global_gpa, .{
         .parent = parent,
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
@@ -816,7 +866,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
 }
 
 fn pushEvalFrame(interp: *Interp) !u32 {
-    try interp.eval_frames.append(interp.gpa, .{
+    try interp.eval_frames.append(Heap.global_gpa, .{
         .call_frame = interp.currentCallFrameIndex(),
         .args = null,
     });
@@ -835,7 +885,10 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
         },
         .variable_subst => {
             var det: objutil.ErrorDetails = undefined;
-            const var_target = try interp.wrapError(&det, interp.getVariableImpl(&det, value));
+            const var_target: Handle = try interp.wrapError(
+                &det,
+                interp.getVariableInner(&det, interp.currentCallFrame().level, value),
+            );
             return var_target.borrow();
         },
         .dict_sugar => {
@@ -877,7 +930,7 @@ fn interpolateTokens(
     value_len: u32,
     substitution_only: bool,
 ) !Handle {
-    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, interp.gpa);
+    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
     const tokens_alloc = sf.get();
 
     const new_values = try tokens_alloc.alloc(Handle, value_len);
@@ -929,7 +982,7 @@ fn interpolateTokens(
 
     var new_str_len: usize = 0;
     for (new_values) |new_value| {
-        new_str_len += (try Heap.getString(new_value)).len;
+        new_str_len += (try new_value.getString()).len;
     }
 
     const new_str = try objutil.newStringToFill(interp.heap, new_str_len);
@@ -937,7 +990,7 @@ fn interpolateTokens(
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
         for (new_values) |new_value| {
-            const value_str = try Heap.getString(new_value);
+            const value_str = try new_value.getString();
             @memcpy(new_str_mut[written..][0..value_str.len], value_str);
             written += value_str.len;
         }
@@ -948,24 +1001,31 @@ fn interpolateTokens(
     return new_str;
 }
 
-/// Qualifies a name to its canonical version. For example, a name of "bar", and a namespace
-/// of "foo" would return "foo::bar". Allocated on the arena. Returns null if no qualification
-/// is needed.
-pub fn qualifyName(arena: std.mem.Allocator, namespace: ?Handle, name: []const u8) !?[]const u8 {
-    // We're in a non-global namespace, so we'll need to append the namespace to the
-    // beginning of the name, if the name isn't globally scoped (e.g. by not
-    // having :: at the beginning).
-    if (name.len < 2 or name[0] != ':' or name[1] != ':') {
-        const namespace_name = try Heap.getString(namespace orelse Heap.local_heap.emptyObject());
-        return try std.fmt.allocPrint(arena, "{s}::{s}", .{ namespace_name, name });
-    }
+const CommandOrClosure = union(enum) {
+    closure: Handle,
+    command: NativeCommand,
+};
 
-    return null;
+pub fn getCommand(
+    interp: *Interp,
+    det: ?*objutil.ErrorDetails,
+    call_frame: u32,
+    provided_name: Handle,
+    new_name: *OptionalHandle,
+) !CommandOrClosure {
+    errdefer new_name.swapWithNone();
+
+    try Heap.ensureShimmerableOrDup(provided_name, new_name);
+    const handle = new_name.orElse(provided_name);
+
+    if (interp.getVariableInner(null, call_frame, handle)) |var_val| {
+        if (handle.canShimmer()) {}
+    }
 }
 
 /// This function returns the command that's found based on the string contents of `handle`.
 /// This also specializes the object to contain a cached lookup for the command.
-pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !*Command {
+pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !*NativeCommand {
     errdefer new_handle.swapWithNone();
 
     early_exit: {
@@ -980,7 +1040,7 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
 
         // In order for the cached value to be valid, the proc epoch must match and the
         // lookup must have occurred in the same namespace.
-        if (obj.tag == .command and obj.body.command.procedure_epoch == interp.current_procedure_epoch) {
+        if (obj.tag == .command and obj.body.command.procedure_epoch == interp.global_procedure_epoch) {
             if (interp.currentCallFrame().namespace) |namespace| {
                 // Another check: if this command was in a namespace, it needs to be the same as the current
                 // call frame's namespace.
@@ -1000,10 +1060,10 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
             // All checks passed, so now we can return the cached command's pointer.
             const command = blk: {
                 if (obj.body.command.in_global_namespace) {
-                    break :blk &interp.commands.values()[obj.body.command.u.global_namespace.command_index];
+                    break :blk &interp.global_commands.values()[obj.body.command.u.global_namespace.command_index];
                 } else {
                     const extra_data = interp.heap.getExtraData(obj.body.command.u.other_namespace);
-                    break :blk &interp.commands.values()[extra_data.command.command_index];
+                    break :blk &interp.global_commands.values()[extra_data.command.command_index];
                 }
             };
             return command;
@@ -1012,11 +1072,11 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
         }
     }
 
-    const command_name = try Heap.getString(provided_handle);
+    const command_name = try provided_handle.getString();
 
     // There wasn't a cached version, or it was invalid, so we'll need to look up this command.
     const current_namespace = interp.currentCallFrame().namespace;
-    var sf = std.heap.stackFallback(64, interp.gpa);
+    var sf = std.heap.stackFallback(64, Heap.global_gpa);
     const scratch = sf.get();
     const qualified = blk: {
         // Only qualify if we're in a namespace.
@@ -1027,11 +1087,11 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
     };
     defer if (qualified) |unwrapped| scratch.free(unwrapped);
 
-    var command_index: ?usize = interp.commands.getIndex(qualified orelse command_name);
+    var command_index: ?usize = interp.global_commands.getIndex(qualified orelse command_name);
     if (qualified != null and command_index == null) {
         // If we couldn't find the command in the namespace, we should check if it's in the global
         // namespace (by not qualifying the name, and instead using it raw).
-        command_index = interp.commands.getIndex(command_name);
+        command_index = interp.global_commands.getIndex(command_name);
     }
 
     // Cache the command.
@@ -1058,7 +1118,7 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
             try handle.prepareToShimmer();
             handle.peek().tag = .command;
             handle.peek().body.command = .{
-                .procedure_epoch = interp.current_procedure_epoch,
+                .procedure_epoch = interp.global_procedure_epoch,
                 .in_global_namespace = false,
                 .u = .{ .other_namespace = extra_data },
             };
@@ -1066,13 +1126,13 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
             try handle.prepareToShimmer();
             handle.peek().tag = .command;
             handle.peek().body.command = .{
-                .procedure_epoch = interp.current_procedure_epoch,
+                .procedure_epoch = interp.global_procedure_epoch,
                 .in_global_namespace = true,
                 .u = .{ .global_namespace = .{ .command_index = @intCast(index) } },
             };
         }
 
-        return &interp.commands.values()[index];
+        return &interp.global_commands.values()[index];
     } else {
         // If it was null, we better error.
         if (det) |details| details.* = .{
@@ -1082,7 +1142,7 @@ pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle:
     }
 }
 
-fn invokeCommand(interp: *Interp, args: []Handle) !void {
+fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
     var det: objutil.ErrorDetails = undefined;
 
     var new_command: OptionalHandle = .none;
@@ -1116,7 +1176,7 @@ fn invokeCommand(interp: *Interp, args: []Handle) !void {
 
         const result = blk: {
             switch (command.call_info) {
-                .native => |info| {
+                .zig => |info| {
                     _ = info;
 
                     break :blk interp.callNative(command, current_args);
@@ -1134,7 +1194,7 @@ fn invokeCommand(interp: *Interp, args: []Handle) !void {
                 // Be sure to free the previous tailcall.
                 if (tailcall_info) |prev_tailcall| {
                     for (prev_tailcall.args) |arg| arg.decrRefCount();
-                    interp.gpa.free(prev_tailcall.args);
+                    Heap.global_gpa.free(prev_tailcall.args);
                 }
 
                 tailcall_info = tailcall;
@@ -1449,16 +1509,16 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             const lhs_string = switch (lhs_value) {
                 .float => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
                 .int => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_handle => |val| (try Heap.getString(val.*))[0..],
-                .stack_handle => |val| (try Heap.getString(val))[0..],
+                .owned_handle => |val| (try val.*.getString())[0..],
+                .stack_handle => |val| (try val.getString())[0..],
             };
             var rhs_buffer: [50]u8 = @splat(0);
             var rhs_alloc = std.heap.FixedBufferAllocator.init(rhs_buffer[0..]);
             const rhs_string = switch (lhs_value) {
                 .float => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
                 .int => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_handle => |val| (try Heap.getString(val.*))[0..],
-                .stack_handle => |val| (try Heap.getString(val))[0..],
+                .owned_handle => |val| (try val.*.getString())[0..],
+                .stack_handle => |val| (try val.getString())[0..],
             };
 
             const result = switch (node_tag) {
@@ -1508,7 +1568,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .variable_subst => {
             // This should not change, since it should be a local heap object.
             var det: objutil.ErrorDetails = undefined;
-            const var_value = try interp.wrapError(&det, interp.getVariableImpl(&det, node_data.object));
+            const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, node_data.object));
 
             return .{ .stack_handle = var_value.borrow() };
         },
@@ -1773,7 +1833,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
     defer interp.popEvalFrame();
 
     // Used for allocating the arguments passed into a command call.
-    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, interp.gpa);
+    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
     var args_alloc = sf.get();
 
     // Execute every command sequentially until the end of the script or an error occurs.
@@ -1846,7 +1906,7 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
 
         // Now that we've populated the arguments for this command, we'll go ahead and run it.
         std.debug.print("Calling command: ", .{});
-        for (args) |arg| std.debug.print("{{{s}}} ", .{try Heap.getString(arg)});
+        for (args) |arg| std.debug.print("{{{s}}} ", .{try arg.getString()});
         std.debug.print("\n", .{});
 
         const cmd_result = interp.invokeCommand(args);
@@ -1893,8 +1953,8 @@ pub fn init() !Interp {
         .eval_frames = .empty,
         .call_frames = .empty,
         .current_call_epoch = 0,
-        .current_procedure_epoch = 0,
-        .commands = .empty,
+        .global_procedure_epoch = 0,
+        .global_commands = .empty,
         .evaluating_safe_expr = false,
         .eval_depth = 0,
         .max_eval_depth = 100_000,
@@ -1919,15 +1979,15 @@ pub fn init() !Interp {
 
 pub fn deinit(interp: *Interp) void {
     interp.result.decrRefCount();
-    interp.commands.deinit(interp.gpa);
+    interp.global_commands.deinit(Heap.global_gpa);
 
     // Deinit all frames.
     for (interp.call_frames.items) |*frame| {
         frame.deinit();
     }
-    interp.call_frames.deinit(interp.gpa);
+    interp.call_frames.deinit(Heap.global_gpa);
 
-    interp.eval_frames.deinit(interp.gpa);
+    interp.eval_frames.deinit(Heap.global_gpa);
 }
 
 // Export various utility functions with a nicer interface.
@@ -2018,7 +2078,7 @@ pub fn getVariable(interp: *Interp, provided_name: *Handle) !OptionalHandle {
     var new_name: OptionalHandle = .none;
     try Heap.ensureShimmerableOrDup(provided_name.*, &new_name);
     provided_name.swapIfNew(new_name);
-    const value = interp.getVariableImpl(null, provided_name.*) catch |err| switch (err) {
+    const value = interp.getVariableInner(null, provided_name.*) catch |err| switch (err) {
         error.VariableNotFound => return .none,
         else => return err,
     };
@@ -2028,7 +2088,7 @@ pub fn getVariable(interp: *Interp, provided_name: *Handle) !OptionalHandle {
 pub fn getVariableOrError(interp: *Interp, name: *Handle) !Handle {
     try interp.ensureShimmerable(name);
     var det: objutil.ErrorDetails = undefined;
-    const var_value = try interp.wrapError(&det, interp.getVariableImpl(&det, name.*));
+    const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, name.*));
     return var_value;
 }
 
@@ -2136,7 +2196,7 @@ test "recursive dict keys" {
     defer value_qux.decrRefCount();
 
     _ = try interp.putDictValueRecursively(&dict, &[_]Handle{ key_foo, key_bar, key_baz }, value_qux);
-    try testing.expectEqualStrings("foo {bar {baz qux}}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.getString());
 
     // Try taking ownership of one of the intermediate dictionaries.
     var to_take_result = try interp.getDictValueRecursively(&dict, &.{ key_foo, key_bar });
@@ -2149,10 +2209,10 @@ test "recursive dict keys" {
 
     // Let's try some very cursed aliasing.
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, objutil.dictItem(dict, 0));
-    try testing.expectEqualStrings("foo {bar foo}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar foo}", try dict.getString());
 
     const value_result = try interp.getDictValueRecursively(&dict, &.{ key_foo, key_bar });
-    try testing.expectEqualStrings("foo", try Heap.getString(value_result.toHandle().?));
+    try testing.expectEqualStrings("foo", try value_result.toHandle().?.getString());
 }
 
 fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
@@ -2175,20 +2235,20 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     // Test 1: Remove a deeply nested value (3 levels).
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz }, value_qux);
 
-    try testing.expectEqualStrings("foo {bar {baz qux}}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.getString());
     var did_remove = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
 
     // Test 2: Try to remove the same key again (should return false).
     did_remove = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz });
     try testing.expect(!did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
 
     // Test 3: Remove a non-existent key from an existing intermediate dict.
     did_remove = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar, key_foo });
     try testing.expect(!did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
 
     // Test 4: Remove from a non-existent intermediate dict.
     try memutil.expectErrorOrOom(
@@ -2197,20 +2257,20 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     );
     try testing.expectEqualStrings(
         \\key "bar" not known in dictionary "foo {bar {}}"
-    , try Heap.getString(interp.result));
-    try testing.expectEqualStrings("foo {bar {}}", try Heap.getString(dict));
+    , try interp.result.getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
 
     // Test 5: Single-level removal (base case).
     did_remove = try interp.removeDictValueRecursively(&dict, &.{key_foo});
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("", try Heap.getString(dict));
+    try testing.expectEqualStrings("", try dict.getString());
 
     // Test 6: Two-level removal.
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, value_qux);
-    try testing.expectEqualStrings("foo {bar qux}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar qux}", try dict.getString());
     did_remove = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {}", try dict.getString());
 
     // Test 7: Removal when intermediate dict is shared (copy-on-write).
     var interm_test_dict = try objutil.newDict(heap, &.{});
@@ -2224,17 +2284,17 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     defer intermediate.decrRefCount();
 
     const initial_refcount = intermediate.debugRefCount();
-    try testing.expectEqualStrings("baz qux foo qux", try Heap.getString(intermediate));
+    try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
 
     // Remove from the nested dict while it's owned elsewhere.
     did_remove = try interp.removeDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar, key_baz });
     try testing.expect(did_remove);
 
     // The intermediate dict we own should be unchanged (copy-on-write).
-    try testing.expectEqualStrings("baz qux foo qux", try Heap.getString(intermediate));
+    try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
     // But the main dict should have a new copy without 'baz'.
     const foo_bar_result = try interp.getDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar });
-    try testing.expectEqualStrings("foo qux", try Heap.getString(foo_bar_result.toHandle().?));
+    try testing.expectEqualStrings("foo qux", try foo_bar_result.toHandle().?.getString());
     // Reference count should drop by 1 since the parent no longer references it.
     try testing.expectEqual(initial_refcount - 1, intermediate.debugRefCount());
 
@@ -2242,13 +2302,13 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     dict.swap(try objutil.newDict(heap, &.{}));
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, value_qux);
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_baz }, value_qux);
-    try testing.expectEqualStrings("foo {bar qux baz qux}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict.getString());
     did_remove = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_bar });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {baz qux}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {baz qux}", try dict.getString());
     did_remove = try interp.removeDictValueRecursively(&dict, &.{ key_foo, key_baz });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try Heap.getString(dict));
+    try testing.expectEqualStrings("foo {}", try dict.getString());
 }
 
 test "recursive dict removal" {

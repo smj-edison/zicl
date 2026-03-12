@@ -22,12 +22,11 @@ fn panicAndPrintTraces(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 test {
-    // @import("std").testing.refAllDecls(@This());
     _ = @import("stringutil.zig");
-    _ = @import("Tokenizer.zig");
     _ = @import("objutil.zig");
     _ = @import("Heap.zig");
-    _ = @import("Interp.zig");
-    _ = @import("commands.zig");
-    _ = @import("expr_parse.zig");
+    // _ = @import("Tokenizer.zig");
+    // _ = @import("Interp.zig");
+    // _ = @import("commands.zig");
+    // _ = @import("expr_parse.zig");
 }

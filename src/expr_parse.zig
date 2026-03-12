@@ -548,7 +548,7 @@ pub const Parse = struct {
     /// Does not borrow source_file_name.
     pub fn init(heap: *Heap, source_file_name: OptionalHandle, source: []const u8, tokens: Tokens) Parse {
         return .{
-            .gpa = heap.gpa,
+            .gpa = Heap.global_gpa,
             .heap = heap,
             .source = source,
             .source_file_name = source_file_name,

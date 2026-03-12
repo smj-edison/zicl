@@ -14,7 +14,6 @@ const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const expr_parse = @import("expr_parse.zig");
 const objutil = @import("objutil.zig");
-const Interp = @import("Interp.zig");
 
 // These numbers are final, and can be depended on to be their current values
 pub const special_string_count = 2;
@@ -52,13 +51,12 @@ pub const GlobalHeapState = struct {
     /// Use to lock custom_types or script_metadata when adding or removing
     /// (no need to lock when using).
     mutex: memutil.Mutex = .{},
-    /// Used for all global data structures (currently custom_types and script_metadata)
-    gpa: std.mem.Allocator = memutil.null_allocator,
     next_open_heap: usize = 0,
     /// Used to turn some panics into useful messages.
     running_leak_check: bool = false,
 };
 pub var state: GlobalHeapState = .{};
+pub var global_gpa: std.mem.Allocator = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
 pub var custom_types: memutil.IndexedMemoryPool(CustomType, cfg.use_vmem) = undefined;
 pub var script_metadata: ScriptMetadataPool = undefined;
@@ -72,10 +70,8 @@ const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
 const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
 const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
-gpa: Allocator,
-
 /// Used to create and destroy extra data.
-extra_data_muta: memutil.Mutex = .{},
+extra_data_mutex: memutil.Mutex = .{},
 /// Used for locking when adding trace info.
 trace_mutex: memutil.Mutex = .{},
 
@@ -298,15 +294,15 @@ pub const ParsedScript = struct {
                 .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
                     const item = objutil.listItem(script.values, @intCast(i));
-                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), getString(item) catch "<oom string>" });
+                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), item.getString() catch "<oom string>" });
                 },
             }
         }
     }
 
-    pub fn deinit(parsed: *ParsedScript, script_heap: *Heap) void {
+    pub fn deinit(parsed: *ParsedScript) void {
         if (parsed.file_name_obj.toHandle()) |file_name| file_name.decrRefCount();
-        parsed.tags.deinit(script_heap.gpa);
+        parsed.tags.deinit(Heap.global_gpa);
         parsed.values.decrRefCount();
     }
 };
@@ -347,7 +343,7 @@ pub const Object = packed struct(u128) {
         pub fn deinit(str: StrOrPtr, heap: *Heap) void {
             switch (heap.getLocalStringDetails(str)) {
                 .long => |long_str| {
-                    long_str.decrRefCount(heap.gpa);
+                    long_str.decrRefCount(Heap.global_gpa);
                 },
                 .normal => {
                     heap.freeString(str.u.str.index, str.u.str.len);
@@ -412,17 +408,8 @@ pub const Object = packed struct(u128) {
                 // How come string is a no-op? Because the string is separate
                 // from its cached length.
             },
-            .script => {
-                const script = obj.body.script;
-                script.id.release();
-            },
-            .expr => {
-                const expr = obj.body.expr;
-                expr.id.release();
-            },
             .source => {
-                const source = obj.body.source;
-                if (source.file_name_obj.toOptional(heap).toHandle()) |val| val.decrRefCount();
+                heap.destroyExtraData(obj.body.source.extra_data);
             },
             .cached_lexical_var => {
                 heap.destroyExtraData(obj.body.cached_lexical_var.extra_data);
@@ -436,9 +423,6 @@ pub const Object = packed struct(u128) {
                 heap.getHandle(dict_sugar.var_name_index).decrRefCount();
                 heap.getHandle(dict_sugar.dict_value_index).decrRefCount();
             },
-            .closure => {
-                heap.destroyExtraData(obj.body.closure.extra_data);
-            },
             .none,
             .index,
             .integer,
@@ -447,7 +431,6 @@ pub const Object = packed struct(u128) {
             .parsed_script_command,
             .marked,
             .invalid,
-            .native_command,
             .cached_local_var,
             => {},
             .dict, .list => unreachable,
@@ -476,11 +459,7 @@ pub const Object = packed struct(u128) {
             .list => try writer.print(" = {}", .{self.body.list}),
             .dict => try writer.print(" = {}", .{self.body.dict}),
             .dict_sugar => try writer.print(" = {}", .{self.body.dict_sugar}),
-            .native_command => try writer.print(" = {}", .{self.body.native_command}),
-            .closure => try writer.print(" = {}", .{self.body.closure}),
             .parsed_script_command => try writer.print(" = {}", .{self.body.parsed_script_command}),
-            .script => try writer.print(" = {}", .{self.body.script}),
-            .expr => try writer.print(" = {}", .{self.body.expr}),
             .reference => try writer.print(" = {any}", .{self.body.reference}),
             .cached_local_var => try writer.print(" = {}", .{self.body.cached_local_var}),
             .cached_lexical_var => try writer.print(" = {}", .{self.body.cached_lexical_var}),
@@ -505,38 +484,12 @@ pub const Tag = enum(u5) {
     list,
     dict,
     dict_sugar,
-    native_command,
-    closure,
     parsed_script_command,
-    script,
-    expr,
     reference,
     cached_local_var,
     cached_lexical_var,
     upvar_link,
     custom_type,
-};
-
-pub const IndexError = error{BadIndex};
-/// Tcl list index. Indexes are inclusive both for start and end in tcl. Additionally,
-/// an index may be relative, such as "end" or "end-1".
-pub const ListIndex = packed struct {
-    u: packed union {
-        index: u32,
-        end_offset: i33,
-    },
-    /// Whether this is a relative index, such as "end", "end-1", "end+5", etc
-    is_relative: bool,
-
-    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
-
-    pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) i33 {
-        if (self.is_relative) {
-            return self.u.end_offset + (list_len -| 1);
-        } else {
-            return self.u.index;
-        }
-    }
 };
 
 pub const Body = packed union {
@@ -554,9 +507,7 @@ pub const Body = packed union {
         length_determined: bool,
     },
     source: packed struct {
-        /// Pointer to an object in the same heap that contains the file name.
-        file_name_obj: OptionalIndex,
-        line_no: u32,
+        extra_data: ExtraData,
     },
     list: packed struct {
         len: u32,
@@ -576,23 +527,10 @@ pub const Body = packed union {
         var_name_index: u32,
         dict_value_index: u32,
     },
-    native_command: packed struct {
-        native_command_epoch: u32,
-        command_index: u32,
-    },
-    closure: packed struct {
-        extra_data: ExtraData,
-    },
     /// Information about a parsed command.
     parsed_script_command: packed struct {
         line: u32,
         arg_count: u32,
-    },
-    script: packed struct {
-        id: ScriptId,
-    },
-    expr: packed struct {
-        id: ScriptId,
     },
     reference: Handle,
     cached_local_var: packed struct {
@@ -647,7 +585,7 @@ pub const ExtraDataValue = union(enum) {
             pub fn hash(ctx: @This(), key: Handle) u64 {
                 _ = ctx;
 
-                const str = getString(key) catch unreachable;
+                const str = key.getString() catch unreachable;
                 return std.hash_map.hashString(str);
             }
 
@@ -667,6 +605,26 @@ pub const ExtraDataValue = union(enum) {
         parent_link: OptionalHandle,
     };
 
+    pub const ParsedSource = struct {
+        state: std.atomic.Value(enum(u8) {
+            not_parsed,
+            parsed,
+        }) = .init(.not_parsed),
+        slow_path_mutex: memutil.Mutex = .{},
+        value: union(enum) {
+            closure: struct {
+                script: ScriptId,
+                signature: ClosureSignature,
+            },
+            native_command: struct {
+                native_command_epoch: u32,
+                command_index: u32,
+            },
+            script: ScriptId,
+            expr: ScriptId,
+        },
+    };
+
     /// This does not store the key/value pairs directly, instead it
     /// is a mapping of key to value index.
     dict: Dictionary,
@@ -674,14 +632,52 @@ pub const ExtraDataValue = union(enum) {
         /// Borrows the value it references.
         ref: Handle,
     },
-    closure: struct {
-        script: ScriptId,
-        signature: ClosureSignature,
+    source: struct {
+        file_name: OptionalHandle,
+        line_no: u32,
+        /// This uses double-checked locking. Fast path is seeing that
+        /// `state` is not .none. Slow path is locking the mutex to parse
+        /// the script. This means that `state` _must_ never change after
+        /// being changed from .none.
+        parsed: ParsedSource,
+
+        pub fn getScriptId(self: *@This()) ScriptId {
+            assert(self.parsed.state.load(.acquire) == .parsed);
+            return self.parsed.value.script;
+        }
+
+        pub fn getExprId(self: *@This()) ScriptId {
+            assert(self.parsed.state.load(.acquire) == .parsed);
+            return self.parsed.value.expr;
+        }
     },
     custom_type: struct {
         first_ptr: *anyopaque,
         second_ptr: *anyopaque,
     },
+    none: void,
+};
+
+pub const IndexError = error{BadIndex};
+/// Tcl list index. Indexes are inclusive both for start and end in tcl. Additionally,
+/// an index may be relative, such as "end" or "end-1".
+pub const ListIndex = packed struct {
+    u: packed union {
+        index: u32,
+        end_offset: i33,
+    },
+    /// Whether this is a relative index, such as "end", "end-1", "end+5", etc
+    is_relative: bool,
+
+    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
+
+    pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) i33 {
+        if (self.is_relative) {
+            return self.u.end_offset + (list_len -| 1);
+        } else {
+            return self.u.index;
+        }
+    }
 };
 
 pub const VariableValue = union(enum) {
@@ -745,17 +741,17 @@ const HeapIndex = u32;
 const HandleBacking = u64;
 
 pub const OptionalIndex = enum(HeapIndex) {
-    null = 0,
+    none = 0,
     _,
 
     pub fn toOptional(index: OptionalIndex, heap: *Heap) OptionalHandle {
-        if (index == .null) return .none;
+        if (index == .none) return .none;
         const unwrapped_index: HeapIndex = @intFromEnum(index);
         return heap.getHandle(unwrapped_index).toOptional();
     }
 
     pub fn getIndex(index: OptionalIndex) ?HeapIndex {
-        if (index != .null) {
+        if (index != .none) {
             return @intFromEnum(index);
         } else return null;
     }
@@ -774,7 +770,7 @@ pub const OptionalHandle = enum(HandleBacking) {
     pub fn getIndex(optional: OptionalHandle) OptionalIndex {
         if (optional.toHandle()) |val| {
             return @enumFromInt(val.index);
-        } else return .null;
+        } else return .none;
     }
 
     pub fn toHandleRef(optional: *OptionalHandle) ?*Handle {
@@ -849,7 +845,7 @@ pub const Handle = packed struct(HandleBacking) {
     pub fn prepareToShimmer(handle: Handle) !void {
         handle.assert(handle.canShimmer());
         // Make sure the object has a string rep before we free its body.
-        _ = try Heap.getString(handle);
+        _ = try handle.getString();
         handle.invalidateBody();
     }
 
@@ -1025,6 +1021,153 @@ pub const Handle = packed struct(HandleBacking) {
         };
     }
 
+    pub fn getStringDetails(handle: Handle) StringDetails {
+        return handle.getHeap().getLocalStringDetails(handle.peek().str);
+    }
+
+    pub fn getSourceExtraData(handle: Handle) *@FieldType(ExtraDataValue, "source") {
+        handle.assert(handle.peek().tag == .source);
+        return &handle.getHeap().getExtraData(handle.peek().body.source.extra_data).source;
+    }
+
+    pub fn getDictExtraData(handle: Handle) *ExtraDataValue.Dictionary {
+        handle.assert(handle.peek().tag == .dict);
+        return &handle.getHeap().getExtraData(handle.peek().body.dict.extra_data).dict;
+    }
+
+    const empty_string_value = "";
+    /// This returns a temporary string. Whenever the object is mutated, it
+    /// may become invalid. Guaranteed to be valid, barring OOM.
+    fn getString(handle: Handle) error{OutOfMemory}![:0]const u8 {
+        const obj = handle.peek();
+
+        switch (handle.getStringDetails()) {
+            .long => |long_str| {
+                return long_str.getString();
+            },
+            .normal => |str| {
+                return str;
+            },
+            .empty => {
+                return empty_string_value;
+            },
+            .null => {
+                // Keep going in code
+            },
+        }
+
+        // No representation, so we better generate it
+        const new_str = blk: switch (obj.tag) {
+            .index => {
+                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.index}, 0);
+            },
+            .integer => {
+                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.integer}, 0);
+            },
+            .float => {
+                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.float}, 0);
+            },
+            .bool => {
+                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
+            },
+            .list => {
+                const list = obj.body.list;
+                break :blk try getListString(handle.getHeap(), handle.index + 1, list.len);
+            },
+            .dict => {
+                // Dict string generation is surprisingly intricate. We have a couple of cases:
+                // 1. The dict has the same number of elements as table entries. We can
+                //    use the same function as list generation.
+                // 2. The dict has a different number of elements as table entries. This means
+                //    we have duplicate keys, but we're generating a dict, so we should maintain
+                //    consistency with every other time we'd generate dict entries.
+                // 3. We have a linked dict. This means we need to generate a string containing
+                //    both the values from the top-level dict, and all the values that aren't
+                //    overriden in the child dicts. Note, we generate in {oldest, older, newest}
+                //    order, hence why we do everything in reverse order (to make prepending fast).
+                const extra_data = handle.getDictExtraData();
+                if (extra_data.parent_link.toHandle()) |parent_link| {
+                    _ = parent_link;
+                    @panic("Need to follow dict links when building dict");
+                } else {
+                    const table = try objutil.dictGetTable(extra_data);
+                    if (table.size != obj.body.dict.len * 2) {
+                        @panic("Need to handle generation for dict with duplicate entries");
+                    } else {
+                        // Use same method as with lists.
+                        break :blk try getListString(handle.getHeap(), handle.index + 1, obj.body.dict.len);
+                    }
+                }
+            },
+            .custom_type => {
+                const custom_type = obj.body.custom_type;
+                break :blk try custom_types.items[custom_type.type_id].get_string(self, obj);
+            },
+            .reference => {
+                // Intentionally return early, since we should always use
+                // the reference's string, not our own.
+                return getString(obj.body.reference);
+            },
+            .parsed_script_command => {
+                if (builtin.mode == .Debug and state.running_leak_check) {
+                    const script_command = obj.body.parsed_script_command;
+                    break :blk try std.fmt.allocPrintSentinel(
+                        global_gpa,
+                        "<script command: args: {}, line: {}>",
+                        .{ script_command.arg_count, script_command.line },
+                        0,
+                    );
+                } else @panic("Script line is an internal object only");
+            },
+            .none => {
+                if (builtin.mode == .Debug and state.running_leak_check) {
+                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<none>", .{}, 0);
+                } else {
+                    last_touched = self.getHandle(index);
+                    Heap.dumpLastTouchedTrace();
+                    @panic("Tried to generate a string for .none");
+                }
+            },
+            .invalid => {
+                if (builtin.mode == .Debug and state.running_leak_check) {
+                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<invalid>", .{}, 0);
+                } else {
+                    last_touched = self.getHandle(index);
+                    Heap.dumpLastTouchedTrace();
+                    @panic("Tried to generate a string for .invalid");
+                }
+            },
+            .marked => {
+                if (builtin.mode == .Debug and state.running_leak_check) {
+                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<marked>", .{}, 0);
+                } else @panic("Tried to generate a string for .marked");
+            },
+            .upvar_link => {
+                if (builtin.mode == .Debug and state.running_leak_check) {
+                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<upvar_link>", .{}, 0);
+                } else @panic("Tried to generate a string for .upvar_link");
+            },
+            .string,
+            .source,
+            .dict_sugar,
+            .cached_local_var,
+            .cached_lexical_var,
+            => {
+                std.debug.panic("{} should always have a string representation", .{obj.tag});
+            },
+        };
+
+        // Ensure new_str is freed if setStringOwning fails (e.g., OOM during LongString allocation).
+        {
+            errdefer global_gpa.free(new_str);
+            const took_ownership = try setStringOwning(self.getHandle(index), new_str);
+            if (!took_ownership) global_gpa.free(new_str);
+        }
+
+        // Rerun this function to figure out where the new string is
+        return self.getLocalString(index);
+    }
+
     pub fn trace(handle: Handle, comptime fmt: []const u8, args: anytype) void {
         if (options.trace_mem) {
             handle.getHeap().trace_mutex.lock();
@@ -1143,11 +1286,14 @@ const ObjectAndMetadata = struct {
     trace: std.debug.ConfigurableTrace(16, 16, options.trace_mem),
 };
 
-fn heapAlloc(self: *Heap) Allocator {
+/// Used for the big backing objects, such as Heap.objects or Heap.strings.
+/// These are backed by vmem if possible, or need to be fully pre-allocated
+/// if threading is enabled.
+fn heapBackingAlloc() Allocator {
     if (cfg.use_vmem or options.threading) {
         return memutil.null_allocator;
     } else {
-        return self.gpa;
+        return global_gpa;
     }
 }
 
@@ -1206,7 +1352,7 @@ pub fn init(heap: *Heap, gpa: Allocator) !void {
     // Clean up if we hit an error.
     errdefer heap.* = undefined;
 
-    heap.gpa = gpa;
+    Heap.global_gpa = gpa;
 
     // Init objects
     heap.object_tracking = try .init(gpa, cfg.object_heap_order);
@@ -1310,7 +1456,7 @@ fn clearParsedScripts(self: *Heap) void {
 
     var parsed_expr_iter = self.parsed_exprs.valueIterator();
     while (parsed_expr_iter.next()) |parsed_expr| {
-        parsed_expr.expr.deinit(self.gpa);
+        parsed_expr.expr.deinit(global_gpa);
     }
     self.parsed_exprs.clearRetainingCapacity();
 }
@@ -1318,8 +1464,8 @@ fn clearParsedScripts(self: *Heap) void {
 pub fn deinit(heap: *Heap) void {
     // Parsed scripts have references to objects, so we'll deinit scripts before objects.
     heap.clearParsedScripts();
-    heap.parsed_scripts.deinit(heap.gpa);
-    heap.parsed_exprs.deinit(heap.gpa);
+    heap.parsed_scripts.deinit(Heap.global_gpa);
+    heap.parsed_exprs.deinit(Heap.global_gpa);
 
     for ((special_object_count + interned_string_count)..heap.objects.len) |i| {
         const metadata = heap.objects.get(i).metadata;
@@ -1342,7 +1488,7 @@ pub fn deinit(heap: *Heap) void {
 
     // Be sure to free the specialty objects and strings.
     assert(special_object_count == 3);
-    Heap.getStringDetails(heap.tempObject()).long.freeInner(heap.gpa);
+    Heap.getStringDetails(heap.tempObject()).long.freeInner(Heap.global_gpa);
     heap.object_tracking.freeFromOwningThread(0, 0);
     heap.object_tracking.freeFromOwningThread(1, 0);
     heap.object_tracking.freeFromOwningThread(2, 0);
@@ -1354,16 +1500,16 @@ pub fn deinit(heap: *Heap) void {
         memutil.vmemUnmap(@alignCast(heap.strings.items));
         memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
     } else {
-        // Don't use self.heapAlloc() in this case, as that will error
+        // Don't use heapBackingAlloc() in this case, as that will error
         // with the null allocator.
-        heap.strings.deinit(heap.gpa);
-        heap.objects.deinit(heap.gpa);
+        heap.strings.deinit(Heap.global_gpa);
+        heap.objects.deinit(Heap.global_gpa);
     }
 
     if (heap.object_tracking.deinit() == .leaked) @panic("Heap leaks when deiniting");
     if (heap.string_tracking.deinit() == .leaked) @panic("Heap leaks when deiniting");
 
-    heap.extra.deinit(heap.gpa);
+    heap.extra.deinit(Heap.global_gpa);
     heap.* = undefined;
 }
 
@@ -1387,7 +1533,7 @@ pub fn tempObject(self: *Heap) Handle {
 
 pub fn resetTempObject(heap: *Heap) void {
     if (heap.tempObject().hasString()) {
-        const long_string = getStringDetails(heap.tempObject()).long;
+        const long_string = heap.tempObject().getStringDetails().long;
         long_string.string_type.temp = undefined;
     }
 }
@@ -1397,12 +1543,11 @@ pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
     assert(temp_handle.hasString());
     assert(temp_handle.getMetadata().cross_thread == false);
 
-    const long_string = getStringDetails(temp_handle).long;
+    const long_string = temp_handle.getStringDetails().long;
     // Avoid churning the LongString allocation by making it
     // extremely unlikely for its ref_count to reach zero.
     long_string.ref_count = std.math.maxInt(usize) / 2;
     // Reset anything that may have previously been computed.
-    @atomicStore(u64, &long_string.utf8_length, std.math.maxInt(u64), .monotonic);
     long_string.utf8_length = std.math.maxInt(u64);
     long_string.hash.mutex.lock();
     long_string.hash.value = null;
@@ -1479,7 +1624,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     // Make object list has space for new objects
     if (self.objects.len < index + aligned_count) {
         const start_of_new = self.objects.len;
-        try self.objects.resize(self.heapAlloc(), index + aligned_count);
+        try self.objects.resize(heapBackingAlloc(), index + aligned_count);
         @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
             .order = 31,
             .cross_thread = false,
@@ -1628,7 +1773,7 @@ pub fn createString(self: *Heap, len: u32) !u32 {
         }
     };
     errdefer self.string_tracking.freeFromAnyThread(new_string, order);
-    try self.strings.ensureTotalCapacity(self.heapAlloc(), new_string + length_with_null);
+    try self.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + length_with_null);
     self.strings.items.len = @max(self.strings.items.len, new_string + length_with_null);
 
     self.strings.items[new_string + len] = 0; // Set null byte.
@@ -1651,10 +1796,10 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
     if (a == b) return true;
 
     // Make sure they have a string rep before checking the details
-    const a_str = try getString(a);
-    const b_str = try getString(b);
-    const a_details = getStringDetails(a);
-    const b_details = getStringDetails(b);
+    const a_str = try a.getString();
+    const b_str = try a.getString();
+    const a_details = a.getStringDetails();
+    const b_details = b.getStringDetails();
 
     blk: {
         const a_long_str = switch (a_details) {
@@ -1771,49 +1916,62 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 .body = src.body,
             };
         },
-        .script => {
-            const script = src.body.script;
-            incrRefCountOf(u32, &script_metadata.items[script.id.index].ref_count, options.threading);
-            return .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = src.tag,
-                .body = src.body,
-            };
-        },
-        .expr => {
-            const expr = src.body.expr;
-            incrRefCountOf(u32, &script_metadata.items[expr.id.index].ref_count, options.threading);
-            return .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = src.tag,
-                .body = src.body,
-            };
-        },
         .source => {
             const source = src.body.source;
+            const src_extra_data = handle.getHeap().getExtraData(source.extra_data).source;
+            const extra_data_index = try dest_heap.createExtraData();
+            errdefer dest_heap.destroyExtraData(extra_data_index);
 
-            const file_name_handle: OptionalHandle = blk: {
-                if (source.file_name_obj.toOptional(handle.getHeap()).toHandle()) |file_name| {
-                    // Better make sure it's in our heap.
-                    if (file_name.heap != dest_heap.heapId()) {
-                        const duped = try dest_heap.duplicate(file_name);
-                        break :blk duped.toOptional();
-                    } else {
-                        const to_break = file_name.borrow();
-                        break :blk to_break.toOptional();
-                    }
-                } else break :blk .none;
+            const new_extra_data = dest_heap.getExtraData(extra_data_index);
+            new_extra_data.* = .{
+                .source = .{
+                    .file_name = src_extra_data.file_name.borrowOptional(),
+                    .line_no = src_extra_data.line_no,
+                    .parsed = .{
+                        .state = undefined,
+                        // Initialize mutex in place.
+                        .slow_path_mutex = .{},
+                        .value = undefined,
+                    },
+                },
             };
+
+            const parsed_state = src_extra_data.parsed.state.load(.acquire);
+            const src_parsed = &src_extra_data.parsed.value;
+            const new_parsed = &new_extra_data.source.parsed.value;
+            switch (parsed_state) {
+                .not_parsed => {
+                    new_extra_data.source.parsed.state.store(.not_parsed, .release);
+                },
+                .parsed => {
+                    switch (src_parsed.*) {
+                        .closure => |src_closure| {
+                            new_parsed.* = .{ .closure = .{
+                                .script = src_closure.script.borrow(),
+                                .signature = src_closure.signature.borrow(),
+                            } };
+                            new_extra_data.source.parsed.state.store(.parsed, .release);
+                        },
+                        .native_command => |_| {
+                            // native command caching is thread-local, so we can't send it between threads.
+                            new_extra_data.source.parsed.state.store(.not_parsed, .release);
+                        },
+                        .script => |src_script| {
+                            new_parsed.* = .{ .script = src_script.borrow() };
+                            new_extra_data.source.parsed.state.store(.parsed, .release);
+                        },
+                        .expr => |src_expr| {
+                            new_parsed.* = .{ .expr = src_expr.borrow() };
+                            new_extra_data.source.parsed.state.store(.parsed, .release);
+                        },
+                    }
+                },
+            }
 
             return .{
                 .str = try dest_heap.duplicateObjString(handle),
                 .tag = .source,
-                .body = .{
-                    .source = .{
-                        .file_name_obj = file_name_handle.getIndex(),
-                        .line_no = source.line_no,
-                    },
-                },
+                .body = .{ .source = .{ .extra_data = extra_data_index } },
             };
         },
         .reference => {
@@ -1841,7 +1999,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             return new_object;
         },
-        .dict_sugar, .cached_local_var, .cached_lexical_var, .native_command => {
+        .dict_sugar, .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
                 .str = try dest_heap.duplicateObjString(handle),
@@ -1851,22 +2009,6 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         },
         .list, .dict => {
             return error.MultiItemObject;
-        },
-        .closure => {
-            const closure = handle.getHeap().getExtraData(src.body.closure.extra_data).closure;
-            const new_extra_data = try dest_heap.createExtraData();
-            errdefer dest_heap.destroyExtraData(new_extra_data);
-
-            dest_heap.getExtraData(new_extra_data).* = .{ .closure = .{
-                .script = closure.script.borrow(),
-                .signature = closure.signature.borrow(),
-            } };
-
-            return .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = .closure,
-                .body = .{ .closure = .{ .extra_data = new_extra_data } },
-            };
         },
         .upvar_link => @panic("Cannot duplicate an upvar"),
         .invalid => @panic("Tried to duplicate an invalid object."),
@@ -1923,7 +2065,7 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
         .dict => {
             const old_len = src.body.dict.len;
             const old_start = src_handle.index + 1;
-            const old_metadata = objutil.dictGetMetadata(src_handle);
+            const old_metadata = src_handle.getDictExtraData();
 
             const new_dict_idx = try dest_heap.createObjects(1 + old_len);
             errdefer dest_heap.getHandle(new_dict_idx).decrRefCount();
@@ -2007,11 +2149,6 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
     }
 }
 
-/// Guaranteed to be valid, barring OOM.
-pub fn getString(handle: Handle) Allocator.Error![:0]const u8 {
-    return try handle.getHeap().getLocalString(handle.index);
-}
-
 pub fn stringEquals(handle: Handle, value: []const u8) !bool {
     const bytes = try getString(handle);
     return std.mem.eql(u8, bytes, value);
@@ -2026,10 +2163,10 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
     if (!did_set) {
         // Setting it as a long string will most likely take ownership,
         // so we need to copy.
-        const new_str = try heap.gpa.dupeZ(u8, bytes);
-        errdefer heap.gpa.free(new_str);
+        const new_str = try Heap.global_gpa.dupeZ(u8, bytes);
+        errdefer Heap.global_gpa.free(new_str);
         const took_ownership = try heap.setLongString(handle.index, .{ .normal = new_str });
-        if (!took_ownership) heap.gpa.free(new_str);
+        if (!took_ownership) Heap.global_gpa.free(new_str);
     }
 }
 
@@ -2155,8 +2292,8 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
 /// The only case where this would fail is OOM or if someone else
 /// exchanged the string right before us.
 pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allocator.Error!bool {
-    const long_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
-    errdefer self.gpa.free(long_string);
+    const long_string = &(try global_gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
+    errdefer global_gpa.free(long_string);
     long_string.* = .{ .string_type = string_type };
 
     const string_header = Object.StrOrPtr{
@@ -2168,124 +2305,8 @@ pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allo
     return res;
 }
 
-const empty_string_value = "";
-/// This returns a temporary string. Whenever the object is mutated, it
-/// may become invalid.
-fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
-    const obj: *Object = self.getLocalObject(index);
-
-    switch (self.getLocalStringDetails(obj.str)) {
-        .long => |long_str| {
-            return long_str.getString();
-        },
-        .normal => |str| {
-            return str;
-        },
-        .empty => {
-            return empty_string_value;
-        },
-        .null => {
-            // Keep going in code
-        },
-    }
-
-    // No representation, so we better generate it
-    const new_str = blk: switch (obj.tag) {
-        .index => {
-            break :blk try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.index}, 0);
-        },
-        .integer => {
-            break :blk try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.integer}, 0);
-        },
-        .float => {
-            break :blk try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.float}, 0);
-        },
-        .bool => {
-            break :blk try std.fmt.allocPrintSentinel(self.gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
-        },
-        .list => {
-            const list = obj.body.list;
-            break :blk try getListString(self, index + 1, list.len);
-        },
-        .dict => {
-            @panic("Need to follow dict links when building dict");
-            // break :blk try getListString(self, index + 1, obj.body.dict.len);
-        },
-        .custom_type => {
-            const custom_type = obj.body.custom_type;
-            break :blk try custom_types.items[custom_type.type_id].get_string(self, obj);
-        },
-        .reference => {
-            // Intentionally return early, since we should always use
-            // the reference's string, not our own.
-            return getString(obj.body.reference);
-        },
-        .parsed_script_command => {
-            if (builtin.mode == .Debug and state.running_leak_check) {
-                const script_command = obj.body.parsed_script_command;
-                break :blk try std.fmt.allocPrintSentinel(
-                    self.gpa,
-                    "<script command: args: {}, line: {}>",
-                    .{ script_command.arg_count, script_command.line },
-                    0,
-                );
-            } else @panic("Script line is an internal object only");
-        },
-        .none => {
-            if (builtin.mode == .Debug and state.running_leak_check) {
-                break :blk try std.fmt.allocPrintSentinel(self.gpa, "<none>", .{}, 0);
-            } else {
-                last_touched = self.getHandle(index);
-                Heap.dumpLastTouchedTrace();
-                @panic("Tried to generate a string for .none");
-            }
-        },
-        .invalid => {
-            if (builtin.mode == .Debug and state.running_leak_check) {
-                break :blk try std.fmt.allocPrintSentinel(self.gpa, "<invalid>", .{}, 0);
-            } else {
-                last_touched = self.getHandle(index);
-                Heap.dumpLastTouchedTrace();
-                @panic("Tried to generate a string for .invalid");
-            }
-        },
-        .marked => {
-            if (builtin.mode == .Debug and state.running_leak_check) {
-                break :blk try std.fmt.allocPrintSentinel(self.gpa, "<marked>", .{}, 0);
-            } else @panic("Tried to generate a string for .marked");
-        },
-        .upvar_link => {
-            if (builtin.mode == .Debug and state.running_leak_check) {
-                break :blk try std.fmt.allocPrintSentinel(self.gpa, "<upvar_link>", .{}, 0);
-            } else @panic("Tried to generate a string for .upvar_link");
-        },
-        .string,
-        .source,
-        .script,
-        .expr,
-        .dict_sugar,
-        .cached_local_var,
-        .cached_lexical_var,
-        .native_command,
-        .closure,
-        => {
-            std.debug.panic("{} should always have a string representation", .{obj.tag});
-        },
-    };
-
-    // Ensure new_str is freed if setStringOwning fails (e.g., OOM during LongString allocation).
-    {
-        errdefer self.gpa.free(new_str);
-        const took_ownership = try setStringOwning(self.getHandle(index), new_str);
-        if (!took_ownership) self.gpa.free(new_str);
-    }
-
-    // Rerun this function to figure out where the new string is
-    return self.getLocalString(index);
-}
-
 fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
-    var fallback = std.heap.stackFallback(64, self.gpa);
+    var fallback = std.heap.stackFallback(64, global_gpa);
     var stack_alloc = fallback.get();
     var quoting_types = try stack_alloc.alloc(stringutil.QuotingType, len);
     defer stack_alloc.free(quoting_types);
@@ -2306,8 +2327,8 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     }
 
     // Step 2: actually create said string.
-    var unfinished_str = try self.gpa.alloc(u8, total_length + 1);
-    errdefer self.gpa.free(unfinished_str);
+    var unfinished_str = try global_gpa.alloc(u8, total_length + 1);
+    errdefer global_gpa.free(unfinished_str);
     var written: usize = 0;
 
     for (0..len) |i| {
@@ -2333,7 +2354,7 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     // We actually need to realloc, because allocator.free needs the
     // original slice length (and we don't track the original slice
     // length, only the accessible length)
-    const finished_str = try self.gpa.realloc(unfinished_str, written);
+    const finished_str = try global_gpa.realloc(unfinished_str, written);
     return finished_str[0..(written - 1) :0];
 }
 
@@ -2343,10 +2364,6 @@ const StringDetails = union(enum) {
     normal: [:0]u8,
     long: *align(LongString.align_amt) LongString,
 };
-
-pub fn getStringDetails(handle: Handle) StringDetails {
-    return handle.getHeap().getLocalStringDetails(handle.peek().str);
-}
 
 fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
     // Normal string or long string?
@@ -2473,10 +2490,12 @@ pub const LongString = struct {
 };
 
 pub fn createExtraData(self: *Heap) !ExtraData {
-    self.extra_data_muta.lock();
-    defer self.extra_data_muta.unlock();
+    // TODO PERF make a fast case where this uses a heap-local list of
+    // available extra data.
+    self.extra_data_mutex.lock();
+    defer self.extra_data_mutex.unlock();
 
-    const new_index = try self.extra.create(self.heapAlloc());
+    const new_index = try self.extra.create(heapBackingAlloc());
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
 
     return @enumFromInt(new_index);
@@ -2493,19 +2512,37 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
         },
         .dict => |*dict| {
             dict.parent_link.decrOptional();
-            if (dict.table) |*table| table.deinit(self.gpa);
+            if (dict.table) |*table| table.deinit(global_gpa);
         },
-        .closure => |*closure| {
-            closure.signature.deinit();
-            closure.script.release();
+        .source => |*source| {
+            source.file_name.decrOptional();
+
+            const parsed_state = source.parsed.state.load(.acquire);
+            const value = &source.parsed.value;
+
+            if (parsed_state == .not_parsed) return;
+            switch (value.*) {
+                .closure => |closure| {
+                    closure.script.release();
+                    closure.signature.deinit();
+                },
+                .native_command => |_| {},
+                .script => |script| {
+                    script.release();
+                },
+                .expr => |expr| {
+                    expr.release();
+                },
+            }
         },
         .custom_type => {
             @panic("Need to clean up custom type");
         },
+        .none => {},
     }
 
-    self.extra_data_muta.lock();
-    defer self.extra_data_muta.unlock();
+    self.extra_data_mutex.lock();
+    defer self.extra_data_mutex.unlock();
 
     self.getExtraData(index).* = undefined;
     self.extra.destroy(@intFromEnum(index));
@@ -2515,19 +2552,19 @@ pub fn initGlobals(gpa: Allocator) !void {
     state.mutex.lock();
     defer state.mutex.unlock();
 
-    state.gpa = gpa;
-    custom_types = try .initWithCapacity(gpa, if (options.threading) cfg.max_custom_types else 32);
-    errdefer custom_types.deinit(gpa);
+    global_gpa = gpa;
+    custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
+    errdefer custom_types.deinit(global_gpa);
 
-    script_metadata = try .initWithCapacity(gpa, if (options.threading) cfg.max_scripts else 32);
-    errdefer script_metadata.deinit(gpa);
+    script_metadata = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_scripts else 32);
+    errdefer script_metadata.deinit(global_gpa);
 
     // Create null script. TODO do we need a null script?
-    assert(try script_metadata.create(gpa) == 0);
+    assert(try script_metadata.create(global_gpa) == 0);
     state.initialized = true;
 }
 
-pub fn initHeap(gpa: Allocator) !void {
+pub fn initHeap() !void {
     const slot_index = blk: {
         state.mutex.lock();
         defer state.mutex.unlock();
@@ -2548,7 +2585,7 @@ pub fn initHeap(gpa: Allocator) !void {
 
     if (slot_index < cfg.max_heaps) {
         const new_heap = &heaps[slot_index];
-        try new_heap.init(gpa);
+        try new_heap.init();
         local_heap = new_heap;
     } else {
         return error.OutOfMemory;
@@ -2794,7 +2831,6 @@ fn getTagColor(tag: Tag) []const u8 {
         .float => "lightpink",
         .bool => "plum",
         .reference => "orange",
-        .script, .expr => "lavender",
         .source => "peachpuff",
         .parsed_script_command => "khaki",
         .cached_local_var, .cached_lexical_var => "lightcyan",
@@ -2888,9 +2924,11 @@ fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32)
             try w.print("  obj{} -> obj{} [label=\"ref\", color=red];\n", .{ index, ref_handle.index });
         },
         .source => {
-            if (obj.body.source.file_name_obj.getIndex()) |file_name_index| {
-                try w.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name_index });
+            if (objutil.getSourceInfo(handle).?.file_name.toHandle()) |file_name| {
+                try w.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name.index });
             }
+
+            @panic("FIXME need to implement other references");
         },
         .cached_local_var => {
             try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
