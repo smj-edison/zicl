@@ -518,21 +518,6 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
         }
 
         pub fn create(self: *Self, gpa: Allocator) !usize {
-            self.count += 1;
-            errdefer self.count -= 1;
-
-            // Check if there's anything on the free list
-            if (self.next_free != no_next_free) {
-                const next_free = self.next_free;
-                // follow to next free
-                const item_ptr: *Item = &self.items[next_free];
-                const int_ptr: *usize = @ptrCast(item_ptr);
-                self.next_free = int_ptr.*;
-                // We intentionally don't set the item as undefined here, since
-                // some use cases (generation tracking) reuse the previous memory.
-                return next_free;
-            }
-
             // Resize/realloc if needed
             const new_size = @max(self.items.len, 4) * 2;
             if (self.len >= self.items.len) {
@@ -544,6 +529,27 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
                     self.items = try gpa.realloc(self.items, new_size);
                 }
             }
+
+            return self.createAssumeCapacity();
+        }
+
+        pub fn createAssumeCapacity(self: *Self) usize {
+            self.count += 1;
+            errdefer self.count -= 1;
+
+            // Check if there's anything on the free list.
+            if (self.next_free != no_next_free) {
+                const next_free = self.next_free;
+                // follow to next free
+                const item_ptr: *Item = &self.items[next_free];
+                const int_ptr: *usize = @ptrCast(item_ptr);
+                self.next_free = int_ptr.*;
+                // We intentionally don't set the item as undefined here, since
+                // some use cases (generation tracking) reuse the previous memory.
+                return next_free;
+            }
+
+            assert(self.len < self.items.len);
 
             const new_index = self.len;
             self.len += 1;
@@ -635,4 +641,205 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
     }
 
     try testing.expectError(expected_error, actual_error_union);
+}
+
+/// Context is a standard hash map context
+pub fn LruCache(comptime K: type, comptime V: type, comptime Context: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Node = struct {
+            prev: ?u32,
+            next: ?u32,
+            key: K,
+            item: V,
+        };
+
+        pool: IndexedMemoryPool(Node, false),
+        mapping: std.HashMapUnmanaged(K, u32, Context, 80),
+        max_size: u32,
+        last: ?u32 = null,
+        first: ?u32 = null,
+
+        pub fn initWithCapacity(gpa: Allocator, max_size: u32) !Self {
+            var new_lru: Self = .{
+                .pool = try .initWithCapacity(gpa, max_size),
+                .mapping = .{},
+                .max_size = max_size,
+                .last = null,
+                .first = null,
+            };
+
+            try new_lru.mapping.ensureTotalCapacity(gpa, max_size);
+
+            return new_lru;
+        }
+
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            self.mapping.deinit(gpa);
+            self.pool.deinit(gpa);
+        }
+
+        fn moveToFirst(self: *Self, index: u32) void {
+            const nodes = self.pool.items;
+            const node = &nodes[index];
+
+            // Already the first item?
+            if (self.first == index) return;
+
+            // Unlink the item.
+            if (node.prev) |prev| nodes[prev].next = node.next;
+            if (node.next) |next| nodes[next].prev = node.prev;
+
+            // If it was the last, update the last.
+            if (index == self.last) self.last = node.prev;
+
+            // Move to first item.
+            node.prev = null;
+            node.next = self.first;
+            if (self.first) |first| nodes[first].prev = index;
+            self.first = index;
+        }
+
+        pub fn get(self: *Self, key: K) ?*V {
+            const value = self.mapping.get(key);
+
+            if (value) |val_index| {
+                self.moveToFirst(val_index);
+                return &self.pool.items[val_index].item;
+            } else return null;
+        }
+
+        /// Returns an old value if it was evicted.
+        pub fn put(self: *Self, key: K, value: V) ?V {
+            // Check if this key already exists.
+            if (self.mapping.get(key)) |val_index| {
+                self.moveToFirst(val_index);
+                // Save the old value so we can return it to the caller.
+                const old_value = self.pool.items[val_index].item;
+                // Update in place.
+                self.pool.items[val_index].item = value;
+
+                return old_value;
+            } else {
+                // Doesn't exist, so we need to create it.
+                var last_value: ?V = null;
+
+                // Evict the last used item if we've reached `max_size`.
+                const new: u32 = blk: {
+                    if (self.pool.count >= self.max_size) {
+                        const last_index = self.last.?;
+                        const last = &self.pool.items[last_index];
+
+                        assert(self.mapping.remove(last.key));
+                        self.last = last.prev;
+                        if (self.last) |new_last| {
+                            self.pool.items[new_last].next = null;
+                        }
+                        last_value = last.item;
+                        last.* = undefined;
+                        // No need to destroy the item, since we'll reuse it.
+                        break :blk last_index;
+                    } else {
+                        break :blk @intCast(self.pool.createAssumeCapacity());
+                    }
+                };
+
+                self.pool.items[new] = .{
+                    .prev = null,
+                    .next = self.first,
+                    .key = key,
+                    .item = value,
+                };
+
+                // Link the new item in.
+                if (self.first) |first| {
+                    self.pool.items[first].prev = new;
+                    self.first = new;
+                } else {
+                    self.first = new;
+                    self.last = new;
+                }
+
+                self.mapping.putAssumeCapacity(key, new);
+
+                return last_value;
+            }
+        }
+    };
+}
+
+const StringCache = LruCache([]const u8, []const u8, struct {
+    pub fn hash(self: @This(), s: []const u8) u64 {
+        _ = self;
+        return std.hash.Wyhash.hash(0, s);
+    }
+
+    pub fn eql(self: @This(), a: []const u8, b: []const u8) bool {
+        _ = self;
+        return mem.eql(u8, a, b);
+    }
+});
+
+test "lru cache" {
+    // Basic put and get.
+    {
+        var cache: StringCache = try .initWithCapacity(testing.allocator, 3);
+        defer cache.deinit(testing.allocator);
+
+        try testing.expectEqual(null, cache.put("key1", "value1"));
+        try testing.expectEqualStrings("value1", cache.get("key1").?.*);
+        try testing.expectEqual(null, cache.put("key2", "value2"));
+        try testing.expectEqual(null, cache.put("key3", "value3"));
+        try testing.expectEqual(cache.put("key4", "value4"), "value1");
+        try testing.expectEqual(null, cache.get("key1"));
+    }
+
+    // Check that get promotes key, saving it from eviction.
+    {
+        var cache: StringCache = try .initWithCapacity(testing.allocator, 2);
+        defer cache.deinit(testing.allocator);
+
+        // Fill cache, then promote key1 by accessing it.
+        try testing.expectEqual(null, cache.put("key1", "value1"));
+        try testing.expectEqual(null, cache.put("key2", "value2"));
+        try testing.expectEqualStrings("value1", cache.get("key1").?.*);
+
+        // key2 should be evicted, not key1.
+        try testing.expectEqualStrings("value2", cache.put("key3", "value3").?);
+        try testing.expectEqualStrings("value1", cache.get("key1").?.*);
+        try testing.expectEqual(null, cache.get("key2"));
+    }
+
+    // Check that updating existing key returns old value without evicting.
+    {
+        var cache: StringCache = try .initWithCapacity(testing.allocator, 2);
+        defer cache.deinit(testing.allocator);
+
+        // Fill cache, then update key1 in place.
+        try testing.expectEqual(null, cache.put("key1", "old"));
+        try testing.expectEqual(null, cache.put("key2", "value2"));
+        try testing.expectEqualStrings("old", cache.put("key1", "new").?);
+
+        // Both keys should still be present.
+        try testing.expectEqualStrings("new", cache.get("key1").?.*);
+        try testing.expectEqualStrings("value2", cache.get("key2").?.*);
+    }
+
+    // Check re-inserting an evicted key.
+    {
+        var cache: StringCache = try .initWithCapacity(testing.allocator, 2);
+        defer cache.deinit(testing.allocator);
+
+        // Evict key1, then re-insert it — evicts key2 (now LRU).
+        try testing.expectEqual(null, cache.put("key1", "value1"));
+        try testing.expectEqual(null, cache.put("key2", "value2"));
+        try testing.expectEqualStrings("value1", cache.put("key3", "value3").?);
+        try testing.expectEqualStrings("value2", cache.put("key1", "value1-new").?);
+
+        // key1 and key3 remain; key2 was evicted.
+        try testing.expectEqualStrings("value1-new", cache.get("key1").?.*);
+        try testing.expectEqualStrings("value3", cache.get("key3").?.*);
+        try testing.expectEqual(null, cache.get("key2"));
+    }
 }
