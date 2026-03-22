@@ -59,8 +59,6 @@ pub var state: GlobalHeapState = .{};
 pub var global_gpa: std.mem.Allocator = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
 pub var custom_types: memutil.IndexedMemoryPool(CustomType, cfg.use_vmem) = undefined;
-pub var script_metadata: ScriptMetadataPool = undefined;
-const ScriptMetadataPool = memutil.IndexedMemoryPool(ScriptMetadata, cfg.use_vmem);
 
 pub threadlocal var local_heap: *Heap = undefined;
 
@@ -85,6 +83,7 @@ interned_strings: std.EnumArray(InternedString, Heap.Handle),
 extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
 parsed_exprs: ParsedExpressions,
+parsed_closures: ParsedClosures,
 
 pub const HeapId = u16;
 
@@ -102,102 +101,29 @@ const StringTracker = memutil.BuddyUnmanaged(.{
 const StringList = std.ArrayList(u8);
 
 const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, cfg.use_vmem);
-const ParsedScripts = std.AutoHashMapUnmanaged(u32, struct { script: ParsedScript, generation: u32 });
-const ParsedExpressions = std.AutoHashMapUnmanaged(u32, struct { expr: ParsedExpression, generation: u32 });
+const FullHashContext = struct {
+    pub fn hash(self: @This(), full_hash: u256) u64 {
+        _ = self;
+        return @truncate(full_hash);
+    }
+    pub fn eql(self: @This(), a: u256, b: u256) bool {
+        _ = self;
+        return a == b;
+    }
+};
+const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
+const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullHashContext);
 
 const InternedString = enum {
-    lambda_apply_expr,
+    @"apply lambdaExpr",
+    closure,
+    impl,
+    scope,
+    name,
 };
 
 const interned_string_count = std.enums.values(InternedString).len;
-
-/// Each script is assigned a unique id when created. Each interpreter
-/// has a hashmap that associates a script id with its local parsed
-/// representation. This way, when a script is sent between threads,
-/// the script doesn't need to be parsed twice. The script parsing
-/// is not guaranteed to be idempotent.
-pub const ScriptId = packed struct(u64) {
-    index: u32,
-    generation: u32,
-
-    pub fn next() !ScriptId {
-        state.mutex.lock();
-        defer state.mutex.unlock();
-
-        const index = try script_metadata.create(global_gpa);
-        const generation = @atomicLoad(u32, &script_metadata.items[index].generation, .monotonic);
-        @atomicStore(u32, &script_metadata.items[index].ref_count, 1, .monotonic);
-
-        return .{
-            .index = @intCast(index),
-            .generation = generation,
-        };
-    }
-
-    pub fn borrow(script: ScriptId) ScriptId {
-        const current_generation = @atomicLoad(u32, &script_metadata.items[script.index].generation, .monotonic);
-        assert(script.generation == current_generation);
-
-        incrRefCountOf(u32, &script_metadata.items[script.index].ref_count, options.threading);
-
-        return script;
-    }
-
-    pub fn release(script: ScriptId) void {
-        const current_generation = @atomicLoad(u32, &script_metadata.items[script.index].generation, .monotonic);
-        assert(script.generation == current_generation);
-
-        if (decrRefCountOf(u32, &script_metadata.items[script.index].ref_count, options.threading)) {
-            script.retire();
-        }
-    }
-
-    pub fn retire(id: ScriptId) void {
-        state.mutex.lock();
-        defer state.mutex.unlock();
-
-        // Null script should never be retired.
-        assert(id.index != 0);
-
-        script_metadata.destroy(id.index);
-        // Increment generation.
-        _ = @atomicRmw(u32, &script_metadata.items[id.index].generation, .Add, 1, .monotonic);
-    }
-};
-
-/// This can get a little confusing, as objects are ref counted, but their
-/// script metadata is also ref counted. The reason is so that a parsed script
-/// isn't freed, even if the script object gets freed, until _all_ script objects
-/// for a certain ID are freed.
-pub const ScriptMetadata = packed struct(ScriptMetadata.get_full_size()) {
-    // This must be backed by a packed u64 (32-bit systems) or u96 (64-bit systems),
-    // and ref_count must be the first field. Why? This struct is stored
-    // in an IndexedMemoryPool, which uses the first usize bits of
-    // ScriptMetadata to store a next pointer.
-
-    inline fn get_needed_padding() type {
-        const needed_padding = @as(u16, @bitSizeOf(usize)) -| 32;
-        return @Type(.{
-            .int = .{
-                .bits = needed_padding,
-                .signedness = .unsigned,
-            },
-        });
-    }
-
-    inline fn get_full_size() type {
-        return @Type(.{
-            .int = .{
-                .bits = @bitSizeOf(usize) + 32,
-                .signedness = .unsigned,
-            },
-        });
-    }
-
-    ref_count: u32,
-    _padding: get_needed_padding() = 0,
-    generation: u32,
-};
 
 /// This is the script object internal representation. It is an array
 /// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
@@ -271,15 +197,10 @@ pub const ScriptMetadata = packed struct(ScriptMetadata.get_full_size()) {
 ///
 pub const ParsedScript = struct {
     /// A handle pointing to a tcl list that has the same length as `tokens`,
-    /// that stores the state of the evaluated script. Note, this is not
-    /// the same as the stack.
+    /// that stores all the string values that the script references.
     values: Handle,
     /// Tokens array.
     tags: std.ArrayList(Tokenizer.Token.Tag),
-    /// File name.
-    file_name_obj: OptionalHandle,
-    /// Line number of the first line.
-    first_line: u32,
 
     pub fn printTokens(script: *const ParsedScript) void {
         const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
@@ -301,7 +222,6 @@ pub const ParsedScript = struct {
     }
 
     pub fn deinit(parsed: *ParsedScript) void {
-        if (parsed.file_name_obj.toHandle()) |file_name| file_name.decrRefCount();
         parsed.tags.deinit(global_gpa);
         parsed.values.decrRefCount();
     }
@@ -489,6 +409,7 @@ pub const Tag = enum(u5) {
     cached_local_var,
     cached_lexical_var,
     upvar_link,
+    closure,
     custom_type,
 };
 
@@ -557,6 +478,9 @@ pub const Body = packed union {
         /// always do it in `call_frame`.
         linked_name: HeapIndex,
     },
+    closure: packed struct {
+        extra_data: ExtraData,
+    },
     custom_type: packed struct {
         type_id: u32,
         extra_data: ExtraData,
@@ -605,26 +529,6 @@ pub const ExtraDataValue = union(enum) {
         parent_link: OptionalHandle,
     };
 
-    pub const ParsedSource = struct {
-        state: std.atomic.Value(enum(u8) {
-            not_parsed,
-            parsed,
-        }) = .init(.not_parsed),
-        slow_path_mutex: memutil.Mutex = .{},
-        value: union(enum) {
-            closure: struct {
-                script: ScriptId,
-                signature: ClosureSignature,
-            },
-            native_command: struct {
-                native_command_epoch: u32,
-                command_index: u32,
-            },
-            script: ScriptId,
-            expr: ScriptId,
-        },
-    };
-
     /// This does not store the key/value pairs directly, instead it
     /// is a mapping of key to value index.
     dict: Dictionary,
@@ -635,26 +539,19 @@ pub const ExtraDataValue = union(enum) {
     source: struct {
         file_name: OptionalHandle,
         line_no: u32,
-        /// This uses double-checked locking. Fast path is seeing that
-        /// `state` is not .none. Slow path is locking the mutex to parse
-        /// the script. This means that `state` _must_ never change after
-        /// being changed from .none.
-        parsed: ParsedSource,
-
-        pub fn getScriptId(self: *@This()) ScriptId {
-            assert(self.parsed.state.load(.acquire) == .parsed);
-            return self.parsed.value.script;
-        }
-
-        pub fn getExprId(self: *@This()) ScriptId {
-            assert(self.parsed.state.load(.acquire) == .parsed);
-            return self.parsed.value.expr;
-        }
+        hash: struct {
+            state: std.atomic.Value(enum(u8) {
+                not_computed,
+                computed,
+            }) = .init(.not_computed),
+            hash: u256,
+        },
     },
     custom_type: struct {
         first_ptr: *anyopaque,
         second_ptr: *anyopaque,
     },
+    closure: Closure,
     none: void,
 };
 
@@ -690,11 +587,13 @@ pub const VariableValue = union(enum) {
     },
 };
 
-pub const ClosureSignature = struct {
+pub const Closure = struct {
     /// Handle to the argument list of the procedure.
     args: Handle,
-    /// Handle to the ScriptId object.
+    /// Handle to the script's body.
     body: Handle,
+    /// We do our best to track the closure's name.
+    name: OptionalHandle,
     /// Handle to the closure's scope (linked dictionary).
     scope: OptionalHandle,
     /// Required number of arguments.
@@ -707,23 +606,44 @@ pub const ClosureSignature = struct {
     /// the last argument name.
     has_args_parameter: bool,
 
-    pub fn borrow(sign: ClosureSignature) ClosureSignature {
+    pub fn borrow(closure: Closure) Closure {
         return .{
-            .args = sign.args.borrow(),
-            .body = sign.body.borrow(),
-            .scope = sign.scope.borrowOptional(),
-            .required_arity = sign.required_arity,
-            .optional_arity = sign.optional_arity,
-            .optional_values = sign.optional_values.borrowOptional(),
-            .has_args_parameter = sign.has_args_parameter,
+            .args = closure.args.borrow(),
+            .body = closure.body.borrow(),
+            .name = closure.name.borrowOptional(),
+            .scope = closure.scope.borrowOptional(),
+            .required_arity = closure.required_arity,
+            .optional_arity = closure.optional_arity,
+            .optional_values = closure.optional_values.borrowOptional(),
+            .has_args_parameter = closure.has_args_parameter,
         };
     }
 
-    pub fn deinit(sign: ClosureSignature) void {
-        sign.args.decrRefCount();
-        sign.body.decrRefCount();
-        sign.scope.decrOptional();
-        sign.optional_values.decrOptional();
+    pub fn deinit(closure: Closure) void {
+        closure.args.decrRefCount();
+        closure.body.decrRefCount();
+        closure.name.decrOptional();
+        closure.scope.decrOptional();
+        closure.optional_values.decrOptional();
+    }
+
+    pub fn cacheKey(closure: Closure) !u256 {
+        // Closures are potentially created piece-meal, so we create
+        // a compound hash of all their parts. Note, we don't hash
+        // the scope directly, since that would force the scope to
+        // be converted into a string, which is potentially costly.
+        const args_hash = try closure.args.getHash();
+        const body_hash = try closure.body.getHash();
+        const scope_hash: HandleBacking = @bitCast(closure.scope);
+
+        var out: [32]u8 = @splat(0);
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(std.mem.asBytes(&args_hash));
+        hasher.update(std.mem.asBytes(&body_hash));
+        hasher.update(std.mem.asBytes(&scope_hash));
+        hasher.final(&out);
+
+        return @bitCast(out);
     }
 };
 
@@ -892,10 +812,6 @@ pub const Handle = packed struct(HandleBacking) {
         return true;
     }
 
-    pub const SwapFlags = struct {
-        free_old: bool = true,
-    };
-
     pub fn swap(ref: *Handle, new: Handle) void {
         const before_duplicating = ref.*;
         ref.* = new;
@@ -1037,6 +953,11 @@ pub const Handle = packed struct(HandleBacking) {
         return &handle.getHeap().getExtraData(handle.peek().body.dict.extra_data).dict;
     }
 
+    pub fn getClosureExtraData(handle: Handle) *Closure {
+        handle.assert(handle.peek().tag == .closure);
+        return &handle.getHeap().getExtraData(handle.peek().body.closure.extra_data).closure;
+    }
+
     const empty_string_value = "";
     /// This returns a temporary string. Whenever the object is mutated, it
     /// may become invalid. Guaranteed to be valid, barring OOM.
@@ -1170,6 +1091,40 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.getString();
     }
 
+    pub fn getHash(handle: Handle) !u256 {
+        switch (handle.getStringDetails()) {
+            .empty => {
+                return comptime blk: {
+                    break :blk memutil.hashBytes("");
+                };
+            },
+            .long => |long_str| {
+                return long_str.getHash();
+            },
+            .null, .normal => {
+                // Fall through.
+            },
+        }
+
+        if (handle.peek().tag == .source) {
+            const source = handle.getSourceExtraData();
+            // If it's a source object, it may contain a cached hash.
+            const hash_state = source.hash.state.load(.acquire);
+            if (hash_state == .computed) {
+                return source.hash.hash;
+            } else {
+                const hash = memutil.hashBytes(try handle.getString());
+                source.hash.hash = hash;
+                source.hash.state.store(.computed, .release);
+                return hash;
+            }
+        }
+
+        // We don't save the hash when it's not a long string, since
+        // it should be pretty cheap to compute it again.
+        return memutil.hashBytes(try handle.getString());
+    }
+
     pub fn trace(handle: Handle, comptime fmt: []const u8, args: anytype) void {
         if (options.trace_mem) {
             handle.getHeap().trace_mutex.lock();
@@ -1202,6 +1157,13 @@ fn invalidateStringInner(handle: Handle) void {
         .empty => handle.trace("Invalidate string (was empty)", .{}),
         .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
         .long => |long_str| handle.trace("Invalidate string (was {s})", .{long_str.getString()}),
+    }
+    if (handle.peek().tag == .source) {
+        // Why store unordered? Because there's no way to do the atomics
+        // correctly here, so I'd much rather tsan complained. It _shouldn't_
+        // be an issue, since strings shared between threads can't be invalidated,
+        // except in the case of deiniting an object.
+        handle.getSourceExtraData().hash.state.store(.not_computed, .unordered);
     }
     handle.peek().deinitString(handle.getHeap());
 }
@@ -1317,10 +1279,7 @@ fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Hand
 }
 
 fn createInternedStrings(heap: *Heap) !void {
-    const MappingEntry = struct { InternedString, []const u8 };
-    const mapping = [_]MappingEntry{
-        .{ .lambda_apply_expr, "apply lambdaExpr" },
-    };
+    const values = std.enums.values(InternedString);
     var converted_mapping: std.enums.EnumFieldStruct(InternedString, Handle, null) = undefined;
 
     // Init all the interned strings, handling failure as needed.
@@ -1328,8 +1287,8 @@ fn createInternedStrings(heap: *Heap) !void {
     errdefer {
         // Since we can't loop up to `converted` at comptime, we'll generate
         // an if-ladder that only deinits fields that have been initialized.
-        inline for (0..mapping.len) |i| {
-            const key = @tagName(mapping[i].@"0");
+        inline for (0..values.len) |i| {
+            const key = @tagName(values[i]);
             if (i < converted) {
                 const handle: Handle = @field(converted_mapping, key);
                 handle.peek().str.deinit(heap);
@@ -1338,12 +1297,11 @@ fn createInternedStrings(heap: *Heap) !void {
         }
     }
     // Fill the mapping.
-    inline for (0..mapping.len) |i| {
-        const key = @tagName(mapping[i].@"0");
-        const value = mapping[i].@"1";
+    inline for (0..values.len) |i| {
+        const value = @tagName(values[i]);
         const new_str = try heap.createInternedString(i, value);
         converted += 1; // After `new_str` is successfully created
-        @field(converted_mapping, key) = new_str;
+        @field(converted_mapping, value) = new_str;
     }
 
     heap.interned_strings = .init(converted_mapping);
@@ -1927,44 +1885,21 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 .source = .{
                     .file_name = src_extra_data.file_name.borrowOptional(),
                     .line_no = src_extra_data.line_no,
-                    .parsed = .{
+                    .hash = .{
                         .state = undefined,
-                        // Initialize mutex in place.
-                        .slow_path_mutex = .{},
                         .value = undefined,
                     },
                 },
             };
 
-            const parsed_state = src_extra_data.parsed.state.load(.acquire);
-            const src_parsed = &src_extra_data.parsed.value;
-            const new_parsed = &new_extra_data.source.parsed.value;
+            const parsed_state = src_extra_data.hash.state.load(.acquire);
             switch (parsed_state) {
-                .not_parsed => {
-                    new_extra_data.source.parsed.state.store(.not_parsed, .release);
+                .not_computed => {
+                    new_extra_data.source.hash.state.store(.not_computed, .release);
                 },
-                .parsed => {
-                    switch (src_parsed.*) {
-                        .closure => |src_closure| {
-                            new_parsed.* = .{ .closure = .{
-                                .script = src_closure.script.borrow(),
-                                .signature = src_closure.signature.borrow(),
-                            } };
-                            new_extra_data.source.parsed.state.store(.parsed, .release);
-                        },
-                        .native_command => |_| {
-                            // native command caching is thread-local, so we can't send it between threads.
-                            new_extra_data.source.parsed.state.store(.not_parsed, .release);
-                        },
-                        .script => |src_script| {
-                            new_parsed.* = .{ .script = src_script.borrow() };
-                            new_extra_data.source.parsed.state.store(.parsed, .release);
-                        },
-                        .expr => |src_expr| {
-                            new_parsed.* = .{ .expr = src_expr.borrow() };
-                            new_extra_data.source.parsed.state.store(.parsed, .release);
-                        },
-                    }
+                .computed => {
+                    new_extra_data.source.hash.hash = src_extra_data.hash.hash;
+                    new_extra_data.source.hash.state.store(.computed, .release);
                 },
             }
 
@@ -2436,10 +2371,7 @@ pub const LongString = struct {
         if (self.hash.value) |hash| {
             return hash;
         } else {
-            var out: [32]u8 = @splat(0);
-            std.crypto.hash.Blake3.hash(self.getString(), &out, .{});
-
-            const hash: u256 = @bitCast(out);
+            const hash = memutil.hashBytes(self.getString());
             self.hash.value = hash;
             return hash;
         }
@@ -2517,24 +2449,6 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
         },
         .source => |*source| {
             source.file_name.decrOptional();
-
-            const parsed_state = source.parsed.state.load(.acquire);
-            const value = &source.parsed.value;
-
-            if (parsed_state == .not_parsed) return;
-            switch (value.*) {
-                .closure => |closure| {
-                    closure.script.release();
-                    closure.signature.deinit();
-                },
-                .native_command => |_| {},
-                .script => |script| {
-                    script.release();
-                },
-                .expr => |expr| {
-                    expr.release();
-                },
-            }
         },
         .custom_type => {
             @panic("Need to clean up custom type");
@@ -2557,11 +2471,6 @@ pub fn initGlobals(gpa: Allocator) !void {
     custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
     errdefer custom_types.deinit(global_gpa);
 
-    script_metadata = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_scripts else 32);
-    errdefer script_metadata.deinit(global_gpa);
-
-    // Create null script. TODO do we need a null script?
-    assert(try script_metadata.create(global_gpa) == 0);
     state.initialized = true;
 }
 
@@ -2607,7 +2516,6 @@ pub fn deinitAll() void {
     // Deinit global state.
     state.mutex.lock();
     if (state.initialized) {
-        script_metadata.deinit(global_gpa);
         custom_types.deinit(global_gpa);
         state.initialized = false;
     }
@@ -2726,17 +2634,6 @@ pub fn leakCheckAll() void {
             leaked = true;
         }
     }
-
-    state.mutex.lock();
-    // Make sure that all the global script ids were freed.
-    if (script_metadata.count > 1) {
-        leaked = true;
-        std.debug.print("Script IDs leaked!\n", .{});
-        script_metadata.dumpLeaked(global_gpa, "ID: {}, contents: {}\n") catch unreachable;
-    }
-
-    state.running_leak_check = false;
-    state.mutex.unlock();
 }
 
 pub fn testFinish() void {

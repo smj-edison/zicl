@@ -35,7 +35,6 @@ current_call_epoch: u32,
 global_procedure_epoch: u32,
 global_commands: CommandHashTable,
 
-evaluating_safe_expr: bool,
 eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
@@ -57,7 +56,6 @@ pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
 pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
 
 pub const Error = std.mem.Allocator.Error || error{
-    EvaluatingSafeExpression,
     EvalError,
     Break,
     Continue,
@@ -396,9 +394,12 @@ pub fn setVariableLinkImpl(
 }
 
 /// Resolves to the variable's value. Must be called with a heap-native name.
-pub fn getVariableInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !Handle {
-    if (interp.evaluating_safe_expr) return error.EvaluatingSafeExpression;
-
+pub fn getVariableInner(
+    interp: *Interp,
+    det: ?*objutil.ErrorDetails,
+    call_frame: u32,
+    name: Handle,
+) error{ OutOfMemory, VariableNotFound }!Handle {
     try interp.ensureValidVariableType(det, call_frame, name);
 
     const name_obj = name.peek();
@@ -566,46 +567,182 @@ pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeComma
     interp.global_procedure_epoch += 1;
 }
 
-/// Must already be a closure.
-pub fn getClosureUsageInfo(interp: *Interp, gpa: std.mem.Allocator, closure: Handle, command_name: []const u8) ![]const u8 {
-    closure.assert(closure.peek().tag == .source);
-    const source_data = interp.heap.getExtraData(closure.peek().body.source).source;
-    closure.assert(source_data.parsed.state.load(.acquire) == .closure);
-    const signature = source_data.parsed.value.closure.signature;
+pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closure {
+    if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..8], "closure ")) {
+        if (det) |details| details.* = .{
+            .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure: \"{f}\"", .{bytes}),
+        };
+        return error.BadClosure;
+    }
 
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    defer aw.deinit();
-    aw.writer.writeAll(command_name) catch return error.OutOfMemory;
+    const closure_value = try objutil.newString(Heap.local_heap, bytes[8..]);
+    defer closure_value.decrRefCount();
 
-    const args_list = signature.args;
-    const args_len = objutil.listLengthRaw(args_list);
+    var new_handle: OptionalHandle = .none;
+    const shimmer_result = objutil.shimmerToDict(null, closure_value, &new_handle);
+    assert(new_handle == .none);
+    if (shimmer_result) |_| {} else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure: \"{f}\"", .{bytes}),
+            };
+            return error.BadClosure;
+        },
+    }
 
-    for (0..args_len) |i| {
-        const arg = objutil.listItem(args_list, @intCast(i));
+    const name = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.name));
+    const impl_raw = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.impl));
+    const scope = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.scope));
 
-        aw.writer.writeAll(" ") catch return error.OutOfMemory;
-
-        if (i == args_len - 1 and signature.has_args_parameter) {
-            // Handle `args` paramater.
-            aw.writer.writeAll("?arg ...?") catch return error.OutOfMemory;
-        } else {
-            // If this argument is a list, it means that it has a default value.
-            if (arg.peek().tag == .list) {
-                assert(objutil.listLengthRaw(arg) == 2);
-
-                aw.writer.print("?{s}?", .{try arg.getString()}) catch return error.OutOfMemory;
-            } else {
-                aw.writer.writeAll(try arg.getString()) catch return error.OutOfMemory;
+    const args, const body = blk: {
+        if (impl_raw.toHandle()) |impl| {
+            const impl_shimmer_result = objutil.shimmerToList(null, impl, &new_handle);
+            assert(new_handle == .none);
+            if (impl_shimmer_result) {} else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    if (det) |details| details.* = .{
+                        .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure implementation: \"{f}\"", .{bytes}),
+                    };
+                    return error.BadClosure;
+                },
             }
+
+            if (objutil.listLengthRaw(impl) != 2) {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure implementation: \"{f}\"", .{bytes}),
+                };
+                return error.BadClosure;
+            }
+
+            break :blk .{ objutil.listItem(impl, 0), objutil.listItem(impl, 1) };
+        } else {
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt(Heap.local_heap, "closure missing implementation: \"{f}\"", .{bytes}),
+            };
+            return error.BadClosure;
+        }
+    };
+
+    // We've got everything into the right data types, so now we can
+    // start parsing the args list.
+    objutil.shimmerToList(null, args, &new_handle) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt(Heap.local_heap, "closure args is not a valid list: \"{f}\"", .{args}),
+            };
+            return error.BadClosure;
+        },
+    };
+    assert(new_handle == .none);
+
+    const arg_list_len = objutil.listLengthRaw(args);
+
+    var optional_values: ?Handle = null;
+    errdefer if (optional_values) |val| val.decrRefCount();
+    var args_parameter_found = false;
+    var required_arity: u32 = 0;
+    var optional_arity: u32 = 0;
+
+    for (0..arg_list_len) |i| {
+        if (args_parameter_found) {
+            if (det) |details| details.* = .{
+                .message = try objutil.newString(Heap.local_heap, "parameter after 'args' not allowed"),
+            };
+            return error.BadClosure;
+        }
+
+        const arg = objutil.listItem(args, @intCast(i));
+        objutil.shimmerToList(null, arg, &new_handle) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg}),
+                };
+                return error.BadClosure;
+            },
+        };
+        assert(new_handle == .none);
+        const arg_len = objutil.listLengthRaw(arg);
+
+        if (arg_len == 0) {
+            if (det) |details| details.* = .{
+                .message = try objutil.newString(Heap.local_heap, "argument with no name"),
+            };
+            return error.BadClosure;
+        } else if (arg_len > 2) {
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg}),
+            };
+            return error.BadClosure;
+        } else if (arg_len == 2) {
+            // Optional parameter.
+            if (optional_values == null) {
+                optional_values = try objutil.newList(&.{});
+            }
+
+            if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newString(Heap.local_heap, "'args' must be a required parameter"),
+                };
+                return error.BadClosure;
+            }
+
+            _ = try objutil.listAppend(null, optional_values.?, &new_handle, objutil.listItem(arg, 1));
+            assert(new_handle == .none);
+
+            // Replace {name default} with just the name.
+            const new_item = try Heap.local_heap.dupOrReference(objutil.listItem(arg, 0));
+            try objutil.listSetObject(null, args, &new_handle, @intCast(i), new_item);
+            assert(new_handle == .none);
+
+            optional_arity += 1;
+        } else {
+            if (optional_values != null) {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newString(Heap.local_heap, "required parameter after optional parameter not allowed"),
+                };
+                return error.BadClosure;
+            }
+
+            const arg_name = try objutil.listItem(arg, 0).getString();
+            if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
+
+            required_arity += 1;
         }
     }
 
-    return aw.toOwnedSlice();
+    return .{
+        .args = args.borrow(),
+        .body = body.borrow(),
+        .name = name.borrowOptional(),
+        .scope = scope.borrowOptional(),
+        .required_arity = required_arity,
+        .optional_arity = optional_arity,
+        .optional_values = if (optional_values) |val| val.toOptional() else .none,
+        .has_args_parameter = args_parameter_found,
+    };
 }
 
-/// Must be called with a closure.
+pub fn getClosure(interp: *Interp, handle: Handle) !Heap.Closure {
+    if (handle.peek().tag == .closure) {
+        return handle.getClosureExtraData().*;
+    }
+
+    const cache_key = handle.getHash();
+
+    if (interp.heap.parsed_closures.get(cache_key)) |cached| {
+        return cached.closure;
+    } else {
+        // We need to parse the closure.
+
+    }
+}
+
 pub fn callClosure(interp: *Interp, closure: Handle, args: []Handle) !void {
-    closure.assert(closure.peek().tag == .source);
+    const hash = try closure.getHash();
     const source_data = interp.heap.getExtraData(closure.peek().body.source).source;
     closure.assert(source_data.parsed.state.load(.acquire) == .closure);
     const signature = source_data.parsed.value.closure.signature;
@@ -762,7 +899,7 @@ const CallFrame = struct {
     /// Arguments of this procedure call. Lifetime managed by creator.
     args: []Handle,
     /// Signature of this procedure.
-    signature: Heap.ClosureSignature,
+    signature: Heap.Closure,
     /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
     /// but when it overflows it'll scan the heap and reset all cached lookups.
     call_epoch: u32,
@@ -843,7 +980,7 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentCallFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.ClosureSignature) !u32 {
+fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
     const vars_handle = try objutil.newDict(interp.heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
@@ -1006,20 +1143,29 @@ const CommandOrClosure = union(enum) {
     command: NativeCommand,
 };
 
-pub fn getCommand(
+/// Caller needs to decrRefCount on the closure if this returns a closure.
+fn getCommandInner(
     interp: *Interp,
     det: ?*objutil.ErrorDetails,
     call_frame: u32,
-    provided_name: Handle,
-    new_name: *OptionalHandle,
+    name: Handle,
 ) !CommandOrClosure {
-    errdefer new_name.swapWithNone();
+    if (interp.getVariableInner(null, call_frame, name)) |var_val| {
+        var shimmerable_val = var_val;
+        errdefer shimmerable_val.decrRefCount();
 
-    try Heap.ensureShimmerableOrDup(provided_name, new_name);
-    const handle = new_name.orElse(provided_name);
-
-    if (interp.getVariableInner(null, call_frame, handle)) |var_val| {
-        if (handle.canShimmer()) {}
+        if (shimmerable_val.canShimmer()) {
+            shimmerable_val.borrow();
+        } else {
+            shimmerable_val = try Heap.local_heap.duplicate(var_val);
+        }
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.VariableNotFound => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt(Heap.local_heap, "invalid command name \"{f}\"", .{name}),
+            };
+        },
     }
 }
 
@@ -1955,7 +2101,6 @@ pub fn init() !Interp {
         .current_call_epoch = 0,
         .global_procedure_epoch = 0,
         .global_commands = .empty,
-        .evaluating_safe_expr = false,
         .eval_depth = 0,
         .max_eval_depth = 100_000,
         .max_call_depth = 100_000,

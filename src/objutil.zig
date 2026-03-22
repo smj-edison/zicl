@@ -2156,7 +2156,7 @@ pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
         handle.getHeap().getExtraData(extra_data).* = .{ .source = .{
             .file_name = source_info.file_name.borrowOptional(),
             .line_no = source_info.line_no,
-            .parsed = .{ .value = undefined },
+            .hash = .{ .value = undefined },
         } };
         errdefer handle.getHeap().destroyExtraData(extra_data);
 
@@ -2482,10 +2482,10 @@ test "script parsing" {
 pub fn assignScriptId(handle: Handle, script_type: enum { script, expr }) !Heap.ScriptId {
     if (handle.peek().tag == .source) {
         const extra_data = handle.getSourceExtraData();
-        const parsed = &extra_data.parsed;
+        const parsed = &extra_data.hash;
         const state = parsed.state.load(.acquire);
 
-        if (state == .parsed) {
+        if (state == .computed) {
             switch (parsed.value) {
                 .script => |script_id| {
                     if (script_type == .script) return script_id;
@@ -2502,13 +2502,13 @@ pub fn assignScriptId(handle: Handle, script_type: enum { script, expr }) !Heap.
                 defer parsed.slow_path_mutex.unlock();
 
                 // Need to check if it's still not parsed, since we're in a multithreaded context.
-                if (parsed.state.load(.acquire) == .not_parsed) {
+                if (parsed.state.load(.acquire) == .not_computed) {
                     const new_id = try Heap.ScriptId.next();
                     switch (script_type) {
                         .script => parsed.value = .{ .script = new_id },
                         .expr => parsed.value = .{ .expr = new_id },
                     }
-                    parsed.state.store(.parsed, .release);
+                    parsed.state.store(.computed, .release);
                     return new_id;
                 }
             }
@@ -2517,7 +2517,7 @@ pub fn assignScriptId(handle: Handle, script_type: enum { script, expr }) !Heap.
             // this as a script, then we'll return the new script id. If it parsed it as
             // something else (like an expr or native call) then fall through, since
             // we'll need to duplicate the script in that case.
-            assert(parsed.state.load(.acquire) == .parsed);
+            assert(parsed.state.load(.acquire) == .computed);
             switch (parsed.value) {
                 .script => |script_id| {
                     if (script_type == .script) return script_id;
@@ -2591,8 +2591,8 @@ pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle:
         Heap.local_heap.getExtraData(extra_data).* = .{ .source = .{
             .file_name = if (source_info) |val| val.file_name.borrowOptional() else .none,
             .line_no = if (source_info) |val| val.line_no else 1,
-            .parsed = .{
-                .state = .init(.parsed),
+            .hash = .{
+                .state = .init(.computed),
                 .value = .{ .script = script_id },
             },
         } };
@@ -2784,8 +2784,8 @@ pub fn shimmerToExpression(det: ?*ErrorDetails, provided_handle: Handle, new_han
         Heap.local_heap.getExtraData(extra_data).* = .{ .source = .{
             .file_name = source_info.file_name.borrowOptional(),
             .line_no = source_info.line_no,
-            .parsed = .{
-                .state = .init(.parsed),
+            .hash = .{
+                .state = .init(.computed),
                 .value = .{ .expr = expr_id },
             },
         } };

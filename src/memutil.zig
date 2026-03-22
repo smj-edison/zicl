@@ -26,6 +26,14 @@ const DummyMutex = struct {
     }
 };
 
+/// Uses blake3 to make a hash that, in theory, should never
+/// overlap with any other byte string.
+pub fn hashBytes(bytes: []const u8) u256 {
+    var out: [32]u8 = @splat(0);
+    std.crypto.hash.Blake3.hash(bytes, &out, .{});
+    return @bitCast(out);
+}
+
 // These functions are all when appending to the free list (it should have
 // already resized itself)
 fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
@@ -544,8 +552,6 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
                 const item_ptr: *Item = &self.items[next_free];
                 const int_ptr: *usize = @ptrCast(item_ptr);
                 self.next_free = int_ptr.*;
-                // We intentionally don't set the item as undefined here, since
-                // some use cases (generation tracking) reuse the previous memory.
                 return next_free;
             }
 
@@ -553,14 +559,14 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
 
             const new_index = self.len;
             self.len += 1;
-            // We intentionally don't set the item as undefined here, since
-            // some use cases (generation tracking) reuse the previous memory.
+            assert(new_index != no_next_free);
             return new_index;
         }
 
         pub fn destroy(self: *Self, index: usize) void {
             self.count -= 1;
 
+            self.items[index] = undefined;
             const item_ptr: *Item = &self.items[index];
             const int_ptr: *usize = @ptrCast(item_ptr);
             int_ptr.* = self.next_free;
@@ -701,12 +707,12 @@ pub fn LruCache(comptime K: type, comptime V: type, comptime Context: type) type
             self.first = index;
         }
 
-        pub fn get(self: *Self, key: K) ?*V {
+        pub fn get(self: *Self, key: K) ?V {
             const value = self.mapping.get(key);
 
             if (value) |val_index| {
                 self.moveToFirst(val_index);
-                return &self.pool.items[val_index].item;
+                return self.pool.items[val_index].item;
             } else return null;
         }
 
@@ -788,7 +794,7 @@ test "lru cache" {
         defer cache.deinit(testing.allocator);
 
         try testing.expectEqual(null, cache.put("key1", "value1"));
-        try testing.expectEqualStrings("value1", cache.get("key1").?.*);
+        try testing.expectEqualStrings("value1", cache.get("key1").?);
         try testing.expectEqual(null, cache.put("key2", "value2"));
         try testing.expectEqual(null, cache.put("key3", "value3"));
         try testing.expectEqual(cache.put("key4", "value4"), "value1");
@@ -803,11 +809,11 @@ test "lru cache" {
         // Fill cache, then promote key1 by accessing it.
         try testing.expectEqual(null, cache.put("key1", "value1"));
         try testing.expectEqual(null, cache.put("key2", "value2"));
-        try testing.expectEqualStrings("value1", cache.get("key1").?.*);
+        try testing.expectEqualStrings("value1", cache.get("key1").?);
 
         // key2 should be evicted, not key1.
         try testing.expectEqualStrings("value2", cache.put("key3", "value3").?);
-        try testing.expectEqualStrings("value1", cache.get("key1").?.*);
+        try testing.expectEqualStrings("value1", cache.get("key1").?);
         try testing.expectEqual(null, cache.get("key2"));
     }
 
@@ -822,8 +828,8 @@ test "lru cache" {
         try testing.expectEqualStrings("old", cache.put("key1", "new").?);
 
         // Both keys should still be present.
-        try testing.expectEqualStrings("new", cache.get("key1").?.*);
-        try testing.expectEqualStrings("value2", cache.get("key2").?.*);
+        try testing.expectEqualStrings("new", cache.get("key1").?);
+        try testing.expectEqualStrings("value2", cache.get("key2").?);
     }
 
     // Check re-inserting an evicted key.
@@ -838,8 +844,8 @@ test "lru cache" {
         try testing.expectEqualStrings("value2", cache.put("key1", "value1-new").?);
 
         // key1 and key3 remain; key2 was evicted.
-        try testing.expectEqualStrings("value1-new", cache.get("key1").?.*);
-        try testing.expectEqualStrings("value3", cache.get("key3").?.*);
+        try testing.expectEqualStrings("value1-new", cache.get("key1").?);
+        try testing.expectEqualStrings("value3", cache.get("key3").?);
         try testing.expectEqual(null, cache.get("key2"));
     }
 }
