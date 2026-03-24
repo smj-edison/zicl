@@ -939,8 +939,51 @@ pub const Handle = packed struct(HandleBacking) {
         };
     }
 
+    pub fn getStringIfExists(handle: Handle) ?[:0]const u8 {
+        switch (handle.getStringDetails()) {
+            .null => return null,
+            .empty => return "",
+            .normal => |str| return str,
+            .long => |long_str| return long_str.getString(),
+        }
+    }
+
     pub fn getStringDetails(handle: Handle) StringDetails {
-        return handle.getHeap().getLocalStringDetails(handle.peek().str);
+        const str_or_ptr: Object.StrOrPtr = blk: {
+            // TODO PERF I should probably benchmark whether it's faster
+            // to check the metadata, or just to do an acquire load.
+            if (options.threading and handle.getMetadata().cross_thread) {
+                // Workaround not being able to cast to Object.Head.
+                if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
+                if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
+                if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
+
+                const object_head: *u64 = @ptrCast(handle.peek());
+                const current_head = @atomicLoad(u64, object_head, .acquire);
+                break :blk @bitCast(@as(@truncate(current_head), u58));
+            } else {
+                break :blk handle.peek().str;
+            }
+        };
+
+        // Normal string or long string?
+        if (str_or_ptr.is_ptr) {
+            // Convert to LongString ptr (guaranteed to be non-null).
+            return .{
+                .long = LongString.fromInt(str_or_ptr.u.ptr),
+            };
+        } else {
+            const str = str_or_ptr.u.str;
+            if (str.index == null_string) {
+                return .null;
+            } else if (str.index == empty_string) {
+                return .empty;
+            } else {
+                return .{
+                    .normal = handle.getHeap().getHeapString(str.index, str.index + str.len),
+                };
+            }
+        }
     }
 
     pub fn getSourceExtraData(handle: Handle) *@FieldType(ExtraDataValue, "source") {
@@ -2300,27 +2343,6 @@ const StringDetails = union(enum) {
     normal: [:0]u8,
     long: *align(LongString.align_amt) LongString,
 };
-
-fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
-    // Normal string or long string?
-    if (str_or_ptr.is_ptr) {
-        // Convert to LongString ptr (guaranteed to be non-null).
-        return .{
-            .long = LongString.fromInt(str_or_ptr.u.ptr),
-        };
-    } else {
-        const str = str_or_ptr.u.str;
-        if (str.index == null_string) {
-            return .null;
-        } else if (str.index == empty_string) {
-            return .empty;
-        } else {
-            return .{
-                .normal = heap.getHeapString(str.index, str.index + str.len),
-            };
-        }
-    }
-}
 
 pub const LongString = struct {
     /// At what point should we switch to using a long string?
