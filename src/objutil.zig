@@ -2606,15 +2606,16 @@ pub fn shimmerToScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle:
     return;
 }
 
-pub fn getScript(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !Heap.ParsedScript {
-    try shimmerToScript(det, provided_handle, new_handle);
-    const handle = new_handle.orElse(provided_handle);
-    const script_id = handle.getSourceExtraData().getScriptId();
-
-    const script_and_generation = Heap.local_heap.parsed_scripts.get(script_id.index).?;
-    assert(script_and_generation.generation == script_id.generation);
-
-    return script_and_generation.script;
+pub fn getScript(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap.ParsedScript {
+    if (Heap.local_heap.parsed_scripts.get(cache_key)) |parsed| {
+        return parsed.script;
+    } else {
+        const new_script = try parseScript(det, handle);
+        if (Heap.local_heap.parsed_scripts.put(cache_key, .{ .script = new_script })) |ejected| {
+            ejected.script.deinit();
+        }
+        return new_script;
+    }
 }
 
 fn testScriptShimmering(ta: std.mem.Allocator) !void {

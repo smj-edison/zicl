@@ -579,9 +579,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     defer closure_value.decrRefCount();
 
     var new_handle: OptionalHandle = .none;
-    const shimmer_result = objutil.shimmerToDict(null, closure_value, &new_handle);
-    assert(new_handle == .none);
-    if (shimmer_result) |_| {} else |err| switch (err) {
+    objutil.shimmerToDict(null, closure_value, &new_handle) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (det) |details| details.* = .{
@@ -589,7 +587,8 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
             };
             return error.BadClosure;
         },
-    }
+    };
+    assert(new_handle == .none);
 
     const name = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.name));
     const impl_raw = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.impl));
@@ -726,6 +725,8 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     };
 }
 
+/// Caller is responsible for borrowing the returned closure
+/// if they intend to use it beyond temporarily.
 pub fn getClosure(interp: *Interp, handle: Handle) !Heap.Closure {
     if (handle.peek().tag == .closure) {
         return handle.getClosureExtraData().*;
@@ -737,41 +738,38 @@ pub fn getClosure(interp: *Interp, handle: Handle) !Heap.Closure {
         return cached.closure;
     } else {
         // We need to parse the closure.
-
+        var det: objutil.ErrorDetails = undefined;
+        const closure: Heap.Closure = try interp.wrapError(&det, parseClosure(&det, try handle.getString()));
+        if (interp.heap.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
+            old_value.closure.deinit();
+        }
+        return interp.heap.parsed_closures.get(cache_key);
     }
 }
 
-pub fn callClosure(interp: *Interp, closure: Handle, args: []Handle) !void {
-    const hash = try closure.getHash();
-    const source_data = interp.heap.getExtraData(closure.peek().body.source).source;
-    closure.assert(source_data.parsed.state.load(.acquire) == .closure);
-    const signature = source_data.parsed.value.closure.signature;
+pub fn callClosure(interp: *Interp, handle: Handle, args: []Handle) !void {
+    const closure = try interp.getClosure(handle);
 
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
-    const too_few_arguments = arg_count < signature.required_arity;
-    const has_args = signature.has_args_parameter;
-    const too_many_arguments = !has_args and arg_count > signature.required_arity + signature.optional_arity;
+    const too_few_arguments: bool = arg_count < closure.required_arity;
+    const has_args: bool = closure.has_args_parameter;
+    const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
     if (too_few_arguments or too_many_arguments) {
         // Wrong argument count, error accordingly.
-        var sf = std.heap.stackFallback(64, Heap.global_gpa);
-        const scratch = sf.get();
-        const command_name = try args[0].getString();
-        const command_usage = try signature.getUsageInfo(scratch, command_name);
-        defer scratch.free(command_usage);
         var det: objutil.ErrorDetails = undefined;
-        return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
+        return interp.wrapError(&det, wrongArgumentCountError(&det, "FIXME"));
     }
 
     // Check for infinite recursion.
     if (interp.currentCallFrame().level >= interp.max_call_depth) {
         try interp.setResultString("Too many nested calls. Infinite recursion?");
-        return Error.InfiniteRecursion;
+        return error.InfiniteRecursion;
     }
 
     const parent_idx = interp.currentCallFrameIndex();
-    const call_frame_idx = try interp.pushCallFrame(parent_idx, args, signature.*);
+    const call_frame_idx = try interp.pushCallFrame(parent_idx, args, closure.*);
     defer interp.call_frames.pop().?.deinit();
 
     // Next, we'll populate the call frame.
@@ -780,18 +778,18 @@ pub fn callClosure(interp: *Interp, closure: Handle, args: []Handle) !void {
     var called_idx: usize = 1;
     // Where we are in the signature.
     var signature_idx: u32 = 0;
-    const signature_len = objutil.listLengthRaw(signature.args);
+    const signature_len = objutil.listLengthRaw(closure.args);
 
     while (signature_idx < signature_len) : (signature_idx += 1) {
-        const var_name = objutil.listItem(signature.args, signature_idx);
+        const var_name = objutil.listItem(closure.args, signature_idx);
 
         // Are we at the last argument? If so, is it `args`?
-        if (signature_idx == signature_len - 1 and signature.has_args_parameter) {
+        if (signature_idx == signature_len - 1 and closure.has_args_parameter) {
             // Assign remaining arguments to `args`.
             const list = try objutil.newList(args[called_idx..]);
             defer list.decrRefCount();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
-        } else if (signature_idx > signature.required_arity) {
+        } else if (signature_idx > closure.required_arity) {
             // This is an optional argument.
 
             // Are there any remaining unassigned arguments?
@@ -800,7 +798,7 @@ pub fn callClosure(interp: *Interp, closure: Handle, args: []Handle) !void {
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
-                const default_value = objutil.listItem(signature.optional_values.?, signature_idx - signature.required_arity);
+                const default_value = objutil.listItem(closure.optional_values.?, signature_idx - closure.required_arity);
                 try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(default_value));
             }
         } else {
@@ -809,11 +807,15 @@ pub fn callClosure(interp: *Interp, closure: Handle, args: []Handle) !void {
         }
     }
 
-    // TODO implement trace
-
-    var new_body: OptionalHandle = .none;
-    try interp.evalObject(signature.body, &new_body);
-    assert(new_body == .none);
+    // Use the string's hash if it exists, since this will deduplicate
+    // the scope.
+    if (handle.getStringIfExists()) |_| {
+        const hash = try handle.getHash();
+        try interp.evalObjectInner(closure.body, hash);
+    } else {
+        const cache_key = try closure.cacheKey();
+        try interp.evalObjectInner(closure.body, cache_key);
+    }
 }
 
 fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
@@ -1036,7 +1038,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
         },
         .command_subst => {
             var new_script: OptionalHandle = .none;
-            try interp.evalObject(value, &new_script);
+            try interp.evalObjectInner(value, &new_script);
             if (new_script.toHandle()) |new| {
                 // The only case where the new value is not the same as the last value is if `eval`
                 // converted it from a string to a script. If so, we want to copy that script id
@@ -1700,7 +1702,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .float => return .{ .float = node_data.float },
         .command_subst => {
             var new_handle: OptionalHandle = .none;
-            const result = interp.evalObject(node_data.object, &new_handle);
+            const result = interp.evalObjectInner(node_data.object, &new_handle);
             // This should not change, since it should be a local heap object.
             assert(new_handle == .none);
 
@@ -1956,12 +1958,10 @@ test "eval expression" {
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
 }
 
-pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) Error!void {
-    errdefer new_script.swapWithNone();
-
+pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
-    const parsed = try interp.wrapError(&det, objutil.getScript(&det, script, new_script));
+    const parsed = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key));
     // Don't evaluate empty scripts.
     if (parsed.tags.items.len <= 1) return;
 
@@ -2084,11 +2084,9 @@ pub fn evalObject(interp: *Interp, script: Handle, new_script: *OptionalHandle) 
     return;
 }
 
-pub fn evalObjectInPlace(interp: *Interp, handle: *Handle) !void {
-    var new_handle: OptionalHandle = .none;
-    const res = try evalObject(interp, handle.*, &new_handle);
-    handle.swapIfNew(new_handle);
-    return res;
+pub fn evalObject(interp: *Interp, script: Handle) Error!void {
+    const cache_key = try script.getHash();
+    return evalObjectInner(interp, script, cache_key);
 }
 
 pub fn init() !Interp {
