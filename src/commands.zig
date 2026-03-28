@@ -64,7 +64,7 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
         };
     }
 
-    interp.setResultOwning(try objutil.newFloat(interp.heap, result));
+    interp.setResultOwning(try objutil.newFloat(Heap.local_heap, result));
 }
 
 pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -73,49 +73,6 @@ pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
 pub fn mulCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .mul);
-}
-
-pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const lambda_len = try interp.getListLength(&args[1]);
-    if (lambda_len < 2 or lambda_len > 3) {
-        try interp.setResultFormatted("can't interpret \"{f}\" as a lambda expression", .{args[1]});
-        return error.EvalError;
-    }
-
-    var namespace: Heap.OptionalHandle = .none;
-    if (lambda_len == 3) {
-        namespace = objutil.listItemFollowRefs(args[1], 2).toOptional();
-    }
-
-    const arg_list = objutil.listItemFollowRefs(args[1], 0);
-    const body = objutil.listItemFollowRefs(args[1], 1);
-
-    var new_arg_list = arg_list.borrow();
-    defer new_arg_list.decrRefCount();
-    var new_body = body.borrow();
-    defer new_body.decrRefCount();
-    var command = createProcedureCommand(interp, &new_arg_list, null, &new_body, namespace) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.EvalError,
-    };
-    defer command.deinit();
-
-    // Create a new arg array with a dummy arg[0] for error messages (as the command name
-    // is the first argument).
-    var sf = std.heap.stackFallback(32, Heap.global_gpa);
-    const stack_alloc = sf.get();
-
-    // 1 (the first argument, "apply lambdaProc") + args.len - 2 (skip "apply" and the lambda).
-    const lambda_args = try stack_alloc.alloc(Heap.Handle, 1 + args.len - 2);
-    defer stack_alloc.free(lambda_args);
-
-    lambda_args[0] = interp.heap.getInternedString(.lambda_apply_expr);
-    for (args[2..], lambda_args[1..]) |provided_arg, *lambda_arg| {
-        lambda_arg.* = provided_arg.borrow();
-    }
-    defer for (lambda_args[1..]) |lambda_arg| lambda_arg.decrRefCount();
-
-    try interp.callProcedure(&command, lambda_args);
 }
 
 pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -203,7 +160,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 }
             };
 
-            const new_value = try interp.heap.dupOrReference(args[args.len - 1]);
+            const new_value = try Heap.local_heap.dupOrReference(args[args.len - 1]);
             const put_result = try interp.wrapError(
                 &det,
                 objutil.dictPutRecursively(&det, dict, args[3..(args.len - 1)], new_value),
@@ -242,7 +199,7 @@ test "dict commands" {
 }
 
 pub fn exprCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const result = try (try interp.evalExpressionInPlace(&args[1])).toObject(interp);
+    const result = try (try interp.evalExpressionInPlace(&args[1])).toObject();
     defer result.decrRefCount();
     interp.setResult(result);
 }
@@ -271,12 +228,12 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
 
 pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     // Do the initialization.
-    try interp.evalObjectInPlace(&args[1]);
+    try interp.evalObject(args[1]);
 
     // Check condition.
     while (try interp.getBoolFromExpression(&args[2])) {
         // Evaluate body.
-        switch (try propagateLoopControl(interp, interp.evalObjectInPlace(&args[4]))) {
+        switch (try propagateLoopControl(interp, interp.evalObject(args[4]))) {
             .@"break" => {
                 break;
             },
@@ -289,7 +246,7 @@ pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         }
 
         // Run increment.
-        try interp.evalObjectInPlace(&args[3]);
+        try interp.evalObject(args[3]);
     }
 
     interp.setEmptyResult();
@@ -301,7 +258,7 @@ test "loop commands" {
 
     // Basic loop.
     try testExpectScriptResult(&interp, "5",
-        \\ for {set i 0} {$i < 5} {incr i} {}
+        \\ for {set i 0} {$i < 5} {incr i} { }
         \\ set i
     );
 
@@ -348,7 +305,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         // Check condition.
         if (try interp.getBoolFromExpression(&remaining_args[0])) {
             // Evaluate true branch.
-            try interp.evalObjectInPlace(&remaining_args[1]);
+            try interp.evalObject(remaining_args[1]);
             return;
         }
 
@@ -366,7 +323,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             // There should only be one more argument, since there shouldn't
             // be anything after "else".
             if (remaining_args.len > 2) return error.WrongUsage;
-            try interp.evalObjectInPlace(&remaining_args[1]);
+            try interp.evalObject(remaining_args[1]);
             return;
         }
 
@@ -406,16 +363,14 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
             interp.setResult(val);
         } else {
             try interp.setVariableToObject(&args[1], .{
-                .str = Heap.Object.null_string,
-                .tag = .integer,
+                .head = .{ .str = Heap.Object.null_string, .tag = .integer },
                 .body = .{ .integer = new_contents },
             });
             interp.setResult((interp.getVariable(&args[1]) catch unreachable).toHandle().?);
         }
     } else {
         try interp.setVariableToObject(&args[1], .{
-            .str = Heap.Object.null_string,
-            .tag = .integer,
+            .head = .{ .str = Heap.Object.null_string, .tag = .integer },
             .body = .{ .integer = increment_by },
         });
         interp.setResult((try interp.getVariable(&args[1])).toHandle().?);
@@ -432,185 +387,9 @@ pub fn setCmd(interp: *Interp, args: []Handle) !void {
     }
 }
 
-fn namespaceSplit(full_name: []const u8) struct { namespace: []const u8, command_name: []const u8 } {
-    // Skip any leading colons.
-    var trimmed = full_name;
-    while (trimmed.len > 0 and trimmed[0] == ':') trimmed = trimmed[1..];
-
-    // Look for the last colon pair, as that's where the command name starts.
-    var command_name = trimmed;
-    if (std.mem.lastIndexOf(u8, trimmed, "::")) |last_pair| {
-        trimmed = trimmed[0..last_pair];
-        command_name = trimmed[(last_pair + 2)..];
-    } else {
-        trimmed = full_name[0..0];
-    }
-
-    return .{
-        .namespace = trimmed,
-        .command_name = command_name,
-    };
-}
-
-/// Modifies arg_list to only contain names of variables (optional values
-/// are stored elsewhere).
-pub fn createProcedureCommand(
-    interp: *Interp,
-    arg_list: *Handle,
-    statics_names: ?*Handle,
-    body: *Handle,
-    namespace: Heap.OptionalHandle,
-) !Interp.Command {
-    const statics: ?Handle = blk: {
-        if (statics_names) |names| {
-            try interp.ensureShimmerable(names);
-            const statics_count = try interp.getListLength(names);
-
-            const statics_dict = try objutil.newDictWithCapacity(statics_count * 2);
-            statics_dict.peek().body.dict.len = statics_count * 2;
-            const dict_items = objutil.dictItems(statics_dict);
-            errdefer statics_dict.decrRefCount();
-
-            for (0..statics_count) |i| {
-                const static_name = objutil.listItem(names.*, @intCast(i));
-                if (interp.getVariableImpl(null, static_name)) |static_value| {
-                    const dict_name_str = try Heap.duplicateObjString(Heap.local_heap, static_name);
-                    errdefer dict_name_str.deinit(Heap.local_heap);
-                    const dict_value = try Heap.local_heap.dupOrReference(static_value);
-
-                    dict_items[i * 2] = .{
-                        .str = dict_name_str,
-                        .tag = .none,
-                        .body = undefined,
-                    };
-                    dict_items[i * 2 + 1] = dict_value;
-                } else |err| switch (err) {
-                    error.VariableNotFound => {
-                        try interp.setResultFormatted("variable for initialization of static \"{f}\" not found in the local context", .{static_name});
-                        return error.VariableNotFound;
-                    },
-                    else => return err,
-                }
-            }
-
-            break :blk statics_dict;
-        } else {
-            break :blk null;
-        }
-    };
-
-    const arg_list_len = try interp.getListLength(arg_list);
-
-    // We'll set this to a list if we encounter any optional values.
-    var optional_values: ?Handle = null;
-    errdefer if (optional_values) |val| val.decrRefCount();
-    // Set to true if we find args.
-    var args_parameter_found = false;
-    // Keep track of how many arguments there are.
-    var required_arity: u32 = 0;
-    var optional_arity: u32 = 0;
-
-    // Validate the args as we go along, replacing any optional arguments with just
-    // their variables' name.
-    for (0..arg_list_len) |i| {
-        if (args_parameter_found) {
-            try interp.setResultString("parameter after 'args' not allowed");
-            return error.ParameterAfterArgs;
-        }
-
-        var arg = objutil.listItem(arg_list.*, @intCast(i)).borrow();
-        defer arg.decrRefCount();
-        const arg_len = try interp.getListLength(&arg);
-
-        if (arg_len == 0) {
-            try interp.setResultString("argument with no name");
-            return error.ArgumentWithNoName;
-        } else if (arg_len > 2) {
-            try interp.setResultFormatted("too many fields in argument specifier \"{f}\"", .{arg});
-            return error.TooManyFieldsInArgument;
-        } else if (arg_len == 2) {
-            // Optional parameter.
-            if (optional_values == null) {
-                // Init the optional_values list.
-                optional_values = try objutil.newList(&.{});
-            }
-
-            if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
-                try interp.setResultString("'args' must be a required parameter");
-                return error.ArgsWasOptional;
-            }
-
-            // Append value to optional values.
-            _ = try interp.listAppend(&(optional_values.?), objutil.listItem(arg, 1));
-            // And replace the `arg_list`'s parameter/value with just the parameter name.
-            var det: objutil.ErrorDetails = undefined;
-            const new_item = try Heap.local_heap.dupOrReference(objutil.listItem(arg, 0));
-            var new_arg_list: OptionalHandle = .none;
-            try objutil.listSetObject(&det, arg_list.*, &new_arg_list, @intCast(i), new_item);
-            arg_list.swapIfNew(new_arg_list);
-
-            optional_arity += 1;
-        } else {
-            if (optional_values != null) {
-                // This breaks tcl behavior, but really, it shouldn't just silently convert required
-                // values to optional values.
-                try interp.setResultString("required parameter after optional parameter not allowed");
-                return error.RequiredParameterAfterOptionalParameter;
-            }
-
-            const arg_name = try objutil.listItem(arg, 0).getString();
-            if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
-
-            // Required parameter.
-            required_arity += 1;
-        }
-    }
-
-    return .{
-        .namespace = namespace.borrowOptional(),
-        .call_info = .{ .tcl = .{
-            .signature = .{
-                .args = arg_list.borrow(),
-                .body = body.borrow(),
-                .statics = statics,
-                .has_args_parameter = args_parameter_found,
-                .required_arity = required_arity,
-                .optional_arity = optional_arity,
-                .optional_values = optional_values,
-            },
-        } },
-    };
-}
-
-/// [proc]
-pub fn procCmd(interp: *Interp, args: []Handle) !void {
-    const proc_name = try args[1].getString();
-    const arg_list = &args[2];
-    const statics = if (args.len == 5) &args[3] else null;
-    const body = if (args.len == 5) &args[4] else &args[3];
-
-    const qualified = try Interp.qualifyName(Heap.global_gpa, interp.namespace, proc_name);
-    defer if (qualified) |val| Heap.global_gpa.free(val);
-    const qualified_name = qualified orelse proc_name;
-
-    const name_parts = namespaceSplit(qualified_name);
-
-    // The procedure's namespace may not be the same as the current namespace.
-    const proc_namespace = try objutil.newString(interp.heap, name_parts.namespace);
-    defer proc_namespace.decrRefCount();
-
-    var command = createProcedureCommand(interp, arg_list, statics, body, proc_namespace.toOptional()) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.EvalError,
-    };
-    errdefer command.deinit();
-    try interp.createCommand(try Heap.global_gpa.dupe(u8, proc_name), command);
-}
-
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambdaExpr ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
@@ -618,7 +397,6 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("proc", .{ .to_call = procCmd, .description = "name arglist ?statics? body", .min_arity = 3, .max_arity = 4 });
     try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
 }
@@ -638,24 +416,24 @@ pub fn testFinish(interp: *Interp) void {
 }
 
 fn testRunScript(interp: *Interp, script: []const u8) !Handle {
-    var script_handle = try objutil.newString(interp.heap, script);
+    var script_handle = try objutil.newString(Heap.local_heap, script);
     defer script_handle.decrRefCount();
-    try interp.evalObjectInPlace(&script_handle);
+    try interp.evalObject(script_handle);
     return interp.result;
 }
 
 fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
-    try testing.expectEqualStrings(expected, try try testRunScript(interp, script).getString());
+    try testing.expectEqualStrings(expected, try (try testRunScript(interp, script)).getString());
 }
 
 test "commands" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
-    var script = try objutil.newString(interp.heap,
+    var script = try objutil.newString(Heap.local_heap,
         \\ dict set x a 10
         \\ puts [dict get $x a 5]
     );
     defer script.decrRefCount();
-    interp.evalObjectInPlace(&script) catch {};
+    interp.evalObject(script) catch {};
 }

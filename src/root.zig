@@ -27,7 +27,7 @@ test {
     _ = @import("objutil.zig");
     _ = @import("Heap.zig");
     _ = @import("Tokenizer.zig");
-    // _ = @import("Interp.zig");
-    // _ = @import("commands.zig");
+    _ = @import("Interp.zig");
+    _ = @import("commands.zig");
     _ = @import("expr_parse.zig");
 }

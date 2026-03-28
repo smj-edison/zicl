@@ -586,6 +586,15 @@ pub const VariableValue = union(enum) {
     },
 };
 
+/// Monotonic counter for parsed script and expression cache keys.
+/// Ensures that closures at different call sites don't share cached
+/// variable lookups, even if their bodies are identical.
+var next_cache_id: std.atomic.Value(u64) = .init(1);
+
+pub fn nextCacheId() u64 {
+    return next_cache_id.fetchAdd(1, .monotonic);
+}
+
 pub const Closure = struct {
     /// Handle to the argument list of the procedure.
     args: Handle,
@@ -604,6 +613,8 @@ pub const Closure = struct {
     /// Whether `args` is provided as an argument name. `args`, if present, is always
     /// the last argument name.
     has_args_parameter: bool,
+    /// Unique identifier for cache keying.
+    cache_id: u64,
 
     pub fn borrow(closure: Closure) Closure {
         return .{
@@ -615,6 +626,7 @@ pub const Closure = struct {
             .optional_arity = closure.optional_arity,
             .optional_values = closure.optional_values.borrowOptional(),
             .has_args_parameter = closure.has_args_parameter,
+            .cache_id = closure.cache_id,
         };
     }
 
@@ -624,26 +636,6 @@ pub const Closure = struct {
         closure.name.decrOptional();
         closure.scope.decrOptional();
         closure.optional_values.decrOptional();
-    }
-
-    /// Closures are potentially created piece-meal, so we create
-    /// a compound hash of all their parts. Note, we don't hash
-    /// the scope directly, and instead hash its heap ID, since hashing
-    /// the scope directly would force the scope to be converted into
-    /// a string, which is potentially costly.
-    pub fn cacheKey(closure: Closure) !u256 {
-        const args_hash = try closure.args.getHash();
-        const body_hash = try closure.body.getHash();
-        const scope_hash: HandleBacking = @bitCast(closure.scope);
-
-        var out: [32]u8 = @splat(0);
-        var hasher = std.crypto.hash.Blake3.init(.{});
-        hasher.update(std.mem.asBytes(&args_hash));
-        hasher.update(std.mem.asBytes(&body_hash));
-        hasher.update(std.mem.asBytes(&scope_hash));
-        hasher.final(&out);
-
-        return @bitCast(out);
     }
 };
 

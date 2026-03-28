@@ -1455,6 +1455,18 @@ pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
 }
 
 /// Asserts `dict` is a .dict.
+/// Like `dictLookupFollowRefs`, but returns the raw dict slot handle
+/// without following references.
+pub fn dictLookupInner(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
+    dict.assert(dict.tag() == .dict);
+    _ = try key.getString();
+
+    const table = try dictGetTable(dict);
+    if (table.get(key)) |value_offset| {
+        return dictItem(dict, value_offset).toOptional();
+    } else return .none;
+}
+
 pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
     dict.assert(dict.tag() == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
