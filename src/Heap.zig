@@ -19,10 +19,9 @@ const objutil = @import("objutil.zig");
 pub const special_string_count = 2;
 pub const null_string = 0;
 pub const empty_string = 1;
-pub const special_object_count = 3;
+pub const special_object_count = 2;
 pub const null_object_idx: u32 = 0;
 pub const empty_object_idx: u32 = 1;
-pub const temp_object_idx: u32 = 2;
 
 pub const HeapSettings = struct {
     use_vmem: bool = true,
@@ -36,6 +35,8 @@ pub const HeapSettings = struct {
     max_scripts: usize = 65536,
     /// Maximum number of heaps (not necessarily initialized).
     max_heaps: usize = 128,
+    /// Parsed script cache size.
+    cache_size: usize = 512,
 };
 const cfg: HeapSettings = .{};
 
@@ -117,7 +118,7 @@ const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullH
 
 const InternedString = enum {
     @"apply lambdaExpr",
-    closure,
+    @"fn",
     impl,
     scope,
     name,
@@ -281,20 +282,13 @@ pub const Object = packed struct(u128) {
         }
     };
 
-    // Make sure this stays in sync with Head fields.
-    str: StrOrPtr,
-    tag: Tag,
-    body: Body,
-
-    // Make sure this stays in sync with Object fields.
     pub const Head = packed struct(u64) {
         str: StrOrPtr,
         tag: Tag,
     };
 
-    pub fn asHead(obj: *Object) *Head {
-        return @ptrCast(obj);
-    }
+    head: Head,
+    body: Body,
 
     pub fn deinitSingle(obj: *Object, heap: *Heap) void {
         obj.deinitBodySingle(heap);
@@ -362,10 +356,10 @@ pub const Object = packed struct(u128) {
 
     pub fn format(self: Object, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print(
-            ".{{ .str = {f}, .body = .{{ .{s}",
-            .{ self.str, @tagName(self.tag) },
+            ".{{ .head = {{ .str = {f} }}, .body = .{{ .{s}",
+            .{ self.head.str, @tagName(self.head.tag) },
         );
-        switch (self.tag) {
+        switch (self.head.tag) {
             .invalid,
             .none,
             .marked,
@@ -384,6 +378,7 @@ pub const Object = packed struct(u128) {
             .cached_local_var => try writer.print(" = {}", .{self.body.cached_local_var}),
             .cached_lexical_var => try writer.print(" = {}", .{self.body.cached_lexical_var}),
             .upvar_link => try writer.print(" = {}", .{self.body.upvar_link}),
+            .closure => try writer.print(" = {}", .{self.body.closure}),
             .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
         }
         try writer.writeAll(" } }");
@@ -539,6 +534,7 @@ pub const ExtraDataValue = union(enum) {
     source: struct {
         file_name: OptionalHandle,
         line_no: u32,
+        /// Computed hash for faster script lookup.
         hash: struct {
             state: std.atomic.Value(enum(u8) {
                 not_computed,
@@ -627,11 +623,12 @@ pub const Closure = struct {
         closure.optional_values.decrOptional();
     }
 
+    /// Closures are potentially created piece-meal, so we create
+    /// a compound hash of all their parts. Note, we don't hash
+    /// the scope directly, and instead hash its heap ID, since hashing
+    /// the scope directly would force the scope to be converted into
+    /// a string, which is potentially costly.
     pub fn cacheKey(closure: Closure) !u256 {
-        // Closures are potentially created piece-meal, so we create
-        // a compound hash of all their parts. Note, we don't hash
-        // the scope directly, since that would force the scope to
-        // be converted into a string, which is potentially costly.
         const args_hash = try closure.args.getHash();
         const body_hash = try closure.body.getHash();
         const scope_hash: HandleBacking = @bitCast(closure.scope);
@@ -749,6 +746,10 @@ pub const Handle = packed struct(HandleBacking) {
         return getHeap(handle).getLocalObject(handle.index);
     }
 
+    pub fn tag(self: Object) Tag {
+        return self.peek().head.tag;
+    }
+
     pub fn getHeap(handle: Handle) *Heap {
         return &heaps[handle.heap];
     }
@@ -767,7 +768,7 @@ pub const Handle = packed struct(HandleBacking) {
         // Make sure the object has a string rep before we free its body. That is, if
         // it has a string rep. `.none` objects are brand new, so they obviously don't
         // have a string rep yet.
-        if (handle.peek().tag != .none) _ = try handle.getString();
+        if (handle.tag() != .none) _ = try handle.getString();
         handle.invalidateBody();
     }
 
@@ -835,7 +836,7 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn hasString(handle: Handle) bool {
-        return handle.peek().tag == .reference or handle.peek().str != Object.null_string;
+        return handle.tag() == .reference or handle.peek().str != Object.null_string;
     }
 
     pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
@@ -856,7 +857,7 @@ pub const Handle = packed struct(HandleBacking) {
         if (handle.index < special_object_count + interned_string_count) return;
         // Make sure we never try to borrow a freed object.
         handle.assert(handle.debugRefCount() > 0);
-        handle.assert(handle.peek().tag != .reference);
+        handle.assert(handle.tag() != .reference);
 
         const metadata = handle.getMetadata();
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
@@ -866,7 +867,7 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn referenceTakeOwnership(handle: Handle) Object {
         // Make sure we're never making a reference to a reference.
-        handle.assert(handle.peek().tag != .reference);
+        handle.assert(handle.tag() != .reference);
 
         return .{
             // References are guaranteed to always have a null representation.
@@ -953,51 +954,28 @@ pub const Handle = packed struct(HandleBacking) {
             // TODO PERF I should probably benchmark whether it's faster
             // to check the metadata, or just to do an acquire load.
             if (options.threading and handle.getMetadata().cross_thread) {
-                // Workaround not being able to cast to Object.Head.
-                if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
-                if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
-                if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
-
-                const object_head: *u64 = @ptrCast(handle.peek());
-                const current_head = @atomicLoad(u64, object_head, .acquire);
-                break :blk @bitCast(@as(@truncate(current_head), u58));
+                const head = @atomicLoad(Object.Head, &handle.peek().head, .acquire);
+                break :blk head.str;
             } else {
-                break :blk handle.peek().str;
+                break :blk handle.peek().head.str;
             }
         };
 
-        // Normal string or long string?
-        if (str_or_ptr.is_ptr) {
-            // Convert to LongString ptr (guaranteed to be non-null).
-            return .{
-                .long = LongString.fromInt(str_or_ptr.u.ptr),
-            };
-        } else {
-            const str = str_or_ptr.u.str;
-            if (str.index == null_string) {
-                return .null;
-            } else if (str.index == empty_string) {
-                return .empty;
-            } else {
-                return .{
-                    .normal = handle.getHeap().getHeapString(str.index, str.index + str.len),
-                };
-            }
-        }
+        return handle.getHeap().getLocalStringDetails(str_or_ptr);
     }
 
     pub fn getSourceExtraData(handle: Handle) *@FieldType(ExtraDataValue, "source") {
-        handle.assert(handle.peek().tag == .source);
+        handle.assert(handle.tag() == .source);
         return &handle.getHeap().getExtraData(handle.peek().body.source.extra_data).source;
     }
 
     pub fn getDictExtraData(handle: Handle) *ExtraDataValue.Dictionary {
-        handle.assert(handle.peek().tag == .dict);
+        handle.assert(handle.tag() == .dict);
         return &handle.getHeap().getExtraData(handle.peek().body.dict.extra_data).dict;
     }
 
     pub fn getClosureExtraData(handle: Handle) *Closure {
-        handle.assert(handle.peek().tag == .closure);
+        handle.assert(handle.tag() == .closure);
         return &handle.getHeap().getExtraData(handle.peek().body.closure.extra_data).closure;
     }
 
@@ -1023,7 +1001,7 @@ pub const Handle = packed struct(HandleBacking) {
         }
 
         // No representation, so we better generate it
-        const new_str = blk: switch (obj.tag) {
+        const new_str = blk: switch (obj.head.tag) {
             .index => {
                 break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.index}, 0);
             },
@@ -1064,6 +1042,13 @@ pub const Handle = packed struct(HandleBacking) {
                         break :blk try getListString(handle.getHeap(), handle.index + 1, obj.body.dict.len);
                     }
                 }
+            },
+            .closure => {
+                const closure = handle.getClosureExtraData();
+
+                const fn_string = Heap.local_heap.getInternedString(.@"fn");
+
+                var args_list = objutil.newListWithCapacity(closure.args);
             },
             .custom_type => {
                 const custom_type = obj.body.custom_type;
@@ -1149,7 +1134,7 @@ pub const Handle = packed struct(HandleBacking) {
             },
         }
 
-        if (handle.peek().tag == .source) {
+        if (handle.tag() == .source) {
             const source = handle.getSourceExtraData();
             // If it's a source object, it may contain a cached hash.
             const hash_state = source.hash.state.load(.acquire);
@@ -1201,7 +1186,7 @@ fn invalidateStringInner(handle: Handle) void {
         .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
         .long => |long_str| handle.trace("Invalidate string (was {s})", .{long_str.getString()}),
     }
-    if (handle.peek().tag == .source) {
+    if (handle.tag() == .source) {
         // Why store unordered? Because there's no way to do the atomics
         // correctly here, so I'd much rather tsan complained. It _shouldn't_
         // be an issue, since strings shared between threads can't be invalidated,
@@ -1212,7 +1197,7 @@ fn invalidateStringInner(handle: Handle) void {
 }
 
 fn invalidateCollection(handle: Handle) void {
-    assert(handle.peek().tag == .dict or handle.peek().tag == .list);
+    assert(handle.tag() == .dict or handle.tag() == .list);
 
     const len = memutil.getOrderSize(handle.getMetadata().order) - 1;
 
@@ -1257,7 +1242,7 @@ fn invalidateCollection(handle: Handle) void {
 fn invalidateBodyInner(handle: Handle) void {
     handle.trace("Invalidate body", .{});
 
-    switch (handle.peek().tag) {
+    switch (handle.tag()) {
         .list => {
             invalidateCollection(handle);
         },
@@ -1270,7 +1255,7 @@ fn invalidateBodyInner(handle: Handle) void {
     }
 
     handle.peek().body = undefined;
-    handle.peek().tag = .invalid;
+    handle.peek().head.tag = .invalid;
 }
 
 const ObjectAndMetadata = struct {
@@ -1322,7 +1307,9 @@ fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Hand
 }
 
 fn createInternedStrings(heap: *Heap) !void {
-    const values = std.enums.values(InternedString);
+    const values = comptime blk: {
+        break :blk std.enums.values(InternedString);
+    };
     var converted_mapping: std.enums.EnumFieldStruct(InternedString, Handle, null) = undefined;
 
     // Init all the interned strings, handling failure as needed.
@@ -1334,7 +1321,7 @@ fn createInternedStrings(heap: *Heap) !void {
             const key = @tagName(values[i]);
             if (i < converted) {
                 const handle: Handle = @field(converted_mapping, key);
-                handle.peek().str.deinit(heap);
+                handle.peek().head.str.deinit(heap);
                 freeObjectBackingInner(handle);
             }
         }
@@ -1407,8 +1394,10 @@ pub fn init(heap: *Heap) !void {
     heap.extra = try .initWithCapacity(global_gpa, object_capacity);
     errdefer heap.extra.deinit(global_gpa);
 
-    heap.parsed_scripts = .empty;
-    heap.parsed_exprs = .empty;
+    heap.parsed_scripts = try .initWithCapacity(global_gpa, cfg.cache_size);
+    errdefer heap.parsed_scripts.deinit(global_gpa);
+    heap.parsed_exprs = try .initWithCapacity(global_gpa, cfg.cache_size);
+    errdefer heap.parsed_exprs.deinit(global_gpa);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
@@ -1423,7 +1412,7 @@ pub fn init(heap: *Heap) !void {
 
     // This is to remember to update this section whenever the special
     // objects change.
-    comptime assert(special_object_count == 3);
+    comptime assert(special_object_count == 2);
 
     // Specialty objects
     // null object is guaranteed to have index 0.
@@ -1433,16 +1422,8 @@ pub fn init(heap: *Heap) !void {
     // Empty object is guaranteed to have index 1.
     const empty_object = try heap.createObject();
     assert(empty_object.index == empty_object_idx);
-    empty_object.peek().str = Object.empty_string;
+    empty_object.peek().head.str = Object.empty_string;
     errdefer freeObjectBackingInner(empty_object);
-    // Temp object is guaranteed to have index 2.
-    const temp_object = try heap.createObject();
-    assert(temp_object.index == temp_object_idx);
-    errdefer freeObjectBackingInner(temp_object);
-
-    // We need to init the temp object as well by setting its string to a long string.
-    assert(try heap.setLongString(temp_object_idx, .{ .temp = "" }));
-    errdefer heap.tempObject().peek().str.deinit(heap);
 
     // Create all the interned strings.
     try heap.createInternedStrings();
@@ -1488,11 +1469,9 @@ pub fn deinit(heap: *Heap) void {
     }
 
     // Be sure to free the specialty objects and strings.
-    assert(special_object_count == 3);
-    heap.tempObject().getStringDetails().long.freeInner(global_gpa);
+    assert(special_object_count == 2);
     heap.object_tracking.freeFromOwningThread(0, 0);
     heap.object_tracking.freeFromOwningThread(1, 0);
-    heap.object_tracking.freeFromOwningThread(2, 0);
     assert(special_string_count == 2);
     heap.string_tracking.freeFromOwningThread(0, 0);
     heap.string_tracking.freeFromOwningThread(1, 0);
@@ -1522,40 +1501,6 @@ pub fn emptyObject(self: *Heap) Handle {
     return .{
         .index = empty_object_idx,
         .heap = self.heapId(),
-    };
-}
-
-pub fn tempObject(self: *Heap) Handle {
-    return .{
-        .index = temp_object_idx,
-        .heap = self.heapId(),
-    };
-}
-
-pub fn resetTempObject(heap: *Heap) void {
-    if (heap.tempObject().hasString()) {
-        const long_string = heap.tempObject().getStringDetails().long;
-        long_string.string_type.temp = undefined;
-    }
-}
-
-pub fn setTempObjectString(heap: *Heap, bytes: [:0]const u8) void {
-    const temp_handle = heap.tempObject();
-    assert(temp_handle.hasString());
-    assert(temp_handle.getMetadata().cross_thread == false);
-
-    const long_string = temp_handle.getStringDetails().long;
-    // Avoid churning the LongString allocation by making it
-    // extremely unlikely for its ref_count to reach zero.
-    long_string.ref_count = std.math.maxInt(usize) / 2;
-    // Reset anything that may have previously been computed.
-    long_string.utf8_length = std.math.maxInt(u64);
-    long_string.hash.mutex.lock();
-    long_string.hash.value = null;
-    long_string.hash.mutex.unlock();
-
-    long_string.string_type = .{
-        .temp = bytes,
     };
 }
 
@@ -1650,8 +1595,10 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
     // Initialize all as empty objects
     @memset(self.objectSlice(index, end), .{
-        .str = Object.null_string,
-        .tag = .none,
+        .head = .{
+            .str = Object.null_string,
+            .tag = .none,
+        },
         .body = .{
             .integer = 0,
         },
@@ -1798,7 +1745,7 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
 
     // Make sure they have a string rep before checking the details
     const a_str = try a.getString();
-    const b_str = try a.getString();
+    const b_str = try b.getString();
     const a_details = a.getStringDetails();
     const b_details = b.getStringDetails();
 
@@ -1808,7 +1755,7 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
             // The only case where an object can have a null string after getting
             // its string value is a reference.
             .null => {
-                assert(a.peek().tag == .reference);
+                assert(a.tag() == .reference);
                 break :blk;
             },
             else => break :blk,
@@ -1817,7 +1764,7 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
         const b_long_str = switch (b_details) {
             .long => |unwrapped| unwrapped,
             .null => {
-                assert(b.peek().tag == .reference);
+                assert(b.tag() == .reference);
                 break :blk;
             },
             else => break :blk,
@@ -1889,7 +1836,7 @@ pub fn dupSingleOrReference(dest_heap: *Heap, handle: Handle) !Object {
 pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
     _ = dest_heap;
 
-    const tag = handle.peek().tag;
+    const tag = handle.tag();
     if (tag == .reference) {
         // We can't reference a reference, so we'll create a new reference.
         return handle.peek().body.reference.reference();
@@ -2344,6 +2291,27 @@ const StringDetails = union(enum) {
     long: *align(LongString.align_amt) LongString,
 };
 
+fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
+    // Normal string or long string?
+    if (str_or_ptr.is_ptr) {
+        // Convert to LongString ptr (guaranteed to be non-null).
+        return .{
+            .long = LongString.fromInt(str_or_ptr.u.ptr),
+        };
+    } else {
+        const str = str_or_ptr.u.str;
+        if (str.index == null_string) {
+            return .null;
+        } else if (str.index == empty_string) {
+            return .empty;
+        } else {
+            return .{
+                .normal = heap.getHeapString(str.index, str.index + str.len),
+            };
+        }
+    }
+}
+
 pub const LongString = struct {
     /// At what point should we switch to using a long string?
     /// Whenever the string length >= split_point
@@ -2698,7 +2666,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
                 std.debug.print("next object: {f}\n", .{heap.getHandle(@intCast(i + 1)).peek()});
             }
             std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
-                handle.peek().tag,
+                handle.tag(),
                 i,
                 handle.getMetadata().order,
                 handle.debugRefCount(),
@@ -2714,7 +2682,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
             if (metadata.in_use) {
                 const handle = heap.getHandle(@intCast(i));
                 std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
-                    handle.peek().tag,
+                    handle.tag(),
                     i,
                     handle.debugRefCount(),
                     handle.getString() catch "oom",
@@ -2812,7 +2780,7 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
 
         try stderr.print("    obj{} [label=\"{{", .{item_idx});
         try renderDotNodeLabel(stderr, item_handle, @intCast(item_idx), max_str_len);
-        try stderr.print("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.peek().tag)});
+        try stderr.print("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.tag())});
     }
 
     try stderr.writeAll("  }\n\n");

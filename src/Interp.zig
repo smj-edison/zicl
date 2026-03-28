@@ -11,9 +11,9 @@ const memutil = @import("memutil.zig");
 const expr_parse = @import("expr_parse.zig");
 
 const Interp = @This();
+const InterpId = u16;
 
-heap: *Heap,
-gpa: std.mem.Allocator,
+interp_id: InterpId,
 
 /// The result from a procedure or eval call
 result: Handle,
@@ -52,6 +52,7 @@ return_propagate: struct {
 
 prng: std.Random.DefaultPrng,
 
+pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
 pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
 
@@ -141,7 +142,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: Handle) !?Hea
 /// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name, so it can shimmer in place.
 fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_frame: u32, name: Handle) !void {
-    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.getHeap() == Heap.local_heap);
     name.assert(name.canShimmer());
 
     const var_name = try name.getString();
@@ -151,21 +152,21 @@ fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_fr
         switch (var_value) {
             .local_variable => |local_var| {
                 try name.prepareToShimmer();
-                name.peek().tag = .cached_local_var;
+                name.peek().head.tag = .cached_local_var;
                 name.peek().body.cached_local_var = .{
                     .call_epoch = call_frame.call_epoch,
                     .cached_index = local_var.target.index,
                 };
             },
             .lexical_variable => |lexical_var| {
-                const extra_data = try interp.heap.createExtraData();
-                errdefer interp.heap.destroyExtraData(extra_data);
-                interp.heap.getExtraData(extra_data).* = .{ .lexical_variable = .{
+                const extra_data = try Heap.local_heap.createExtraData();
+                errdefer Heap.local_heap.destroyExtraData(extra_data);
+                Heap.local_heap.getExtraData(extra_data).* = .{ .lexical_variable = .{
                     .ref = lexical_var.target.borrow(),
                 } };
 
                 try name.prepareToShimmer();
-                name.peek().tag = .cached_lexical_var;
+                name.peek().head.tag = .cached_lexical_var;
                 name.peek().body.cached_lexical_var = .{
                     .call_epoch = call_frame.call_epoch,
                     .extra_data = extra_data,
@@ -180,9 +181,11 @@ fn reshimmerToVariable(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_fr
 /// Ensures that this is a valid variable, dict sugar, or upvar. If not, it'll shimmer it to whichever one applies.
 /// Must be called with a heap-native variable name.
 fn ensureValidVariableType(interp: *Interp, det: ?*objutil.ErrorDetails, var_call_frame: u32, name: Handle) !void {
+    assert(name.getHeap() == Heap.local_heap);
+
     const call_frame = interp.call_frames.items[var_call_frame];
 
-    switch (name.peek().tag) {
+    switch (name.tag()) {
         .cached_local_var => {
             // Fast case: if we're in the same epoch as last time, so we don't
             // need to do anything.
@@ -238,7 +241,7 @@ fn ensureValidVariableType(interp: *Interp, det: ?*objutil.ErrorDetails, var_cal
 
 // Must be called with a heap-native variable name.
 fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
-    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.getHeap() == Heap.local_heap);
     name.assert(name.canShimmer());
 
     const call_frame = &interp.call_frames.items[call_frame_idx];
@@ -249,7 +252,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
     call_frame.variables.swapIfNew(put_result.new_dict);
 
     try name.prepareToShimmer();
-    name.peek().tag = .cached_local_var;
+    name.peek().head.tag = .cached_local_var;
     name.peek().body.cached_local_var = .{
         .call_epoch = call_frame.call_epoch,
         .cached_index = put_result.new_value.index,
@@ -258,19 +261,19 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
 
 /// Must be called with a heap-native name. Always takes ownership of `value`, even in error cases.
 pub fn setVariableImpl(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
-    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.getHeap() == Heap.local_heap);
     name.assert(name.canShimmer());
 
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
-        switch (name.peek().tag) {
+        switch (name.tag()) {
             .dict_sugar => @panic("Dict sugar not implemented"),
             .cached_local_var => {
                 const cached_var = &name.peek().body.cached_local_var;
-                const var_value = interp.heap.getHandle(cached_var.cached_index);
-                if (var_value.peek().tag == .upvar_link) {
+                const var_value = Heap.local_heap.getHandle(cached_var.cached_index);
+                if (var_value.tag() == .upvar_link) {
                     const upvar_link = var_value.peek().body.upvar_link;
                     // Set the value through the linked name in the linked frame.
-                    try interp.setVariableImpl(upvar_link.call_frame, interp.heap.getHandle(upvar_link.linked_name), value);
+                    try interp.setVariableImpl(upvar_link.call_frame, Heap.local_heap.getHandle(upvar_link.linked_name), value);
                     return;
                 }
 
@@ -308,7 +311,7 @@ pub fn setVariableLinkImpl(
     target_call_frame_idx: u32,
     target_name: Handle,
 ) !void {
-    name.assert(name.getHeap() == interp.heap);
+    name.assert(name.getHeap() == Heap.local_heap);
     name.assert(name.canShimmer());
 
     const name_bytes = try name.getString();
@@ -317,7 +320,7 @@ pub fn setVariableLinkImpl(
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) |_| {
         // Variable already exists.
         if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt(interp.heap, "variable \"{s}\" already exists", .{name_bytes}),
+            .message = try objutil.newStringFmt(Heap.local_heap, "variable \"{s}\" already exists", .{name_bytes}),
         };
 
         return error.VariableAlreadyExists;
@@ -328,9 +331,9 @@ pub fn setVariableLinkImpl(
         error.OutOfMemory => return error.OutOfMemory,
     }
 
-    if (name.peek().tag == .dict_sugar) {
+    if (name.tag() == .dict_sugar) {
         if (det) |details| details.* = .{
-            .message = try objutil.newString(interp.heap, "cannot create an upvar name that has dict sugar"),
+            .message = try objutil.newString(Heap.local_heap, "cannot create an upvar name that has dict sugar"),
         };
         return error.DictSugarInUpvarName;
     }
@@ -346,7 +349,7 @@ pub fn setVariableLinkImpl(
                 // we managed to find ourselves when traversing the upvar
                 // chain. Obviously, we can't let this happen.
                 if (det) |details| details.* = .{
-                    .message = try objutil.newString(interp.heap, "can't upvar from variable to itself"),
+                    .message = try objutil.newString(Heap.local_heap, "can't upvar from variable to itself"),
                 };
                 return error.CircularUpvar;
             }
@@ -354,7 +357,7 @@ pub fn setVariableLinkImpl(
             const var_exists = interp.ensureValidVariableType(null, target_call_frame_idx, obj_currently_checking);
             if (var_exists) |_| {
                 // Can't use `getVariableImpl` here, as it follows upvars.
-                if (obj_currently_checking.peek().tag == .cached_local_var) {
+                if (obj_currently_checking.tag() == .cached_local_var) {
                     const index = obj_currently_checking.peek().body.cached_local_var.cached_index;
                     const var_val = obj_currently_checking.getHeap().getHandle(index);
                     // Need to check the next link in this upvar chain to see if
@@ -380,7 +383,7 @@ pub fn setVariableLinkImpl(
             }
         }
 
-        const target_name_duped = try objutil.newString(interp.heap, target_name_bytes);
+        const target_name_duped = try objutil.newString(Heap.local_heap, target_name_bytes);
 
         try interp.setVariableImpl(call_frame_idx, name, .{
             .str = Heap.Object.null_string,
@@ -408,7 +411,7 @@ pub fn getVariableInner(
     switch (name_obj.tag) {
         .cached_local_var => {
             const resolved = name_heap.getHandle(name_obj.body.cached_local_var.cached_index);
-            if (resolved.peek().tag == .upvar_link) {
+            if (resolved.tag() == .upvar_link) {
                 // Recursively follow upvar.
                 const upvar_link = resolved.peek().body.upvar_link;
                 const linked_name = resolved.getHeap().getHandle(upvar_link.linked_name);
@@ -546,8 +549,6 @@ pub const NativeCommand = struct {
     }
 };
 
-pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
-
 fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
         .message = try objutil.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
@@ -596,9 +597,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
 
     const args, const body = blk: {
         if (impl_raw.toHandle()) |impl| {
-            const impl_shimmer_result = objutil.shimmerToList(null, impl, &new_handle);
-            assert(new_handle == .none);
-            if (impl_shimmer_result) {} else |err| switch (err) {
+            objutil.shimmerToList(null, impl, &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     if (det) |details| details.* = .{
@@ -606,7 +605,8 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
                     };
                     return error.BadClosure;
                 },
-            }
+            };
+            assert(new_handle == .none);
 
             if (objutil.listLengthRaw(impl) != 2) {
                 if (det) |details| details.* = .{
@@ -725,31 +725,34 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     };
 }
 
+const ClosureAndCacheKey = struct {
+    closure: Heap.Closure,
+    cache_key: u256,
+};
 /// Caller is responsible for borrowing the returned closure
 /// if they intend to use it beyond temporarily.
-pub fn getClosure(interp: *Interp, handle: Handle) !Heap.Closure {
-    if (handle.peek().tag == .closure) {
-        return handle.getClosureExtraData().*;
+pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
+    if (handle.tag() == .closure) {
+        const closure = handle.getClosureExtraData().*;
+        return .{ .closure = closure, .cache_key = closure.cacheKey() };
     }
 
     const cache_key = handle.getHash();
 
-    if (interp.heap.parsed_closures.get(cache_key)) |cached| {
-        return cached.closure;
+    if (Heap.local_heap.parsed_closures.get(cache_key)) |cached| {
+        return .{ .closure = cached.closure, .cache_key = cache_key };
     } else {
         // We need to parse the closure.
         var det: objutil.ErrorDetails = undefined;
         const closure: Heap.Closure = try interp.wrapError(&det, parseClosure(&det, try handle.getString()));
-        if (interp.heap.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
+        if (Heap.local_heap.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
             old_value.closure.deinit();
         }
-        return interp.heap.parsed_closures.get(cache_key);
+        return Heap.local_heap.parsed_closures.get(cache_key);
     }
 }
 
-pub fn callClosure(interp: *Interp, handle: Handle, args: []Handle) !void {
-    const closure = try interp.getClosure(handle);
-
+pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -794,28 +797,20 @@ pub fn callClosure(interp: *Interp, handle: Handle, args: []Handle) !void {
 
             // Are there any remaining unassigned arguments?
             if (called_idx < args.len) {
-                try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(args[called_idx]));
+                try interp.setVariableImpl(call_frame_idx, var_name, try Heap.local_heap.dupOrReference(args[called_idx]));
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
                 const default_value = objutil.listItem(closure.optional_values.?, signature_idx - closure.required_arity);
-                try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(default_value));
+                try interp.setVariableImpl(call_frame_idx, var_name, try Heap.local_heap.dupOrReference(default_value));
             }
         } else {
-            try interp.setVariableImpl(call_frame_idx, var_name, try interp.heap.dupOrReference(args[called_idx]));
+            try interp.setVariableImpl(call_frame_idx, var_name, try Heap.local_heap.dupOrReference(args[called_idx]));
             called_idx += 1;
         }
     }
 
-    // Use the string's hash if it exists, since this will deduplicate
-    // the scope.
-    if (handle.getStringIfExists()) |_| {
-        const hash = try handle.getHash();
-        try interp.evalObjectInner(closure.body, hash);
-    } else {
-        const cache_key = try closure.cacheKey();
-        try interp.evalObjectInner(closure.body, cache_key);
-    }
+    try interp.evalObjectInner(closure.body, cache_key);
 }
 
 fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
@@ -845,16 +840,9 @@ fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
     return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
 }
 
-pub fn evalList(interp: *Interp, list: Handle) !void {
-    _ = interp;
-    _ = list;
-
-    @panic("unimplemented");
-}
-
 fn freeLastResult(interp: *Interp) void {
     interp.result.decrRefCount();
-    interp.result = interp.heap.emptyObject();
+    interp.result = Heap.local_heap.emptyObject();
 }
 
 pub fn setResult(interp: *Interp, handle: Handle) void {
@@ -868,26 +856,26 @@ pub fn setResultOwning(interp: *Interp, handle: Handle) void {
 }
 
 pub fn setResultInteger(interp: *Interp, value: i64) !void {
-    interp.setResultOwning(try objutil.newInteger(interp.heap, value));
+    interp.setResultOwning(try objutil.newInteger(Heap.local_heap, value));
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.freeLastResult();
-    const bytes_handle = try objutil.newString(interp.heap, bytes);
+    const bytes_handle = try objutil.newString(Heap.local_heap, bytes);
 
     setResult(interp, bytes_handle);
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
     interp.freeLastResult();
-    const fmt_handle = try objutil.newStringFmt(interp.heap, fmt, args);
+    const fmt_handle = try objutil.newStringFmt(Heap.local_heap, fmt, args);
 
     setResult(interp, fmt_handle);
 }
 
 pub fn setEmptyResult(interp: *Interp) void {
     interp.freeLastResult();
-    interp.result = interp.heap.emptyObject();
+    interp.result = Heap.local_heap.emptyObject();
 }
 
 /// Call frame.
@@ -921,7 +909,7 @@ const CallFrame = struct {
         // Make sure there's no upvars.
         for (0..pairs) |i| {
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
-            if (value.peek().tag == .upvar_link) break;
+            if (value.tag() == .upvar_link) break;
         } else {
             // No upvars found, so we can just borrow the variables.
             return frame.variables.borrow();
@@ -934,7 +922,7 @@ const CallFrame = struct {
             const key = objutil.dictItem(frame.variables, i * 2);
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
 
-            if (value.peek().tag == .upvar_link) {
+            if (value.tag() == .upvar_link) {
                 const upvar_link = value.peek().body.upvar_link;
                 if (interp.getVariableInner(null, upvar_link.call_frame, upvar_link.linked_name)) |upvar_val| {
                     try objutil.dictPut(new_dict, key, upvar_val);
@@ -983,7 +971,7 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
-    const vars_handle = try objutil.newDict(interp.heap, &.{});
+    const vars_handle = try objutil.newDict(Heap.local_heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
@@ -1043,13 +1031,13 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
                 // The only case where the new value is not the same as the last value is if `eval`
                 // converted it from a string to a script. If so, we want to copy that script id
                 // back to the token list so we'll use the cached script for future invocations.
-                assert(value.heap == interp.heap.heapId());
-                assert(new.heap == interp.heap.heapId());
-                assert(new.peek().tag == .script);
+                assert(value.heap == Heap.local_heap.heapId());
+                assert(new.heap == Heap.local_heap.heapId());
+                assert(new.tag() == .script);
 
                 // Copy over the new script id.
                 value.invalidateBody();
-                value.peek().tag = .script;
+                value.peek().head.tag = .script;
                 value.peek().body.script = new.peek().body.script;
             }
 
@@ -1091,7 +1079,7 @@ fn interpolateTokens(
                         break;
                     },
                     Error.Continue => {
-                        new_values[i] = interp.heap.emptyObject();
+                        new_values[i] = Heap.local_heap.emptyObject();
                         continue;
                     },
                     else => {},
@@ -1124,7 +1112,7 @@ fn interpolateTokens(
         new_str_len += (try new_value.getString()).len;
     }
 
-    const new_str = try objutil.newStringToFill(interp.heap, new_str_len);
+    const new_str = try objutil.newStringToFill(Heap.local_heap, new_str_len);
     errdefer new_str.decrRefCount();
     if (Heap.getStringMut(new_str)) |new_str_mut| {
         var written: usize = 0;
@@ -1141,25 +1129,31 @@ fn interpolateTokens(
 }
 
 const CommandOrClosure = union(enum) {
-    closure: Handle,
-    command: NativeCommand,
+    closure: ClosureAndCacheKey,
+    command: *NativeCommand,
 };
 
-/// Caller needs to decrRefCount on the closure if this returns a closure.
-fn getCommandInner(
-    interp: *Interp,
-    det: ?*objutil.ErrorDetails,
-    call_frame: u32,
-    name: Handle,
-) !CommandOrClosure {
+/// `name` must be from the threadlocal heap.
+fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !CommandOrClosure {
     if (interp.getVariableInner(null, call_frame, name)) |var_val| {
-        var shimmerable_val = var_val;
-        errdefer shimmerable_val.decrRefCount();
+        if (var_val.tag() == .closure) {
+            return interp.getClosure(var_val);
+        }
 
-        if (shimmerable_val.canShimmer()) {
-            shimmerable_val.borrow();
+        // TODO PERF figure out whether caching nativefn lookup would be beneficial.
+        const bytes = try var_val.getString();
+        if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
+            // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
+            const command = interp.global_commands.getPtr(bytes[9..]) orelse {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt(Heap.local_heap, "invalid native command name \"{f}\"", .{bytes[9..]}),
+                };
+                return error.CommandNotFound;
+            };
+            return .{ .command = command };
         } else {
-            shimmerable_val = try Heap.local_heap.duplicate(var_val);
+            const closure = try interp.getClosure(var_val);
+            return .{ .closure = closure };
         }
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1167,134 +1161,30 @@ fn getCommandInner(
             if (det) |details| details.* = .{
                 .message = try objutil.newStringFmt(Heap.local_heap, "invalid command name \"{f}\"", .{name}),
             };
+            return error.CommandNotFound;
         },
     }
 }
 
-/// This function returns the command that's found based on the string contents of `handle`.
-/// This also specializes the object to contain a cached lookup for the command.
-pub fn getCommand(interp: *Interp, det: ?*objutil.ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !*NativeCommand {
+pub fn getCommand(
+    interp: *Interp,
+    call_frame_idx: u32,
+    provided_handle: Handle,
+    new_handle: *OptionalHandle,
+) !CommandOrClosure {
     errdefer new_handle.swapWithNone();
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
 
-    early_exit: {
-        // Can't use a command's cached value if it's from another heap.
-        if (provided_handle.heap != interp.heap.heapId()) break :early_exit;
-
-        const obj = provided_handle.peek();
-
-        // TODO PERF honestly at this point, because the namespace has to be stored off the heap,
-        // it might be faster to just do a hashmap lookup every time if it's not in the global
-        // namespace.
-
-        // In order for the cached value to be valid, the proc epoch must match and the
-        // lookup must have occurred in the same namespace.
-        if (obj.tag == .command and obj.body.command.procedure_epoch == interp.global_procedure_epoch) {
-            if (interp.currentCallFrame().namespace) |namespace| {
-                // Another check: if this command was in a namespace, it needs to be the same as the current
-                // call frame's namespace.
-                if (obj.body.command.in_global_namespace) break :early_exit;
-                const obj_namespace = interp.heap.getExtraData(obj.body.command.u.other_namespace).command;
-                if (!try Heap.checkIfEqual(namespace, provided_handle.getHeap().getHandle(obj_namespace.namespace))) {
-                    break :early_exit;
-                }
-            } else if (!obj.body.command.in_global_namespace) {
-                // The interpreter is in a global namespace, and this object wasn't, so we'll need to look
-                // up the command again.
-                break :early_exit;
-            }
-
-            // TODO should I implement `local`?
-
-            // All checks passed, so now we can return the cached command's pointer.
-            const command = blk: {
-                if (obj.body.command.in_global_namespace) {
-                    break :blk &interp.global_commands.values()[obj.body.command.u.global_namespace.command_index];
-                } else {
-                    const extra_data = interp.heap.getExtraData(obj.body.command.u.other_namespace);
-                    break :blk &interp.global_commands.values()[extra_data.command.command_index];
-                }
-            };
-            return command;
-        } else {
-            break :early_exit;
-        }
-    }
-
-    const command_name = try provided_handle.getString();
-
-    // There wasn't a cached version, or it was invalid, so we'll need to look up this command.
-    const current_namespace = interp.currentCallFrame().namespace;
-    var sf = std.heap.stackFallback(64, Heap.global_gpa);
-    const scratch = sf.get();
-    const qualified = blk: {
-        // Only qualify if we're in a namespace.
-        if (current_namespace) |namespace| {
-            break :blk try qualifyName(scratch, namespace, command_name);
-        }
-        break :blk null;
-    };
-    defer if (qualified) |unwrapped| scratch.free(unwrapped);
-
-    var command_index: ?usize = interp.global_commands.getIndex(qualified orelse command_name);
-    if (qualified != null and command_index == null) {
-        // If we couldn't find the command in the namespace, we should check if it's in the global
-        // namespace (by not qualifying the name, and instead using it raw).
-        command_index = interp.global_commands.getIndex(command_name);
-    }
-
-    // Cache the command.
-    if (command_index) |index| {
-        try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-        const handle = new_handle.orElse(provided_handle);
-
-        if (current_namespace) |namespace| {
-            assert(handle.heap == interp.heap.heapId());
-
-            const borrowed_namespace = namespace.borrow();
-            errdefer borrowed_namespace.decrRefCount();
-            assert(borrowed_namespace.heap == handle.heap);
-
-            const extra_data = try interp.heap.createExtraData();
-            errdefer interp.heap.destroyExtraData(extra_data);
-            interp.heap.getExtraData(extra_data).* = .{
-                .command = .{
-                    .command_index = @intCast(index),
-                    .namespace = borrowed_namespace.index,
-                },
-            };
-
-            try handle.prepareToShimmer();
-            handle.peek().tag = .command;
-            handle.peek().body.command = .{
-                .procedure_epoch = interp.global_procedure_epoch,
-                .in_global_namespace = false,
-                .u = .{ .other_namespace = extra_data },
-            };
-        } else {
-            try handle.prepareToShimmer();
-            handle.peek().tag = .command;
-            handle.peek().body.command = .{
-                .procedure_epoch = interp.global_procedure_epoch,
-                .in_global_namespace = true,
-                .u = .{ .global_namespace = .{ .command_index = @intCast(index) } },
-            };
-        }
-
-        return &interp.global_commands.values()[index];
-    } else {
-        // If it was null, we better error.
-        if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt(interp.heap, "invalid command name \"{s}\"", .{command_name}),
-        };
-        return error.CommandNotFound;
-    }
+    var det: objutil.ErrorDetails = undefined;
+    return try interp.wrapError(
+        &det,
+        interp.getCommandInner(&det, call_frame_idx, new_handle.orElse(provided_handle)),
+    );
 }
 
 fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
-    var det: objutil.ErrorDetails = undefined;
-
     var new_command: OptionalHandle = .none;
-    const command = getCommand(interp, &det, args[0], &new_command) catch |err| switch (err) {
+    const command_or_closure = interp.getCommand(call_frame_idx, args[0], &new_command) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // TODO invoke jim unknown
@@ -1323,16 +1213,12 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
         interp.setEmptyResult();
 
         const result = blk: {
-            switch (command.call_info) {
-                .zig => |info| {
-                    _ = info;
-
+            switch (command_or_closure) {
+                .command => |command| {
                     break :blk interp.callNative(command, current_args);
                 },
-                .tcl => |info| {
-                    _ = info;
-
-                    break :blk interp.callProcedure(command, current_args);
+                .closure => |closure| {
+                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args);
                 },
             }
         };
@@ -1563,10 +1449,10 @@ const ExprResult = union(enum) {
         }
     }
 
-    pub fn toObject(result: ExprResult, interp: *Interp) !Handle {
+    pub fn toObject(result: ExprResult) !Handle {
         switch (result) {
-            .int => |int| return try objutil.newInteger(interp.heap, int),
-            .float => |float| return try objutil.newFloat(interp.heap, float),
+            .int => |int| return try objutil.newInteger(Heap.local_heap, int),
+            .float => |float| return try objutil.newFloat(Heap.local_heap, float),
             .owned_handle => |handle| return handle.borrow(),
             .stack_handle => |handle| return handle,
         }
@@ -2296,7 +2182,7 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
     var det: objutil.ErrorDetails = undefined;
     const put_result = try interp.wrapError(
         &det,
-        objutil.dictPutRecursively(&det, dict.*, keys, try interp.heap.dupOrReference(value)),
+        objutil.dictPutRecursively(&det, dict.*, keys, try Heap.local_heap.dupOrReference(value)),
     );
     dict.swapIfNew(put_result.new_dict);
     return put_result.new_value;

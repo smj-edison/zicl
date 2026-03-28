@@ -15,9 +15,9 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
 
         for (1..args.len) |i| {
             const operand = blk: {
-                if (args[i].peek().tag == .integer) {
+                if (args[i].tag() == .integer) {
                     break :blk args[i].peek().body.integer;
-                } else if (args[i].peek().tag == .float) {
+                } else if (args[i].tag() == .float) {
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
@@ -48,9 +48,9 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
 
     for (1..args.len) |i| {
         const operand: f64 = blk: {
-            if (args[i].peek().tag == .integer) {
+            if (args[i].tag() == .integer) {
                 break :blk @floatFromInt(args[i].peek().body.integer);
-            } else if (args[i].peek().tag == .float) {
+            } else if (args[i].tag() == .float) {
                 break :blk args[i].peek().body.float;
             } else {
                 // Try to shimmer it to a float.
@@ -401,7 +401,7 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
         if (val.canMutate()) {
             // Can modify directly.
             val.invalidateBoth();
-            val.peek().tag = .integer;
+            val.peek().head.tag = .integer;
             val.peek().body = .{ .integer = new_contents };
             interp.setResult(val);
         } else {
