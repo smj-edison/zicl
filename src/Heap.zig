@@ -296,11 +296,11 @@ pub const Object = packed struct(u128) {
     }
 
     pub fn deinitString(obj: *Object, heap: *Heap) void {
-        obj.str.deinit(heap);
+        obj.head.str.deinit(heap);
 
         // Be sure to set the null string afterwards (we can directly assign,
         // as we've already checked that we can shimmer).
-        obj.str = Object.null_string;
+        obj.head.str = Object.null_string;
     }
 
     /// Only deinitializes if this is a single object, panics otherwise. Can
@@ -308,7 +308,7 @@ pub const Object = packed struct(u128) {
     /// the strings/extra data this object contains.
     pub fn deinitBodySingle(obj: *Object, heap: *Heap) void {
         // Deinit body
-        switch (obj.tag) {
+        switch (obj.head.tag) {
             .custom_type => {
                 const custom_type = obj.body.custom_type;
                 const type_fns = custom_types.items[custom_type.type_id];
@@ -327,6 +327,9 @@ pub const Object = packed struct(u128) {
             },
             .cached_lexical_var => {
                 heap.destroyExtraData(obj.body.cached_lexical_var.extra_data);
+            },
+            .closure => {
+                heap.destroyExtraData(obj.body.closure.extra_data);
             },
             .upvar_link => {
                 const upvar_link = obj.body.upvar_link;
@@ -351,7 +354,7 @@ pub const Object = packed struct(u128) {
         }
 
         obj.body = undefined;
-        obj.tag = .none;
+        obj.head.tag = .none;
     }
 
     pub fn format(self: Object, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -746,8 +749,8 @@ pub const Handle = packed struct(HandleBacking) {
         return getHeap(handle).getLocalObject(handle.index);
     }
 
-    pub fn tag(self: Object) Tag {
-        return self.peek().head.tag;
+    pub fn tag(handle: Handle) Tag {
+        return handle.peek().head.tag;
     }
 
     pub fn getHeap(handle: Handle) *Heap {
@@ -871,8 +874,10 @@ pub const Handle = packed struct(HandleBacking) {
 
         return .{
             // References are guaranteed to always have a null representation.
-            .str = Object.null_string,
-            .tag = .reference,
+            .head = .{
+                .str = Object.null_string,
+                .tag = .reference,
+            },
             .body = .{
                 .reference = handle,
             },
@@ -1045,10 +1050,77 @@ pub const Handle = packed struct(HandleBacking) {
             },
             .closure => {
                 const closure = handle.getClosureExtraData();
+                const heap = handle.getHeap();
+                const total_args = objutil.listLengthRaw(closure.args);
+                const opt_values = closure.optional_values.toHandle();
 
-                const fn_string = Heap.local_heap.getInternedString(.@"fn");
+                // Build the args spec list. Required/args params use the name directly;
+                // optional params become 2-element lists {name default}.
+                const args_spec = try objutil.newListWithCapacity(total_args);
+                errdefer args_spec.decrRefCount();
+                args_spec.peek().body.list.len = total_args;
+                const arg_items = objutil.listItems(args_spec);
 
-                var args_list = objutil.newListWithCapacity(closure.args);
+                for (0..total_args) |i| {
+                    const arg_name = objutil.listItem(closure.args, @intCast(i));
+                    const is_args_param = closure.has_args_parameter and i == total_args - 1;
+                    const is_optional = !is_args_param and i >= closure.required_arity;
+
+                    if (is_optional) {
+                        const opt_idx = i - closure.required_arity;
+                        const default_val = objutil.listItem(opt_values.?, @intCast(opt_idx));
+                        const spec = try objutil.newList(&.{ arg_name, default_val });
+                        arg_items[i] = spec.referenceTakeOwnership();
+                    } else {
+                        arg_items[i] = try heap.dupOrReference(arg_name);
+                    }
+                }
+
+                // impl is a 2-element list: {args_spec body}.
+                const impl_val = try objutil.newList(&.{ args_spec, closure.body });
+                errdefer impl_val.decrRefCount();
+
+                // Build the outer list: fn ?name <name>? impl <impl> ?scope <scope>?
+                var word_count: u32 = 3; // fn, impl keyword, impl value
+                if (closure.name.toHandle() != null) word_count += 2;
+                if (closure.scope.toHandle() != null) word_count += 2;
+
+                const outer = try objutil.newListWithCapacity(word_count);
+                errdefer outer.decrRefCount();
+                outer.peek().body.list.len = word_count;
+                const words = objutil.listItems(outer);
+
+                var w: u32 = 0;
+                words[w] = try heap.dupOrReference(heap.getInternedString(.@"fn"));
+                w += 1;
+
+                if (closure.name.toHandle()) |name_handle| {
+                    words[w] = try heap.dupOrReference(heap.getInternedString(.name));
+                    w += 1;
+                    words[w] = try heap.dupOrReference(name_handle);
+                    w += 1;
+                }
+
+                words[w] = try heap.dupOrReference(heap.getInternedString(.impl));
+                w += 1;
+                words[w] = try heap.dupOrReference(impl_val);
+                w += 1;
+
+                if (closure.scope.toHandle()) |scope_handle| {
+                    words[w] = try heap.dupOrReference(heap.getInternedString(.scope));
+                    w += 1;
+                    words[w] = try heap.dupOrReference(scope_handle);
+                    w += 1;
+                }
+
+                std.debug.assert(w == word_count);
+
+                const result = try getListString(heap, outer.index + 1, word_count);
+                // Clean up temporary objects before returning.
+                outer.decrRefCount();
+                impl_val.decrRefCount();
+                args_spec.decrRefCount();
+                break :blk result;
             },
             .custom_type => {
                 const custom_type = obj.body.custom_type;
@@ -1104,7 +1176,7 @@ pub const Handle = packed struct(HandleBacking) {
             .cached_local_var,
             .cached_lexical_var,
             => {
-                std.debug.panic("{} should always have a string representation", .{obj.tag});
+                std.debug.panic("{} should always have a string representation", .{obj.head.tag});
             },
         };
 
@@ -1464,7 +1536,7 @@ pub fn deinit(heap: *Heap) void {
         // Need to free these objects directly, since they're not normally allowed
         // to be mutated.
         const interned = heap.getHandle(@intCast(i));
-        interned.peek().str.deinit(heap);
+        interned.peek().head.str.deinit(heap);
         freeObjectBackingInner(interned);
     }
 
@@ -1818,7 +1890,7 @@ pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
             };
         },
         .null, .empty => {
-            return handle.peek().str;
+            return handle.peek().head.str;
         },
     }
 }
@@ -1840,12 +1912,14 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
     if (tag == .reference) {
         // We can't reference a reference, so we'll create a new reference.
         return handle.peek().body.reference.reference();
-    } else if (handle.peek().str == Object.null_string and tag == .float or tag == .integer) {
+    } else if (handle.peek().head.str == Object.null_string and tag == .float or tag == .integer) {
         // We can't just use a number if it has a string rep, because the string may
         // be different than how the number will be rendered.
         return .{
-            .str = Object.null_string,
-            .tag = tag,
+            .head = .{
+                .str = Object.null_string,
+                .tag = tag,
+            },
             .body = handle.peek().body,
         };
     } else {
@@ -1856,11 +1930,13 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
 /// If called with a multi-item object, will return error.MultiItemObject
 pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
-    switch (src.tag) {
+    switch (handle.tag()) {
         .none, .index, .integer, .float, .string, .bool, .parsed_script_command, .marked => {
             return .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = src.tag,
+                .head = .{
+                    .str = try dest_heap.duplicateObjString(handle),
+                    .tag = handle.tag(),
+                },
                 .body = src.body,
             };
         },
@@ -1877,7 +1953,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                     .line_no = src_extra_data.line_no,
                     .hash = .{
                         .state = undefined,
-                        .value = undefined,
+                        .hash = undefined,
                     },
                 },
             };
@@ -1894,8 +1970,10 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
             }
 
             return .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = .source,
+                .head = .{
+                    .str = try dest_heap.duplicateObjString(handle),
+                    .tag = .source,
+                },
                 .body = .{ .source = .{ .extra_data = extra_data_index } },
             };
         },
@@ -1911,8 +1989,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             var new_object: Object = .{
                 // TODO make sure this doesn't leak
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = .custom_type,
+                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .custom_type },
                 .body = .{
                     .custom_type = .{
                         .extra_data = try dest_heap.createExtraData(),
@@ -1927,9 +2004,22 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .dict_sugar, .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
-                .str = try dest_heap.duplicateObjString(handle),
-                .tag = .none,
+                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .none },
                 .body = undefined,
+            };
+        },
+        .closure => {
+            const closure = handle.getClosureExtraData();
+            const new_extra_data = try dest_heap.createExtraData();
+            errdefer dest_heap.destroyExtraData(new_extra_data);
+            dest_heap.getExtraData(new_extra_data).* = .{ .closure = closure.borrow() };
+
+            return .{
+                .head = .{
+                    .str = try dest_heap.duplicateObjString(handle),
+                    .tag = .closure,
+                },
+                .body = .{ .closure = .{ .extra_data = new_extra_data } },
             };
         },
         .list, .dict => {
@@ -1943,7 +2033,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle {
     const src = src_handle.peek();
 
-    switch (src.tag) {
+    switch (src_handle.tag()) {
         .list => {
             const old_body = src.body.list;
             const old_start = src_handle.index + 1;
@@ -1966,8 +2056,10 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
 
             // Duplicate head of list
             new_head.* = .{
-                .str = try dest_heap.duplicateObjString(src_handle),
-                .tag = .list,
+                .head = .{
+                    .str = try dest_heap.duplicateObjString(src_handle),
+                    .tag = .list,
+                },
                 .body = .{
                     .list = .{ .len = old_body.len },
                 },
@@ -2006,8 +2098,10 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
                 errdefer dest_heap.destroyExtraData(new_extra_data);
 
                 new_head.peek().* = .{
-                    .str = new_str,
-                    .tag = .dict,
+                    .head = .{
+                        .str = new_str,
+                        .tag = .dict,
+                    },
                     .body = .{ .dict = .{
                         .extra_data = new_extra_data,
                         .len = old_len,
@@ -2108,7 +2202,7 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
             }
         },
         .normal => {
-            const str = handle.peek().str.u.str;
+            const str = handle.peek().head.str.u.str;
             return handle.getHeap().getHeapString(str.index, str.index + str.len);
         },
         .null, .empty => return error.NotMutable,
@@ -2155,7 +2249,7 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
                 }
             }
         } else {
-            obj.str = to_set_to;
+            obj.head.str = to_set_to;
             break :blk true;
         }
     };
@@ -2443,6 +2537,9 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
         .custom_type => {
             @panic("Need to clean up custom type");
         },
+        .closure => |*closure| {
+            closure.deinit();
+        },
         .none => {},
     }
 
@@ -2534,15 +2631,14 @@ test "object duplication" {
     const obj = try heap.createObject();
     defer obj.decrRefCount();
     var ref = obj.peek();
-    ref.tag = .integer;
+    ref.head.tag = .integer;
     ref.body.integer = 10;
 
     const new_obj = try heap.duplicate(obj);
-    const new_ref = new_obj.peek();
     defer new_obj.decrRefCount();
 
-    try expectEqual(.integer, new_ref.tag);
-    try expectEqual(10, new_ref.body.integer);
+    try expectEqual(.integer, new_obj.tag());
+    try expectEqual(10, new_obj.peek().body.integer);
 
     // try borrowing
     new_obj.incrRefCount();
@@ -2560,7 +2656,7 @@ test "get string" {
     const obj = try heap.createObject();
     defer obj.decrRefCount();
     var ref = obj.peek();
-    ref.tag = .integer;
+    ref.head.tag = .integer;
     ref.body.integer = 10;
 
     try expectEqualSlices(u8, "10", try obj.getString());
@@ -2728,12 +2824,11 @@ fn getTagColor(tag: Tag) []const u8 {
 }
 
 fn renderDotNodeLabel(stderr: *std.Io.Writer, handle: Handle, index: u32, max_str_len: u32) !void {
-    const obj = handle.peek();
     const str = handle.getString() catch "oom";
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
     try stderr.print("idx: {} | ", .{index});
-    try stderr.print("{s} | ", .{@tagName(obj.tag)});
+    try stderr.print("{s} | ", .{@tagName(handle.tag())});
     try stderr.print("rc: {} | ", .{handle.debugRefCount()});
     try stderr.writeAll("\\\"");
     try escapeDotString(truncated_str, stderr);
@@ -2748,7 +2843,7 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
     const allocated_len = memutil.getOrderSize(handle.getMetadata().order) - 1;
 
     // Get the actual used length for the label.
-    const used_len = switch (obj.tag) {
+    const used_len = switch (obj.head.tag) {
         .list => obj.body.list.len,
         .dict => obj.body.dict.len,
         else => unreachable,
@@ -2760,18 +2855,18 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
 
     // Subgraph header.
     try stderr.print("  subgraph cluster_{} {{\n", .{index});
-    try stderr.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(obj.tag), index, handle.debugRefCount(), used_len, allocated_len });
+    try stderr.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.debugRefCount(), used_len, allocated_len });
     try escapeDotString(truncated_str, stderr);
     if (str.len > max_str_len) try stderr.writeAll("...");
     try stderr.writeAll("\";\n");
     try stderr.print("    style=outlined;\n", .{});
-    try stderr.print("    fillcolor=\"{s}\";\n", .{if (obj.tag == .list) "lightblue1" else "lightgreen1"});
+    try stderr.print("    fillcolor=\"{s}\";\n", .{if (handle.tag() == .list) "lightblue1" else "lightgreen1"});
     try stderr.writeAll("    node [style=filled];\n\n");
 
     // Collection head node.
     try stderr.print("    obj{} [label=\"{{", .{index});
     try stderr.print("HEAD | idx: {} | ", .{index});
-    try stderr.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(obj.tag), handle.debugRefCount(), getTagColor(obj.tag) });
+    try stderr.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.debugRefCount(), getTagColor(handle.tag()) });
 
     // Collection items (all allocated slots, including unused ones).
     for (0..allocated_len) |offset| {
@@ -2789,7 +2884,7 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
 fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32) !void {
     const obj = handle.peek();
 
-    switch (obj.tag) {
+    switch (handle.tag()) {
         .list => {
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
@@ -2855,9 +2950,8 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         if (!metadata.in_use) continue;
 
         const handle = heap.getHandle(@intCast(i));
-        const obj = handle.peek();
 
-        if (obj.tag == .list or obj.tag == .dict) {
+        if (handle.tag() == .list or handle.tag() == .dict) {
             try renderCollectionSubgraph(heap, stderr, handle, @intCast(i));
         }
     }
@@ -2867,15 +2961,14 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         if (!metadata.in_use) continue;
 
         const handle = heap.getHandle(@intCast(i));
-        const obj = handle.peek();
 
         // Skip collections (already output as subgraphs) and collection items.
-        if (obj.tag == .list or obj.tag == .dict) continue;
+        if (handle.tag() == .list or handle.tag() == .dict) continue;
         if (!handle.isAllocHead()) continue;
 
         try stderr.print("  obj{} [label=\"{{", .{i});
         try renderDotNodeLabel(stderr, handle, @intCast(i), 60);
-        try stderr.print("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(obj.tag)});
+        try stderr.print("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(handle.tag())});
     }
 
     try stderr.writeAll("\n");

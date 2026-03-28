@@ -563,6 +563,13 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
             return new_index;
         }
 
+        /// Resets the pool to empty while keeping the backing memory allocated.
+        pub fn clearRetainingCapacity(self: *Self) void {
+            self.next_free = no_next_free;
+            self.len = 0;
+            self.count = 0;
+        }
+
         pub fn destroy(self: *Self, index: usize) void {
             self.count -= 1;
 
@@ -675,6 +682,7 @@ pub fn LruCache(comptime K: type, comptime V: type, comptime Context: type) type
                 .last = null,
                 .first = null,
             };
+            errdefer new_lru.pool.deinit(gpa);
 
             try new_lru.mapping.ensureTotalCapacity(gpa, max_size);
 
@@ -705,6 +713,34 @@ pub fn LruCache(comptime K: type, comptime V: type, comptime Context: type) type
             node.next = self.first;
             if (self.first) |first| nodes[first].prev = index;
             self.first = index;
+        }
+
+        pub const ValueIterator = struct {
+            nodes: []Node,
+            current: ?u32,
+
+            pub fn next(self: *ValueIterator) ?*V {
+                const index = self.current orelse return null;
+                const node = &self.nodes[index];
+                self.current = node.next;
+                return &node.item;
+            }
+        };
+
+        /// Iterates over all values in LRU order (most recently used first).
+        pub fn valueIterator(self: *Self) ValueIterator {
+            return .{
+                .nodes = self.pool.items,
+                .current = self.first,
+            };
+        }
+
+        /// Removes all entries but keeps the underlying capacity allocated.
+        pub fn clearRetainingCapacity(self: *Self) void {
+            self.mapping.clearRetainingCapacity();
+            self.pool.clearRetainingCapacity();
+            self.first = null;
+            self.last = null;
         }
 
         pub fn get(self: *Self, key: K) ?V {

@@ -125,7 +125,7 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
         @memset(heap.getHeapString(new_str, new_str_end), 0);
 
         // New object, so we can set directly.
-        handle.peek().str = .{
+        handle.peek().head.str = .{
             .u = .{
                 .str = .{ .index = new_str, .len = @intCast(len) },
             },
@@ -845,8 +845,10 @@ pub fn newListWithCapacity(capacity: u32) !Handle {
     const list_head = Heap.local_heap.getLocalObject(list_index);
 
     list_head.* = .{
-        .str = Heap.Object.null_string,
-        .tag = .list,
+        .head = .{
+            .str = Heap.Object.null_string,
+            .tag = .list,
+        },
         .body = .{
             .list = .{
                 .len = 0,
@@ -983,8 +985,7 @@ pub fn followIfRef(handle: Handle) Handle {
 }
 
 fn collectionItem(handle: Handle, index: u32, len: u32) Handle {
-    const obj = handle.peek();
-    handle.assert(obj.tag == .list or obj.tag == .dict);
+    handle.assert(handle.tag() == .list or handle.tag() == .dict);
     handle.assert(index < len);
 
     return .{
@@ -994,8 +995,7 @@ fn collectionItem(handle: Handle, index: u32, len: u32) Handle {
 }
 
 fn collectionItemFollowRefs(handle: Handle, index: u32, len: u32) Heap.Handle {
-    const obj = handle.peek();
-    assert(obj.tag == .list or obj.tag == .dict);
+    assert(handle.tag() == .list or handle.tag() == .dict);
 
     if (index < len) {
         const elem: Heap.Handle = .{
@@ -1008,8 +1008,7 @@ fn collectionItemFollowRefs(handle: Handle, index: u32, len: u32) Heap.Handle {
 }
 
 pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
-    const list = handle.peek();
-    assert(list.tag == .list or list.tag == .dict);
+    assert(handle.tag() == .list or handle.tag() == .dict);
 
     return handle.getHeap().objectSlice(handle.index + 1, handle.index + 1 + len);
 }
@@ -1106,8 +1105,10 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
                 new_item.* = old_item.peek().*;
                 // Be sure to "zero" out the old item after we steal it.
                 old_item.peek().* = .{
-                    .str = Heap.Object.null_string,
-                    .tag = .none,
+                    .head = .{
+                        .str = Heap.Object.null_string,
+                        .tag = .none,
+                    },
                     .body = undefined,
                 };
                 old_item.trace("Object stolen", .{});
@@ -1174,26 +1175,23 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
 
 /// Assumes provided handle is a list.
 pub fn listItem(handle: Handle, index: u32) Handle {
-    const list = handle.peek();
-    assert(list.tag == .list);
+    assert(handle.tag() == .list);
 
-    return collectionItem(handle, index, list.body.list.len);
+    return collectionItem(handle, index, handle.peek().body.list.len);
 }
 
 /// Assumes provided handle is a list.
 pub fn listItemFollowRefs(handle: Handle, index: u32) Handle {
-    const list = handle.peek();
-    assert(list.tag == .list);
+    assert(handle.tag() == .list);
 
-    return collectionItemFollowRefs(handle, index, list.body.list.len);
+    return collectionItemFollowRefs(handle, index, handle.peek().body.list.len);
 }
 
 /// Assumes handle is a list.
 pub fn listItems(handle: Handle) []Heap.Object {
-    const list = handle.peek();
-    assert(list.tag == .list);
+    assert(handle.tag() == .list);
 
-    return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..list.body.list.len];
+    return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..handle.peek().body.list.len];
 }
 
 /// Returns a new list if the list had to move. Takes ownership of `value` in all cases, including errors.
@@ -1428,8 +1426,10 @@ pub fn newDictWithCapacity(len: u32) !Handle {
 
     const dict_head = Heap.local_heap.getLocalObject(dict_index);
     dict_head.* = .{
-        .str = Heap.Object.null_string,
-        .tag = .dict,
+        .head = .{
+            .str = Heap.Object.null_string,
+            .tag = .dict,
+        },
         .body = .{ .dict = .{
             .extra_data = dict_metadata,
             .len = 0,
@@ -1593,8 +1593,10 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
     for ((original_len - removed * 2)..original_len) |to_zero| {
         const item_handle = collectionItem(dict, @intCast(to_zero), original_len);
         item_handle.peek().* = .{
-            .str = Heap.Object.null_string,
-            .tag = .none,
+            .head = .{
+                .str = Heap.Object.null_string,
+                .tag = .none,
+            },
             .body = undefined,
         };
         item_handle.trace("Zero out removed", .{});
@@ -2013,7 +2015,7 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     const start_of_removed = dict_len - pairs_removed * 2;
     for (start_of_removed..dict_len) |removed| {
         const item_handle = dictItem(dict, @intCast(removed));
-        item_handle.peek().* = .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined };
+        item_handle.peek().* = .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined };
         // Mark abandoned keys as mutable again.
         item_handle.getMetadata().mutable = true;
     }
@@ -2126,8 +2128,7 @@ pub const SourceInfo = struct {
 /// `SourceInfo` does not contain a borrowed value from `handle`, it's
 /// a temporary reference.
 pub fn getSourceInfo(handle: Handle) ?SourceInfo {
-    const obj = handle.peek();
-    if (obj.tag != .source) return null;
+    if (handle.tag() != .source) return null;
 
     const extra_data = handle.getSourceExtraData();
 
@@ -2156,7 +2157,7 @@ pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
         handle.getHeap().getExtraData(extra_data).* = .{ .source = .{
             .file_name = source_info.file_name.borrowOptional(),
             .line_no = source_info.line_no,
-            .hash = .{ .value = undefined },
+            .hash = .{ .state = .init(.not_computed), .hash = undefined },
         } };
         errdefer handle.getHeap().destroyExtraData(extra_data);
 
@@ -2178,9 +2179,8 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
 
     try setSourceInfo(obj, .{ .file_name = file_name.toOptional(), .line_no = 42 });
 
-    // Verify the object has the source tag
-    const ref = obj.peek();
-    try testing.expectEqual(.source, ref.tag);
+    // Verify the object has the source tag.
+    try testing.expectEqual(.source, obj.tag());
     try testing.expectEqual(@as(u32, 42), obj.getSourceExtraData().line_no);
 
     const info = getSourceInfo(obj);
@@ -2286,8 +2286,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     try new_token_tags.append(Heap.global_gpa, .start_of_command);
     var first_append_result: OptionalHandle = .none;
     _ = try listAppendObject(det, new_token_values, &first_append_result, .{
-        .str = Heap.Object.null_string,
-        .tag = .parsed_script_command,
+        .head = .{
+            .str = Heap.Object.null_string,
+            .tag = .parsed_script_command,
+        },
         .body = .{
             .parsed_script_command = .{
                 .line = source_info.line_no,
@@ -2335,8 +2337,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             try new_token_tags.append(Heap.global_gpa, .start_of_command);
             var append_result: OptionalHandle = .none;
             const index = try listAppendObject(det, new_token_values, &append_result, .{
-                .str = Heap.Object.null_string,
-                .tag = .parsed_script_command,
+                .head = .{
+                    .str = Heap.Object.null_string,
+                    .tag = .parsed_script_command,
+                },
                 .body = .{ .parsed_script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
             });
             new_token_values.swapIfNew(append_result);
@@ -2355,8 +2359,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
             var append_result: OptionalHandle = .none;
             _ = try listAppendObject(det, new_token_values, &append_result, .{
-                .str = Heap.Object.null_string,
-                .tag = .integer,
+                .head = .{
+                    .str = Heap.Object.null_string,
+                    .tag = .integer,
+                },
                 .body = .{
                     .integer = @intCast(arg_token_count),
                 },
@@ -2380,7 +2386,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                             det,
                             new_token_values,
                             &append_result,
-                            .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
+                            .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined },
                         );
                         new_token_values.swapIfNew(append_result);
 
@@ -2396,7 +2402,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                             det,
                             new_token_values,
                             &append_result,
-                            .{ .str = Heap.Object.null_string, .tag = .none, .body = undefined },
+                            .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined },
                         );
                         new_token_values.swapIfNew(append_result);
 
@@ -2422,13 +2428,9 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         last_i = i;
     }
 
-    // Increment reference count to file name, if not null.
-    if (source_info.file_name.toHandle()) |file_name| file_name.incrRefCount();
     const parsed_script: Heap.ParsedScript = .{
         .tags = new_token_tags,
         .values = new_token_values,
-        .first_line = source_info.line_no,
-        .file_name_obj = source_info.file_name,
     };
     if (options.token_debugging) {
         std.debug.print("Dumping tokens\n", .{});
@@ -2482,60 +2484,56 @@ pub fn getScript(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap.Par
     } else {
         const new_script = try parseScript(det, handle);
         if (Heap.local_heap.parsed_scripts.put(cache_key, .{ .script = new_script })) |ejected| {
-            ejected.script.deinit();
+            var old = ejected;
+            old.script.deinit();
         }
         return new_script;
     }
 }
 
-// FIXME get this working
-// fn testScriptShimmering(ta: std.mem.Allocator) !void {
-//     const heap = try Heap.testStart(ta);
-//     defer Heap.testFinish();
+fn testScriptShimmering(ta: std.mem.Allocator) !void {
+    const heap = try Heap.testStart(ta);
+    defer Heap.testFinish();
 
-//     const old_script_id = blk: {
-//         var old_script = try newString(heap,
-//             \\ set foo 5
-//             \\ set y $foo[set foo]
-//         );
-//         defer old_script.decrRefCount();
+    var script = try newString(heap,
+        \\ set foo 5
+        \\ set y $foo[set foo]
+    );
+    defer script.decrRefCount();
 
-//         var parse_result: OptionalHandle = .none;
-//         const parsed_script = try getScript(null, old_script, &parse_result);
-//         old_script.swapIfNew(parse_result);
-//         const script1_id = old_script.getSourceExtraData().getScriptId();
-//         try testing.expectEqualSlices(Tokenizer.Token.Tag, &[_]Tokenizer.Token.Tag{
-//             .start_of_command,
-//             .simple_string,
-//             .simple_string,
-//             .simple_string,
-//             .start_of_command,
-//             .simple_string,
-//             .simple_string,
-//             .start_of_word,
-//             .variable_subst,
-//             .command_subst,
-//         }, parsed_script.tags.items);
+    const cache_key = try script.getHash();
 
-//         break :blk script1_id;
-//     };
+    // First call parses and caches.
+    const parsed1 = try getScript(null, script, cache_key);
+    try testing.expectEqualSlices(Tokenizer.Token.Tag, &[_]Tokenizer.Token.Tag{
+        .start_of_command,
+        .simple_string,
+        .simple_string,
+        .simple_string,
+        .start_of_command,
+        .simple_string,
+        .simple_string,
+        .start_of_word,
+        .variable_subst,
+        .command_subst,
+    }, parsed1.tags.items);
 
-//     var new_script = try newString(heap, "set x 5");
-//     defer new_script.decrRefCount();
+    // Second call with the same key returns the cached version.
+    const parsed2 = try getScript(null, script, cache_key);
+    try testing.expectEqual(parsed1.tags.items.ptr, parsed2.tags.items.ptr);
 
-//     var parse_result: OptionalHandle = .none;
-//     try shimmerToScript(null, new_script, &parse_result);
-//     new_script.swapIfNew(parse_result);
-//     const new_script_id = new_script.getSourceExtraData().getScriptId();
+    // A different script gets its own cache entry.
+    var script2 = try newString(heap, "set x 5");
+    defer script2.decrRefCount();
 
-//     // Make sure the new script recycles the old script's index.
-//     try testing.expectEqual(old_script_id.index, new_script_id.index);
-//     try testing.expect(old_script_id.generation != new_script_id.generation);
-// }
+    const cache_key2 = try script2.getHash();
+    const parsed3 = try getScript(null, script2, cache_key2);
+    try testing.expect(parsed1.tags.items.ptr != parsed3.tags.items.ptr);
+}
 
-// test "script shimmering" {
-//     try testing.checkAllAllocationFailures(testing.allocator, testScriptShimmering, .{});
-// }
+test "script shimmering" {
+    try testing.checkAllAllocationFailures(testing.allocator, testScriptShimmering, .{});
+}
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer.Token.Tag, value: []const u8) !void {
     try testing.expectEqual(tag, script.tags.items[index]);
@@ -2543,20 +2541,20 @@ fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer
 }
 
 pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpression {
-    const source_info: SourceInfo = getSourceInfo(handle) orelse .{ .file_name = null, .line_no = 1 };
+    const source_info: SourceInfo = getSourceInfo(handle) orelse .{ .file_name = .none, .line_no = 1 };
     const file_name = source_info.file_name.borrowOptional();
     errdefer file_name.decrOptional();
     const line_no = source_info.line_no;
 
     // Parse all the tokens of the expr, handling any errors that come up.
-    const bytes = try Heap.getString(handle.*);
+    const bytes = try handle.getString();
     var tokenizer = Tokenizer.init(bytes, line_no);
     var tokens = std.MultiArrayList(Tokenizer.Token).empty;
-    defer tokens.deinit(Heap.local_heap.gpa);
+    defer tokens.deinit(Heap.global_gpa);
     while (true) {
         const next_token = tokenizer.nextExpressionToken();
         if (next_token) |token| {
-            try tokens.append(Heap.local_heap.gpa, token);
+            try tokens.append(Heap.global_gpa, token);
             if (token.tag == .end_of_file) break;
         } else |err| if (det) |details| {
             details.* = try convertTokenizerError(Heap.local_heap, err);
@@ -2611,11 +2609,12 @@ pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpressi
 
 pub fn getExpression(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap.ParsedExpression {
     if (Heap.local_heap.parsed_exprs.get(cache_key)) |parsed| {
-        return parsed.script;
+        return parsed.expr;
     } else {
         const new_expr = try parseExpression(det, handle);
         if (Heap.local_heap.parsed_exprs.put(cache_key, .{ .expr = new_expr })) |ejected| {
-            ejected.script.deinit();
+            var old = ejected;
+            old.expr.deinit();
         }
         return new_expr;
     }
@@ -2629,7 +2628,7 @@ fn testExpressions(ta: std.mem.Allocator) !void {
     defer expr1.decrRefCount();
 
     const parsed = try getExpression(null, expr1, try expr1.getHash());
-    try testing.expectEqual(.add, parsed.expr.nodes.get(@intFromEnum(parsed.expr.root_node)).tag);
+    try testing.expectEqual(.add, parsed.nodes.get(@intFromEnum(parsed.root_node)).tag);
 }
 
 test "expressions" {
