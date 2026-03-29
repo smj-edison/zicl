@@ -635,9 +635,10 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
         }
     };
 
-    // We've got everything into the right data types, so now we can
-    // start parsing the args list.
-    objutil.shimmerToList(null, args, &new_handle) catch |err| switch (err) {
+    // Make sure args is a list.
+    var args_new: OptionalHandle = .none;
+    errdefer args_new.swapWithNone();
+    objutil.shimmerToList(null, args, &args_new) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (det) |details| details.* = .{
@@ -646,10 +647,42 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
             return error.BadClosure;
         },
     };
-    assert(new_handle == .none);
+    const args_list = args_new.orElse(args);
 
+    const parsed_args = try parseClosureArgList(det, args_list);
+    errdefer parsed_args.deinit();
+
+    return .{
+        .args = args_list.borrow(),
+        .body = body.borrow(),
+        .name = name.borrowOptional(),
+        .scope = scope.borrowOptional(),
+        .required_arity = parsed_args.required_arity,
+        .optional_arity = parsed_args.optional_arity,
+        .optional_values = parsed_args.optional_values,
+        .has_args_parameter = parsed_args.has_args_parameter,
+        .cache_id = Heap.nextCacheId(),
+    };
+}
+
+const ParsedArgList = struct {
+    required_arity: u32,
+    optional_arity: u32,
+    optional_values: OptionalHandle,
+    has_args_parameter: bool,
+
+    pub fn deinit(self: ParsedArgList) void {
+        self.optional_values.decrOptional();
+    }
+};
+
+/// Validates a closure argument list and extracts arity information. Modifies
+/// the list in-place to strip default values from optional parameter specifiers.
+/// `args` must already be shimmered to a list.
+pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArgList {
     const arg_list_len = objutil.listLengthRaw(args);
 
+    // Pre-allocate for optional default values. arg_list_len is an upper bound.
     var optional_values: ?Handle = null;
     errdefer if (optional_values) |val| val.decrRefCount();
     var args_parameter_found = false;
@@ -664,17 +697,19 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
             return error.BadClosure;
         }
 
-        const arg = objutil.listItem(args, @intCast(i));
-        objutil.shimmerToList(null, arg, &new_handle) catch |err| switch (err) {
+        const arg_raw = objutil.listItem(args, @intCast(i));
+        var arg_new: OptionalHandle = .none;
+        defer arg_new.swapWithNone();
+        objutil.shimmerToList(null, arg_raw, &arg_new) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg}),
+                    .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg_raw}),
                 };
                 return error.BadClosure;
             },
         };
-        assert(new_handle == .none);
+        const arg = arg_new.orElse(arg_raw);
         const arg_len = objutil.listLengthRaw(arg);
 
         if (arg_len == 0) {
@@ -690,7 +725,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
         } else if (arg_len == 2) {
             // Optional parameter.
             if (optional_values == null) {
-                optional_values = try objutil.newList(&.{});
+                optional_values = try objutil.newListWithCapacity(arg_list_len);
             }
 
             if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
@@ -700,13 +735,15 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
                 return error.BadClosure;
             }
 
-            _ = try objutil.listAppend(null, optional_values.?, &new_handle, objutil.listItem(arg, 1));
-            assert(new_handle == .none);
+            // Add the optional parameter onto the optional parameters list.
+            var never_new: OptionalHandle = .none;
+            _ = try objutil.listAppend(det, optional_values.?, &never_new, objutil.listItem(arg, 1));
+            assert(never_new == .none);
 
-            // Replace {name default} with just the name.
+            // Replace {name default} with just the name in the args list.
             const new_item = try Heap.local_heap.dupOrReference(objutil.listItem(arg, 0));
-            try objutil.listSetObject(null, args, &new_handle, @intCast(i), new_item);
-            assert(new_handle == .none);
+            try objutil.listSetObject(null, args, &never_new, @intCast(i), new_item);
+            assert(never_new == .none);
 
             optional_arity += 1;
         } else {
@@ -725,16 +762,25 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     }
 
     return .{
-        .args = args.borrow(),
-        .body = body.borrow(),
-        .name = name.borrowOptional(),
-        .scope = scope.borrowOptional(),
         .required_arity = required_arity,
         .optional_arity = optional_arity,
         .optional_values = if (optional_values) |val| val.toOptional() else .none,
         .has_args_parameter = args_parameter_found,
-        .cache_id = Heap.nextCacheId(),
     };
+}
+
+/// Creates a heap object with the `.closure` tag and associated extra data.
+/// The closure's fields are borrowed, so the caller retains ownership of the
+/// inputs. Returns an owned handle.
+pub fn createClosureObject(closure: Heap.Closure) !Handle {
+    const obj = try Heap.local_heap.createObject();
+    errdefer obj.decrRefCount();
+    const extra_data = try Heap.local_heap.createExtraData();
+    errdefer Heap.local_heap.destroyExtraData(extra_data);
+    Heap.local_heap.getExtraData(extra_data).* = .{ .closure = closure.borrow() };
+    obj.peek().head.tag = .closure;
+    obj.peek().body = .{ .closure = .{ .extra_data = extra_data } };
+    return obj;
 }
 
 const ClosureAndCacheKey = struct {
@@ -809,7 +855,7 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
             const list = try objutil.newList(args[called_idx..]);
             defer list.decrRefCount();
             try interp.setVariableImpl(call_frame_idx, var_name, list.reference());
-        } else if (signature_idx > closure.required_arity) {
+        } else if (signature_idx >= closure.required_arity) {
             // This is an optional argument.
 
             // Are there any remaining unassigned arguments?
@@ -924,25 +970,29 @@ const CallFrame = struct {
         const pairs = objutil.dictPairLengthRaw(frame.variables);
 
         // Make sure there's no upvars.
-        for (0..pairs) |i| {
+        for (0..pairs) |i_usize| {
+            const i: u32 = @intCast(i_usize);
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
             if (value.tag() == .upvar_link) break;
         } else {
             // No upvars found, so we can just borrow the variables.
-            return frame.variables.borrow();
+            const scope = frame.variables.borrow();
+            return scope;
         }
 
         // Found upvars if we made it to this point, so we need
         // to duplicate everything, and follow any upvars.
         const new_dict = try objutil.newDictWithCapacity(pairs * 2);
-        for (0..pairs) |i| {
+        new_dict.getDictExtraData().parent_link = frame.variables.getDictExtraData().parent_link;
+        for (0..pairs) |i_usize| {
+            const i: u32 = @intCast(i_usize);
             const key = objutil.dictItem(frame.variables, i * 2);
             const value = objutil.dictItem(frame.variables, i * 2 + 1);
 
             if (value.tag() == .upvar_link) {
                 const upvar_link = value.peek().body.upvar_link;
-                if (interp.getVariableInner(null, upvar_link.call_frame, upvar_link.linked_name)) |upvar_val| {
-                    try objutil.dictPut(new_dict, key, upvar_val);
+                if (interp.getVariableInner(null, upvar_link.call_frame, Heap.local_heap.getHandle(upvar_link.linked_name))) |upvar_val| {
+                    assert((try objutil.dictPut(new_dict, key, upvar_val)).new_dict == .none);
                 } else |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.VariableNotFound => {
@@ -951,9 +1001,11 @@ const CallFrame = struct {
                     },
                 }
             } else {
-                try objutil.dictPut(new_dict, key, value);
+                assert((try objutil.dictPut(new_dict, key, value)).new_dict == .none);
             }
         }
+
+        return new_dict;
     }
 };
 
@@ -963,6 +1015,11 @@ fn currentCallFrameIndex(interp: *Interp) u32 {
 
 fn currentCallFrame(interp: *Interp) *CallFrame {
     return &interp.call_frames.items[interp.currentCallFrameIndex()];
+}
+
+/// Returns a dict capturing the current call frame's variables.
+pub fn captureCurrentScope(interp: *Interp) !Handle {
+    return interp.currentCallFrame().captureScope(interp);
 }
 
 fn nextCallEpoch(interp: *Interp) u32 {
@@ -992,6 +1049,11 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
+
+    if (signature.scope.toHandle()) |scope| {
+        // Safe since vars_handle is freshly allocated.
+        vars_handle.getDictExtraData().parent_link = scope.borrow().toOptional();
+    }
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
@@ -2062,11 +2124,17 @@ pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
     return interp.wrapError(&det, objutil.floatGetNoShimmer(&det, handle));
 }
 
-pub fn getListLength(interp: *Interp, handle: *Handle) !u32 {
-    var new_handle: OptionalHandle = .none;
+/// Shimmers a handle to a list, updating it in place if a duplicate was
+/// created. Converts errors to EvalError via the interpreter result.
+pub fn shimmerToList(interp: *Interp, handle: *Handle) !void {
     var det: objutil.ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToList(&det, handle.*, &new_handle));
+    var new_handle: OptionalHandle = .none;
+    try wrapError(interp, &det, objutil.shimmerToList(&det, handle.*, &new_handle));
     handle.swapIfNew(new_handle);
+}
+
+pub fn getListLength(interp: *Interp, handle: *Handle) !u32 {
+    try interp.shimmerToList(handle);
     return handle.peek().body.list.len;
 }
 

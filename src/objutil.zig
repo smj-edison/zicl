@@ -1082,7 +1082,11 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
     // We've exhausted all other options, so we'll need to make a new collection.
     const new_handle = switch (provided_handle.tag()) {
         .list => try newListWithCapacity(new_len),
-        .dict => try newDictWithCapacity(new_len),
+        .dict => blk: {
+            const new_dict = try newDictWithCapacity(new_len);
+            new_dict.getDictExtraData().parent_link = provided_handle.getDictExtraData().parent_link.borrowOptional();
+            break :blk new_dict;
+        },
         else => unreachable,
     };
     errdefer new_handle.decrRefCount();
@@ -1147,6 +1151,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             provided_handle.getHeap().destroyExtraData(provided_handle.peek().body.dict.extra_data);
         }
         provided_handle.invalidateString();
+        provided_handle.trace("Invalidated old dict", .{});
         provided_handle.peek().head.tag = .invalid;
         provided_handle.peek().body = undefined;
 

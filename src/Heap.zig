@@ -722,6 +722,14 @@ pub const OptionalHandle = enum(HandleBacking) {
     pub fn decrOptional(ref: OptionalHandle) void {
         if (ref.toHandle()) |val| val.decrRefCount();
     }
+
+    pub fn format(self: OptionalHandle, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.toHandle()) |handle| {
+            try handle.format(writer);
+        } else {
+            try writer.writeAll("<none>");
+        }
+    }
 };
 
 pub const Handle = packed struct(HandleBacking) {
@@ -828,10 +836,6 @@ pub const Handle = packed struct(HandleBacking) {
             ref.* = new;
             old.decrRefCount();
         }
-    }
-
-    pub fn hasString(handle: Handle) bool {
-        return handle.tag() == .reference or handle.peek().str != Object.null_string;
     }
 
     pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
@@ -1016,29 +1020,7 @@ pub const Handle = packed struct(HandleBacking) {
                 break :blk try getListString(handle.getHeap(), handle.index + 1, list.len);
             },
             .dict => {
-                // Dict string generation is surprisingly intricate. We have a couple of cases:
-                // 1. The dict has the same number of elements as table entries. We can
-                //    use the same function as list generation.
-                // 2. The dict has a different number of elements as table entries. This means
-                //    we have duplicate keys, but we're generating a dict, so we should maintain
-                //    consistency with every other time we'd generate dict entries.
-                // 3. We have a linked dict. This means we need to generate a string containing
-                //    both the values from the top-level dict, and all the values that aren't
-                //    overriden in the child dicts. Note, we generate in {oldest, older, newest}
-                //    order, hence why we do everything in reverse order (to make prepending fast).
-                const extra_data = handle.getDictExtraData();
-                if (extra_data.parent_link.toHandle()) |parent_link| {
-                    _ = parent_link;
-                    @panic("Need to follow dict links when building dict");
-                } else {
-                    const table = try objutil.dictGetTable(handle);
-                    if (table.size * 2 != obj.body.dict.len) {
-                        @panic("Need to handle generation for dict with duplicate entries");
-                    } else {
-                        // Use same method as with lists.
-                        break :blk try getListString(handle.getHeap(), handle.index + 1, obj.body.dict.len);
-                    }
-                }
+                break :blk try generateDictString(handle);
             },
             .closure => {
                 const closure = handle.getClosureExtraData();
@@ -2368,6 +2350,82 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     // length, only the accessible length)
     const finished_str = try global_gpa.realloc(unfinished_str, written);
     return finished_str[0..(written - 1) :0];
+}
+
+fn generateDictString(handle: Handle) ![:0]u8 {
+    const extra_data = handle.getDictExtraData();
+    const table = try objutil.dictGetTable(handle);
+
+    // If we've lost our string rep, we sure as heck should not have duplicate
+    // keys. Any other way of handling this would be self-contradictory.
+    handle.assert(table.size * 2 == handle.peek().body.dict.len);
+    if (extra_data.parent_link == .none) {
+        // Easy case: no parent link.
+        return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
+    }
+
+    // This uses an array hash map, so insertion order is maintained. This
+    // means that if we go through it in reverse order, we'll get oldest
+    // to newest (since we descend starting at newest and go down to oldest).
+    var keys_used = std.ArrayHashMapUnmanaged(Handle, Handle, struct {
+        pub fn hash(ctx: @This(), key: Handle) u32 {
+            _ = ctx;
+            const str = key.getString() catch unreachable;
+            return std.array_hash_map.hashString(str);
+        }
+
+        pub fn eql(ctx: @This(), a: Handle, b: Handle, b_index: usize) bool {
+            _ = ctx;
+            _ = b_index;
+            return checkIfEqual(a, b) catch unreachable;
+        }
+    }, true).empty;
+    defer keys_used.deinit(global_gpa);
+
+    // Traverse all linked dicts.
+    var current_dict = handle;
+    var depth: u64 = 0;
+    while (true) {
+        // Make sure to reverse the order we go through the dictionary,
+        // so when we reverse again at the end, everything will be in the
+        // correct order.
+        depth += 1;
+        var item_index = objutil.dictItemLength(current_dict);
+        while (item_index > 0) {
+            item_index -= 2;
+
+            const key = objutil.dictItemFollowRefs(current_dict, item_index);
+            const value = objutil.dictItemFollowRefs(current_dict, item_index + 1);
+
+            _ = try key.getString(); // Make sure it has a string rep.
+            const entry = try keys_used.getOrPut(global_gpa, key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = value;
+            }
+        }
+
+        if (current_dict.getDictExtraData().parent_link.toHandle()) |next| {
+            current_dict = next;
+        } else break;
+    }
+
+    const item_count: u32 = @intCast(keys_used.entries.len * 2);
+    const merged_handle = try objutil.newListWithCapacity(item_count);
+    defer merged_handle.decrRefCount();
+    merged_handle.peek().body.list.len = item_count;
+    const items = objutil.listItems(merged_handle);
+
+    var pair_index = keys_used.entries.len;
+    while (pair_index > 0) {
+        pair_index -= 1;
+        const entry = keys_used.entries.get(pair_index);
+        const reflected_pair_index = keys_used.entries.len - pair_index - 1;
+        items[reflected_pair_index * 2] = entry.key.reference();
+        items[reflected_pair_index * 2 + 1] = entry.value.reference();
+    }
+
+    const result = try getListString(merged_handle.getHeap(), merged_handle.index + 1, item_count);
+    return result;
 }
 
 const StringDetails = union(enum) {

@@ -387,6 +387,43 @@ pub fn setCmd(interp: *Interp, args: []Handle) !void {
     }
 }
 
+/// [fn] - creates a closure capturing the current scope and sets it as a
+/// variable in the current scope.
+pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const fn_name = args[1];
+    const body = args[3];
+
+    // Shimmer to list via the interp helper, which handles the case where
+    // the handle can't be shimmered in place.
+    try interp.shimmerToList(&args[2]);
+
+    var det: objutil.ErrorDetails = undefined;
+    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, args[2]));
+    defer parsed_args.deinit();
+
+    // Capture the current scope.
+    const scope = try interp.captureCurrentScope();
+    defer scope.decrRefCount();
+
+    // Build a non-owning closure descriptor. createClosureObject borrows
+    // all fields, so we don't need to borrow here.
+    const closure_obj = try Interp.createClosureObject(.{
+        .args = args[2],
+        .body = body,
+        .name = fn_name.toOptional(),
+        .scope = scope.toOptional(),
+        .required_arity = parsed_args.required_arity,
+        .optional_arity = parsed_args.optional_arity,
+        .optional_values = parsed_args.optional_values,
+        .has_args_parameter = parsed_args.has_args_parameter,
+        .cache_id = Heap.nextCacheId(),
+    });
+    defer closure_obj.decrRefCount();
+
+    try interp.setVariableTo(&args[1], closure_obj);
+    interp.setResult(try interp.getVariableOrError(&args[1]));
+}
+
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
@@ -394,6 +431,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = exprCmd, .description = "expression", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 3, .max_arity = 3 });
     try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
@@ -424,6 +462,51 @@ fn testRunScript(interp: *Interp, script: []const u8) !Handle {
 
 fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
     try testing.expectEqualStrings(expected, try (try testRunScript(interp, script)).getString());
+}
+
+test "fn command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Basic closure.
+    try testExpectScriptResult(&interp, "30",
+        \\ fn add {a b} { + $a $b }
+        \\ add 10 20
+    );
+
+    // Closure captures scope.
+    try testExpectScriptResult(&interp, "15",
+        \\ set x 10
+        \\ fn addx {a} { + $a $x }
+        \\ addx 5
+    );
+
+    // Nested closure captures outer scope via parent_link chain.
+    testExpectScriptResult(&interp, "15",
+        \\ set outer 5
+        \\ fn foo {} {
+        \\   set inner 10
+        \\   fn bar {} { + $inner $outer }
+        \\   set bar
+        \\ }
+        \\ set bar [foo]
+        \\ bar
+    ) catch {
+        std.debug.print("Error result: {f}\n", .{interp.result});
+        return error.TestFailed;
+    };
+
+    // Optional parameters.
+    try testExpectScriptResult(&interp, "3",
+        \\ fn greet {a {b 3}} { + $a $b }
+        \\ greet 0
+    );
+
+    // Variadic args parameter.
+    try testExpectScriptResult(&interp, "10 20 30",
+        \\ fn collect {args} { set args }
+        \\ collect 10 20 30
+    );
 }
 
 test "commands" {
