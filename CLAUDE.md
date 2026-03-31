@@ -58,7 +58,7 @@ zig build -Dtoken-debugging=true
 -   Cross-thread object sharing with atomic operations
 -   Object "shimmering" - dynamic type conversion that preserves cached representations
 
-**Object System (src/object.zig)**: Implements TCL's dynamic typing through type shimmering:
+**Object System (src/objutil.zig)**: Implements TCL's dynamic typing through type shimmering:
 
 -   Objects can dynamically convert between types (string → list → dict, etc.)
 -   Maintains string representation alongside typed representation when beneficial
@@ -71,7 +71,6 @@ zig build -Dtoken-debugging=true
 
 -   Variable substitution (`$var`, `${var}`)
 -   Command substitution (`[cmd]`)
--   Dictionary sugar (`$var(key)`)
 -   Argument expansion (`{*}`)
 -   Proper quote/brace/bracket balancing with detailed error reporting
 
@@ -99,7 +98,7 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
 1. **Handles vs Objects**: Handles are lightweight references (64 bits) to objects in a heap. Objects live in the heap's object storage.
 
-2. **OptionalHandle**: A special enum type that can be `.null` or contain a `Handle`. Used as an output parameter in shimmer functions to indicate whether duplication occurred.
+2. **OptionalHandle**: A special enum type that can be `.none` or contain a `Handle`. Used as an output parameter in shimmer functions to indicate whether duplication occurred.
 
 3. **Reference Counting**: Handles can be ref-counted (sharable) or non-ref-counted (e.g., list items).
 
@@ -122,11 +121,11 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
     **OptionalHandle Operations:**
 
-    - `OptionalHandle.orElse(handle)` - Return contained handle if non-null, else fallback
+    - `OptionalHandle.orElse(handle)` - Return contained handle if non-none, else fallback
     - `OptionalHandle.toHandle()` - Convert to `?Handle`
-    - `OptionalHandle.swapWithNull()` - Decrement ref count and set to null (use in `errdefer`)
+    - `OptionalHandle.swapWithNone()` - Decrement ref count and set to none (use in `errdefer`)
     - `OptionalHandle.swapRef(handle)` - Swap and decref old value
-    - `OptionalHandle.swapRefIfNew(optional)` - Conditionally swap if non-null
+    - `OptionalHandle.swapRefIfNew(optional)` - Conditionally swap if non-none
     - `Handle.toOptional()` - Convert Handle to OptionalHandle
 
     **Handle Swapping** (for updating handle references):
@@ -190,7 +189,7 @@ Objects automatically "shimmer" between types, maintaining cached representation
     - Objects can only shimmer if not shared between threads (`canShimmer()` checks this)
     - Shimmer functions take `provided_handle: Handle` and output parameter `new_handle: *OptionalHandle`
     - If duplication occurs, `new_handle` will be non-null
-    - Always use `errdefer new_handle.swapWithNull()` at the start of shimmer functions
+    - Always use `errdefer new_handle.swapWithNone()` at the start of shimmer functions
     - Use `new_handle.orElse(provided_handle)` to get the actual handle to work with
     - Caller uses `handle.swapIfNew(new_handle)` to update their handle reference
     - Shimmering invalidates the old body but preserves string rep when possible
@@ -208,11 +207,11 @@ Objects automatically "shimmer" between types, maintaining cached representation
 Scripts go through several stages:
 
 1. **Tokenization** (Tokenizer): Source → tokens with location info
-2. **Preprocessing** (parseScript in object.zig): Tokens → optimized script structure
+2. **Preprocessing** (parseScript in objutil.zig): Tokens → optimized script structure
     - Precomputes word boundaries and argument counts
     - Stores tokens as `.start_of_command` + arguments
     - Example: `set x 5` becomes [start_of_command(2), "set", "x", "5"]
-3. **Caching** (ScriptId system): Parsed scripts cached per-heap by unique ID
+3. **Caching** (LRU cache): Parsed scripts, expressions, and closures cached per-heap by unique ID
 4. **Evaluation** (evalObject): Walks token list, substitutes variables/commands, invokes commands
 
 ### Testing Patterns
@@ -268,7 +267,7 @@ const item = object.listItem(list, 0); // Non-owning handle
 ```zig
 // Shimmer functions take Handle by value and *OptionalHandle output parameter.
 var det: object.ErrorDetails = undefined;
-var new_handle: OptionalHandle = .null;
+var new_handle: OptionalHandle = .none;
 try object.shimmerToList(&det, handle, &new_handle);
 handle.swapIfNew(new_handle);  // Update if shimmer created a duplicate
 // handle is now a list type
@@ -276,7 +275,7 @@ handle.swapIfNew(new_handle);  // Update if shimmer created a duplicate
 // Pattern inside shimmer functions:
 pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
     if (provided_handle.tag() == .integer) return;
-    errdefer new_handle.swapWithNull();
+    errdefer new_handle.swapWithNone();
 
     try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
     const handle = new_handle.orElse(provided_handle);
@@ -305,14 +304,15 @@ const result = try someFn(heap, &det, arg);
 
 ## Key Files
 
--   `src/Heap.zig`: Memory allocator and object storage (~2500 lines)
--   `src/object.zig`: Object type system and operations (~2400 lines)
--   `src/Interp.zig`: Interpreter and command execution (~2100 lines)
+-   `src/Heap.zig`: Memory allocator and object storage (~3000 lines)
+-   `src/objutil.zig`: Object type system and operations (~2700 lines)
+-   `src/Interp.zig`: Interpreter and command execution (~2400 lines)
 -   `src/Tokenizer.zig`: TCL tokenizer (~1200 lines)
 -   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
--   `src/stringutil.zig`: String utilities with optional UTF-8 support (~900 lines)
--   `src/commands.zig`: Built-in command implementations (~650 lines)
--   `src/memutil.zig`: Buddy allocator and memory primitives (~600 lines)
+-   `src/stringutil.zig`: String utilities with optional UTF-8 support (~875 lines)
+-   `src/memutil.zig`: Buddy allocator, memory primitives, and LRU cache (~900 lines)
+-   `src/commands.zig`: Built-in command implementations (~520 lines)
+-   `src/tripwire.zig`: Vendored failure-injection library for testing error paths (~290 lines)
 -   `src/repl.zig`: REPL (stub, not yet implemented)
 
 ## Configuration
@@ -370,15 +370,12 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 
 Recent fixes and improvements:
 
--   **Handle Refactoring (January 2026)**: Major refactoring of Handle management API (in progress, ~80% complete)
-    -   Changed from pointer-based mutation (`shimmerToX(&det, &handle)`) to output parameter pattern
-    -   Introduced `OptionalHandle` type for optional handle returns
+-   **Closures via `[fn]`**: Implemented first-class closures with lexical scope capture. `[fn]` replaces both `[proc]` and `[apply]`. Closures capture their defining scope and support required args, optional args with defaults, and varargs.
+-   **LRU cache**: Parsed scripts, expressions, and closures are now cached per-heap using an LRU cache (in `memutil.zig`), replacing the old ScriptId system.
+-   **Handle Refactoring (complete)**: Refactored Handle management API from pointer-based mutation (`shimmerToX(&det, &handle)`) to an output parameter pattern that eliminates use-after-free issues.
     -   New signature: `shimmerToX(det, provided_handle, new_handle: *OptionalHandle) !void`
-    -   Eliminates use-after-free (UAF) issues by never mutating handles through pointers
-    -   All shimmer functions use output parameter API
     -   Get functions (e.g., `integerGet`) take same parameters and return the value directly
-    -   Added helper methods: `OptionalHandle.orElse()`, `OptionalHandle.swapWithNull()`, `Handle.swapIfNew()`
-    -   Standard pattern: `errdefer new_handle.swapWithNull()` at function start
+    -   Standard pattern: `errdefer new_handle.swapWithNone()` at function start
     -   Caller pattern: `handle.swapIfNew(new_handle)` to update handle references
 -   Dictionary operations: Added `dictRemove`, fixed duplicate handling
 -   Command architecture: Standardized function naming conventions
@@ -402,11 +399,12 @@ Currently implemented:
     -   Random: rand(), srand()
 -   Variable management and scoping with epoch-based caching
 -   Command registration and dispatch system
--   Core built-in commands (13 implemented):
+-   Closures with lexical scope capture
+-   Core built-in commands (12 implemented):
     -   Math: [+], [*], [incr], [expr]
     -   Control flow: [if], [for], [break], [continue]
     -   Variables: [set]
-    -   Procedures: [proc], [apply]
+    -   Closures: [fn]
     -   Data structures: [dict] (get, getdef, set, remove)
     -   I/O: [puts]
 
@@ -422,8 +420,6 @@ Not yet implemented:
 -   While/foreach loops
 -   File I/O (open, close, read, write)
 -   Most TCL standard library commands
--   Namespaces (partial support exists)
--   Upvar/uplevel (structures exist but incomplete)
 -   Error stack traces
 -   REPL
 
