@@ -41,7 +41,6 @@ const ScriptError = error{
     NotVariable,
 };
 const ExpressionError = error{
-    DictSugarInExpression,
     FunctionMissingParentheses,
     NotOperator,
     NotNumber,
@@ -69,8 +68,6 @@ pub const Token = struct {
         argument_expansion,
         /// Variable substitution
         variable_subst,
-        /// Syntax sugar for [dict get], $foo(bar)
-        dict_sugar,
         /// command substitution
         command_subst,
         /// word separator (white space)
@@ -447,49 +444,6 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
             break;
         }
 
-        // Parse [dict get] syntax sugar (e.g. $foo(bar)).
-        if (!self.atEnd() and self.current() == '(') {
-            token.tag = .dict_sugar;
-
-            self.advance(1); // skip '('
-
-            var paren_depth: u32 = 1;
-            // We need to keep track of the last seen closing paren,
-            // because the parser will happily keep chugging along
-            // until it's consumed everything. If that's the case,
-            // we'll just rewind to the last seen closing paren.
-            var last_seen_closing_paren: ?Mark = null;
-            while (!self.atEnd() and paren_depth > 0) {
-                switch (self.current()) {
-                    '\\' => {
-                        self.advance(1);
-                        try self.errorIfAtEndAfterBackslash();
-                    },
-                    '(' => {
-                        paren_depth += 1;
-                    },
-                    ')' => {
-                        last_seen_closing_paren = self.mark();
-                        paren_depth -= 1;
-                    },
-                    else => {},
-                }
-                self.advance(1);
-            }
-
-            if (paren_depth != 0 and last_seen_closing_paren != null) {
-                // We ended unbalanced and may have consumed the universe,
-                // so rewind to the last closing paren
-                self.restore(last_seen_closing_paren.?);
-                self.advance(1);
-            }
-
-            if (self.buffer[token.loc.start] == '(') {
-                // Expression sugar, e.g. $(expr)
-                token.tag = .expression_sugar;
-            }
-        }
-
         token.loc.end = self.index;
     }
 
@@ -842,7 +796,6 @@ pub fn nextExpressionToken(self: *Tokenizer) Error!Token {
         '[' => return self.nextCommandToken(),
         '$' => {
             if (self.nextVariableToken()) |val| {
-                if (val.tag == .dict_sugar) return error.DictSugarInExpression;
                 return val;
             } else |err| switch (err) {
                 error.NotVariable => {

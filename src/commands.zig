@@ -161,14 +161,15 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             };
 
             const new_value = try Heap.local_heap.dupOrReference(args[args.len - 1]);
-            const put_result = try interp.wrapError(
+            var new_dict: OptionalHandle = .none;
+            _ = try interp.wrapError(
                 &det,
-                objutil.dictPutRecursively(&det, dict, args[3..(args.len - 1)], new_value),
+                objutil.dictPutRecursively(&det, dict, &new_dict, args[3..(args.len - 1)], new_value),
             );
 
-            if (put_result.new_dict.toHandle()) |new_dict| {
-                defer new_dict.decrRefCount();
-                try interp.setVariableTo(&args[2], new_dict);
+            if (new_dict.toHandle()) |new| {
+                defer new.decrRefCount();
+                try interp.setVariableTo(&args[2], new);
                 // TODO probably can do this faster than looking back up every time.
                 interp.setResult((try interp.getVariable(&args[2])).toHandle().?);
             } else {

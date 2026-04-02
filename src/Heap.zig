@@ -45,7 +45,7 @@ var debugging_gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator
 var debug_gpa = if (builtin.mode == .Debug) debugging_gpa.allocator() else memutil.null_allocator;
 /// Set this right before doing an operation that may cause a panic. The runtime will dump its
 /// traces on panic if set.
-threadlocal var last_touched: ?Handle = null;
+pub threadlocal var last_touched: ?Handle = null;
 
 pub const GlobalHeapState = struct {
     initialized: bool = false,
@@ -337,8 +337,8 @@ pub const Object = packed struct(u128) {
             },
             .dict_sugar => {
                 const dict_sugar = obj.body.dict_sugar;
-                heap.getHandle(dict_sugar.var_name_index).decrRefCount();
-                heap.getHandle(dict_sugar.dict_value_index).decrRefCount();
+                heap.getHandle(dict_sugar.dict_name_index).decrRefCount();
+                heap.getHandle(dict_sugar.path_index).decrRefCount();
             },
             .none,
             .index,
@@ -441,10 +441,18 @@ pub const Body = packed union {
         len: u32,
         extra_data: ExtraData,
     },
-    /// Both objects must be in the object's heap.
+    /// Both objects must be in the parent object's heap. `dict_name_index` points
+    /// to an object that contains the name of the dictionary (and most likely
+    /// specializes to whatever type of variable caching is necessary), while
+    /// `path_index` points to a list containing all parts of the path. For
+    /// example, `foo::bar::baz` would turn into roughly
+    /// ```
+    /// dict_name_index: "foo"
+    /// path_index: ["bar", "baz"]
+    /// ```
     dict_sugar: packed struct {
-        var_name_index: u32,
-        dict_value_index: u32,
+        dict_name_index: HeapIndex,
+        path_index: HeapIndex,
     },
     /// Information about a parsed command.
     parsed_script_command: packed struct {
@@ -1121,7 +1129,6 @@ pub const Handle = packed struct(HandleBacking) {
                     break :blk try std.fmt.allocPrintSentinel(global_gpa, "<none>", .{}, 0);
                 } else {
                     last_touched = handle;
-                    Heap.dumpLastTouchedTrace();
                     @panic("Tried to generate a string for .none");
                 }
             },
@@ -1130,7 +1137,6 @@ pub const Handle = packed struct(HandleBacking) {
                     break :blk try std.fmt.allocPrintSentinel(global_gpa, "<invalid>", .{}, 0);
                 } else {
                     last_touched = handle;
-                    Heap.dumpLastTouchedTrace();
                     @panic("Tried to generate a string for .invalid");
                 }
             },
@@ -1213,7 +1219,6 @@ pub const Handle = packed struct(HandleBacking) {
         if (!ok) {
             if (options.trace_mem) {
                 last_touched = handle;
-                Heap.dumpLastTouchedTrace();
             }
             unreachable;
         }
@@ -1543,7 +1548,14 @@ pub inline fn heapId(self: *Heap) HeapId {
     return @intCast(self - &heaps);
 }
 
-pub fn emptyObject(self: *Heap) Handle {
+pub fn emptyObject() Object {
+    return .{
+        .head = .{ .str = Object.empty_string, .tag = .none },
+        .body = undefined,
+    };
+}
+
+pub fn emptyHandle(self: *Heap) Handle {
     return .{
         .index = empty_object_idx,
         .heap = self.heapId(),
@@ -1708,7 +1720,6 @@ fn freeObjectBackingInner(handle: Handle) void {
 pub fn freeObjectBacking(handle: Handle) void {
     // HACK: should use a custom panic handler for this.
     if (options.trace_mem) last_touched = handle;
-    if (!handle.isAllocHead()) Heap.dumpLastTouchedTrace();
     assert(handle.isAllocHead());
 
     freeObjectBackingInner(handle);
@@ -2742,8 +2753,6 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
             _ = @atomicLoad(T, ref, .acquire);
         }
     } else {
-        // HACK: once I figure out how to register a panic handler I don't need this.
-        if (ref.* == 0) dumpLastTouchedTrace();
         ref.* -= 1;
         after_sub = ref.*;
     }
@@ -2960,8 +2969,6 @@ fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32)
             if (objutil.getSourceInfo(handle).?.file_name.toHandle()) |file_name| {
                 try w.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name.index });
             }
-
-            @panic("FIXME need to implement other references");
         },
         .cached_local_var => {
             try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
@@ -2971,8 +2978,8 @@ fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32)
             try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, lexical_variable.ref.index });
         },
         .dict_sugar => {
-            try w.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.var_name_index });
-            try w.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.dict_value_index });
+            try w.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.dict_name_index });
+            try w.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.path_index });
         },
         .upvar_link => {
             const upvar_link = obj.body.upvar_link;
@@ -3032,12 +3039,19 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
     try stderr.print("}}\n", .{});
 }
 
-pub fn dumpLastTouchedTrace() void {
+pub export fn dumpLastTouchedTrace() void {
+    if (!options.trace_mem) {
+        std.debug.print("WARNING: no trace collected as it was disabled in options.\n\n", .{});
+        return;
+    }
+
     if (last_touched) |val| {
         val.getHeap().trace_mutex.lock();
         defer val.getHeap().trace_mutex.unlock();
 
+        std.debug.print("== Last touched details ==\n\n", .{});
         val.getHeap().objects.get(val.index).trace.dump();
+        std.debug.print("== End of last touched details ==\n\n", .{});
     } else {
         std.debug.print("No last leaked object\n", .{});
     }

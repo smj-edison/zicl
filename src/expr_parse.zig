@@ -69,7 +69,6 @@ pub const Node = struct {
         float,
         command_subst,
         variable_subst,
-        dict_sugar,
         value_false,
         value_true,
         // Unary operators
@@ -395,7 +394,6 @@ pub const Parse = struct {
                 });
             },
             .variable_subst,
-            .dict_sugar,
             .keyword_false,
             .keyword_true,
             => {
@@ -406,7 +404,6 @@ pub const Parse = struct {
                 return try p.addNode(.{
                     .tag = switch (token) {
                         .variable_subst => .variable_subst,
-                        .dict_sugar => .dict_sugar,
                         .keyword_false => .value_false,
                         .keyword_true => .value_true,
                         inline else => unreachable,
@@ -436,7 +433,6 @@ pub const Parse = struct {
                 .simple_string,
                 .escaped_string,
                 .variable_subst,
-                .dict_sugar,
                 .command_subst,
                 .l_paren,
                 .integer,
@@ -729,7 +725,6 @@ pub const Parse = struct {
             .float => try writer.print("{}", .{data.float}),
             .command_subst => try writer.print("[{f}]", .{data.object}),
             .variable_subst => try writer.print("${f}", .{data.object}),
-            .dict_sugar => try writer.print("${f}", .{data.object}),
             .value_false => try writer.print("false", .{}),
             .value_true => try writer.print("true", .{}),
             // Unary operators
@@ -779,7 +774,6 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
         const node = nodes.get(i);
         switch (node.tag) {
             .variable_subst,
-            .dict_sugar,
             .value_false,
             .value_true,
             .command_subst,

@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .name = "zicl-test",
         .filters = test_filters,
         .root_module = root,
+        .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .server },
     });
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);

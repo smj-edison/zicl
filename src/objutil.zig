@@ -105,7 +105,7 @@ pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handl
     const new_count = std.fmt.count(fmt, args);
     const str = try newStringToFill(heap, new_count);
     // Don't try setting the string of an empty object.
-    if (str == heap.emptyObject()) return str;
+    if (str == heap.emptyHandle()) return str;
 
     const written = std.fmt.bufPrint(Heap.getStringMut(str) catch unreachable, fmt, args) catch return error.OutOfMemory;
     assert(written.len == new_count);
@@ -114,7 +114,7 @@ pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handl
 }
 
 pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
-    if (len == 0) return heap.emptyObject();
+    if (len == 0) return heap.emptyHandle();
 
     const handle = try heap.createObject();
     errdefer handle.decrRefCount();
@@ -829,7 +829,6 @@ pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemor
         error.MissingCloseBracket => try newString(heap, "unmatched \"[\""),
         error.MissingCloseQuote => try newString(heap, "missing quote"),
         error.TrailingBackslash => try newString(heap, "no character after \\"),
-        error.DictSugarInExpression => try newString(heap, "dict sugar in expression"),
         error.FunctionMissingParentheses => try newString(heap, "function missing parentheses"),
         error.NotOperator => try newString(heap, "not operator"),
         error.NotNumber => try newString(heap, "not number"),
@@ -1387,12 +1386,12 @@ pub fn dictItems(handle: Handle) []Heap.Object {
 }
 
 pub fn dictItem(dict: Handle, index: u32) Handle {
-    assert(dict.tag() == .dict);
+    dict.assert(dict.tag() == .dict);
     return collectionItem(dict, index, dict.peek().body.dict.len);
 }
 
 pub fn dictItemFollowRefs(dict: Handle, index: u32) Handle {
-    assert(dict.tag() == .dict);
+    dict.assert(dict.tag() == .dict);
     return collectionItemFollowRefs(dict, index, dict.peek().body.dict.len);
 }
 
@@ -1820,15 +1819,20 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
 }
 
 /// Takes ownership of `value`, including in error cases. `value` must be in the local heap.
-pub fn dictPutRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle, value: Heap.Object) !DictAndValueResult {
+pub fn dictPutRecursively(
+    det: ?*ErrorDetails,
+    provided_dict: Handle,
+    new_dict: *OptionalHandle,
+    keys: []const Handle,
+    value: Heap.Object,
+) !Handle {
     var value_taken = false;
     errdefer if (!value_taken) {
         var value_mut = value;
         value_mut.deinitSingle(Heap.local_heap);
     };
 
-    var new_dict: OptionalHandle = .none;
-    try shimmerToDict(det, provided_dict, &new_dict);
+    try shimmerToDict(det, provided_dict, new_dict);
     errdefer new_dict.swapWithNone();
 
     assert(keys.len > 0);
@@ -1837,7 +1841,7 @@ pub fn dictPutRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []co
         value_taken = true; // `dictPutInner` always takes ownership.
         const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], value);
         new_dict.swapRefIfNew(put_result.new_dict);
-        return .{ .new_dict = new_dict, .new_value = put_result.new_value };
+        return put_result.new_value;
     }
 
     // Find/create the child dict.
@@ -1859,8 +1863,9 @@ pub fn dictPutRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []co
     };
 
     value_taken = true;
-    const child_put_result = try dictPutRecursively(det, child_dict, keys[1..], value);
-    if (child_put_result.new_dict.toHandle()) |new_child| {
+    var new_child_dict: OptionalHandle = .none;
+    const child_put_result = try dictPutRecursively(det, child_dict, &new_child_dict, keys[1..], value);
+    if (new_child_dict.toHandle()) |new_child| {
         errdefer new_child.decrRefCount();
 
         // The child dict changed, so we need to update ours.
@@ -1874,7 +1879,7 @@ pub fn dictPutRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []co
 
     new_dict.orElse(provided_dict).invalidateString();
 
-    return .{ .new_dict = new_dict, .new_value = child_put_result.new_value };
+    return child_put_result;
 }
 
 pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle) !DictAndRemovedResult {
@@ -1917,28 +1922,32 @@ pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: [
     }
 }
 
-pub const DictAndValueLookupResult = struct { new_dict: OptionalHandle, value: OptionalHandle };
-pub fn dictLookupRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle) !DictAndValueLookupResult {
-    var new_dict: OptionalHandle = .none;
+pub fn dictLookupRecursively(
+    det: ?*ErrorDetails,
+    provided_dict: Handle,
+    new_dict: *OptionalHandle,
+    keys: []const Handle,
+) !OptionalHandle {
     new_dict.swapWithNone();
-    try shimmerToDict(det, provided_dict, &new_dict);
+    try shimmerToDict(det, provided_dict, new_dict);
 
-    if (keys.len == 0) return .{ .new_dict = new_dict, .value = new_dict.orElse(provided_dict).toOptional() };
+    if (keys.len == 0) return new_dict.orElse(provided_dict).toOptional();
     if (keys.len == 1) {
-        return .{ .new_dict = new_dict, .value = try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0]) };
+        return try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0]);
     }
 
     if ((try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0])).toHandle()) |child_dict| {
-        const child_result = try dictLookupRecursively(det, child_dict, keys[1..]);
-        if (child_result.new_dict.toHandle()) |new_child| {
-            errdefer new_child.decrRefCount();
+        var new_child: OptionalHandle = .none;
+        const child_result = try dictLookupRecursively(det, child_dict, &new_child, keys[1..]);
+        if (new_child.toHandle()) |new| {
+            errdefer new.decrRefCount();
             // The child dict changed, propagate back up.
-            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new_child.referenceTakeOwnership());
+            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new.referenceTakeOwnership());
             new_dict.swapRefIfNew(put_result.new_dict);
         }
-        return .{ .new_dict = new_dict, .value = child_result.value };
+        return child_result;
     } else {
-        return .{ .new_dict = new_dict, .value = .none };
+        return .none;
     }
 }
 
