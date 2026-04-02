@@ -176,7 +176,7 @@ Objects automatically "shimmer" between types, maintaining cached representation
     **Special Object Access:**
 
     - `heap.nullObject()` - Get the null object handle
-    - `heap.emptyObject()` - Get empty object handle
+    - `heap.emptyHandle()` - Get empty object handle
     - `heap.tempObject()` - Get temporary object handle
 
     **Debugging:**

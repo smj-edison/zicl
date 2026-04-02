@@ -6,6 +6,12 @@ This file provides guidance to Google's Gemini when working with code in this re
 
 **zicl** (Zig TCL) is a TCL interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe TCL implementation with optional threading support and modern memory management.
 
+### Design Constraints
+
+-   **Cross-thread sharing is a primary goal.** The multi-heap architecture exists specifically to support this. Design decisions should treat cross-thread object sharing as a first-class use case, not an afterthought.
+-   **Interpreters can block indefinitely.** Blocking in C FFI (or otherwise) is considered normal operation. Nothing in the system may require an interpreter's owning thread to be active in order to make progress. In particular, foreign threads must be able to free objects belonging to a blocked heap without any cooperation from the owning thread.
+-   **Allocation is thread-local; deallocation is cross-thread safe.** The buddy allocator uses a mutex-protected main list for operations from any thread, and a lock-free pool as a fast path for the owning thread only. Cross-thread frees go directly through the mutex to the main list — no deferred queue is used, precisely because a deferred queue would require the owning thread to drain it.
+
 ## Build Commands
 
 Build and run the project:
@@ -52,12 +58,12 @@ zig build -Dtoken-debugging=true
 -   Cross-thread object sharing with atomic operations
 -   Object "shimmering" - dynamic type conversion that preserves cached representations
 
-**Object System (src/object.zig)**: Implements TCL's dynamic typing through type shimmering:
+**Object System (src/objutil.zig)**: Implements TCL's dynamic typing through type shimmering:
 
 -   Objects can dynamically convert between types (string → list → dict, etc.)
 -   Maintains string representation alongside typed representation when beneficial
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
--   Dictionary operations: `dictGet`, `dictGetDefault`, `dictSet`, `dictPut`, `dictRemove`, `dictRemoveDuplicates`, `dictReindex`
+-   Dictionary operations: `dictPut`, `dictPutRecursively`, `dictRemove`, `dictRemoveRecursively`, `dictLookupRecursively`, `dictLookupFollowRefs`, `dictReindex`
 -   Supports recursive key lookups for nested dictionaries
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
@@ -65,7 +71,6 @@ zig build -Dtoken-debugging=true
 
 -   Variable substitution (`$var`, `${var}`)
 -   Command substitution (`[cmd]`)
--   Dictionary sugar (`$var(key)`)
 -   Argument expansion (`{*}`)
 -   Proper quote/brace/bracket balancing with detailed error reporting
 
@@ -93,32 +98,41 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
 1. **Handles vs Objects**: Handles are lightweight references (64 bits) to objects in a heap. Objects live in the heap's object storage.
 
-2. **Reference Counting**: Handles can be ref-counted (sharable) or non-ref-counted (e.g., list items). Use `heap.borrow()` and `handle.release()`.
+2. **OptionalHandle**: A special enum type that can be `.none` or contain a `Handle`. Used as an output parameter in shimmer functions to indicate whether duplication occurred.
 
-3. **Ownership Patterns**:
+3. **Reference Counting**: Handles can be ref-counted (sharable) or non-ref-counted (e.g., list items).
+
+4. **Ownership Patterns**:
 
     - Functions that allocate return owned handles (caller must release)
-    - `borrow()` increases ref count (may duplicate if the handle being borrowed isn't ref counted)
+    - `borrow()` increases ref count and returns the handle
     - `duplicate()` creates shallow copies
-    - `steal()` transfers ownership without copying (internal use)
-    - `decrRefCount()` decrements ref count and frees if zero (NOT `release()`)
+    - `decrRefCount()` decrements ref count and frees if zero (use in `defer` for cleanup)
 
-4. **Handle Helper Functions** (prefer these over manual operations):
+5. **Handle Helper Functions** (prefer these over manual operations):
 
     **Reference Counting:**
 
     - `handle.borrow()` - Increment ref count and return handle (for creating owned references)
-    - `Handle.borrowOptional()` - Borrow optional handle
+    - `OptionalHandle.borrowOptional()` - Borrow optional handle if it has a value, else a nop.
     - `handle.decrRefCount()` - Decrement ref count, free if zero (use in `defer` for cleanup)
     - `handle.incrRefCount()` - Increment ref count (rarely needed directly)
     - `handle.debugRefCount()` - Get current ref count (debugging only)
 
+    **OptionalHandle Operations:**
+
+    - `OptionalHandle.orElse(handle)` - Return contained handle if non-none, else fallback
+    - `OptionalHandle.toHandle()` - Convert to `?Handle`
+    - `OptionalHandle.swapWithNone()` - Decrement ref count and set to none (use in `errdefer`)
+    - `OptionalHandle.swapRef(handle)` - Swap and decref old value
+    - `OptionalHandle.swapRefIfNew(optional)` - Conditionally swap if non-none
+    - `Handle.toOptional()` - Convert Handle to OptionalHandle
+
     **Handle Swapping** (for updating handle references):
 
-    - `handle.swapIfNew(new_handle)` - Swap if new_handle is non-null, releasing old
-    - `handle.swapThenReleaseOld(new)` - Always swap and release old
-    - `Handle.swapRef(new_handle)` - Swap optional handle reference
-    - `Handle.swapRefIfNew(new_handle)` - Swap optional if new is non-null
+    - `handle.swapIfNew(optional_handle)` - Update handle if optional is non-null, releasing old
+    - `handle.swap(new_handle)` - Always swap and release old
+    - `handle.swapAndClear(&optional_handle)` - Transfer ownership from optional and clear it
 
     **Querying Handle State:**
 
@@ -129,25 +143,32 @@ Objects automatically "shimmer" between types, maintaining cached representation
     - `handle.isShared()` - Check if ref_count > 1 or cross-thread
     - `handle.hasString()` - Check if has string representation cached
     - `handle.getMetadata()` - Get object metadata (order, mutable flag, etc.)
-    - `handle.isAllocHead()` - Check if this is the allocation head for multi-object allocation
+
+    **Shimmering Helpers:**
+
+    - `handle.prepareToShimmer()` - Ensure string rep exists, invalidate body (requires canShimmer)
+
+    **Invalidation** (low-level, rarely used directly):
+
+    - `handle.invalidateBody()` - Clear body (called by prepareToShimmer)
+    - `handle.invalidateString()` - Clear string rep when mutating
+    - `handle.invalidateBoth()` - Clear both body and string
 
     **Creating References:**
 
     - `handle.reference()` - Create reference object, incrementing ref count
-    - `handle.referenceTakeOwnership()` - Create reference without incrementing (caller owns handle)
+    - `handle.referenceTakeOwnership()` - Create reference object without incrementing ref count
 
-    **Invalidation** (for shimmering/mutation):
+    **Other Handle Operations:**
 
-    - `handle.invalidateBody()` - Clear body when shimmering (requires canShimmer)
-    - `handle.invalidateString()` - Clear string rep when mutating (requires canMutate)
-    - `handle.invalidateBoth()` - Clear both body and string
+    - `handle.isAllocHead()` - Check if this is the allocation head for multi-object allocation
 
     **Heap-Level Helpers:**
 
     - `heap.duplicate(handle)` - Deep copy to same or different heap
-    - `heap.steal(handle)` - Transfer ownership to newly created object
-    - `Heap.ensureShimmerableOrDup(handle)` - Returns duplicated handle if can't shimmer
-    - `Heap.ensureMutableOrDup(handle)` - Returns duplicated handle if can't mutate
+    - `Heap.ensureShimmerableOrDup(handle, *OptionalHandle)` - Duplicates if can't shimmer (output parameter)
+    - `Heap.ensureMutableOrDup(handle, *OptionalHandle)` - Duplicates if can't mutate (output parameter)
+    - `Heap.ensureSameHeapOrDup(handle, *OptionalHandle)` - Duplicates if different heap (output parameter)
     - `Heap.getString(handle)` - Get string representation (may allocate)
     - `Heap.setString(handle, bytes)` - Set string representation
     - `Heap.checkIfEqual(a, b)` - Deep equality check
@@ -155,7 +176,7 @@ Objects automatically "shimmer" between types, maintaining cached representation
     **Special Object Access:**
 
     - `heap.nullObject()` - Get the null object handle
-    - `heap.emptyObject()` - Get empty object handle
+    - `heap.handleToEmpty()` - Get empty object handle
     - `heap.tempObject()` - Get temporary object handle
 
     **Debugging:**
@@ -163,26 +184,34 @@ Objects automatically "shimmer" between types, maintaining cached representation
     - `handle.trace(fmt, args)` - Add trace entry (if trace_mem enabled)
     - `handle.assert(condition)` - Assert with automatic trace dump on failure
 
-5. **Shimmering Rules**:
+6. **Shimmering Rules**:
 
     - Objects can only shimmer if not shared between threads (`canShimmer()` checks this)
-    - Shimmer functions take `Handle` by value and return `!?Handle` (optional new handle if duplicated)
-    - Use `Handle.swapIfNew(new_handle)` to update handle references when shimmer returns a new handle
+    - Shimmer functions take `provided_handle: Handle` and output parameter `new_handle: *OptionalHandle`
+    - If duplication occurs, `new_handle` will be non-null
+    - Always use `errdefer new_handle.swapWithNone()` at the start of shimmer functions
+    - Use `new_handle.orElse(provided_handle)` to get the actual handle to work with
+    - Caller uses `handle.swapIfNew(new_handle)` to update their handle reference
     - Shimmering invalidates the old body but preserves string rep when possible
-    - Helper functions: `Heap.ensureShimmerableOrDup()`, `Heap.ensureMutableOrDup()` check if duplication is needed
 
-6. **Collections (Lists/Dicts)**: Stored as contiguous object arrays. First object is head (contains metadata), subsequent objects are items. Cannot reference individual items externally (they're not ref-counted), but `borrow()` accounts for this.
+7. **Collections (Lists/Dicts)**:
+    - Stored as contiguous object arrays allocated via the buddy allocator
+    - First object is head (contains metadata), subsequent objects are items
+    - Each item has its own ref count and CAN be borrowed individually with `handle.borrow()`
+    - When the collection is freed, if any items are shared (ref count > 1), the buddy allocator automatically splits the multi-object block into individual allocations
+    - Shared items survive the collection being freed because they have independent ref counts
+    - Non-shared items are freed along with the collection head
 
 ### Script Execution Model
 
 Scripts go through several stages:
 
 1. **Tokenization** (Tokenizer): Source → tokens with location info
-2. **Preprocessing** (parseScript in object.zig): Tokens → optimized script structure
+2. **Preprocessing** (parseScript in objutil.zig): Tokens → optimized script structure
     - Precomputes word boundaries and argument counts
     - Stores tokens as `.start_of_command` + arguments
     - Example: `set x 5` becomes [start_of_command(2), "set", "x", "5"]
-3. **Caching** (ScriptId system): Parsed scripts cached per-heap by unique ID
+3. **Caching** (LRU cache): Parsed scripts, expressions, and closures cached per-heap by unique ID
 4. **Evaluation** (evalObject): Walks token list, substitutes variables/commands, invokes commands
 
 ### Testing Patterns
@@ -228,36 +257,41 @@ defer str.decrRefCount();
 **Working with Lists**:
 
 ```zig
-const list = try object.listNew(heap, &.{item1, item2});
+const list = try object.newList(&.{item1, item2});
 defer list.decrRefCount();
 const item = object.listItem(list, 0); // Non-owning handle
 ```
 
-**Type Shimmering** (value-based API):
+**Type Shimmering** (output parameter API):
 
 ```zig
-// Shimmer functions take Handle by value and return optional new handle
-const new_handle = try object.shimmerToList(&det, handle);
+// Shimmer functions take Handle by value and *OptionalHandle output parameter.
+var det: object.ErrorDetails = undefined;
+var new_handle: OptionalHandle = .none;
+try object.shimmerToList(&det, handle, &new_handle);
 handle.swapIfNew(new_handle);  // Update if shimmer created a duplicate
 // handle is now a list type
 
-// For wrapper functions that return both new handle and value:
-const result = try object.getBoolean(&det, handle);
-handle.swapIfNew(result.new_handle);
-const value = result.value;
+// Pattern inside shimmer functions:
+pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
+    if (provided_handle.tag() == .integer) return;
+    errdefer new_handle.swapWithNone();
+
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
+
+    // ... shimmer logic ...
+}
 ```
 
-**Handle Update Pattern**:
+**Get Functions** (shimmer + extract value):
 
 ```zig
-// When a function returns !?Handle (shimmer functions):
-const new_handle = try shimmerToInteger(&det, my_handle);
-my_handle.swapIfNew(new_handle);  // Automatically releases old and swaps if needed
-
-// When a function returns struct { new_handle: ?Handle, value: T }:
-const result = try integerGet(&det, my_handle);
-my_handle.swapIfNew(result.new_handle);
-const value = result.value;
+// Get functions that shimmer and return a value.
+var new_handle: OptionalHandle = .null;
+const value = try object.integerGet(&det, my_handle, &new_handle);
+my_handle.swapIfNew(new_handle);
+// my_handle is now an integer type, value contains the i64
 ```
 
 **Error Handling with Details**:
@@ -270,14 +304,15 @@ const result = try someFn(heap, &det, arg);
 
 ## Key Files
 
--   `src/Heap.zig`: Memory allocator and object storage (~2500 lines)
--   `src/object.zig`: Object type system and operations (~2400 lines)
--   `src/Interp.zig`: Interpreter and command execution (~2100 lines)
+-   `src/Heap.zig`: Memory allocator and object storage (~3000 lines)
+-   `src/objutil.zig`: Object type system and operations (~2700 lines)
+-   `src/Interp.zig`: Interpreter and command execution (~2400 lines)
 -   `src/Tokenizer.zig`: TCL tokenizer (~1200 lines)
 -   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
--   `src/stringutil.zig`: String utilities with optional UTF-8 support (~900 lines)
--   `src/commands.zig`: Built-in command implementations (~650 lines)
--   `src/memutil.zig`: Buddy allocator and memory primitives (~600 lines)
+-   `src/stringutil.zig`: String utilities with optional UTF-8 support (~875 lines)
+-   `src/memutil.zig`: Buddy allocator, memory primitives, and LRU cache (~900 lines)
+-   `src/commands.zig`: Built-in command implementations (~520 lines)
+-   `src/tripwire.zig`: Vendored failure-injection library for testing error paths (~290 lines)
 -   `src/repl.zig`: REPL (stub, not yet implemented)
 
 ## Configuration
@@ -317,9 +352,9 @@ const result = try processData(data);  // This might fail
 
 ## Common Issues
 
-**Double Free**: If you see double-free panics, check that objects from collections (lists/dicts) aren't being released. List items are not ref-counted handles. Enable options.trace_mem to figure out why.
+**Double Free**: If you see double-free panics, check the memory trace. With the splitting allocator design, collection items CAN be borrowed and ref-counted individually. However, you should only call `decrRefCount()` on items you explicitly borrowed. Enable `options.trace_mem` to dump the full allocation/deallocation trace.
 
-**Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `prepareToShimmer()` which will duplicate if needed.
+**Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `Heap.ensureShimmerableOrDup()` to automatically duplicate if the handle cannot shimmer.
 
 **OOM in Tests**: Use `testing.checkAllAllocationFailures()` wrapper to test all OOM code paths. All tests should pass without leaks even when allocations fail at any point.
 
@@ -333,15 +368,20 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 
 ## Recent Development
 
-The project has recently undergone a major refactoring of the Handle management API to improve memory safety and simplify the code. This involved moving from a pointer-based mutation model to a value-based duplication model. Gemini's involvement begins after this refactoring.
+Recent fixes and improvements:
 
--   **Handle Refactoring (January 2026)**: Completed major refactoring of Handle management API
-    -   Changed from pointer-based mutation (`shimmerToX(&det, &handle)`) to value-based duplication (`shimmerToX(&det, handle) -> !?Handle`)
-    -   Eliminates use-after-free (UAF) issues by returning new handles instead of mutating through pointers
-    -   All shimmer functions (`shimmerToInteger`, `shimmerToFloat`, `shimmerToList`, `shimmerToDict`, `shimmerToScript`, `shimmerToExpression`, `shimmerToBoolean`) now use value-based API
-    -   Get functions (`getScript`, `getExpression`, `getBoolean`, `integerGet`) return structs with both new handle and value
-    -   Added `Handle.swapIfNew(?Handle)` helper method to simplify handle updates
-    -   Pattern: Functions return `!?Handle` when only shimmering, or `!struct { new_handle: ?Handle, value: T }` when also extracting a value
+-   **Closures via `[fn]`**: Implemented first-class closures with lexical scope capture. `[fn]` replaces both `[proc]` and `[apply]`. Closures capture their defining scope and support required args, optional args with defaults, and varargs.
+-   **LRU cache**: Parsed scripts, expressions, and closures are now cached per-heap using an LRU cache (in `memutil.zig`), replacing the old ScriptId system.
+-   **Handle Refactoring (complete)**: Refactored Handle management API from pointer-based mutation (`shimmerToX(&det, &handle)`) to an output parameter pattern that eliminates use-after-free issues.
+    -   New signature: `shimmerToX(det, provided_handle, new_handle: *OptionalHandle) !void`
+    -   Get functions (e.g., `integerGet`) take same parameters and return the value directly
+    -   Standard pattern: `errdefer new_handle.swapWithNone()` at function start
+    -   Caller pattern: `handle.swapIfNew(new_handle)` to update handle references
+-   Dictionary operations: Added `dictRemove`, fixed duplicate handling
+-   Command architecture: Standardized function naming conventions
+-   Loop control: Fixed break/continue propagation with level support
+-   Memory safety: Fixed double-free on initialization failure and interned string leaks
+-   Dictionary commands: Fixed `[dict set]` bugs for nested operations
 
 ## Development Status
 
@@ -359,11 +399,12 @@ Currently implemented:
     -   Random: rand(), srand()
 -   Variable management and scoping with epoch-based caching
 -   Command registration and dispatch system
--   Core built-in commands (13 implemented):
+-   Closures with lexical scope capture
+-   Core built-in commands (12 implemented):
     -   Math: [+], [*], [incr], [expr]
     -   Control flow: [if], [for], [break], [continue]
     -   Variables: [set]
-    -   Procedures: [proc], [apply]
+    -   Closures: [fn]
     -   Data structures: [dict] (get, getdef, set, remove)
     -   I/O: [puts]
 
@@ -379,14 +420,12 @@ Not yet implemented:
 -   While/foreach loops
 -   File I/O (open, close, read, write)
 -   Most TCL standard library commands
--   Namespaces (partial support exists)
--   Upvar/uplevel (structures exist but incomplete)
 -   Error stack traces
 -   REPL
 
 ## Notes
 
-**LLM Involvement**: This project has been developed with the assistance of AI models, including Anthropic's Claude and Google's Gemini. Commits made with AI assistance are noted in the git history.
+**Experimental Files**: The repository contains `foo.zig` and `bar.zig` which are one-off prototypes not relevant to the overall architecture and can be ignored.
 
 ## Style guide
 
