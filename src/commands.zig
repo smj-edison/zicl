@@ -185,15 +185,14 @@ test "dict commands" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
-    try testing.expectError(error.EvalError, testRunScript(&interp,
+    try interp.testExpectScriptError(error.EvalError,
+        \\Missing value to go with key when converting "10" to a dictionary.
+    ,
         \\ dict set x a 10
         \\ puts [dict get $x a 5]
-    ));
-    try testing.expectEqualStrings(
-        \\Missing value to go with key when converting "10" to a dictionary.
-    , try interp.result.getString());
+    );
 
-    try testExpectScriptResult(&interp, "qux",
+    try interp.testExpectScriptResult("qux",
         \\ dict set foo bar baz qux
         \\ dict get $foo bar baz
     );
@@ -258,18 +257,18 @@ test "loop commands" {
     defer testFinish(&interp);
 
     // Basic loop.
-    try testExpectScriptResult(&interp, "5",
+    try interp.testExpectScriptResult("5",
         \\ for {set i 0} {$i < 5} {incr i} { }
         \\ set i
     );
 
     // [continue]
-    try testExpectScriptResult(&interp, "5",
+    try interp.testExpectScriptResult("5",
         \\ for {set i 0} {$i < 5} {incr i} { continue }
         \\ set i
     );
 
-    try testExpectScriptResult(&interp, "0",
+    try interp.testExpectScriptResult("0",
         \\ for {set i 0} {$i < 5} {incr i} {
         \\   for {set j 0} {$j < 5} {incr j} {
         \\     continue 2
@@ -454,36 +453,25 @@ pub fn testFinish(interp: *Interp) void {
     Heap.testFinish();
 }
 
-fn testRunScript(interp: *Interp, script: []const u8) !Handle {
-    var script_handle = try objutil.newString(Heap.local_heap, script);
-    defer script_handle.decrRefCount();
-    try interp.evalObject(script_handle);
-    return interp.result;
-}
-
-fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
-    try testing.expectEqualStrings(expected, try (try testRunScript(interp, script)).getString());
-}
-
 test "fn command" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
     // Basic closure.
-    try testExpectScriptResult(&interp, "30",
+    try interp.testExpectScriptResult("30",
         \\ fn add {a b} { + $a $b }
         \\ add 10 20
     );
 
     // Closure captures scope.
-    try testExpectScriptResult(&interp, "15",
+    try interp.testExpectScriptResult("15",
         \\ set x 10
         \\ fn addx {a} { + $a $x }
         \\ addx 5
     );
 
     // Nested closure captures outer scope via parent_link chain.
-    testExpectScriptResult(&interp, "15",
+    try interp.testExpectScriptResult("15",
         \\ set outer 5
         \\ fn foo {} {
         \\   set inner 10
@@ -498,13 +486,13 @@ test "fn command" {
     };
 
     // Optional parameters.
-    try testExpectScriptResult(&interp, "3",
+    try interp.testExpectScriptResult("3",
         \\ fn greet {a {b 3}} { + $a $b }
         \\ greet 0
     );
 
     // Variadic args parameter.
-    try testExpectScriptResult(&interp, "10 20 30",
+    try interp.testExpectScriptResult("10 20 30",
         \\ fn collect {args} { set args }
         \\ collect 10 20 30
     );

@@ -313,6 +313,10 @@ pub fn setVariableInner(
     name: Handle,
     value: Heap.Object,
 ) error{ OutOfMemory, BadDict }!void {
+    // TODO PERF a lot of functions look the variable back up after setting it. We should probably
+    // return the variable's new handle after setting it. After doing so, be sure to audit all
+    // the call sites.
+
     var value_taken = false;
     errdefer if (!value_taken) {
         var value_mut = value;
@@ -2123,6 +2127,7 @@ test "eval expression" {
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
+    std.debug.print("raw script: `{f}`\n", .{script});
     const parsed = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key));
     // Don't evaluate empty scripts.
     if (parsed.tags.items.len <= 1) return;
@@ -2653,6 +2658,31 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
 
 test "recursive dict removal" {
     try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDictRemoval, .{});
+}
+
+fn testRunScript(interp: *Interp, script: []const u8) !Handle {
+    var script_handle = try objutil.newString(Heap.local_heap, script);
+    defer script_handle.decrRefCount();
+    try interp.evalObject(script_handle);
+    return interp.result;
+}
+
+pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
+    try testing.expectEqualStrings(expected, try (try testRunScript(interp, script)).getString());
+}
+
+pub fn testExpectScriptError(interp: *Interp, expected_error: anyerror, expected_str: []const u8, script: []const u8) !void {
+    if (testRunScript(interp, script)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const error_str = try interp.result.getString();
+        if (err == expected_error and std.mem.eql(u8, expected_str, error_str)) {
+            // All good!
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 pub fn nextRandomFloat(interp: *Interp) f64 {

@@ -2330,7 +2330,6 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // The number of arguments for this command.
     var command_arg_count: u32 = 0;
     var i: usize = 0;
-    var last_i: usize = 0;
     while (i < tokens.items.len) {
         // Skip any leading separators.
         while (tokens.items[i].tag == .word_separator) i += 1;
@@ -2390,7 +2389,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                     .tag = .integer,
                 },
                 .body = .{
-                    .integer = @intCast(arg_token_count),
+                    // The argument_expansion token itself is not stored in the values
+                    // list (it's skipped in the loop below), so subtract 1 from the
+                    // count to reflect the actual number of tokens that follow.
+                    .integer = @intCast(if (found_expansion) arg_token_count - 1 else arg_token_count),
                 },
             });
             new_token_values.swapIfNew(append_result);
@@ -2450,8 +2452,6 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
         // Be sure to advance our index to the next word.
         i += arg_token_count;
-
-        last_i = i;
     }
 
     const parsed_script: Heap.ParsedScript = .{

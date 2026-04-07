@@ -257,7 +257,22 @@ pub fn nextStringToken(self: *Tokenizer) !Token {
             //
             // One more example, `{can have spaces}[separator]{nospaces this_is_a_new_word`.
             switch (self.current()) {
-                '{' => return self.nextBracedStringToken(),
+                '{' => {
+                    const token = try self.nextBracedStringToken();
+                    // After a braced word, only whitespace and command terminators
+                    // (newline, semicolon) are valid. Other characters (e.g. `x{foo}y`)
+                    // are errors, matching Tcl's "extra characters after close-brace".
+                    // Argument expansion ({*}) is exempt — it's a prefix, so the
+                    // word to expand follows immediately with no whitespace.
+                    if (token.tag != .argument_expansion) {
+                        if (self.peek(0)) |char| {
+                            if (!isWhitespace(char) and char != ';') {
+                                return error.CharactersAfterCloseBrace;
+                            }
+                        }
+                    }
+                    return token;
+                },
                 '"' => {
                     self.in_quote = true;
                     // Save where the opening quote is, so we can point to it
@@ -568,18 +583,8 @@ pub fn nextBracedStringToken(self: *Tokenizer) !Token {
                         token.tag = .argument_expansion;
                         // Make sure to point at after the closing brace.
                         self.advance(1);
-                        // Note that this returns early, since we don't want to return
-                        // Error.CharactersAfterCloseBrace for argument expansion.
-                        return token;
-                    }
 
-                    // We've found the same number of opening and closing braces
-                    // at this point. We'll just double-check that there's nothing
-                    // afterwards.
-                    if (self.peek(1)) |char| {
-                        if (!isWhitespace(char)) {
-                            return Error.CharactersAfterCloseBrace;
-                        }
+                        return token;
                     }
 
                     // make sure to point at after the closing brace
@@ -687,7 +692,14 @@ pub fn nextListToken(self: *Tokenizer) !Token {
             return self.nextListQuoteToken();
         },
         '{' => {
-            return self.nextBracedStringToken();
+            const token = try self.nextBracedStringToken();
+            // In a list, only whitespace is valid after a braced element.
+            if (self.peek(0)) |char| {
+                if (!isWhitespace(char)) {
+                    return error.CharactersAfterCloseBrace;
+                }
+            }
+            return token;
         },
         else => {
             return self.nextListStringToken();

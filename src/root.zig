@@ -78,4 +78,6 @@ test {
     _ = @import("Interp.zig");
     _ = @import("commands.zig");
     _ = @import("expr_parse.zig");
+
+    _ = @import("test/test_root.zig");
 }
