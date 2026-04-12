@@ -24,7 +24,6 @@ pub const null_object_idx: u32 = 0;
 pub const empty_object_idx: u32 = 1;
 
 pub const HeapSettings = struct {
-    use_vmem: bool = true,
     /// Maximum of `1 << heap_order` items.
     object_heap_order: u6 = 16,
     /// Maximum of `1 << heap_order` bytes for all strings.
@@ -59,7 +58,7 @@ pub const GlobalHeapState = struct {
 pub var state: GlobalHeapState = .{};
 pub var global_gpa: std.mem.Allocator = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
-pub var custom_types: memutil.IndexedMemoryPool(CustomType, cfg.use_vmem) = undefined;
+pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
 
 pub threadlocal var local_heap: *Heap = undefined;
 
@@ -101,7 +100,7 @@ const StringTracker = memutil.BuddyUnmanaged(.{
 });
 const StringList = std.ArrayList(u8);
 
-const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, cfg.use_vmem);
+const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, options.threading);
 const FullHashContext = struct {
     pub fn hash(self: @This(), full_hash: u256) u64 {
         _ = self;
@@ -116,12 +115,13 @@ const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, Fu
 const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
 const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullHashContext);
 
-const InternedString = enum {
+pub const InternedString = enum {
     @"apply lambdaExpr",
     @"fn",
     impl,
     scope,
     name,
+    @"division by zero",
 };
 
 const interned_string_count = std.enums.values(InternedString).len;
@@ -1039,7 +1039,7 @@ pub const Handle = packed struct(HandleBacking) {
                 // Build the args spec list. Required/args params use the name directly;
                 // optional params become 2-element lists {name default}.
                 const args_spec = try objutil.newListWithCapacity(total_args);
-                errdefer args_spec.decrRefCount();
+                defer args_spec.decrRefCount();
                 args_spec.peek().body.list.len = total_args;
                 const arg_items = objutil.listItems(args_spec);
 
@@ -1060,7 +1060,7 @@ pub const Handle = packed struct(HandleBacking) {
 
                 // impl is a 2-element list: {args_spec body}.
                 const impl_val = try objutil.newList(&.{ args_spec, closure.body });
-                errdefer impl_val.decrRefCount();
+                defer impl_val.decrRefCount();
 
                 // Build the outer list: fn ?name <name>? impl <impl> ?scope <scope>?
                 var word_count: u32 = 3; // fn, impl keyword, impl value
@@ -1068,40 +1068,32 @@ pub const Handle = packed struct(HandleBacking) {
                 if (closure.scope.toHandle() != null) word_count += 2;
 
                 const outer = try objutil.newListWithCapacity(word_count);
-                errdefer outer.decrRefCount();
-                outer.peek().body.list.len = word_count;
-                const words = objutil.listItems(outer);
+                defer outer.decrRefCount();
 
-                var w: u32 = 0;
-                words[w] = try heap.dupOrReference(heap.getInternedString(.@"fn"));
-                w += 1;
+                var new: OptionalHandle = .none;
+                _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.@"fn")) catch unreachable;
+                outer.assert(new == .none);
 
                 if (closure.name.toHandle()) |name_handle| {
-                    words[w] = try heap.dupOrReference(heap.getInternedString(.name));
-                    w += 1;
-                    words[w] = try heap.dupOrReference(name_handle);
-                    w += 1;
+                    _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.name)) catch unreachable;
+                    outer.assert(new == .none);
+                    _ = objutil.listAppend(null, outer, &new, name_handle) catch unreachable;
+                    outer.assert(new == .none);
                 }
 
-                words[w] = try heap.dupOrReference(heap.getInternedString(.impl));
-                w += 1;
-                words[w] = try heap.dupOrReference(impl_val);
-                w += 1;
+                _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.impl)) catch unreachable;
+                outer.assert(new == .none);
+                _ = objutil.listAppend(null, outer, &new, impl_val) catch unreachable;
+                outer.assert(new == .none);
 
                 if (closure.scope.toHandle()) |scope_handle| {
-                    words[w] = try heap.dupOrReference(heap.getInternedString(.scope));
-                    w += 1;
-                    words[w] = try heap.dupOrReference(scope_handle);
-                    w += 1;
+                    _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.scope)) catch unreachable;
+                    outer.assert(new == .none);
+                    _ = objutil.listAppend(null, outer, &new, scope_handle) catch unreachable;
+                    outer.assert(new == .none);
                 }
 
-                std.debug.assert(w == word_count);
-
                 const result = try getListString(heap, outer.index + 1, word_count);
-                // Clean up temporary objects before returning.
-                outer.decrRefCount();
-                impl_val.decrRefCount();
-                args_spec.decrRefCount();
                 break :blk result;
             },
             .custom_type => {
@@ -1333,7 +1325,7 @@ const ObjectAndMetadata = struct {
 /// These are backed by vmem if possible, or need to be fully pre-allocated
 /// if threading is enabled.
 fn heapBackingAlloc() Allocator {
-    if (cfg.use_vmem or options.threading) {
+    if (options.threading) {
         return memutil.null_allocator;
     } else {
         return global_gpa;
@@ -1398,18 +1390,20 @@ pub fn init(heap: *Heap) !void {
     errdefer _ = heap.object_tracking.deinit();
 
     heap.objects = .empty;
-    if (cfg.use_vmem) {
+    if (options.threading) {
         heap.objects.bytes = (try memutil.vmemMap(object_heap_max_bytes)).ptr;
         heap.objects.capacity = object_heap_max_count;
+        heap.objects.len = object_heap_max_count;
     } else if (options.threading) {
         // if multithreading, we can't have objects moving around. We better allocate
         // everything up front.
         try heap.objects.ensureTotalCapacity(global_gpa, object_heap_max_count);
+        heap.objects.len = object_heap_max_count;
     } else {
         try heap.objects.ensureTotalCapacity(global_gpa, 32);
     }
     errdefer {
-        if (cfg.use_vmem) {
+        if (options.threading) {
             memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
         } else {
             heap.objects.deinit(global_gpa);
@@ -1421,19 +1415,15 @@ pub fn init(heap: *Heap) !void {
     errdefer _ = heap.string_tracking.deinit();
 
     heap.strings = .empty;
-    if (cfg.use_vmem) {
+    if (options.threading) {
         const string_vmem = try memutil.vmemMap(string_heap_max_bytes);
         heap.strings.items = string_vmem.ptr[0..0];
         heap.strings.capacity = string_vmem.len;
-    } else if (options.threading) {
-        // if multithreading, we can't have strings moving around. We better allocate
-        // everything up front.
-        try heap.strings.ensureTotalCapacity(global_gpa, string_heap_max_bytes);
     } else {
         try heap.strings.ensureTotalCapacity(global_gpa, 32);
     }
     errdefer {
-        if (cfg.use_vmem) {
+        if (options.threading) {
             memutil.vmemUnmap(@alignCast(heap.strings.items.ptr[0..heap.strings.capacity]));
         } else {
             heap.strings.deinit(global_gpa);
@@ -1527,7 +1517,7 @@ pub fn deinit(heap: *Heap) void {
     heap.string_tracking.freeFromOwningThread(0, 0);
     heap.string_tracking.freeFromOwningThread(1, 0);
 
-    if (cfg.use_vmem) {
+    if (options.threading) {
         memutil.vmemUnmap(@alignCast(heap.strings.items));
         memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
     } else {
@@ -1628,7 +1618,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     // Make object list has space for new objects
     if (self.objects.len < index + aligned_count) {
         const start_of_new = self.objects.len;
-        try self.objects.resize(heapBackingAlloc(), index + aligned_count);
+        if (!options.threading) try self.objects.resize(heapBackingAlloc(), index + aligned_count);
         @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
             .order = 31,
             .cross_thread = false,

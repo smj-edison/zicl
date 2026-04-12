@@ -234,10 +234,9 @@ pub fn integerOverflowError(det: ?*ErrorDetails, value: ?[]const u8) error{ OutO
 }
 
 pub fn integerOverflowErrorWithWide(det: ?*ErrorDetails, value: i128) error{ OutOfMemory, IntegerOverflow } {
-    if (det) |details| details.* = .{
-        .message = try newStringFmt(Heap.local_heap, "integer value \"{}\" too big to be represented", .{value}),
-    };
-    return error.IntegerOverflow;
+    var buf: [std.fmt.count("{}", .{std.math.minInt(i128)})]u8 = undefined;
+    const as_str = std.fmt.bufPrint(&buf, "{}", .{value}) catch unreachable;
+    return integerOverflowError(det, as_str);
 }
 
 pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
@@ -315,6 +314,12 @@ pub fn shimmerToFloat(det: ?*ErrorDetails, provided_handle: Handle, new_handle: 
     try handle.prepareToShimmer();
     handle.peek().head.tag = .float;
     handle.peek().body.float = value;
+}
+
+pub fn floatGet(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !i64 {
+    try shimmerToFloat(det, provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
+    return handle.peek().body.float;
 }
 
 ///////////////////////////////

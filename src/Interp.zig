@@ -85,6 +85,7 @@ pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) w
         if (result == error.OutOfMemory) {
             return error.OutOfMemory;
         } else {
+            interp.setResultOwning(det.message);
             return error.EvalError;
         }
     }
@@ -1132,23 +1133,27 @@ pub fn setResultInteger(interp: *Interp, value: i64) !void {
     interp.setResultOwning(try objutil.newInteger(Heap.local_heap, value));
 }
 
-pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
-    interp.freeLastResult();
-    const bytes_handle = try objutil.newString(Heap.local_heap, bytes);
+pub fn setResultFloat(interp: *Interp, value: f64) !void {
+    interp.setResultOwning(try objutil.newFloat(Heap.local_heap, value));
+}
 
-    setResult(interp, bytes_handle);
+pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
+    const bytes_handle = try objutil.newString(Heap.local_heap, bytes);
+    interp.setResult(bytes_handle);
+}
+
+pub fn setResultInterned(interp: *Interp, interned: Heap.InternedString) void {
+    interp.setResult(Heap.local_heap.getInternedString(interned));
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
-    interp.freeLastResult();
     const fmt_handle = try objutil.newStringFmt(Heap.local_heap, fmt, args);
 
-    setResult(interp, fmt_handle);
+    interp.setResult(fmt_handle);
 }
 
 pub fn setEmptyResult(interp: *Interp) void {
     interp.freeLastResult();
-    interp.result = Heap.local_heap.emptyHandle();
 }
 
 /// Call frame.
@@ -1601,8 +1606,7 @@ fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
     }
 }
 
-const division_by_zero_message = "division by zero";
-const negative_denom_message = "negative denominator";
+pub const negative_denom_message = "negative denominator";
 fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
     var det: objutil.ErrorDetails = undefined;
     return switch (oper) {
@@ -1617,7 +1621,7 @@ fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i6
                 return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
             },
             error.DivisionByZero => {
-                try interp.setResultString(division_by_zero_message);
+                interp.setResultInterned(.@"division by zero");
                 return error.DivisionByZero;
             },
         },
@@ -1627,7 +1631,7 @@ fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i6
                 return error.NegativeDenominator;
             },
             error.DivisionByZero => {
-                try interp.setResultString(division_by_zero_message);
+                interp.setResultInterned(.@"division by zero");
                 return error.DivisionByZero;
             },
         },
@@ -1673,7 +1677,7 @@ fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64,
         .mul => .{ .float = lhs * rhs },
         .div => blk: {
             if (rhs == 0.0) {
-                try interp.setResultString(division_by_zero_message);
+                interp.setResultInterned(.@"division by zero");
                 return error.DivisionByZero;
             } else {
                 break :blk .{ .float = lhs / rhs };
@@ -1682,7 +1686,7 @@ fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64,
         .mod => .{
             .float = std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
                 error.DivisionByZero => {
-                    try interp.setResultString(division_by_zero_message);
+                    interp.setResultInterned(.@"division by zero");
                     return error.DivisionByZero;
                 },
                 error.NegativeDenominator => {

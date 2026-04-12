@@ -37,11 +37,12 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
                 .add => std.math.add(i64, result, operand),
                 .mul => std.math.mul(i64, result, operand),
             } catch {
-                interp.integerOverflowError(null) catch return error.EvalError;
+                return interp.integerOverflowError(null);
             };
         }
 
         try interp.setResultInteger(result);
+        return;
     }
 
     var result: f64 = 0;
@@ -67,12 +68,160 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
     interp.setResultOwning(try objutil.newFloat(Heap.local_heap, result));
 }
 
+const IntegerOrFloat = union(enum) {
+    int: i64,
+    float: f64,
+};
+fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, div }) Interp.Error!void {
+    if (args.len == 2) {
+        // The arity = 2 case is different. For [- x] returns -x,
+        // while [/ x] returns 1/x.
+        const value: IntegerOrFloat = blk: {
+            if (args[1].tag() == .integer) {
+                break :blk .{ .int = args[1].peek().body.integer };
+            } else if (args[1].tag() == .float) {
+                break :blk .{ .float = args[1].peek().body.float };
+            }
+
+            var new_handle: OptionalHandle = .none;
+            const as_int = objutil.integerGet(null, args[1], &new_handle) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.IntegerOverflow, error.BadInteger => {
+                    // Try parsing it as a float if it's not an integer.
+                    break :blk .{ .float = try interp.getFloat(&args[1]) };
+                },
+            };
+            args[1].swapIfNew(new_handle);
+
+            break :blk .{ .int = as_int };
+        };
+
+        switch (operator) {
+            .sub => {
+                switch (value) {
+                    .int => |int| {
+                        const result = std.math.sub(i64, 0, int) catch {
+                            // The only case an integer can overflow is when negating the
+                            // lowest possible integer (for example, with i8, going from
+                            // -128 to 128).
+                            var buf: [std.fmt.count("{}", .{std.math.minInt(i65)})]u8 = undefined;
+                            const as_str = std.fmt.bufPrint(&buf, "{}", .{-@as(i65, int)}) catch unreachable;
+                            return interp.integerOverflowError(as_str);
+                        };
+                        try interp.setResultInteger(result);
+                    },
+                    .float => |float| {
+                        interp.setResult(try objutil.newFloat(Heap.local_heap, -float));
+                    },
+                }
+            },
+            .div => {
+                const as_float: f64 = switch (value) {
+                    .float => |float| float,
+                    .int => |int| @floatFromInt(int),
+                };
+                if (as_float == 0.0) {
+                    interp.setResultInterned(.@"division by zero");
+                    return error.EvalError;
+                }
+                interp.setResult(try objutil.newFloat(Heap.local_heap, 1.0 / as_float));
+            },
+        }
+
+        return;
+    }
+
+    // 3+ arguments, so we'll apply them in a row.
+
+    // This will break out of the block early if not all arguments are ints.
+    not_all_ints: {
+        var result: i64 = 0;
+
+        for (1..args.len) |i| {
+            const operand = blk: {
+                if (args[i].tag() == .integer) {
+                    break :blk args[i].peek().body.integer;
+                } else if (args[i].tag() == .float) {
+                    break :not_all_ints;
+                } else {
+                    // Try to shimmer it to an integer.
+                    var new_ref: OptionalHandle = .none;
+                    const res = objutil.integerGet(null, args[i], &new_ref) catch |err| switch (err) {
+                        error.IntegerOverflow, error.BadInteger => {
+                            break :not_all_ints;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                    args[i].swapIfNew(new_ref);
+                    break :blk res;
+                }
+            };
+
+            if (i == 1) {
+                result = operand;
+            } else {
+                result = switch (operator) {
+                    .sub => std.math.sub(i64, result, operand) catch {
+                        return interp.integerOverflowError(null);
+                    },
+                    .div => std.math.divFloor(i64, result, operand) catch |err| switch (err) {
+                        error.Overflow => return interp.integerOverflowError(null),
+                        error.DivisionByZero => {
+                            interp.setResultInterned(.@"division by zero");
+                            return error.EvalError;
+                        },
+                    },
+                };
+            }
+        }
+
+        try interp.setResultInteger(result);
+        return;
+    }
+
+    var result: f64 = 0;
+
+    for (1..args.len) |i| {
+        const operand: f64 = blk: {
+            if (args[i].tag() == .integer) {
+                break :blk @floatFromInt(args[i].peek().body.integer);
+            } else if (args[i].tag() == .float) {
+                break :blk args[i].peek().body.float;
+            } else {
+                // Try to shimmer it to a float.
+                break :blk try interp.getFloat(&args[i]);
+            }
+        };
+
+        result = switch (operator) {
+            .sub => result - operand,
+            .div => blk: {
+                if (operand == 0.0) {
+                    interp.setResultInterned(.@"division by zero");
+                    return error.EvalError;
+                }
+                break :blk result / operand;
+            },
+        };
+    }
+
+    interp.setResultOwning(try objutil.newFloat(Heap.local_heap, result));
+}
+
 pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .add);
 }
 
 pub fn mulCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .mul);
+}
+
+pub fn subCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    try subDivHelper(interp, args, .sub);
+}
+
+pub fn divCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    try subDivHelper(interp, args, .div);
 }
 
 pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -425,8 +574,10 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("-", .{ .to_call = subCmd, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("/", .{ .to_call = divCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
@@ -480,10 +631,7 @@ test "fn command" {
         \\ }
         \\ set bar [foo]
         \\ bar
-    ) catch {
-        std.debug.print("Error result: {f}\n", .{interp.result});
-        return error.TestFailed;
-    };
+    );
 
     // Optional parameters.
     try interp.testExpectScriptResult("3",
