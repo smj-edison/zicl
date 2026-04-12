@@ -428,8 +428,9 @@ Not yet implemented:
 **Experimental Files**: The repository contains `foo.zig` and `bar.zig` which are one-off prototypes not relevant to the overall architecture and can be ignored.
 
 ## Style guide
-
--   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
--   End every comment with a period.
--   Don't use UPPERCASE, instead use _emphasis_.
--   If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.
+- Write Tcl as Tcl, not TCL.
+- Prefer commas over em-dashes.
+- Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
+- End every comment with a period.
+- Don't use UPPERCASE, instead use _emphasis_.
+- If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.

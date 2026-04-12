@@ -580,18 +580,30 @@ pub fn setCmd(interp: *Interp, args: []Handle) !void {
     }
 }
 
+/// [apply] - invoke a closure value directly without binding it to a name.
+/// Unlike Tcl's [apply], the lambda must be a Zicl closure object or its
+/// serialized string form, a raw {argList body} list is not supported.
+pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const closure_and_key = try interp.getClosure(args[1]);
+    // args[1..] puts the lambda in the name slot (index 0) that callClosure
+    // expects, with the actual arguments starting at index 1.
+    try interp.callClosure(closure_and_key.closure, closure_and_key.cache_key, args[1..]);
+}
+
 /// [fn] - creates a closure capturing the current scope and sets it as a
 /// variable in the current scope.
 pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const fn_name = args[1];
-    const body = args[3];
+    const fn_name, const arglist, const body = if (args.len == 4)
+        .{ &args[1], &args[2], args[3] }
+    else
+        .{ null, &args[1], args[2] };
 
     // Shimmer to list via the interp helper, which handles the case where
     // the handle can't be shimmered in place.
-    try interp.shimmerToList(&args[2]);
+    try interp.shimmerToList(arglist);
 
     var det: objutil.ErrorDetails = undefined;
-    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, args[2]));
+    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist.*));
     defer parsed_args.deinit();
 
     // Capture the current scope.
@@ -601,9 +613,9 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     // Build a non-owning closure descriptor. createClosureObject borrows
     // all fields, so we don't need to borrow here.
     const closure_obj = try Interp.createClosureObject(.{
-        .args = args[2],
+        .args = arglist.*,
         .body = body,
-        .name = fn_name.toOptional(),
+        .name = if (fn_name) |val| val.toOptional() else .none,
         .scope = scope.toOptional(),
         .required_arity = parsed_args.required_arity,
         .optional_arity = parsed_args.optional_arity,
@@ -613,12 +625,17 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     });
     defer closure_obj.decrRefCount();
 
-    try interp.setVariableTo(&args[1], closure_obj);
-    interp.setResult(try interp.getVariableOrError(&args[1]));
+    if (fn_name) |val| {
+        try interp.setVariableTo(val, closure_obj);
+        interp.setResult(try interp.getVariableOrError(val));
+    } else {
+        interp.setResult(closure_obj);
+    }
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("append", .{ .to_call = appendCmd, .description = "varName ?value ...?", .min_arity = 1 });
+    try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("-", .{ .to_call = subCmd, .description = "?number ...?", .min_arity = 1 });
@@ -627,7 +644,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = exprCmd, .description = "expression", .min_arity = 1, .max_arity = 1 });
-    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 3, .max_arity = 3 });
+    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
     try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
