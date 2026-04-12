@@ -526,6 +526,50 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
     }
 }
 
+/// [append]
+pub fn appendCmd(interp: *Interp, args: []Handle) !void {
+    // Collect the existing variable value's string, or treat as empty.
+    const existing_str: []const u8 = if ((try interp.getVariable(&args[1])).toHandle()) |val|
+        try val.getString()
+    else
+        "";
+
+    // Fast path: no values to append, just ensure the variable exists and return it.
+    if (args.len == 2) {
+        if ((try interp.getVariable(&args[1])).toHandle()) |val| {
+            interp.setResult(val);
+        } else {
+            try interp.setVariableTo(&args[1], Heap.local_heap.emptyHandle());
+            interp.setEmptyResult();
+        }
+        return;
+    }
+
+    // Compute total length so we can allocate a single string.
+    var total_len: usize = existing_str.len;
+    for (args[2..]) |arg| {
+        total_len += (try arg.getString()).len;
+    }
+
+    const result_str = try objutil.newStringToFill(Heap.local_heap, total_len);
+    defer result_str.decrRefCount();
+
+    if (total_len > 0) {
+        const buf = Heap.getStringMut(result_str) catch unreachable;
+        var pos: usize = 0;
+        @memcpy(buf[pos..(pos + existing_str.len)], existing_str);
+        pos += existing_str.len;
+        for (args[2..]) |arg| {
+            const s = try arg.getString();
+            @memcpy(buf[pos..(pos + s.len)], s);
+            pos += s.len;
+        }
+    }
+
+    try interp.setVariableTo(&args[1], result_str);
+    interp.setResult((try interp.getVariable(&args[1])).toHandle().?);
+}
+
 /// [set]
 pub fn setCmd(interp: *Interp, args: []Handle) !void {
     if (args.len == 2) {
@@ -574,6 +618,7 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
+    try interp.registerCommand("append", .{ .to_call = appendCmd, .description = "varName ?value ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("-", .{ .to_call = subCmd, .description = "?number ...?", .min_arity = 1 });
