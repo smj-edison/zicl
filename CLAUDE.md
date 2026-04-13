@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**zicl** (Zig TCL) is a TCL interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe TCL implementation with optional threading support and modern memory management.
+**zicl** (Zig Tcl) is a Tcl interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe Tcl implementation with optional threading support and modern memory management.
 
 ### Design Constraints
-
+-   **Out of memory is considered recoverable.** Zig has strong support for OOM scenarios, and so we follow this idiom and make sure our OOM paths recover correctly.
 -   **Cross-thread sharing is a primary goal.** The multi-heap architecture exists specifically to support this. Design decisions should treat cross-thread object sharing as a first-class use case, not an afterthought.
 -   **Interpreters can block indefinitely.** Blocking in C FFI (or otherwise) is considered normal operation. Nothing in the system may require an interpreter's owning thread to be active in order to make progress. In particular, foreign threads must be able to free objects belonging to a blocked heap without any cooperation from the owning thread.
 -   **Allocation is thread-local; deallocation is cross-thread safe.** The buddy allocator uses a mutex-protected main list for operations from any thread, and a lock-free pool as a fast path for the owning thread only. Cross-thread frees go directly through the mutex to the main list — no deferred queue is used, precisely because a deferred queue would require the owning thread to drain it.
@@ -33,11 +33,14 @@ Run tests with specific filter:
 zig build test -Dtest-filter="test_name_pattern"
 ```
 
+Remember that the default zig test runner (the one we use) does not print anything on success, it only returns a successful code. Use `echo "exit: $?"` to check the status.
+
 Build with specific options:
 
 ```bash
-# Disable UTF-8 support (ASCII only)
-zig build -Duse-utf8=false
+# Disable memory tracing (memory tracing can take up a lot of processing
+# power, but has really useful leak/double free messages)
+zig build -Dtrace-mem=false
 
 # Force LLVM backend
 zig build -Duse-llvm=true
@@ -52,13 +55,13 @@ zig build -Dtoken-debugging=true
 
 **Heap (src/Heap.zig)**: Central memory management system using a buddy allocator for objects and strings. Supports:
 
--   Multi-heap architecture for potential threading (up to 128 heaps)
+-   Multi-heap architecture for potential threading
 -   Reference counting for objects
--   Two string storage modes: normal (in-heap) and long (external allocation with 100KB threshold)
+-   Two string storage modes: normal (in-heap) and long (external allocation with a 100KB threshold)
 -   Cross-thread object sharing with atomic operations
 -   Object "shimmering" - dynamic type conversion that preserves cached representations
 
-**Object System (src/objutil.zig)**: Implements TCL's dynamic typing through type shimmering:
+**Object System (src/objutil.zig)**: Implements Tcl's dynamic typing through type shimmering:
 
 -   Objects can dynamically convert between types (string → list → dict, etc.)
 -   Maintains string representation alongside typed representation when beneficial
@@ -67,7 +70,7 @@ zig build -Dtoken-debugging=true
 -   Supports recursive key lookups for nested dictionaries
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
-**Tokenizer (src/Tokenizer.zig)**: Tokenizes TCL scripts supporting:
+**Tokenizer (src/Tokenizer.zig)**: Tokenizes Tcl scripts supporting:
 
 -   Variable substitution (`$var`, `${var}`)
 -   Command substitution (`[cmd]`)
@@ -78,7 +81,7 @@ zig build -Dtoken-debugging=true
 
 -   Dual frame system: call frames (scope) and eval frames (execution state)
 -   Variable resolution with caching via epochs (invalidated on scope changes)
--   Command dispatch supporting both native and TCL procedures
+-   Command dispatch supporting both native and Tcl procedures
 -   Expression evaluation system
 -   Loop control (break/continue with level support)
 -   Procedure support with optional/required parameters, default values, and `args` parameter
@@ -108,99 +111,6 @@ Objects automatically "shimmer" between types, maintaining cached representation
     - `borrow()` increases ref count and returns the handle
     - `duplicate()` creates shallow copies
     - `decrRefCount()` decrements ref count and frees if zero (use in `defer` for cleanup)
-
-5. **Handle Helper Functions** (prefer these over manual operations):
-
-    **Reference Counting:**
-
-    - `handle.borrow()` - Increment ref count and return handle (for creating owned references)
-    - `OptionalHandle.borrowOptional()` - Borrow optional handle if it has a value, else a nop.
-    - `handle.decrRefCount()` - Decrement ref count, free if zero (use in `defer` for cleanup)
-    - `handle.incrRefCount()` - Increment ref count (rarely needed directly)
-    - `handle.debugRefCount()` - Get current ref count (debugging only)
-
-    **OptionalHandle Operations:**
-
-    - `OptionalHandle.orElse(handle)` - Return contained handle if non-none, else fallback
-    - `OptionalHandle.toHandle()` - Convert to `?Handle`
-    - `OptionalHandle.swapWithNone()` - Decrement ref count and set to none (use in `errdefer`)
-    - `OptionalHandle.swapRef(handle)` - Swap and decref old value
-    - `OptionalHandle.swapRefIfNew(optional)` - Conditionally swap if non-none
-    - `Handle.toOptional()` - Convert Handle to OptionalHandle
-
-    **Handle Swapping** (for updating handle references):
-
-    - `handle.swapIfNew(optional_handle)` - Update handle if optional is non-null, releasing old
-    - `handle.swap(new_handle)` - Always swap and release old
-    - `handle.swapAndClear(&optional_handle)` - Transfer ownership from optional and clear it
-
-    **Querying Handle State:**
-
-    - `handle.peek()` - Get pointer to Object (does NOT increase ref count)
-    - `handle.getHeap()` - Get the heap this handle belongs to
-    - `handle.canShimmer()` - Check if can change type (not shared, not special)
-    - `handle.canMutate()` - Check if can modify in-place (exclusive ownership)
-    - `handle.isShared()` - Check if ref_count > 1 or cross-thread
-    - `handle.hasString()` - Check if has string representation cached
-    - `handle.getMetadata()` - Get object metadata (order, mutable flag, etc.)
-
-    **Shimmering Helpers:**
-
-    - `handle.prepareToShimmer()` - Ensure string rep exists, invalidate body (requires canShimmer)
-
-    **Invalidation** (low-level, rarely used directly):
-
-    - `handle.invalidateBody()` - Clear body (called by prepareToShimmer)
-    - `handle.invalidateString()` - Clear string rep when mutating
-    - `handle.invalidateBoth()` - Clear both body and string
-
-    **Creating References:**
-
-    - `handle.reference()` - Create reference object, incrementing ref count
-    - `handle.referenceTakeOwnership()` - Create reference object without incrementing ref count
-
-    **Other Handle Operations:**
-
-    - `handle.isAllocHead()` - Check if this is the allocation head for multi-object allocation
-
-    **Heap-Level Helpers:**
-
-    - `heap.duplicate(handle)` - Deep copy to same or different heap
-    - `Heap.ensureShimmerableOrDup(handle, *OptionalHandle)` - Duplicates if can't shimmer (output parameter)
-    - `Heap.ensureMutableOrDup(handle, *OptionalHandle)` - Duplicates if can't mutate (output parameter)
-    - `Heap.ensureSameHeapOrDup(handle, *OptionalHandle)` - Duplicates if different heap (output parameter)
-    - `Heap.getString(handle)` - Get string representation (may allocate)
-    - `Heap.setString(handle, bytes)` - Set string representation
-    - `Heap.checkIfEqual(a, b)` - Deep equality check
-
-    **Special Object Access:**
-
-    - `heap.nullObject()` - Get the null object handle
-    - `heap.emptyHandle()` - Get empty object handle
-    - `heap.tempObject()` - Get temporary object handle
-
-    **Debugging:**
-
-    - `handle.trace(fmt, args)` - Add trace entry (if trace_mem enabled)
-    - `handle.assert(condition)` - Assert with automatic trace dump on failure
-
-6. **Shimmering Rules**:
-
-    - Objects can only shimmer if not shared between threads (`canShimmer()` checks this)
-    - Shimmer functions take `provided_handle: Handle` and output parameter `new_handle: *OptionalHandle`
-    - If duplication occurs, `new_handle` will be non-null
-    - Always use `errdefer new_handle.swapWithNone()` at the start of shimmer functions
-    - Use `new_handle.orElse(provided_handle)` to get the actual handle to work with
-    - Caller uses `handle.swapIfNew(new_handle)` to update their handle reference
-    - Shimmering invalidates the old body but preserves string rep when possible
-
-7. **Collections (Lists/Dicts)**:
-    - Stored as contiguous object arrays allocated via the buddy allocator
-    - First object is head (contains metadata), subsequent objects are items
-    - Each item has its own ref count and CAN be borrowed individually with `handle.borrow()`
-    - When the collection is freed, if any items are shared (ref count > 1), the buddy allocator automatically splits the multi-object block into individual allocations
-    - Shared items survive the collection being freed because they have independent ref counts
-    - Non-shared items are freed along with the collection head
 
 ### Script Execution Model
 
@@ -307,13 +217,14 @@ const result = try someFn(heap, &det, arg);
 -   `src/Heap.zig`: Memory allocator and object storage (~3000 lines)
 -   `src/objutil.zig`: Object type system and operations (~2700 lines)
 -   `src/Interp.zig`: Interpreter and command execution (~2400 lines)
--   `src/Tokenizer.zig`: TCL tokenizer (~1200 lines)
+-   `src/Tokenizer.zig`: Tcl tokenizer (~1200 lines)
 -   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
 -   `src/stringutil.zig`: String utilities with optional UTF-8 support (~875 lines)
 -   `src/memutil.zig`: Buddy allocator, memory primitives, and LRU cache (~900 lines)
 -   `src/commands.zig`: Built-in command implementations (~520 lines)
 -   `src/tripwire.zig`: Vendored failure-injection library for testing error paths (~290 lines)
 -   `src/repl.zig`: REPL (stub, not yet implemented)
+-   `.claude/helpers.md`: Index of public helper functions in the utility files
 
 ## Configuration
 
@@ -387,8 +298,8 @@ Recent fixes and improvements:
 
 Currently implemented:
 
--   Complete tokenizer with full TCL syntax support
--   Object system with all major types (string, integer, float, list, dict, bool, index, enum, script, source_info)
+-   Complete tokenizer with full Tcl syntax support
+-   Object system with all major types (none, invalid, marked, index, integer, float, bool, string, source, list, dict, dict_sugar, parsed_script_command, reference, cached_local_var, cached_lexical_var, upvar_link, closure, custom_type)
 -   Memory management with reference counting and buddy allocation
 -   Script parsing and caching
 -   Expression evaluation with full AST
@@ -410,7 +321,6 @@ Currently implemented:
 
 Partially complete:
 
--   Dictionary operations (comprehensive API, subset of subcommands implemented)
 -   Interpreter evaluation (core complete, needs more built-in commands)
 
 Not yet implemented:
@@ -419,18 +329,19 @@ Not yet implemented:
 -   List commands (lindex, lrange, lappend, llength, etc.)
 -   While/foreach loops
 -   File I/O (open, close, read, write)
--   Most TCL standard library commands
+-   Most Tcl standard library commands
 -   Error stack traces
--   REPL
-
-## Notes
-
-**Experimental Files**: The repository contains `foo.zig` and `bar.zig` which are one-off prototypes not relevant to the overall architecture and can be ignored.
 
 ## Style guide
-- Write Tcl as Tcl, not TCL.
-- Prefer commas over em-dashes.
-- Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
-- End every comment with a period.
-- Don't use UPPERCASE, instead use _emphasis_.
-- If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.
+-   Write Tcl as Tcl, not TCL.
+-   Prefer commas or parenthesis over em-dashes. Also, write in ASCII characters exclusively (i.e. no — or →). Double hypens, --, can substitute for a proper em dash.
+-   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
+-   End every comment with a period, exclaimation point, or similar (what's important is that the thought is properly terminated).
+-   Don't use UPPERCASE, instead use _emphasis_. TODO, FIXME, PERF, HACK, etc are exceptions to this rule, as they're used for grepping.
+-   If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.
+-   Avoid using overly terse names, like `ef` for an evaluation frame. Use something like `frame` or `eval_frame` instead. Use `err` instead of `e` as well.
+-   Follow the known-new contract when writing: every sentence, always introduce something that the reader has previously read before introducing something new.
+-   Whenever you refer to a variable or a piece of code, enclose it in backticks. Exceptions to this rule include integer types (i.e. i64, u5) and error types (i.e. error.OutOfMemory).
+
+## Available helper functions
+@.claude/helpers.md
