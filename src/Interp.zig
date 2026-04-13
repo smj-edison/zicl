@@ -35,7 +35,7 @@ eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
 /// Stack trace from a function error.
-stack_trace: ?Handle,
+stack_trace: OptionalHandle,
 
 /// Used to propagate `error.Continue` or `error.Break` up multiple
 /// loop levels.
@@ -1259,8 +1259,13 @@ fn nextCallEpoch(interp: *Interp) u32 {
 const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
-    /// Arguments of this eval frame.
-    args: ?[]Handle,
+    /// Arguments of the command currently being dispatched in this eval frame.
+    args: []Handle,
+    /// The line number of the command currently being dispatched, within
+    /// the script being evaluated (note that this is relative, since that's
+    /// how parsed scripts are stored). Combine with `source_info.line_no`
+    /// to recover the absolute line at error-reporting time.
+    current_line: u32,
 };
 
 fn currentEvalFrameIndex(interp: *Interp) u32 {
@@ -1268,7 +1273,7 @@ fn currentEvalFrameIndex(interp: *Interp) u32 {
 }
 
 fn currentEvalFrame(interp: *Interp) *EvalFrame {
-    return &interp.eval_frames.items[interp.currentCallFrameIndex()];
+    return &interp.eval_frames.items[interp.currentEvalFrameIndex()];
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
@@ -1301,7 +1306,8 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
 fn pushEvalFrame(interp: *Interp) !u32 {
     try interp.eval_frames.append(Heap.global_gpa, .{
         .call_frame = interp.currentCallFrameIndex(),
-        .args = null,
+        .args = &.{},
+        .current_line = 1,
     });
     return interp.currentEvalFrameIndex();
 }
@@ -1526,10 +1532,7 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) Error!voi
         } else |err| {
             switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    // TODO set stack trace
-                    return err;
-                },
+                else => return err,
             }
         }
 
@@ -2128,6 +2131,67 @@ test "eval expression" {
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
 }
 
+fn setErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!void {
+    if (interp.stack_trace != .none) return;
+    interp.stack_trace = (try buildErrorStack(interp, script)).toOptional();
+}
+
+/// Builds the stack trace as a flat list of {name file line args} repeated once per call
+/// frame. The top (innermost) frame is emitted first.
+fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
+    var trace = try objutil.newListWithCapacity(@intCast(interp.call_frames.items.len * 4));
+    errdefer trace.decrRefCount();
+
+    var last_call_frame_idx: ?u32 = null;
+    var is_top = true;
+
+    // Eval frames are walked innermost-first; each one is followed to its call frame.
+    var i = interp.eval_frames.items.len;
+    while (i > 0) {
+        i -= 1;
+        const eval_frame = &interp.eval_frames.items[i];
+
+        // Skip duplicates by taking the topmost eval frame per call frame.
+        if (last_call_frame_idx == eval_frame.call_frame) continue;
+        last_call_frame_idx = eval_frame.call_frame;
+
+        const call_frame = &interp.call_frames.items[eval_frame.call_frame];
+        const closure_name = call_frame.signature.name.orEmpty();
+
+        // Source info: the top frame uses the active script handle so command
+        // substitution positions are reflected correctly; earlier frames use
+        // their closure body.
+        const body = if (is_top) script else call_frame.signature.body;
+        const source_info = objutil.getSourceInfo(body);
+
+        const file_name, const base_line = if (source_info) |info|
+            .{ info.file_name.orEmpty(), info.line_no }
+        else
+            .{ Heap.local_heap.emptyHandle(), 1 };
+
+        const abs_line = base_line + (eval_frame.current_line - 1);
+        const line_handle = try objutil.newInteger(Heap.local_heap, @intCast(abs_line));
+        defer line_handle.decrRefCount();
+
+        // For the top frame, use the command args stored in the eval frame
+        // (set just before invokeCommand while the slice is still live). For
+        // lower frames use the invocation args stored in the call frame (set
+        // when the frame was pushed, also still live on the Zig stack at this
+        // point).
+        const raw_args: []Handle = if (is_top) eval_frame.args else call_frame.args;
+        is_top = false;
+        const args_list = try objutil.newList(raw_args);
+        defer args_list.decrRefCount();
+
+        objutil.listAppendAssumeCapacity(trace, try Heap.local_heap.dupOrReference(closure_name));
+        objutil.listAppendAssumeCapacity(trace, try Heap.local_heap.dupOrReference(file_name));
+        objutil.listAppendAssumeCapacity(trace, try Heap.local_heap.dupOrReference(line_handle));
+        objutil.listAppendAssumeCapacity(trace, try Heap.local_heap.dupOrReference(args_list));
+    }
+
+    return trace;
+}
+
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
@@ -2139,12 +2203,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
     // Reset the interpreter result. This is useful to return the empty result in the case of empty program.
     interp.setEmptyResult();
 
-    // TODO need to set stack frame on error, something like:
-    // errdefer interp.setErrorStack()
-
     // TODO implement JIM_OPTIMIZATION speedups
-
-    // FIXME do I need `script->inUse++;`?
 
     _ = try interp.pushEvalFrame();
     defer interp.popEvalFrame();
@@ -2163,6 +2222,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
         // First token of the line is always .script_command.
         const command_info = values[command_token_i].body.parsed_script_command;
         command_token_i += 1; // Skip .script_command.
+        interp.currentEvalFrame().current_line = command_info.line;
 
         // This is not always the same as which word token we're on, as argument expansion
         // may write multiple arguments from one word.
@@ -2230,15 +2290,25 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
         for (args) |arg| std.debug.print("{{{s}}} ", .{try arg.getString()});
         std.debug.print("\n", .{});
 
+        // `args` is stored in the eval frame so `buildErrorStack` can read it if this command
+        // fails. The slice is still live at that point (before the loop body `defer` frees it),
+        // mirroring Jim's `evalFrame->argv` pattern.
+        interp.currentEvalFrame().args = args[0..args_written];
+
         const cmd_result = interp.invokeCommand(interp.currentCallFrameIndex(), args);
+
         // TODO actually check for signals.
         if (false) {
             return error.Signal;
         } else {
             if (cmd_result) |_| {
+                // Clear args only on success, on error the slice must stay live for
+                // `setErrorStack` to read below.
+                interp.currentEvalFrame().args = &.{};
                 // Keep going through the commands.
             } else |err| switch (err) {
                 error.PropagateResult => {
+                    interp.currentEvalFrame().args = &.{};
                     interp.return_propagate.left_to_go -= 1;
                     if (interp.return_propagate.left_to_go == 0) {
                         if (interp.return_propagate.return_at_end) |return_at_end| {
@@ -2251,7 +2321,12 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
                         return error.PropagateResult;
                     }
                 },
-                else => return err,
+                else => |narrowed_err| {
+                    // `eval_frame.args` and `call_frame.args` are still live here; capture the stack
+                    // trace before the loop-body defers unwind them.
+                    try interp.setErrorStack(script);
+                    return narrowed_err;
+                },
             }
         }
     }
@@ -2260,6 +2335,8 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
 }
 
 pub fn evalObject(interp: *Interp, script: Handle) Error!void {
+    // Reset the stack trace at each new top-level invocation.
+    interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try script.getHash();
     return evalObjectInner(interp, script, cache_key);
 }
@@ -2275,7 +2352,7 @@ pub fn init() !Interp {
         .eval_depth = 0,
         .max_eval_depth = 1000,
         .max_call_depth = 1000,
-        .stack_trace = null,
+        .stack_trace = .none,
         // TODO: init per interpreter
         .prng = .init(0),
     };
@@ -2297,6 +2374,7 @@ pub fn init() !Interp {
 
 pub fn deinit(interp: *Interp) void {
     interp.result.decrRefCount();
+    interp.stack_trace.decrOptional();
     interp.global_commands.deinit(Heap.global_gpa);
 
     // Deinit all frames.

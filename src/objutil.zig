@@ -1253,6 +1253,18 @@ pub fn listAppend(det: ?*ErrorDetails, provided_list: Handle, new_list: *Optiona
     return listItem(new_list.orElse(provided_list), index);
 }
 
+/// `list` must be mutable.
+pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
+    list.assert(list.tag() == .list);
+    list.assert(list.canMutate());
+
+    const current_len = list.peek().body.list.len;
+    list.assert(current_len < memutil.getOrderSize(list.getMetadata().order) - 1); // -1 for list head.
+    list.peek().body.list.len += 1;
+
+    listItem(list, current_len).peek().* = object;
+}
+
 fn testLists(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
     const heap = try Heap.testStart(ta);
@@ -2245,7 +2257,11 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Parse all the tokens of the script, handling any errors that come up.
 
     const bytes = try handle.getString();
-    var parser = Tokenizer.init(bytes, source_info.line_no);
+    // Because scripts are deduplicated, there may be scripts from multiple different
+    // locations in the Tcl code. This means we can't use an absolute line number for the
+    // script, but instead all line numbers are relative (hence why we start at 1 here).
+    // TODO might be more ergonomic to start at 0.
+    var parser = Tokenizer.init(bytes, 1);
 
     // Set up tokens list (to be added to).
     var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.global_gpa, bytes.len / 8);
@@ -2313,6 +2329,15 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.global_gpa, new_token_capacity);
     errdefer new_token_tags.deinit(Heap.global_gpa);
 
+    // Use the first real token's relative line as the starting command line. After
+    // leading separators are trimmed (see is_trimming_start above), tokens[0] is the
+    // first actual word, so its line is the correct relative offset. Fall back to
+    // source_info.line_no (= 1) for empty scripts.
+    const first_command_line: u32 = if (tokens.items.len > 0 and tokens.items[0].tag != .end_of_file)
+        tokens.items[0].loc.line_no
+    else
+        source_info.line_no;
+
     // Be sure to append the first .script_command token.
     try new_token_tags.append(Heap.global_gpa, .start_of_command);
     var first_append_result: OptionalHandle = .none;
@@ -2323,7 +2348,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         },
         .body = .{
             .parsed_script_command = .{
-                .line = source_info.line_no,
+                .line = first_command_line,
                 .arg_count = 0, // Set later.
             },
         },
