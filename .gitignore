@@ -1,6 +1,6 @@
 zig-out
 .zig-cache
-.vscode
+.vscode/settings.json
 
 graph.svg
 perf.data

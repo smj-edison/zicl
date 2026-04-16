@@ -280,8 +280,8 @@ pub fn integerGet(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *Opt
 }
 
 // Float related functions.
-pub fn newFloat(heap: *Heap, value: f64) !Handle {
-    const handle = try heap.createObject();
+pub fn newFloat(value: f64) !Handle {
+    const handle = try Heap.local_heap.createObject();
     handle.peek().head.tag = .float;
     handle.peek().body.float = value;
     return handle;
@@ -680,12 +680,16 @@ pub fn enumNames(comptime T: type) []const u8 {
 
 pub fn EnumMapping(comptime T: type) type {
     comptime {
+        @setEvalBranchQuota(20000);
+
         const values = std.enums.values(T);
 
         // Fill out the mapping
-        var entries: [values.len]struct { []const u8, T } = undefined;
-        for (values, &entries) |value, *entry| {
-            entry.* = .{ @tagName(value), value };
+        var entries: [values.len * 2]struct { []const u8, T } = undefined;
+        for (values, 0..) |value, i| {
+            entries[i * 2] = .{ @tagName(value), value };
+            // Add an entry for the integer value of the enum, to match Tcl behavior.
+            entries[i * 2 + 1] = .{ std.fmt.comptimePrint("{}", .{@intFromEnum(value)}), value };
         }
 
         // Create the table
@@ -726,12 +730,35 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
     };
 }
 
-test "tcl enum" {
+test "enum mapping" {
     const Things = enum { foo, bar, baz };
     const map = (EnumMapping(Things){}).map;
     const names = enumNames(Things);
     try testing.expectEqual(Things.foo, map.get("foo"));
     try testing.expectEqualSlices(u8, "foo, bar, baz", names);
+}
+
+test "tcl enum" {
+    defer Heap.testFinish();
+    const heap = try Heap.testStart(testing.allocator);
+
+    const MyEnum = enum { foo, bar, baz };
+    const MyTclEnum = TclEnum(MyEnum, "myenum");
+
+    var foo_str = try newString(heap, "foo");
+    defer foo_str.decrRefCount();
+    var one_str = try newString(heap, "1");
+    defer one_str.decrRefCount();
+    var bad_str = try newString(heap, "bad");
+    defer bad_str.decrRefCount();
+
+    var new_handle: OptionalHandle = .none;
+    try testing.expectEqual(MyEnum.foo, MyTclEnum.get(null, foo_str, &new_handle));
+    foo_str.swapAndClear(&new_handle);
+    try testing.expectEqual(MyEnum.bar, MyTclEnum.get(null, one_str, &new_handle));
+    foo_str.swapAndClear(&new_handle);
+    try testing.expectError(error.BadEnumVariant, MyTclEnum.get(null, bad_str, &new_handle));
+    foo_str.swapAndClear(&new_handle);
 }
 
 /// Runs a string check based on requested class. `class_to_check` must be shimmerable.

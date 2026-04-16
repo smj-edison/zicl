@@ -8,7 +8,7 @@ const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
-fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
+fn addMulHelper(interp: *Interp, args: []const Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
         var result: i64 = 0;
@@ -21,14 +21,14 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    var new_ref: OptionalHandle = .none;
-                    const res = objutil.integerGet(null, args[i], &new_ref) catch |err| switch (err) {
+                    var new_handle: OptionalHandle = .none;
+                    defer new_handle.decrOptional();
+                    const res = objutil.integerGet(null, args[i], &new_handle) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
                         error.OutOfMemory => return error.OutOfMemory,
                     };
-                    args[i].swapIfNew(new_ref);
                     break :blk res;
                 }
             };
@@ -55,7 +55,9 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
                 break :blk args[i].peek().body.float;
             } else {
                 // Try to shimmer it to a float.
-                break :blk try interp.getFloat(&args[i]);
+                var arg = args[i].borrow();
+                defer arg.decrRefCount();
+                break :blk try interp.getFloat(&arg);
             }
         };
 
@@ -65,14 +67,14 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
         };
     }
 
-    interp.setResultOwning(try objutil.newFloat(Heap.local_heap, result));
+    interp.setResultOwning(try objutil.newFloat(result));
 }
 
 const IntegerOrFloat = union(enum) {
     int: i64,
     float: f64,
 };
-fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, div }) Interp.Error!void {
+fn subDivHelper(interp: *Interp, args: []const Handle, comptime operator: enum { sub, div }) Interp.Error!void {
     if (args.len == 2) {
         // The arity = 2 case is different. For [- x] returns -x,
         // while [/ x] returns 1/x.
@@ -84,14 +86,16 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
             }
 
             var new_handle: OptionalHandle = .none;
+            defer new_handle.decrOptional();
             const as_int = objutil.integerGet(null, args[1], &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.IntegerOverflow, error.BadInteger => {
                     // Try parsing it as a float if it's not an integer.
-                    break :blk .{ .float = try interp.getFloat(&args[1]) };
+                    var arg = args[1].borrow();
+                    defer arg.decrRefCount();
+                    break :blk .{ .float = try interp.getFloat(&arg) };
                 },
             };
-            args[1].swapIfNew(new_handle);
 
             break :blk .{ .int = as_int };
         };
@@ -111,7 +115,7 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
                         try interp.setResultInteger(result);
                     },
                     .float => |float| {
-                        interp.setResult(try objutil.newFloat(Heap.local_heap, -float));
+                        interp.setResult(try objutil.newFloat(-float));
                     },
                 }
             },
@@ -124,7 +128,7 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
                     interp.setResultInterned(.@"division by zero");
                     return error.EvalError;
                 }
-                interp.setResult(try objutil.newFloat(Heap.local_heap, 1.0 / as_float));
+                interp.setResult(try objutil.newFloat(1.0 / as_float));
             },
         }
 
@@ -145,14 +149,14 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    var new_ref: OptionalHandle = .none;
-                    const res = objutil.integerGet(null, args[i], &new_ref) catch |err| switch (err) {
+                    var new_handle: OptionalHandle = .none;
+                    defer new_handle.decrOptional();
+                    const res = objutil.integerGet(null, args[i], &new_handle) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
                         error.OutOfMemory => return error.OutOfMemory,
                     };
-                    args[i].swapIfNew(new_ref);
                     break :blk res;
                 }
             };
@@ -189,7 +193,9 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
                 break :blk args[i].peek().body.float;
             } else {
                 // Try to shimmer it to a float.
-                break :blk try interp.getFloat(&args[i]);
+                var arg = args[i].borrow();
+                defer arg.decrRefCount();
+                break :blk try interp.getFloat(&arg);
             }
         };
 
@@ -205,28 +211,30 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
         };
     }
 
-    interp.setResultOwning(try objutil.newFloat(Heap.local_heap, result));
+    interp.setResultOwning(try objutil.newFloat(result));
 }
 
-pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn addCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     try addMulHelper(interp, args, .add);
 }
 
-pub fn mulCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn mulCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     try addMulHelper(interp, args, .mul);
 }
 
-pub fn subCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn subCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     try subDivHelper(interp, args, .sub);
 }
 
-pub fn divCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn divCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     try subDivHelper(interp, args, .div);
 }
 
-pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn breakCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     if (args.len == 2) {
-        const level = try interp.getInteger(&args[1]);
+        var level_arg = args[1].borrow();
+        defer level_arg.decrRefCount();
+        const level = try interp.getInteger(&level_arg);
         if (level < 1) {
             try interp.setResultFormatted("break level \"{}\" lower than 1", .{level});
         } else if (level > std.math.maxInt(u32)) {
@@ -239,9 +247,11 @@ pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     return error.Break;
 }
 
-pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn continueCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     if (args.len == 2) {
-        const level = try interp.getInteger(&args[1]);
+        var level_arg = args[1].borrow();
+        defer level_arg.decrRefCount();
+        const level = try interp.getInteger(&level_arg);
         if (level < 1) {
             try interp.setResultFormatted("continue level \"{}\" lower than 1", .{level});
         } else if (level > std.math.maxInt(u32)) {
@@ -257,7 +267,7 @@ pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 /// [dict]
-pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     const SubcommandName = enum {
         create,
         get,
@@ -283,29 +293,37 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     var det: objutil.ErrorDetails = undefined;
     var new_enum: OptionalHandle = .none;
+    defer new_enum.decrOptional();
     const subcommand: SubcommandName = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1], &new_enum));
-    args[1].swapIfNew(new_enum);
 
     switch (subcommand) {
         .get => {
-            interp.setResult(try interp.getDictValueRecursivelyOrError(&args[2], args[3..]));
+            var dict = args[2].borrow();
+            defer dict.decrRefCount();
+            var new_dict: OptionalHandle = .none;
+            defer new_dict.swapWithNone();
+            interp.setResult(try interp.getDictValueRecursivelyOrError(&dict, &new_dict, args[3..]));
         },
         .getdef => {
-            if ((try interp.getDictValueRecursively(&args[2], args[3..(args.len - 1)])).toHandle()) |val| {
+            if ((try interp.testGetDictValueRecursively(args[2], args[3..(args.len - 1)])).toHandle()) |val| {
+                defer val.decrRefCount();
                 interp.setResult(val);
             } else {
                 interp.setResult(args[args.len - 1]);
             }
         },
         .set => {
+            var var_name = args[2].borrow();
+            defer var_name.decrRefCount();
+
             const dict = blk: {
-                if ((try interp.getVariable(&args[2])).toHandle()) |val| {
+                if ((try interp.getVariable(&var_name)).toHandle()) |val| {
                     break :blk val;
                 } else {
                     const new_variable_dict = try objutil.newDictWithCapacity(2);
                     defer new_variable_dict.decrRefCount();
-                    try interp.setVariableTo(&args[2], new_variable_dict);
-                    break :blk (try interp.getVariable(&args[2])).toHandle().?;
+                    try interp.setVariableTo(&var_name, new_variable_dict);
+                    break :blk (try interp.getVariable(&var_name)).toHandle().?;
                 }
             };
 
@@ -318,9 +336,9 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
             if (new_dict.toHandle()) |new| {
                 defer new.decrRefCount();
-                try interp.setVariableTo(&args[2], new);
+                try interp.setVariableTo(&var_name, new);
                 // TODO probably can do this faster than looking back up every time.
-                interp.setResult((try interp.getVariable(&args[2])).toHandle().?);
+                interp.setResult((try interp.getVariable(&var_name)).toHandle().?);
             } else {
                 interp.setResult(dict);
             }
@@ -347,8 +365,10 @@ test "dict commands" {
     );
 }
 
-pub fn exprCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const result = try (try interp.evalExpressionInPlace(&args[1])).toObject();
+pub fn exprCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+    var expr = args[1].borrow();
+    defer expr.decrRefCount();
+    const result = try (try interp.evalExpressionInPlace(&expr)).toObject();
     defer result.decrRefCount();
     interp.setResult(result);
 }
@@ -375,12 +395,14 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
     return .none;
 }
 
-pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn forCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     // Do the initialization.
     try interp.evalObject(args[1]);
 
     // Check condition.
-    while (try interp.getBoolFromExpression(&args[2])) {
+    var expr = args[2].borrow();
+    defer expr.decrRefCount();
+    while (try interp.getBoolFromExpression(&expr)) {
         // Evaluate body.
         switch (try propagateLoopControl(interp, interp.evalObject(args[4]))) {
             .@"break" => {
@@ -428,7 +450,7 @@ test "loop commands" {
 }
 
 /// [puts]
-pub fn putsCmd(interp: *Interp, args: []Handle) !void {
+pub fn putsCmd(interp: *Interp, args: []const Handle) !void {
     if (args.len == 3) {
         const first_arg_str = try args[1].getString();
         if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
@@ -445,14 +467,16 @@ pub fn putsCmd(interp: *Interp, args: []Handle) !void {
 }
 
 /// [if]
-pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn ifCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     var remaining_args = args[1..];
     while (true) {
         // Need a condition and a body after.
         if (remaining_args.len < 2) return error.WrongUsage;
 
         // Check condition.
-        if (try interp.getBoolFromExpression(&remaining_args[0])) {
+        var cond = remaining_args[0].borrow();
+        defer cond.decrRefCount();
+        if (try interp.getBoolFromExpression(&cond)) {
             // Evaluate true branch.
             try interp.evalObject(remaining_args[1]);
             return;
@@ -489,15 +513,20 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 /// [incr]
-pub fn incrCmd(interp: *Interp, args: []Handle) !void {
+pub fn incrCmd(interp: *Interp, args: []const Handle) !void {
     var increment_by: i64 = 1;
 
     if (args.len == 3) {
         // There's an amount provided to increment by.
-        increment_by = try interp.getInteger(&args[2]);
+        var increment_handle = args[2].borrow();
+        defer increment_handle.decrRefCount();
+        increment_by = try interp.getInteger(&increment_handle);
     }
 
-    if ((try interp.getVariable(&args[1])).toHandle()) |val| {
+    var var_name = args[1].borrow();
+    defer var_name.decrRefCount();
+
+    if ((try interp.getVariable(&var_name)).toHandle()) |val| {
         const contents = try interp.getIntegerNoShimmer(val);
         const new_contents = std.math.add(i64, contents, increment_by) catch {
             var det: objutil.ErrorDetails = undefined;
@@ -511,42 +540,47 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
             val.peek().body = .{ .integer = new_contents };
             interp.setResult(val);
         } else {
-            try interp.setVariableToObject(&args[1], .{
+            try interp.setVariableToObject(&var_name, .{
                 .head = .{ .str = Heap.Object.null_string, .tag = .integer },
                 .body = .{ .integer = new_contents },
             });
-            interp.setResult((interp.getVariable(&args[1]) catch unreachable).toHandle().?);
+            interp.setResult((interp.getVariable(&var_name) catch unreachable).toHandle().?);
         }
     } else {
-        try interp.setVariableToObject(&args[1], .{
+        try interp.setVariableToObject(&var_name, .{
             .head = .{ .str = Heap.Object.null_string, .tag = .integer },
             .body = .{ .integer = increment_by },
         });
-        interp.setResult((try interp.getVariable(&args[1])).toHandle().?);
+        interp.setResult((try interp.getVariable(&var_name)).toHandle().?);
     }
 }
 
 /// [append]
-pub fn appendCmd(interp: *Interp, args: []Handle) !void {
-    // Collect the existing variable value's string, or treat as empty.
-    const existing_str: []const u8 = if ((try interp.getVariable(&args[1])).toHandle()) |val|
-        try val.getString()
-    else
-        "";
+pub fn appendCmd(interp: *Interp, args: []const Handle) !void {
+    // Get the variable's value if it exists, or else use an empty string.
+    var var_name = args[1].borrow();
+    defer var_name.decrRefCount();
+    const var_value: []const u8 = blk: {
+        if ((try interp.getVariable(&var_name)).toHandle()) |val| {
+            break :blk try val.getString();
+        } else {
+            break :blk "";
+        }
+    };
 
     // Fast path: no values to append, just ensure the variable exists and return it.
     if (args.len == 2) {
-        if ((try interp.getVariable(&args[1])).toHandle()) |val| {
+        if ((try interp.getVariable(&var_name)).toHandle()) |val| {
             interp.setResult(val);
         } else {
-            try interp.setVariableTo(&args[1], Heap.local_heap.emptyHandle());
+            try interp.setVariableTo(&var_name, Heap.local_heap.emptyHandle());
             interp.setEmptyResult();
         }
         return;
     }
 
     // Compute total length so we can allocate a single string.
-    var total_len: usize = existing_str.len;
+    var total_len: usize = var_value.len;
     for (args[2..]) |arg| {
         total_len += (try arg.getString()).len;
     }
@@ -557,8 +591,8 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
     if (total_len > 0) {
         const buf = Heap.getStringMut(result_str) catch unreachable;
         var pos: usize = 0;
-        @memcpy(buf[pos..(pos + existing_str.len)], existing_str);
-        pos += existing_str.len;
+        @memcpy(buf[pos..(pos + var_value.len)], var_value);
+        pos += var_value.len;
         for (args[2..]) |arg| {
             const s = try arg.getString();
             @memcpy(buf[pos..(pos + s.len)], s);
@@ -566,24 +600,27 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
         }
     }
 
-    try interp.setVariableTo(&args[1], result_str);
-    interp.setResult((try interp.getVariable(&args[1])).toHandle().?);
+    try interp.setVariableTo(&var_name, result_str);
+    interp.setResult((try interp.getVariable(&var_name)).toHandle().?);
 }
 
 /// [set]
-pub fn setCmd(interp: *Interp, args: []Handle) !void {
+pub fn setCmd(interp: *Interp, args: []const Handle) !void {
+    var var_name = args[1].borrow();
+    defer var_name.decrRefCount();
+
     if (args.len == 2) {
         // Return the value.
-        interp.setResult(try interp.getVariableOrError(&args[1]));
+        interp.setResult(try interp.getVariableOrError(&var_name));
     } else {
-        try interp.setVariableTo(&args[1], args[2]);
+        try interp.setVariableTo(&var_name, args[2]);
     }
 }
 
 /// [apply] - invoke a closure value directly without binding it to a name.
 /// Unlike Tcl's [apply], the lambda must be a Zicl closure object or its
 /// serialized string form, a raw {argList body} list is not supported.
-pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn applyCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     const closure_and_key = try interp.getClosure(args[1]);
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
@@ -592,18 +629,23 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
 /// [fn] - creates a closure capturing the current scope and sets it as a
 /// variable in the current scope.
-pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const fn_name, const arglist, const body = if (args.len == 4)
-        .{ &args[1], &args[2], args[3] }
-    else
-        .{ null, &args[1], args[2] };
+pub fn fnCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+    var fn_name: ?Handle, var arglist, const body = blk: {
+        if (args.len == 4) {
+            break :blk .{ args[1].borrow(), args[2].borrow(), args[3] };
+        } else {
+            break :blk .{ @as(?Handle, null), args[1].borrow(), args[2] };
+        }
+    };
+    defer if (fn_name) |val| val.decrRefCount();
+    defer arglist.decrRefCount();
 
     // Shimmer to list via the interp helper, which handles the case where
     // the handle can't be shimmered in place.
-    try interp.shimmerToList(arglist);
+    try interp.shimmerToList(&arglist);
 
     var det: objutil.ErrorDetails = undefined;
-    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist.*));
+    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist));
     defer parsed_args.deinit();
 
     // Capture the current scope.
@@ -613,7 +655,7 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     // Build a non-owning closure descriptor. createClosureObject borrows
     // all fields, so we don't need to borrow here.
     const closure_obj = try Interp.createClosureObject(.{
-        .args = arglist.*,
+        .args = arglist,
         .body = body,
         .name = if (fn_name) |val| val.toOptional() else .none,
         .scope = scope.toOptional(),
@@ -625,7 +667,7 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     });
     defer closure_obj.decrRefCount();
 
-    if (fn_name) |val| {
+    if (fn_name) |*val| {
         try interp.setVariableTo(val, closure_obj);
         interp.setResult(try interp.getVariableOrError(val));
     } else {
@@ -634,12 +676,12 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("append", .{ .to_call = appendCmd, .description = "varName ?value ...?", .min_arity = 1 });
-    try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("-", .{ .to_call = subCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("/", .{ .to_call = divCmd, .description = "?number ...?", .min_arity = 1 });
+    try interp.registerCommand("append", .{ .to_call = appendCmd, .description = "varName ?value ...?", .min_arity = 1 });
+    try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });

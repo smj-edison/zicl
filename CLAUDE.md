@@ -342,6 +342,21 @@ Not yet implemented:
 -   Avoid using overly terse names, like `ef` for an evaluation frame. Use something like `frame` or `eval_frame` instead. Use `err` instead of `e` as well.
 -   Follow the known-new contract when writing: every sentence, always introduce something that the reader has previously read before introducing something new.
 -   Whenever you refer to a variable or a piece of code, enclose it in backticks. Exceptions to this rule include integer types (i.e. i64, u5) and error types (i.e. error.OutOfMemory).
+-   Prefer
+    ```
+    blk: {
+        if (foo) {
+            break :blk 123;
+        } else {
+            break :blk 456;
+        }
+    }
+    ```
+    over
+    ```
+    if (foo) 123 else 456;
+    ```
+    except in cases where all parts of the conditional are brief.
 
 ## Available helper functions
 @.claude/helpers.md

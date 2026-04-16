@@ -49,8 +49,8 @@ return_propagate: struct {
 prng: std.Random.DefaultPrng,
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
-pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
+pub const CommandFn = fn (interp: *Interp, args: []const Handle) Error!void;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]const Handle) callconv(.c) c_int;
 
 pub const Error = std.mem.Allocator.Error || error{
     EvalError,
@@ -992,7 +992,7 @@ pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
     }
 }
 
-pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
+pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []const Handle) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -1087,7 +1087,7 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     try interp.evalObjectInner(closure.body, cache_key);
 }
 
-fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
+fn callNative(interp: *Interp, command: *NativeCommand, args: []const Handle) !void {
     const signature = command.call_info.zig;
 
     const arg_count = args.len - 1;
@@ -1134,7 +1134,7 @@ pub fn setResultInteger(interp: *Interp, value: i64) !void {
 }
 
 pub fn setResultFloat(interp: *Interp, value: f64) !void {
-    interp.setResultOwning(try objutil.newFloat(Heap.local_heap, value));
+    interp.setResultOwning(try objutil.newFloat(value));
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
@@ -1165,7 +1165,7 @@ const CallFrame = struct {
     /// Dictionary containing the frame's variables.
     variables: Handle,
     /// Arguments of this procedure call. Lifetime managed by creator.
-    args: []Handle,
+    args: []const Handle,
     /// Signature of this procedure.
     signature: Heap.Closure,
     /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
@@ -1260,7 +1260,7 @@ const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
     /// Arguments of the command currently being dispatched in this eval frame.
-    args: []Handle,
+    args: []const Handle,
     /// The line number of the command currently being dispatched, within
     /// the script being evaluated (note that this is relative, since that's
     /// how parsed scripts are stored). Combine with `source_info.line_no`
@@ -1276,7 +1276,7 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentEvalFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
+fn pushCallFrame(interp: *Interp, parent: ?u32, args: []const Handle, signature: Heap.Closure) !u32 {
     const vars_handle = try objutil.newDict(Heap.local_heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
@@ -1740,7 +1740,7 @@ const ExprResult = union(enum) {
     pub fn toObject(result: ExprResult) !Handle {
         switch (result) {
             .int => |int| return try objutil.newInteger(Heap.local_heap, int),
-            .float => |float| return try objutil.newFloat(Heap.local_heap, float),
+            .float => |float| return try objutil.newFloat(float),
             .owned_handle => |handle| return handle.borrow(),
             .stack_handle => |handle| return handle,
         }
@@ -2178,7 +2178,7 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
         // lower frames use the invocation args stored in the call frame (set
         // when the frame was pushed, also still live on the Zig stack at this
         // point).
-        const raw_args: []Handle = if (is_top) eval_frame.args else call_frame.args;
+        const raw_args: []const Handle = if (is_top) eval_frame.args else call_frame.args;
         is_top = false;
         const args_list = try objutil.newList(raw_args);
         defer args_list.decrRefCount();
@@ -2536,16 +2536,14 @@ pub fn getDictValueOrError(interp: *Interp, dict: Handle, key: Handle) Interp.Er
     }
 }
 
-pub fn getDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle) Interp.Error!OptionalHandle {
+pub fn getDictValueRecursively(interp: *Interp, dict: *Handle, new_dict: *OptionalHandle, keys: []const Handle) Interp.Error!OptionalHandle {
     var det: objutil.ErrorDetails = undefined;
-    var new_dict: OptionalHandle = .none;
-    const result = try interp.wrapError(&det, objutil.dictLookupRecursively(&det, dict.*, &new_dict, keys));
-    dict.swapIfNew(new_dict);
-    return result;
+    return try interp.wrapError(&det, objutil.dictLookupRecursively(&det, dict.*, new_dict, keys));
 }
 
-pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: *Handle, keys: []const Handle) Interp.Error!Handle {
-    const result = try interp.getDictValueRecursively(dict, keys);
+pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: *Handle, new_dict: *OptionalHandle, keys: []const Handle) Interp.Error!Handle {
+    errdefer new_dict.swapWithNone();
+    const result = try interp.getDictValueRecursively(dict, new_dict, keys);
     if (result.toHandle()) |val| return val;
 
     // Else, create a useful error message.
@@ -2558,6 +2556,17 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: *Handle, keys: []co
     }
 
     return error.EvalError;
+}
+
+/// Convenience wrapper for tests: takes `dict` by value, manages `new_dict` internally,
+/// and returns a borrowed `OptionalHandle` (caller must `decrRefCount` if non-null).
+pub fn testGetDictValueRecursively(interp: *Interp, dict: Handle, keys: []const Handle) Interp.Error!OptionalHandle {
+    var dict_mut = dict;
+    var new_dict: OptionalHandle = .none;
+    const result = try interp.getDictValueRecursively(&dict_mut, &new_dict, keys);
+    defer new_dict.swapWithNone();
+    if (result.toHandle()) |val| return val.borrow().toOptional();
+    return .none;
 }
 
 pub fn putDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, key: Handle, value: Handle) Interp.Error!Handle {
@@ -2626,8 +2635,7 @@ test "recursive dict keys" {
     try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.getString());
 
     // Try taking ownership of one of the intermediate dictionaries.
-    var to_take_result = try interp.getDictValueRecursively(&dict, &.{ key_foo, key_bar });
-    const to_take = to_take_result.toHandle().?.borrow();
+    const to_take = (try interp.testGetDictValueRecursively(dict, &.{ key_foo, key_bar })).toHandle().?;
     defer to_take.decrRefCount();
 
     // See if setting still works correctly.
@@ -2638,8 +2646,9 @@ test "recursive dict keys" {
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, objutil.dictItem(dict, 0));
     try testing.expectEqualStrings("foo {bar foo}", try dict.getString());
 
-    const value_result = try interp.getDictValueRecursively(&dict, &.{ key_foo, key_bar });
-    try testing.expectEqualStrings("foo", try value_result.toHandle().?.getString());
+    const value_result = (try interp.testGetDictValueRecursively(dict, &.{ key_foo, key_bar })).toHandle().?;
+    defer value_result.decrRefCount();
+    try testing.expectEqualStrings("foo", try value_result.getString());
 }
 
 fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
@@ -2706,8 +2715,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     _ = try interp.putDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar, key_foo }, value_qux);
 
     // Borrow the intermediate dict.
-    var interm_result = try interp.getDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar });
-    const intermediate = interm_result.toHandle().?.borrow();
+    const intermediate = (try interp.testGetDictValueRecursively(interm_test_dict, &.{ key_foo, key_bar })).toHandle().?;
     defer intermediate.decrRefCount();
 
     const initial_refcount = intermediate.debugRefCount();
@@ -2720,8 +2728,9 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     // The intermediate dict we own should be unchanged (copy-on-write).
     try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
     // But the main dict should have a new copy without 'baz'.
-    const foo_bar_result = try interp.getDictValueRecursively(&interm_test_dict, &.{ key_foo, key_bar });
-    try testing.expectEqualStrings("foo qux", try foo_bar_result.toHandle().?.getString());
+    const foo_bar_result = (try interp.testGetDictValueRecursively(interm_test_dict, &.{ key_foo, key_bar })).toHandle().?;
+    defer foo_bar_result.decrRefCount();
+    try testing.expectEqualStrings("foo qux", try foo_bar_result.getString());
     // Reference count should drop by 1 since the parent no longer references it.
     try testing.expectEqual(initial_refcount - 1, intermediate.debugRefCount());
 
