@@ -6,4 +6,6 @@ zig-pkg
 graph.svg
 perf.data
 perf.data.old
-scratch
+
+jimtcl
+tcl

@@ -265,7 +265,7 @@ pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
 /// [dict]
 pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const SubcommandName = enum {
+    const Subcommands = enum {
         create,
         get,
         getdef,
@@ -286,12 +286,30 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         replace,
         update,
     };
-    const SubcommandEnum = objutil.TclEnum(SubcommandName, "dict subcommand", false);
+    const Parser = objutil.SubcommandParser(Subcommands, &.{
+        .{ .variant = .create, .usage = "?key value ...?", .stride = 2 },
+        .{ .variant = .get, .usage = "dictionary ?key ...?", .min_args = 1 },
+        .{ .variant = .getdef, .usage = "dictionary ?key ...? key default", .min_args = 3 },
+        .{ .variant = .set, .usage = "varName key ?key ...? value", .min_args = 3 },
+        .{ .variant = .unset, .usage = "varName key ?key ...?", .min_args = 2 },
+        .{ .variant = .exists, .usage = "dictionary key ?key ...?", .min_args = 2 },
+        .{ .variant = .keys, .usage = "dictionary ?pattern?", .min_args = 1, .max_args = 2 },
+        .{ .variant = .size, .usage = "dictionary", .min_args = 1, .max_args = 1 },
+        .{ .variant = .info, .usage = "dictionary", .min_args = 1, .max_args = 1 },
+        .{ .variant = .merge, .usage = "?...?" },
+        .{ .variant = .with, .usage = "dictVar ?key ...? script", .min_args = 2 },
+        .{ .variant = .append, .usage = "varName key ?value ...?", .min_args = 2 },
+        .{ .variant = .lappend, .usage = "varName key ?value ...?", .min_args = 2 },
+        .{ .variant = .incr, .usage = "varName key ?increment?", .min_args = 2, .max_args = 3 },
+        .{ .variant = .remove, .usage = "dictionary ?key ...?", .min_args = 1 },
+        .{ .variant = .values, .usage = "dictionary ?pattern?", .min_args = 1, .max_args = 2 },
+        .{ .variant = .@"for", .usage = "vars dictionary script", .min_args = 3, .max_args = 3 },
+        .{ .variant = .replace, .usage = "dictionary ?key value ...?", .min_args = 1 },
+        .{ .variant = .update, .usage = "varName ?arg ...? script", .min_args = 2 },
+    });
 
     var det: objutil.ErrorDetails = undefined;
-    var new_enum: OptionalHandle = .none;
-    defer new_enum.decrOptional();
-    const subcommand: SubcommandName = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1], &new_enum));
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
 
     switch (subcommand) {
         .get => {

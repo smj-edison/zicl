@@ -792,8 +792,19 @@ fn generateSubcommandUsage(comptime Enum: type, args: []Handle) !Handle {
         .{ args[0], enumNames(Enum, ", ") },
     );
 }
-pub const Subcommand = struct { usage: []const u8, min_args: u32 = 0, max_args: ?u32 };
-pub fn SubcommandParser(comptime Enum: type, comptime subcommands: []const Subcommand) type {
+
+pub fn SubcommandParser(
+    comptime Enum: type,
+    comptime subcommands: []const struct {
+        variant: Enum,
+        usage: []const u8,
+        min_args: u32 = 0,
+        max_args: ?u32 = null,
+        stride: u32 = 1,
+    },
+) type {
+    const Subcommand = @typeInfo(@TypeOf(subcommands)).pointer.child;
+
     comptime assert(std.enums.values(Enum).len == subcommands.len);
 
     return struct {
@@ -801,11 +812,12 @@ pub fn SubcommandParser(comptime Enum: type, comptime subcommands: []const Subco
         pub const NameToEnum = (EnumMapping(Enum, false){}).map;
         // As well as a mapping from Enum -> subcommand.
         const EnumToSubcommand = blk: {
-            const values = std.enums.values(Enum);
+            const variants = std.enums.values(Enum);
 
             var converted_mapping: std.enums.EnumFieldStruct(Enum, Subcommand, null) = undefined;
-            for (0..values.len) |i| {
-                const value = @tagName(values[i]);
+            for (0..variants.len) |i| {
+                const value = @tagName(variants[i]);
+                assert(subcommands[i].variant == variants[i]);
                 @field(converted_mapping, value) = subcommands[i];
             }
 
@@ -871,6 +883,7 @@ pub fn SubcommandParser(comptime Enum: type, comptime subcommands: []const Subco
             const correct_arg_count = blk: {
                 if (args.len - 2 < subcommand.min_args) break :blk false;
                 if (subcommand.max_args) |max_args| if (args.len - 2 > max_args) break :blk false;
+                if (@mod(args.len - 2, subcommand.stride) != 0) break :blk false;
                 break :blk true;
             };
             if (!correct_arg_count) {
@@ -889,7 +902,7 @@ pub fn SubcommandParser(comptime Enum: type, comptime subcommands: []const Subco
 
 test "subcommand parser" {
     const Parser = SubcommandParser(enum { foo }, &.{
-        .{ .usage = "arg1 arg2 ?arg3?", .min_args = 2, .max_args = 3 },
+        .{ .variant = .foo, .usage = "arg1 arg2 ?arg3?", .min_args = 2, .max_args = 3 },
     });
 
     defer Heap.testFinish();
@@ -2243,6 +2256,14 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     errdefer new_dict.swapWithNone();
     try Heap.ensureMutableOrDup(provided_dict, &new_dict);
     var dict = new_dict.orElse(provided_dict);
+
+    if (dict.getDictExtraData().parent_link != .none) {
+        // If there's a parent link, we need to flatten the dict before swapping.
+        if ((try dictFlatten(dict)).toHandle()) |new| {
+            new_dict.swapRef(new);
+            dict = new;
+        }
+    }
 
     assert(dict.heap == Heap.local_heap.heapId());
     const dict_len = dictItemLength(dict);
