@@ -921,7 +921,7 @@ pub fn newList(handles: []const Handle) !Handle {
 
     const new_items = listItems(list);
     for (handles, new_items) |handle, *item| {
-        item.* = try Heap.local_heap.dupOrReference(handle);
+        item.* = handle.dupOrRef();
     }
 
     return list;
@@ -1218,9 +1218,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
     } else {
         // If the collection is shared, we need to duplicate all the items.
         for (0.., new_items) |i, *new_item| {
-            new_item.* = try Heap.local_heap.dupOrReference(
-                collectionItemFollowRefs(provided_handle, @intCast(i), current_len),
-            );
+            new_item.* = collectionItemFollowRefs(provided_handle, @intCast(i), current_len).dupOrRef();
         }
 
         switch (new_handle.tag()) {
@@ -1299,7 +1297,7 @@ pub fn listAppendObject(det: ?*ErrorDetails, provided_list: Handle, new_list: *O
 
 pub fn listAppend(det: ?*ErrorDetails, provided_list: Handle, new_list: *OptionalHandle, item: Handle) !Handle {
     errdefer new_list.swapWithNone();
-    const item_obj = try provided_list.getHeap().dupOrReference(item);
+    const item_obj = provided_list.getHeap().dupOrReference(item);
     const index = try listAppendObject(det, provided_list, new_list, item_obj);
     return listItem(new_list.orElse(provided_list), index);
 }
@@ -1520,7 +1518,7 @@ pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
     const new_items = dictItems(dict);
 
     for (handles, new_items) |handle, *item| {
-        item.* = try Heap.dupOrReference(heap, handle);
+        item.* = heap.dupOrReference(handle);
     }
 
     return dict;
@@ -1783,7 +1781,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                 // Duplicate/reference the key _before_ resizing, so we can't fail
                 // after the resize is successful.
                 const new_key_handle, const new_value_handle = blk: {
-                    var key_obj: Heap.Object = try Heap.dupOrReference(Heap.local_heap, key);
+                    var key_obj: Heap.Object = Heap.dupOrReference(Heap.local_heap, key);
                     errdefer key_obj.deinitSingle(Heap.local_heap);
 
                     new_dict.swapRefIfNew(try setCollectionLength(dict, new_length));
@@ -2021,7 +2019,7 @@ pub fn dictLookupRecursively(
 
 /// Assumes `handle` is a dict.
 pub fn dictPut(dict: Handle, key: Handle, value: Handle) !DictAndValueResult {
-    return dictPutInner(dict, key, try Heap.local_heap.dupOrReference(value));
+    return dictPutInner(dict, key, value.dupOrRef());
 }
 
 const DictAndRemovedResult = struct { new_dict: OptionalHandle, did_remove: bool };

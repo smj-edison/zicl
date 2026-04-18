@@ -950,6 +950,10 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.referenceTakeOwnership();
     }
 
+    pub fn dupOrRef(handle: Handle) Object {
+        return local_heap.dupOrReference(handle);
+    }
+
     pub fn invalidateBoth(handle: Handle) void {
         handle.invalidateBody();
         handle.invalidateString();
@@ -1111,7 +1115,7 @@ pub const Handle = packed struct(HandleBacking) {
                         const spec = try objutil.newList(&.{ arg_name, default_val });
                         arg_items[i] = spec.referenceTakeOwnership();
                     } else {
-                        arg_items[i] = try heap.dupOrReference(arg_name);
+                        arg_items[i] = heap.dupOrReference(arg_name);
                     }
                 }
 
@@ -1120,37 +1124,25 @@ pub const Handle = packed struct(HandleBacking) {
                 defer impl_val.decrRefCount();
 
                 // Build the outer list: fn ?name <name>? impl <impl> ?scope <scope>?
-                var word_count: u32 = 3; // fn, impl keyword, impl value
-                if (closure.name.toHandle() != null) word_count += 2;
-                if (closure.scope.toHandle() != null) word_count += 2;
-
-                const outer = try objutil.newListWithCapacity(word_count);
+                const outer = try objutil.newListWithCapacity(7);
                 defer outer.decrRefCount();
 
-                var new: OptionalHandle = .none;
-                _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.@"fn")) catch unreachable;
-                outer.assert(new == .none);
+                objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.@"fn"));
 
                 if (closure.name.toHandle()) |name_handle| {
-                    _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.name)) catch unreachable;
-                    outer.assert(new == .none);
-                    _ = objutil.listAppend(null, outer, &new, name_handle) catch unreachable;
-                    outer.assert(new == .none);
+                    objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.name));
+                    objutil.listAppendAssumeCapacity(outer, name_handle.dupOrRef());
                 }
 
-                _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.impl)) catch unreachable;
-                outer.assert(new == .none);
-                _ = objutil.listAppend(null, outer, &new, impl_val) catch unreachable;
-                outer.assert(new == .none);
+                objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.impl));
+                objutil.listAppendAssumeCapacity(outer, impl_val.dupOrRef());
 
                 if (closure.scope.toHandle()) |scope_handle| {
-                    _ = objutil.listAppend(null, outer, &new, heap.getInternedString(.scope)) catch unreachable;
-                    outer.assert(new == .none);
-                    _ = objutil.listAppend(null, outer, &new, scope_handle) catch unreachable;
-                    outer.assert(new == .none);
+                    objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.scope));
+                    objutil.listAppendAssumeCapacity(outer, scope_handle.dupOrRef());
                 }
 
-                const result = try getListString(heap, outer.index + 1, word_count);
+                const result = try getListString(heap, outer.index + 1, objutil.listLengthRaw(outer));
                 break :blk result;
             },
             .custom_type => {
@@ -1445,7 +1437,9 @@ pub fn init(heap: *Heap) !void {
 
     // Init objects.
     heap.object_tracking = try .init(global_gpa, cfg.object_heap_order);
-    errdefer _ = heap.object_tracking.deinit();
+    errdefer if (heap.object_tracking.deinit() == .leaked) {
+        std.debug.print("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
+    };
 
     heap.objects = .empty;
     if (options.threading) {
@@ -1470,12 +1464,14 @@ pub fn init(heap: *Heap) !void {
 
     // Init strings.
     heap.string_tracking = try .init(global_gpa, cfg.string_heap_order);
-    errdefer _ = heap.string_tracking.deinit();
+    errdefer if (heap.string_tracking.deinit() == .leaked) {
+        std.debug.print("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
+    };
 
     heap.strings = .empty;
     if (options.threading) {
         const string_vmem = try memutil.vmemMap(string_heap_max_bytes);
-        heap.strings.items = string_vmem.ptr[0..0];
+        heap.strings.items = string_vmem.ptr[0..string_vmem.len];
         heap.strings.capacity = string_vmem.len;
     } else {
         try heap.strings.ensureTotalCapacity(global_gpa, 32);
@@ -1526,6 +1522,15 @@ pub fn init(heap: *Heap) !void {
 
     // Create all the interned strings.
     try heap.createInternedStrings();
+    errdefer {
+        for (special_object_count..(special_object_count + interned_string_count)) |i| {
+            // Need to free these objects directly, since they're not normally allowed
+            // to be mutated.
+            const interned = heap.getHandle(@intCast(i));
+            interned.peek().head.str.deinit(heap);
+            freeObjectBackingInner(interned);
+        }
+    }
 
     const oom_dict = try createOomErrorOptionsDict(heap);
     // Pin so it stays immutable.
@@ -1597,8 +1602,8 @@ pub fn deinit(heap: *Heap) void {
         heap.objects.deinit(global_gpa);
     }
 
-    if (heap.object_tracking.deinit() == .leaked) @panic("Heap leaks when deiniting");
-    if (heap.string_tracking.deinit() == .leaked) @panic("Heap leaks when deiniting");
+    if (heap.object_tracking.deinit() == .leaked) @panic("Heap object leaks when deiniting");
+    if (heap.string_tracking.deinit() == .leaked) @panic("Heap string leaks when deiniting");
 
     heap.extra.deinit(global_gpa);
     heap.* = undefined;
@@ -1850,8 +1855,10 @@ pub fn createString(self: *Heap, len: u32) !u32 {
         }
     };
     errdefer self.string_tracking.freeFromAnyThread(new_string, order);
-    try self.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + length_with_null);
-    self.strings.items.len = @max(self.strings.items.len, new_string + length_with_null);
+    if (!options.threading) {
+        try self.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + length_with_null);
+        self.strings.items.len = @max(self.strings.items.len, new_string + length_with_null);
+    }
 
     self.strings.items[new_string + len] = 0; // Set null byte.
     return new_string;
@@ -1962,7 +1969,7 @@ pub fn dupSingleOrReference(dest_heap: *Heap, handle: Handle) !Object {
 }
 
 /// Duplicates the object if it's a fast duplication, else references it.
-pub fn dupOrReference(dest_heap: *Heap, handle: Handle) !Object {
+pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
     _ = dest_heap;
 
     const tag = handle.tag();
@@ -2737,7 +2744,15 @@ fn createOomErrorOptionsDict(heap: *Heap) !Handle {
         heap.getInternedString(.@"-errorcode"), heap.getInternedString(.@"ZICL OOM"),
     };
 
-    return objutil.newDict(heap, &pairs);
+    const new_dict = try objutil.newDict(heap, &pairs);
+    errdefer new_dict.decrRefCount();
+
+    // Make sure it has a dict and a string rep, so it's useful in an
+    // OOM situation.
+    _ = try new_dict.getString();
+    _ = try objutil.dictGetTable(new_dict);
+
+    return new_dict;
 }
 
 pub fn deinitAll() void {
@@ -2907,10 +2922,6 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i));
-            if (i == 40) {
-                std.debug.print("object: {f}\n", .{handle.peek()});
-                std.debug.print("next object: {f}\n", .{heap.getHandle(@intCast(i + 1)).peek()});
-            }
             std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
                 handle.tag(),
                 i,

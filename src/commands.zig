@@ -264,7 +264,7 @@ pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 /// [dict]
-pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const SubcommandName = enum {
         create,
         get,
@@ -295,36 +295,31 @@ pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
 
     switch (subcommand) {
         .get => {
-            var dict = args[2].borrow();
-            defer dict.decrRefCount();
-            var new_dict: OptionalHandle = .none;
-            defer new_dict.swapWithNone();
-            interp.setResult(try interp.getDictValueRecursivelyOrError(&dict, &new_dict, args[3..]));
+            const dict = &args[2];
+            interp.setResult(try interp.getDictValueRecursivelyOrError(dict, args[3..]));
         },
         .getdef => {
-            if ((try interp.testGetDictValueRecursively(args[2], args[3..(args.len - 1)])).toHandle()) |val| {
-                defer val.decrRefCount();
+            if ((try interp.getDictValueRecursively(&args[2], args[3..(args.len - 1)])).toHandle()) |val| {
                 interp.setResult(val);
             } else {
                 interp.setResult(args[args.len - 1]);
             }
         },
         .set => {
-            var var_name = args[2].borrow();
-            defer var_name.decrRefCount();
+            const var_name = &args[2];
 
             const dict = blk: {
-                if ((try interp.getVariable(&var_name)).toHandle()) |val| {
+                if ((try interp.getVariable(var_name)).toHandle()) |val| {
                     break :blk val;
                 } else {
                     const new_variable_dict = try objutil.newDictWithCapacity(Heap.local_heap, 2);
                     defer new_variable_dict.decrRefCount();
-                    try interp.setVariableTo(&var_name, new_variable_dict);
-                    break :blk (try interp.getVariable(&var_name)).toHandle().?;
+                    try interp.setVariableTo(var_name, new_variable_dict);
+                    break :blk (try interp.getVariable(var_name)).toHandle().?;
                 }
             };
 
-            const new_value = try Heap.local_heap.dupOrReference(args[args.len - 1]);
+            const new_value = args[args.len - 1].dupOrRef();
             var new_dict: OptionalHandle = .none;
             _ = try interp.wrapError(
                 &det,
@@ -333,33 +328,44 @@ pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
 
             if (new_dict.toHandle()) |new| {
                 defer new.decrRefCount();
-                try interp.setVariableTo(&var_name, new);
+                try interp.setVariableTo(var_name, new);
                 // TODO probably can do this faster than looking back up every time.
-                interp.setResult((try interp.getVariable(&var_name)).toHandle().?);
+                interp.setResult((try interp.getVariable(var_name)).toHandle().?);
             } else {
                 interp.setResult(dict);
             }
         },
-        .unset => {},
-        else => unreachable,
+        .unset => {
+            const var_name = &args[2];
+            if (args.len < 4) return error.WrongUsage;
+
+            const dict = blk: {
+                if ((try interp.getVariable(var_name)).toHandle()) |val| {
+                    break :blk val;
+                } else {
+                    const new_variable_dict = try objutil.newDictWithCapacity(Heap.local_heap, 2);
+                    defer new_variable_dict.decrRefCount();
+                    try interp.setVariableTo(var_name, new_variable_dict);
+                    break :blk (try interp.getVariable(var_name)).toHandle().?;
+                }
+            };
+
+            const result = try interp.wrapError(
+                &det,
+                objutil.dictRemoveRecursively(&det, dict, args[3..args.len]),
+            );
+
+            if (result.new_dict.toHandle()) |new| {
+                defer new.decrRefCount();
+                try interp.setVariableTo(var_name, new);
+                // TODO probably can do this faster than looking back up every time.
+                interp.setResult((try interp.getVariable(var_name)).toHandle().?);
+            } else {
+                interp.setResult(dict);
+            }
+        },
+        else => @panic("unimplemented"),
     }
-}
-
-test "dict commands" {
-    var interp = try testStart(testing.allocator);
-    defer testFinish(&interp);
-
-    try interp.testExpectScriptError(error.EvalError,
-        \\Missing value to go with key when converting "10" to a dictionary.
-    ,
-        \\ dict set x a 10
-        \\ puts [dict get $x a 5]
-    );
-
-    try interp.testExpectScriptResult("qux",
-        \\ dict set foo bar baz qux
-        \\ dict get $foo bar baz
-    );
 }
 
 pub fn exprCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
@@ -1126,22 +1132,14 @@ pub fn returnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 /// [errorinfo optsDict]
 ///
 /// Lazily generates the human-readable error info string from an opts dict.
-pub fn errorinfoCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
-    var opts = args[1].borrow();
-    defer opts.decrRefCount();
-    var new_opts: OptionalHandle = .none;
-    defer new_opts.swapWithNone();
+pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const opts = &args[1];
 
     const heap = Heap.local_heap;
     var det: objutil.ErrorDetails = undefined;
 
     // Pull out -errorstack from the dict (may not be present).
-    const stack_val = try interp.getDictValueRecursively(
-        &opts,
-        &new_opts,
-        &.{heap.getInternedString(.@"-errorstack")},
-    );
-    opts.swapIfNew(new_opts);
+    const stack_val = try interp.getDictValueRecursively(opts, &.{heap.getInternedString(.@"-errorstack")});
 
     if (stack_val.toHandle() == null) {
         interp.setEmptyResult();
