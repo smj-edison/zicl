@@ -674,11 +674,11 @@ pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
 //  Enum related functions  //
 
 /// Enum names joined by ", "
-pub fn enumNames(comptime T: type) []const u8 {
+pub fn enumNames(comptime T: type, comptime joiner: []const u8) []const u8 {
     return comptime blk: {
         var result: []const u8 = @tagName(std.enums.values(T)[0]);
         for (std.enums.values(T)[1..]) |value| {
-            result = &(result[0..].* ++ ", ".* ++ @tagName(value).*);
+            result = &(result[0..].* ++ joiner.* ++ @tagName(value).*);
         }
 
         break :blk result;
@@ -721,9 +721,9 @@ pub fn EnumMapping(comptime T: type, include_numbers: bool) type {
 
 pub fn TclEnum(comptime T: type, enum_name: []const u8, include_numbers: bool) type {
     return struct {
-        pub const variants = T;
+        pub const Variants = T;
         pub const map = (EnumMapping(T, include_numbers){}).map;
-        pub const names = enumNames(T);
+        pub const names = enumNames(T, ", ");
 
         pub fn get(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !T {
             errdefer new_handle.swapWithNone();
@@ -757,7 +757,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8, include_numbers: bool) t
 test "enum mapping" {
     const Things = enum { foo, bar, baz };
     const map = (EnumMapping(Things, false){}).map;
-    const names = enumNames(Things);
+    const names = enumNames(Things, ", ");
     try testing.expectEqual(Things.foo, map.get("foo"));
     try testing.expectEqualSlices(u8, "foo, bar, baz", names);
 }
@@ -783,6 +783,134 @@ test "tcl enum" {
     foo_str.swapAndClear(&new_handle);
     try testing.expectError(error.BadEnumVariant, MyTclEnum.get(null, bad_str, &new_handle));
     foo_str.swapAndClear(&new_handle);
+}
+
+fn generateSubcommandUsage(comptime Enum: type, args: []Handle) !Handle {
+    return try newStringFmt(
+        Heap.local_heap,
+        "Usage: \"{f} command ... \", where command is one of: {s}",
+        .{ args[0], enumNames(Enum, ", ") },
+    );
+}
+pub const Subcommand = struct { usage: []const u8, min_args: u32 = 0, max_args: ?u32 };
+pub fn SubcommandParser(comptime Enum: type, comptime subcommands: []const Subcommand) type {
+    comptime assert(std.enums.values(Enum).len == subcommands.len);
+
+    return struct {
+        // Create a mapping from subcommand name -> Enum.
+        pub const NameToEnum = (EnumMapping(Enum, false){}).map;
+        // As well as a mapping from Enum -> subcommand.
+        const EnumToSubcommand = blk: {
+            const values = std.enums.values(Enum);
+
+            var converted_mapping: std.enums.EnumFieldStruct(Enum, Subcommand, null) = undefined;
+            for (0..values.len) |i| {
+                const value = @tagName(values[i]);
+                @field(converted_mapping, value) = subcommands[i];
+            }
+
+            break :blk std.EnumArray(Enum, Subcommand).init(converted_mapping);
+        };
+
+        const space_joined_names = enumNames(Enum, " ");
+        const comma_joined_names = enumNames(Enum, ",");
+
+        /// `args` should include the original command name.
+        pub fn parse(det: ?*ErrorDetails, args: []Handle) !Enum {
+            if (args.len < 2) {
+                if (det) |details| details.* = .{
+                    .message = try newStringFmt(Heap.local_heap,
+                        \\wrong # args: should be "{f} command ..."
+                        \\Use "{f} -help ?command?" for help
+                    , .{ args[0], args[0] }),
+                };
+                return error.WrongUsage;
+            }
+
+            // TODO PERF cache the subcommand lookup.
+
+            if (try Heap.stringEquals(args[1], "-help")) {
+                if (args.len >= 3) {
+                    const subcommand_queried = try args[2].getString();
+
+                    // Generate help for a specific subcommand, if the subcommand exists.
+                    if (NameToEnum.get(subcommand_queried)) |val| {
+                        const subcommand = EnumToSubcommand.get(val);
+                        if (det) |details| details.* = .{
+                            .message = try newStringFmt(Heap.local_heap,
+                                \\Usage: "{f} {s} {s}"
+                            , .{ args[0], subcommand_queried, subcommand.usage }),
+                        };
+                        return error.UsageHelp;
+                    }
+
+                    // Else, fall through to the general usage.
+                }
+                if (det) |details| details.* = .{ .message = try generateSubcommandUsage(Enum, args) };
+                return error.UsageHelp;
+            }
+
+            if (try Heap.stringEquals(args[1], "-commands")) {
+                if (det) |details| details.* = .{ .message = try newString(Heap.local_heap, space_joined_names) };
+                return error.UsageHelp;
+            }
+
+            const subcommand_name = try args[1].getString();
+            const subcommand_enum = NameToEnum.get(subcommand_name) orelse {
+                if (det) |details| details.* = .{
+                    .message = try newStringFmt(Heap.local_heap,
+                        \\{f}, unknown command "{f}": should be {s}
+                    , .{ args[0], args[1], space_joined_names }),
+                };
+                return error.WrongUsage;
+            };
+            const subcommand = EnumToSubcommand.get(subcommand_enum);
+
+            // Now that we've gotten the usage, we need to make sure that we have the right
+            // number of arguments.
+            const correct_arg_count = blk: {
+                if (args.len - 2 < subcommand.min_args) break :blk false;
+                if (subcommand.max_args) |max_args| if (args.len - 2 > max_args) break :blk false;
+                break :blk true;
+            };
+            if (!correct_arg_count) {
+                if (det) |details| details.* = .{
+                    .message = try newStringFmt(Heap.local_heap,
+                        \\wrong # args: should be "{s}"
+                    , .{subcommand.usage}),
+                };
+                return error.WrongUsage;
+            }
+
+            return subcommand_enum;
+        }
+    };
+}
+
+test "subcommand parser" {
+    const Parser = SubcommandParser(enum { foo }, &.{
+        .{ .usage = "arg1 arg2 ?arg3?", .min_args = 2, .max_args = 3 },
+    });
+
+    defer Heap.testFinish();
+    const heap = try Heap.testStart(testing.allocator, testing.io);
+
+    var base_str = try newString(heap, "base");
+    defer base_str.decrRefCount();
+    var foo_str = try newString(heap, "foo");
+    defer foo_str.decrRefCount();
+    var arg1_str = try newString(heap, "arg1");
+    defer arg1_str.decrRefCount();
+    var arg2_str = try newString(heap, "arg2");
+    defer arg2_str.decrRefCount();
+    var arg3_str = try newString(heap, "arg3");
+    defer arg3_str.decrRefCount();
+
+    var args = [_]Handle{ base_str, foo_str, arg1_str, arg2_str };
+    try testing.expectEqual(.foo, try Parser.parse(null, &args));
+
+    var args2 = [_]Handle{ base_str, foo_str, arg1_str };
+    try testing.expectError(error.WrongUsage, Parser.parse(null, &args2));
 }
 
 /// Runs a string check based on requested class. `class_to_check` must be shimmerable.
