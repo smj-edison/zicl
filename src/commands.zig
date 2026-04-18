@@ -446,6 +446,25 @@ test "loop commands" {
     );
 }
 
+/// [join]
+/// Converts `list` to a list and joins its items with `joinString` (default " ").
+pub fn joinCmd(interp: *Interp, args: []Handle) !void {
+    const join_str = if (args.len == 3) try args[2].getString() else " ";
+
+    try interp.shimmerToList(&args[1]);
+    const len = objutil.listLengthRaw(args[1]);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(Heap.global_gpa);
+
+    for (0..len) |i| {
+        if (i > 0) try buf.appendSlice(Heap.global_gpa, join_str);
+        try buf.appendSlice(Heap.global_gpa, try objutil.listItem(args[1], @intCast(i)).getString());
+    }
+
+    try interp.setResultString(buf.items);
+}
+
 /// [concat]
 /// Joins arguments into a single string, or a single list if all args are already lists.
 /// In the string case, each arg has leading/trailing whitespace stripped before
@@ -1252,6 +1271,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
     try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("join", .{ .to_call = joinCmd, .description = "list ?joinString?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
 }
@@ -1293,6 +1313,26 @@ test "concat command" {
     try interp.testExpectScriptResult("1 2 3", "concat {1 2 3} {}");
 }
 
+
+test "join command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Default separator is a space.
+    try interp.testExpectScriptResult("a b c", "join {a b c}");
+
+    // Custom separator.
+    try interp.testExpectScriptResult("a,b,c", "join {a b c} ,");
+
+    // Empty separator concatenates items directly.
+    try interp.testExpectScriptResult("abc", "join {a b c} {}");
+
+    // Empty list returns empty string.
+    try interp.testExpectScriptResult("", "join {}");
+
+    // Single-item list returns just that item.
+    try interp.testExpectScriptResult("hello", "join {hello} ,");
+}
 
 test "commands" {
     var interp = try testStart(testing.allocator);
