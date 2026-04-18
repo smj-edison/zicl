@@ -2250,8 +2250,6 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
 }
 
 // TODO PERF might be worthwhile doing something like Jim's compared string type.
-// Though, it might make things worse, since there's some cases where `stringEquals`
-// compares against a script, and it's probably unwise to churn scripts.
 pub fn stringEquals(handle: Handle, value: []const u8) !bool {
     const bytes = try handle.getString();
     return std.mem.eql(u8, bytes, value);
