@@ -446,6 +446,57 @@ test "loop commands" {
     );
 }
 
+/// [concat]
+/// Joins arguments into a single string, or a single list if all args are already lists.
+/// In the string case, each arg has leading/trailing whitespace stripped before
+/// being joined with single spaces -- matching standard Tcl semantics.
+pub fn concatCmd(interp: *Interp, args: []const Handle) !void {
+    const actual_args = args[1..];
+
+    if (actual_args.len == 0) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    // If every argument is already a list, return the concatenation as a list.
+    all_lists: {
+        for (actual_args) |arg| {
+            if (arg.tag() != .list) break :all_lists;
+        }
+
+        var total: u32 = 0;
+        for (actual_args) |arg| total += objutil.listLengthRaw(arg);
+
+        var result = try objutil.newListWithCapacity(total);
+        errdefer result.decrRefCount();
+
+        for (actual_args) |arg| {
+            for (0..objutil.listLengthRaw(arg)) |i| {
+                _ = try interp.listAppend(&result, objutil.listItem(arg, @intCast(i)));
+            }
+        }
+
+        interp.setResultOwning(result);
+        return;
+    }
+
+    // String path: trim each arg and join with single spaces.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(Heap.global_gpa);
+
+    var first_nonempty = true;
+    for (actual_args) |arg| {
+        const raw = try arg.getString();
+        const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        if (!first_nonempty) try buf.append(Heap.global_gpa, ' ');
+        try buf.appendSlice(Heap.global_gpa, trimmed);
+        first_nonempty = false;
+    }
+
+    try interp.setResultString(buf.items);
+}
+
 /// [puts]
 pub fn putsCmd(interp: *Interp, args: []const Handle) !void {
     if (args.len == 3) {
@@ -1189,6 +1240,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("catch", .{ .to_call = catchCmd, .description = "script ?resultVar? ?optsVar?", .min_arity = 1, .max_arity = 3 });
+    try interp.registerCommand("concat", .{ .to_call = concatCmd, .description = "?arg ...?", .min_arity = 0 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("error", .{ .to_call = errorCmd, .description = "message ?errorCode?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("errorinfo", .{ .to_call = errorinfoCmd, .description = "optsDict", .min_arity = 1, .max_arity = 1 });
@@ -1217,6 +1269,30 @@ pub fn testFinish(interp: *Interp) void {
     interp.deinit();
     Heap.testFinish();
 }
+
+test "concat command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // No args returns empty string.
+    try interp.testExpectScriptResult("", "concat");
+
+    // Single string arg is returned as-is (modulo whitespace trimming).
+    try interp.testExpectScriptResult("hello", "concat hello");
+    try interp.testExpectScriptResult("hello", "concat {  hello  }");
+
+    // Multiple string args are trimmed and joined with a space.
+    try interp.testExpectScriptResult("a b c", "concat a b c");
+    try interp.testExpectScriptResult("a b c", "concat {  a  } {  b  } {  c  }");
+
+    // Empty args are dropped.
+    try interp.testExpectScriptResult("a b", "concat a {} b");
+
+    // All-list path: result is the concatenated list.
+    try interp.testExpectScriptResult("1 2 3 4", "concat {1 2} {3 4}");
+    try interp.testExpectScriptResult("1 2 3", "concat {1 2 3} {}");
+}
+
 
 test "commands" {
     var interp = try testStart(testing.allocator);
