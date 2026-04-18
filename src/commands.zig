@@ -465,11 +465,227 @@ pub fn joinCmd(interp: *Interp, args: []Handle) !void {
     try interp.setResultString(buf.items);
 }
 
+/// [list] -- builds a list from the given arguments.
+pub fn listCmd(interp: *Interp, args: []Handle) !void {
+    const result = try objutil.newList(args[1..]);
+    interp.setResultOwning(result);
+}
+
+/// [llength] -- returns the number of items in list.
+pub fn llengthCmd(interp: *Interp, args: []Handle) !void {
+    try interp.shimmerToList(&args[1]);
+    try interp.setResultInteger(@intCast(objutil.listLengthRaw(args[1])));
+}
+
+/// [lindex] -- returns the element at the given index path, or the list itself if
+/// no indices are provided. Handles nested indexing by descending through sub-lists.
+pub fn lindexCmd(interp: *Interp, args: []Handle) !void {
+    if (args.len == 2) {
+        try interp.shimmerToList(&args[1]);
+        interp.setResult(args[1]);
+        return;
+    }
+
+    var current = args[1].borrow();
+    defer current.decrRefCount();
+
+    for (args[2..]) |idx_arg| {
+        try interp.shimmerToList(&current);
+        const len = objutil.listLengthRaw(current);
+
+        var det: objutil.ErrorDetails = undefined;
+        var new_idx: OptionalHandle = .none;
+        defer new_idx.decrOptional();
+        const list_index = try interp.wrapError(&det, objutil.getIndex(&det, idx_arg, &new_idx));
+        const abs = list_index.asAbsoluteIndex(len);
+
+        if (abs < 0 or abs >= len) {
+            interp.setEmptyResult();
+            return;
+        }
+
+        current.swap(objutil.listItem(current, @intCast(abs)).borrow());
+    }
+
+    interp.setResultOwning(current.borrow());
+}
+
+/// [lrange] -- returns a sublist from first to last (inclusive).
+pub fn lrangeCmd(interp: *Interp, args: []Handle) !void {
+    try interp.shimmerToList(&args[1]);
+    const len = objutil.listLengthRaw(args[1]);
+
+    var det: objutil.ErrorDetails = undefined;
+    var new_start: OptionalHandle = .none;
+    var new_end: OptionalHandle = .none;
+    defer new_start.decrOptional();
+    defer new_end.decrOptional();
+
+    const start_idx = try interp.wrapError(&det, objutil.getIndex(&det, args[2], &new_start));
+    const end_idx = try interp.wrapError(&det, objutil.getIndex(&det, args[3], &new_end));
+
+    const range = objutil.Range.fromIndexes(len, start_idx, end_idx);
+    const range_len: u32 = @intCast(range.end - range.start);
+
+    var result = try objutil.newListWithCapacity(range_len);
+    errdefer result.decrRefCount();
+
+    for (range.start..range.end) |i| {
+        _ = try interp.listAppend(&result, objutil.listItem(args[1], @intCast(i)));
+    }
+
+    interp.setResultOwning(result);
+}
+
+/// [lappend] -- appends items to a list variable, creating it if needed.
+pub fn lappendCmd(interp: *Interp, args: []Handle) !void {
+    var list = blk: {
+        if ((try interp.getVariable(&args[1])).toHandle()) |val| {
+            break :blk val.borrow();
+        } else {
+            break :blk try objutil.newListWithCapacity(0);
+        }
+    };
+    defer list.decrRefCount();
+
+    for (args[2..]) |item| {
+        _ = try interp.listAppend(&list, item);
+    }
+
+    try interp.setVariableTo(&args[1], list);
+    interp.setResult(list);
+}
+
+/// [lassign] -- assigns list elements to variables; returns the remainder as a list.
+pub fn lassignCmd(interp: *Interp, args: []Handle) !void {
+    try interp.shimmerToList(&args[1]);
+    const len = objutil.listLengthRaw(args[1]);
+    const n_vars = args.len - 2;
+
+    for (0..n_vars) |i| {
+        const val = if (i < len) objutil.listItem(args[1], @intCast(i)) else Heap.local_heap.emptyHandle();
+        try interp.setVariableTo(&args[i + 2], val);
+    }
+
+    const start: u32 = @min(@as(u32, @intCast(n_vars)), len);
+    var result = try objutil.newListWithCapacity(len - start);
+    errdefer result.decrRefCount();
+
+    for (start..len) |i| {
+        _ = try interp.listAppend(&result, objutil.listItem(args[1], @intCast(i)));
+    }
+
+    interp.setResultOwning(result);
+}
+
+/// [linsert] -- returns a new list with elements inserted before the given index.
+pub fn linsertCmd(interp: *Interp, args: []Handle) !void {
+    try interp.shimmerToList(&args[1]);
+    const len = objutil.listLengthRaw(args[1]);
+
+    var det: objutil.ErrorDetails = undefined;
+    var new_idx: OptionalHandle = .none;
+    defer new_idx.decrOptional();
+    const list_index = try interp.wrapError(&det, objutil.getIndex(&det, args[2], &new_idx));
+    const abs = list_index.asAbsoluteIndex(len);
+    // Clamp to [0, len]; "end" means len-1, "end+1" and beyond appends.
+    const idx: u32 = if (abs < 0) 0 else @min(@as(u32, @intCast(abs)), len);
+
+    const n_new: u32 = @intCast(args.len - 3);
+    var result = try objutil.newListWithCapacity(len + n_new);
+    errdefer result.decrRefCount();
+
+    for (0..idx) |i| _ = try interp.listAppend(&result, objutil.listItem(args[1], @intCast(i)));
+    for (args[3..]) |item| _ = try interp.listAppend(&result, item);
+    for (idx..len) |i| _ = try interp.listAppend(&result, objutil.listItem(args[1], @intCast(i)));
+
+    interp.setResultOwning(result);
+}
+
+/// [lreplace] -- returns a new list with a range replaced by new elements.
+pub fn lreplaceCmd(interp: *Interp, args: []Handle) !void {
+    try interp.shimmerToList(&args[1]);
+    const len = objutil.listLengthRaw(args[1]);
+
+    var det: objutil.ErrorDetails = undefined;
+    var new_first: OptionalHandle = .none;
+    var new_last: OptionalHandle = .none;
+    defer new_first.decrOptional();
+    defer new_last.decrOptional();
+
+    const first_idx = try interp.wrapError(&det, objutil.getIndex(&det, args[2], &new_first));
+    const last_idx = try interp.wrapError(&det, objutil.getIndex(&det, args[3], &new_last));
+
+    const range = objutil.Range.fromIndexes(len, first_idx, last_idx);
+    const n_new: u32 = @intCast(args.len - 4);
+    const replaced: u32 = @intCast(range.end - range.start);
+    var result = try objutil.newListWithCapacity(len - replaced + n_new);
+    errdefer result.decrRefCount();
+
+    for (0..range.start) |i| _ = try interp.listAppend(&result, objutil.listItem(args[1], @intCast(i)));
+    for (args[4..]) |item| _ = try interp.listAppend(&result, item);
+    for (range.end..len) |i| _ = try interp.listAppend(&result, objutil.listItem(args[1], @intCast(i)));
+
+    interp.setResultOwning(result);
+}
+
+/// [lreverse] -- returns a new list with elements in reverse order.
+pub fn lreverseCmd(interp: *Interp, args: []Handle) !void {
+    try interp.shimmerToList(&args[1]);
+    const len = objutil.listLengthRaw(args[1]);
+
+    var result = try objutil.newListWithCapacity(len);
+    errdefer result.decrRefCount();
+
+    var i: u32 = len;
+    while (i > 0) {
+        i -= 1;
+        _ = try interp.listAppend(&result, objutil.listItem(args[1], i));
+    }
+
+    interp.setResultOwning(result);
+}
+
+/// [lset] -- sets an element of a list variable at the given index.
+/// With no indices (lset varName newValue), replaces the entire variable.
+pub fn lsetCmd(interp: *Interp, args: []Handle) !void {
+    if (args.len == 3) {
+        try interp.setVariableTo(&args[1], args[2]);
+        interp.setResult(args[2]);
+        return;
+    }
+
+    var list = (try interp.getVariableOrError(&args[1])).borrow();
+    defer list.decrRefCount();
+
+    try interp.shimmerToList(&list);
+    const len = objutil.listLengthRaw(list);
+
+    var det: objutil.ErrorDetails = undefined;
+    var new_idx: OptionalHandle = .none;
+    defer new_idx.decrOptional();
+    const list_index = try interp.wrapError(&det, objutil.getIndex(&det, args[2], &new_idx));
+    const abs = list_index.asAbsoluteIndex(len);
+
+    if (abs < 0 or abs >= len) {
+        try interp.setResultString("list index out of range");
+        return Interp.Error.EvalError;
+    }
+
+    const item_obj = try Heap.local_heap.dupOrReference(args[args.len - 1]);
+    var new_list: OptionalHandle = .none;
+    try interp.wrapError(&det, objutil.listSetObject(&det, list, &new_list, @intCast(abs), item_obj));
+    list.swapIfNew(new_list);
+
+    try interp.setVariableTo(&args[1], list);
+    interp.setResult(list);
+}
+
 /// [concat]
 /// Joins arguments into a single string, or a single list if all args are already lists.
 /// In the string case, each arg has leading/trailing whitespace stripped before
 /// being joined with single spaces -- matching standard Tcl semantics.
-pub fn concatCmd(interp: *Interp, args: []const Handle) !void {
+pub fn concatCmd(interp: *Interp, args: []Handle) !void {
     const actual_args = args[1..];
 
     if (actual_args.len == 0) {
@@ -1272,6 +1488,16 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("join", .{ .to_call = joinCmd, .description = "list ?joinString?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("lappend", .{ .to_call = lappendCmd, .description = "varName ?value ...?", .min_arity = 1 });
+    try interp.registerCommand("lassign", .{ .to_call = lassignCmd, .description = "list ?varName ...?", .min_arity = 1 });
+    try interp.registerCommand("lindex", .{ .to_call = lindexCmd, .description = "list ?index ...?", .min_arity = 1 });
+    try interp.registerCommand("linsert", .{ .to_call = linsertCmd, .description = "list index ?element ...?", .min_arity = 2 });
+    try interp.registerCommand("list", .{ .to_call = listCmd, .description = "?arg ...?", .min_arity = 0 });
+    try interp.registerCommand("llength", .{ .to_call = llengthCmd, .description = "list", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("lrange", .{ .to_call = lrangeCmd, .description = "list first last", .min_arity = 3, .max_arity = 3 });
+    try interp.registerCommand("lreplace", .{ .to_call = lreplaceCmd, .description = "list first last ?element ...?", .min_arity = 3 });
+    try interp.registerCommand("lreverse", .{ .to_call = lreverseCmd, .description = "list", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("lset", .{ .to_call = lsetCmd, .description = "varName ?index ...? newValue", .min_arity = 2 });
     try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
 }
@@ -1288,6 +1514,73 @@ pub fn testStart(ta: std.mem.Allocator) !Interp {
 pub fn testFinish(interp: *Interp) void {
     interp.deinit();
     Heap.testFinish();
+}
+
+test "list commands" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // [list] builds a list from args.
+    try interp.testExpectScriptResult("a b c", "list a b c");
+    try interp.testExpectScriptResult("", "list");
+    // Items with spaces are braced.
+    try interp.testExpectScriptResult("{a b} c", "list {a b} c");
+
+    // [llength]
+    try interp.testExpectScriptResult("3", "llength {a b c}");
+    try interp.testExpectScriptResult("0", "llength {}");
+
+    // [lindex]
+    try interp.testExpectScriptResult("a", "lindex {a b c} 0");
+    try interp.testExpectScriptResult("c", "lindex {a b c} end");
+    try interp.testExpectScriptResult("b", "lindex {a b c} 1");
+    try interp.testExpectScriptResult("", "lindex {a b c} 5");
+    // Multi-level indexing.
+    try interp.testExpectScriptResult("z", "lindex {{x y z}} 0 2");
+
+    // [lrange]
+    try interp.testExpectScriptResult("b c", "lrange {a b c d} 1 2");
+    try interp.testExpectScriptResult("b c d", "lrange {a b c d} 1 end");
+    try interp.testExpectScriptResult("", "lrange {a b c} 5 end");
+
+    // [lappend]
+    try interp.testExpectScriptResult("a b c", "lappend x a b c");
+    try interp.testExpectScriptResult("a b c d", "lappend x d");
+
+    // [lassign] -- assigns list items to vars; returns the remainder.
+    try interp.testExpectScriptResult("a b",
+        \\ lassign {a b c d} p q
+        \\ list $p $q
+    );
+    try interp.testExpectScriptResult("c d",
+        \\ set rem [lassign {a b c d} p q]
+        \\ set rem
+    );
+
+    // [linsert]
+    try interp.testExpectScriptResult("a x b c", "linsert {a b c} 1 x");
+    try interp.testExpectScriptResult("x a b c", "linsert {a b c} 0 x");
+    try interp.testExpectScriptResult("a b c x", "linsert {a b c} end+1 x");
+
+    // [lreplace]
+    try interp.testExpectScriptResult("a x c", "lreplace {a b c} 1 1 x");
+    try interp.testExpectScriptResult("a c", "lreplace {a b c} 1 1");
+    try interp.testExpectScriptResult("x y z", "lreplace {a b c} 0 end x y z");
+
+    // [lreverse]
+    try interp.testExpectScriptResult("c b a", "lreverse {a b c}");
+    try interp.testExpectScriptResult("", "lreverse {}");
+
+    // [lset]
+    try interp.testExpectScriptResult("a x c",
+        \\ set v {a b c}
+        \\ lset v 1 x
+        \\ set v
+    );
+    try interp.testExpectScriptResult("x y",
+        \\ lset v2 {x y}
+        \\ set v2
+    );
 }
 
 test "concat command" {

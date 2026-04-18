@@ -340,7 +340,7 @@ pub const Range = struct {
     end: usize,
 
     /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
-    pub fn fromIndexes(list_len: usize, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
+    pub fn fromIndexes(list_len: u32, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
         var start = start_index.asAbsoluteIndex(list_len);
         var end = end_index.asAbsoluteIndex(list_len);
 
@@ -361,9 +361,9 @@ pub const Range = struct {
 };
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
-fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
+fn badIndexError(det: ?*ErrorDetails, handle: Handle) error{ BadIndex, OutOfMemory }!void {
     if (det) |details| details.* = .{
-        .message = try newStringFmt("bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
+        .message = try newStringFmt(Heap.local_heap, "bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
     return error.BadIndex;
@@ -371,7 +371,7 @@ fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
 
 /// Shimmers to an index representation.
 pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
-    if (provided_handle.tag() == .index) return null;
+    if (provided_handle.tag() == .index) return;
     errdefer new_handle.swapWithNone();
 
     try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
@@ -380,48 +380,60 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, provided_handle: Handle, new_handle: 
     const bytes = try handle.getString();
 
     const index: Heap.ListIndex = blk: {
-        // Does it start with "end"? If so, it might be end+5, or end-2, etc
+        // Does it start with "end"? If so, it might be end+5, or end-2, etc.
         if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
             if (bytes.len >= 4) {
-                if (bytes[3] != '+' or bytes[3] != '-') return badIndexError(det, handle);
+                if (bytes[3] != '+' and bytes[3] != '-') {
+                    try badIndexError(det, handle);
+                    unreachable;
+                }
 
-                const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, handle);
+                const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch {
+                    try badIndexError(det, handle);
+                    unreachable;
+                };
                 break :blk .{
                     .u = .{ .end_offset = index_offset },
-                    .is_end = true,
+                    .is_relative = true,
                 };
             }
 
             break :blk Heap.ListIndex.end;
         } else {
-            break :blk std.fmt.parseInt(u32, bytes, 10) catch return badIndexError(det, handle);
+            break :blk .{
+                .u = .{
+                    .index = std.fmt.parseInt(u32, bytes, 10) catch {
+                        try badIndexError(det, handle);
+                        unreachable;
+                    },
+                },
+                .is_relative = false,
+            };
         }
     };
 
-    handle.prepareToShimmer();
+    try handle.prepareToShimmer();
     handle.peek().head.tag = .index;
-    handle.peek().index = index;
-
-    return new_handle;
+    handle.peek().body.index = index;
 }
 
 pub fn getIndex(det: ?*ErrorDetails, handle: Handle, new_handle: *OptionalHandle) !Heap.ListIndex {
     // Fast case: if it's an integer or float, we can quickly cast it (don't
-    // shimmer though, as it'll probably still be used for its original purpose)
+    // shimmer though, as it'll probably still be used for its original purpose).
     if (handle.tag() == .integer) {
         const integer = handle.peek().body.integer;
-        if (integer < 0) return badIndexError(det, handle);
-        if (integer > std.math.maxInt(u32)) return badIndexError(det, handle);
+        if (integer < 0) { try badIndexError(det, handle); unreachable; }
+        if (integer > std.math.maxInt(u32)) { try badIndexError(det, handle); unreachable; }
 
-        return .{ .u = .{ .index = @intCast(integer) }, .is_end = false };
+        return .{ .u = .{ .index = @intCast(integer) }, .is_relative = false };
     } else if (handle.tag() == .float) {
         const float = handle.peek().body.float;
 
-        if (std.math.isNan(float)) return badIndexError(det, handle);
-        if (float < 0) return badIndexError(det, handle);
-        if (float > std.math.maxInt(u32)) return badIndexError(det, handle);
+        if (std.math.isNan(float)) { try badIndexError(det, handle); unreachable; }
+        if (float < 0) { try badIndexError(det, handle); unreachable; }
+        if (float > std.math.maxInt(u32)) { try badIndexError(det, handle); unreachable; }
 
-        return .{ .u = .{ .index = @intFromFloat(float) }, .is_end = false };
+        return .{ .u = .{ .index = @intFromFloat(float) }, .is_relative = false };
     }
 
     errdefer new_handle.swapWithNone();
@@ -1216,8 +1228,9 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             else => unreachable,
         }
     } else {
-        // If the collection is shared, we need to duplicate all the items.
-        for (0.., new_items) |i, *new_item| {
+        // If the collection is shared, duplicate only the existing items into the new allocation.
+        // Slots beyond current_len are left for the caller to fill in.
+        for (new_items[0..current_len], 0..) |*new_item, i| {
             new_item.* = try Heap.local_heap.dupOrReference(
                 collectionItemFollowRefs(provided_handle, @intCast(i), current_len),
             );
