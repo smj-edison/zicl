@@ -218,6 +218,13 @@ pub fn newInteger(heap: *Heap, value: i64) !Handle {
     return handle;
 }
 
+pub fn integerObject(value: i64) Heap.Object {
+    return .{
+        .head = .{ .str = Heap.Object.null_string, .tag = .integer },
+        .body = .{ .integer = value },
+    };
+}
+
 pub fn integerOverflowError(det: ?*ErrorDetails, value: ?[]const u8) error{ OutOfMemory, IntegerOverflow } {
     if (det) |details| {
         if (value) |val| {
@@ -678,33 +685,44 @@ pub fn enumNames(comptime T: type) []const u8 {
     };
 }
 
-pub fn EnumMapping(comptime T: type) type {
+pub fn EnumMapping(comptime T: type, include_numbers: bool) type {
     comptime {
         @setEvalBranchQuota(20000);
 
         const values = std.enums.values(T);
 
-        // Fill out the mapping
-        var entries: [values.len * 2]struct { []const u8, T } = undefined;
-        for (values, 0..) |value, i| {
-            entries[i * 2] = .{ @tagName(value), value };
-            // Add an entry for the integer value of the enum, to match Tcl behavior.
-            entries[i * 2 + 1] = .{ std.fmt.comptimePrint("{}", .{@intFromEnum(value)}), value };
-        }
+        // Fill out the mapping.
+        const final_entries = blk: {
+            if (include_numbers) {
+                var entries: [values.len * 2]struct { []const u8, T } = undefined;
+                for (values, 0..) |value, i| {
+                    entries[i * 2] = .{ @tagName(value), value };
+                    // Add an entry for the integer value of the enum, to match Tcl behavior.
+                    entries[i * 2 + 1] = .{ std.fmt.comptimePrint("{}", .{@intFromEnum(value)}), value };
+                }
+                break :blk entries;
+            } else {
+                var entries: [values.len]struct { []const u8, T } = undefined;
+                for (values, 0..) |value, i| {
+                    entries[i] = .{ @tagName(value), value };
+                }
+                break :blk entries;
+            }
+        };
 
         // Create the table
         return struct {
             pub const StaticStringMap = std.StaticStringMap(T);
 
-            map: StaticStringMap = StaticStringMap.initComptime(entries),
+            map: StaticStringMap = StaticStringMap.initComptime(final_entries),
         };
     }
 }
 
-pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
+pub fn TclEnum(comptime T: type, enum_name: []const u8, include_numbers: bool) type {
     return struct {
         pub const variants = T;
-        pub const map = (EnumMapping(T){}).map;
+        pub const map = (EnumMapping(T, include_numbers){}).map;
         pub const names = enumNames(T);
 
         pub fn get(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !T {
@@ -727,12 +745,18 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
                 return error.BadEnumVariant;
             }
         }
+
+        pub fn getInPlace(det: ?*ErrorDetails, handle: *Handle) !T {
+            var new_handle: OptionalHandle = .none;
+            defer handle.swapIfNew(new_handle);
+            return get(det, handle.*, &new_handle);
+        }
     };
 }
 
 test "enum mapping" {
     const Things = enum { foo, bar, baz };
-    const map = (EnumMapping(Things){}).map;
+    const map = (EnumMapping(Things, false){}).map;
     const names = enumNames(Things);
     try testing.expectEqual(Things.foo, map.get("foo"));
     try testing.expectEqualSlices(u8, "foo, bar, baz", names);
@@ -743,7 +767,7 @@ test "tcl enum" {
     const heap = try Heap.testStart(testing.allocator);
 
     const MyEnum = enum { foo, bar, baz };
-    const MyTclEnum = TclEnum(MyEnum, "myenum");
+    const MyTclEnum = TclEnum(MyEnum, "myenum", true);
 
     var foo_str = try newString(heap, "foo");
     defer foo_str.decrRefCount();
@@ -785,7 +809,7 @@ pub fn stringIs(
         graph,
         punct,
         boolean,
-    }, "class");
+    }, "class", false);
 
     errdefer new_class_to_check.swapWithNone();
     const class = try Class.get(det, class_to_check, new_class_to_check);
@@ -1114,7 +1138,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
     const new_handle = switch (provided_handle.tag()) {
         .list => try newListWithCapacity(new_len),
         .dict => blk: {
-            const new_dict = try newDictWithCapacity(new_len);
+            const new_dict = try newDictWithCapacity(Heap.local_heap, new_len);
             new_dict.getDictExtraData().parent_link = provided_handle.getDictExtraData().parent_link.borrowOptional();
             break :blk new_dict;
         },
@@ -1458,21 +1482,21 @@ pub fn dictPairLength(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *O
     return dictPairLengthRaw(handle);
 }
 
-pub fn newDictWithCapacity(len: u32) !Handle {
+pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
     // `1 +` to make space for the dict's head.
-    const dict_index = try Heap.local_heap.createObjects(1 + len);
-    errdefer Heap.freeObjectBacking(Heap.local_heap.getHandle(dict_index));
-    const dict_metadata = try Heap.local_heap.createExtraData();
-    errdefer Heap.local_heap.destroyExtraData(dict_metadata);
+    const dict_index = try heap.createObjects(1 + len);
+    errdefer Heap.freeObjectBacking(heap.getHandle(dict_index));
+    const dict_metadata = try heap.createExtraData();
+    errdefer heap.destroyExtraData(dict_metadata);
 
-    Heap.local_heap.getExtraData(dict_metadata).* = .{ .dict = .{
+    heap.getExtraData(dict_metadata).* = .{ .dict = .{
         .table = null,
         .parent_link = .none,
     } };
 
-    const dict_head = Heap.local_heap.getLocalObject(dict_index);
+    const dict_head = heap.getLocalObject(dict_index);
     dict_head.* = .{
         .head = .{
             .str = Heap.Object.null_string,
@@ -1484,12 +1508,12 @@ pub fn newDictWithCapacity(len: u32) !Handle {
         } },
     };
 
-    return Heap.local_heap.getHandle(dict_index);
+    return heap.getHandle(dict_index);
 }
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
 pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
-    const dict = try newDictWithCapacity(@intCast(handles.len));
+    const dict = try newDictWithCapacity(heap, @intCast(handles.len));
     errdefer dict.decrRefCount();
     dict.peek().body.dict.len = @intCast(handles.len);
 
@@ -1894,7 +1918,7 @@ pub fn dictPutRecursively(
             break :blk existing_dict;
         } else {
             // Create a new child dictionary.
-            const new_child_dict = try newDictWithCapacity(2);
+            const new_child_dict = try newDictWithCapacity(Heap.local_heap, 2);
 
             const put_result = try dictPutInner(
                 new_dict.orElse(provided_dict),

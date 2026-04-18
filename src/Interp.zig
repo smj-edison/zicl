@@ -34,38 +34,75 @@ global_commands: CommandHashTable,
 eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
-/// Stack trace from a function error.
-stack_trace: OptionalHandle,
+/// If this is greater than 0, it means we're catching and handling
+/// signals. Otherwise signals are ignored. This gets incremented
+/// when running [catch -signal].
+signal_depth: usize,
+/// Bit mask of caught signals, or 0 if none.
+signal: u64,
 
 /// Used to propagate `error.Continue` or `error.Break` up multiple
-/// loop levels.
+/// loop levels. This is a separate counter from return_propagate, since
+/// this counter only goes down when going through a loop command, not
+/// just any ol' command.
 loop_propagate: u32 = 0,
 /// Used for propagating a return code up multiple eval levels.
 return_propagate: struct {
     left_to_go: u32 = 0,
-    return_at_end: ?Error = null,
+    return_at_end: ?EvalError = null,
 } = .{},
+/// Stack trace captured at the error site.
+stack_trace: OptionalHandle,
+/// Error code set by `[error]` or `[return -errorcode ...]`. Not a Tcl-visible
+/// global, it lives here only to cross the Zig call boundary to `[catch]`/`[try]`.
+/// Note that this is not the same as a return code. For example, a return code
+/// would be error.OutOfMemory, but an error code would be "ZICL OOM".
+pending_error_code: OptionalHandle,
+/// If an error occurs while a `on`/`trap`/`finally` executes, it can be easy to
+/// lose track of the original error. So instead when this happens we store the
+/// original error in a `-pending` key, inside of the new error.
+pending_error_during: OptionalHandle,
 
 prng: std.Random.DefaultPrng,
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
-pub const CommandFn = fn (interp: *Interp, args: []const Handle) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]const Handle) callconv(.c) c_int;
+pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
 
-pub const Error = std.mem.Allocator.Error || error{
+pub const EvalError = error{
+    OutOfMemory,
     EvalError,
+    PropagateResult,
     Break,
     Continue,
     Signal,
-    PropagateResult,
-    VariableNotFound,
-    VariableAlreadyExists,
-    DictSugarInUpvarName,
-    CircularUpvar,
-    CommandNotFound,
-    InfiniteRecursion,
+    Exit,
+};
+pub const Error = EvalError || error{
     WrongUsage,
 };
+
+fn narrowError(err: anyerror) EvalError {
+    return switch (err) {
+        error.Break => error.Break,
+        error.Continue => error.Continue,
+        error.EvalError => error.EvalError,
+        error.Exit => error.Exit,
+        error.OutOfMemory => error.OutOfMemory,
+        error.Signal => error.Signal,
+        else => error.EvalError,
+    };
+}
+pub fn narrowToEvalError(result: anytype) blk: {
+    const info = @typeInfo(@TypeOf(result));
+    break :blk if (info == .error_set) EvalError else EvalError!info.error_union.payload;
+} {
+    if (@typeInfo(@TypeOf(result)) == .error_set) {
+        return narrowError(result);
+    } else if (result) |val| {
+        return val;
+    } else |err| return narrowError(err);
+}
 
 const Tailcall = struct {
     args: []Handle,
@@ -992,7 +1029,7 @@ pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
     }
 }
 
-pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []const Handle) !void {
+pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -1087,7 +1124,7 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     try interp.evalObjectInner(closure.body, cache_key);
 }
 
-fn callNative(interp: *Interp, command: *NativeCommand, args: []const Handle) !void {
+fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
     const signature = command.call_info.zig;
 
     const arg_count = args.len - 1;
@@ -1165,7 +1202,7 @@ const CallFrame = struct {
     /// Dictionary containing the frame's variables.
     variables: Handle,
     /// Arguments of this procedure call. Lifetime managed by creator.
-    args: []const Handle,
+    args: []Handle,
     /// Signature of this procedure.
     signature: Heap.Closure,
     /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
@@ -1207,7 +1244,7 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
 
     // Found upvars if we made it to this point, so we need
     // to duplicate everything, and follow any upvars.
-    const new_dict = try objutil.newDictWithCapacity(pairs * 2);
+    const new_dict = try objutil.newDictWithCapacity(Heap.local_heap, pairs * 2);
     new_dict.getDictExtraData().parent_link = frame.variables.getDictExtraData().parent_link;
     for (0..pairs) |i_usize| {
         const i: u32 = @intCast(i_usize);
@@ -1260,7 +1297,7 @@ const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
     /// Arguments of the command currently being dispatched in this eval frame.
-    args: []const Handle,
+    args: []Handle,
     /// The line number of the command currently being dispatched, within
     /// the script being evaluated (note that this is relative, since that's
     /// how parsed scripts are stored). Combine with `source_info.line_no`
@@ -1276,7 +1313,7 @@ fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentEvalFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: ?u32, args: []const Handle, signature: Heap.Closure) !u32 {
+fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
     const vars_handle = try objutil.newDict(Heap.local_heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
@@ -1370,11 +1407,11 @@ fn interpolateTokens(
 
             if (substitution_only) {
                 switch (err) {
-                    Error.Break => {
+                    error.Break => {
                         // Stop here.
                         break;
                     },
-                    Error.Continue => {
+                    error.Continue => {
                         new_values.appendAssumeCapacity(Heap.local_heap.emptyHandle());
                         continue;
                     },
@@ -1382,13 +1419,13 @@ fn interpolateTokens(
                 }
             } else {
                 switch (err) {
-                    Error.Break => {
+                    error.Break => {
                         try interp.setResultString("invoked \"break\" outside of a loop");
-                        new_err = Error.EvalError;
+                        new_err = error.EvalError;
                     },
-                    Error.Continue => {
+                    error.Continue => {
                         try interp.setResultString("invoked \"continue\" outside of a loop");
-                        new_err = Error.EvalError;
+                        new_err = error.EvalError;
                     },
                     else => {},
                 }
@@ -1472,7 +1509,7 @@ pub fn getCommand(
     return interp.getCommandInner(det, call_frame_idx, new_handle.orElse(provided_handle));
 }
 
-fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) Error!void {
+fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
     var new_command: OptionalHandle = .none;
     var det: objutil.ErrorDetails = undefined;
     const command_or_closure = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch |err| switch (err) {
@@ -1504,7 +1541,7 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) Error!voi
         // Be sure to clear the previous result.
         interp.setEmptyResult();
 
-        const result: Error!void = blk: {
+        const result = blk: {
             switch (command_or_closure) {
                 .command => |command| {
                     break :blk interp.callNative(command, current_args);
@@ -2131,9 +2168,9 @@ test "eval expression" {
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
 }
 
-fn setErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!void {
+pub fn setErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!void {
     if (interp.stack_trace != .none) return;
-    interp.stack_trace = (try buildErrorStack(interp, script)).toOptional();
+    interp.stack_trace.swapRef(try buildErrorStack(interp, script));
 }
 
 /// Builds the stack trace as a flat list of {name file line args} repeated once per call
@@ -2145,7 +2182,7 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
     var last_call_frame_idx: ?u32 = null;
     var is_top = true;
 
-    // Eval frames are walked innermost-first; each one is followed to its call frame.
+    // Eval frames are walked from top to bottom; each one is followed to its call frame.
     var i = interp.eval_frames.items.len;
     while (i > 0) {
         i -= 1;
@@ -2192,7 +2229,7 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
     return trace;
 }
 
-pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!void {
+pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
     std.debug.print("raw script: `{f}`\n", .{script});
@@ -2294,6 +2331,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
         // fails. The slice is still live at that point (before the loop body `defer` frees it),
         // mirroring Jim's `evalFrame->argv` pattern.
         interp.currentEvalFrame().args = args[0..args_written];
+        defer interp.currentEvalFrame().args = &.{};
 
         const cmd_result = interp.invokeCommand(interp.currentCallFrameIndex(), args);
 
@@ -2301,14 +2339,8 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
         if (false) {
             return error.Signal;
         } else {
-            if (cmd_result) |_| {
-                // Clear args only on success, on error the slice must stay live for
-                // `setErrorStack` to read below.
-                interp.currentEvalFrame().args = &.{};
-                // Keep going through the commands.
-            } else |err| switch (err) {
+            if (cmd_result) |_| {} else |err| switch (err) {
                 error.PropagateResult => {
-                    interp.currentEvalFrame().args = &.{};
                     interp.return_propagate.left_to_go -= 1;
                     if (interp.return_propagate.left_to_go == 0) {
                         if (interp.return_propagate.return_at_end) |return_at_end| {
@@ -2322,19 +2354,71 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) Error!v
                     }
                 },
                 else => |narrowed_err| {
+                    if (narrowed_err == error.OutOfMemory) {
+                        // In the case of OOM, the inside function almost certainly didn't
+                        // set a result, so we set it here.
+                        interp.setResultInterned(.@"out of memory");
+                        interp.pending_error_code.swapRef(Heap.local_heap.getInternedString(.@"ZICL OOM"));
+                    }
+
+                    if (narrowed_err == error.WrongUsage) {
+                        try interp.setResultString("FIXME: prolly should explain how to use the command");
+                    }
+
                     // `eval_frame.args` and `call_frame.args` are still live here; capture the stack
                     // trace before the loop-body defers unwind them.
                     try interp.setErrorStack(script);
-                    return narrowed_err;
+
+                    return narrowToEvalError(narrowed_err);
                 },
             }
         }
     }
-
-    return;
 }
 
-pub fn evalObject(interp: *Interp, script: Handle) Error!void {
+/// Return code values matching Tcl's convention.
+pub const ReturnCode = enum(u3) {
+    ok = 0,
+    @"error" = 1,
+    @"return" = 2,
+    @"break" = 3,
+    @"continue" = 4,
+    signal = 5,
+    exit = 6,
+    oom = 7,
+
+    pub fn fromError(value: EvalError!void) ReturnCode {
+        if (value) {
+            return .ok;
+        } else |err| {
+            return switch (err) {
+                error.EvalError => .@"error",
+                error.PropagateResult => .@"return",
+                error.Break => .@"break",
+                error.Continue => .@"continue",
+                error.Signal => .signal,
+                error.Exit => .exit,
+                error.OutOfMemory => .oom,
+            };
+        }
+    }
+
+    pub fn toError(self: ReturnCode) EvalError!void {
+        switch (self) {
+            .ok => return,
+            .@"error" => return error.EvalError,
+            .@"return" => return error.PropagateResult,
+            .@"break" => return error.Break,
+            .@"continue" => return error.Continue,
+            .signal => return error.Signal,
+            .exit => return error.Exit,
+            .oom => return error.OutOfMemory,
+        }
+    }
+};
+pub const ReturnCodeEnum = objutil.TclEnum(Interp.ReturnCode, "return code", true);
+
+pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try script.getHash();
@@ -2353,6 +2437,10 @@ pub fn init() !Interp {
         .max_eval_depth = 1000,
         .max_call_depth = 1000,
         .stack_trace = .none,
+        .pending_error_code = .none,
+        .pending_error_during = .none,
+        .signal_depth = 0,
+        .signal = 0,
         // TODO: init per interpreter
         .prng = .init(0),
     };
@@ -2375,6 +2463,7 @@ pub fn init() !Interp {
 pub fn deinit(interp: *Interp) void {
     interp.result.decrRefCount();
     interp.stack_trace.decrOptional();
+    interp.pending_error_code.decrOptional();
     interp.global_commands.deinit(Heap.global_gpa);
 
     // Deinit all frames.
@@ -2466,6 +2555,15 @@ pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) !vo
     name.swapIfNew(new_name);
     var det: objutil.ErrorDetails = undefined;
     try interp.wrapError(&det, interp.setVariableInner(&det, interp.currentCallFrameIndex(), name.*, obj));
+}
+
+pub fn setVariableSilent(interp: *Interp, name: *Handle, handle: Handle) !void {
+    var new_name: OptionalHandle = .none;
+    try Heap.ensureShimmerableOrDup(name.*, &new_name);
+    name.swapIfNew(new_name);
+
+    const handle_to_obj = try Heap.local_heap.dupOrReference(handle);
+    try interp.setVariableInner(null, interp.currentCallFrameIndex(), name.*, handle_to_obj);
 }
 
 pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) !void {
@@ -2774,6 +2872,49 @@ pub fn testExpectScriptError(interp: *Interp, expected_error: anyerror, expected
             return error.TestUnexpectedResult;
         }
     }
+}
+
+pub fn checkSignal(interp: *Interp) bool {
+    return interp.signal_depth > 0 and interp.signal != 0;
+}
+
+// Maps signal numbers to their interned name handle. Only includes signals
+// available on the current platform.
+const signal_name_map = blk: {
+    const SIG = std.posix.SIG;
+    const Entry = struct { num: u6, name: Heap.InternedString };
+    const candidates = .{
+        .{ "HUP", .SIGHUP },       .{ "INT", .SIGINT },   .{ "QUIT", .SIGQUIT },
+        .{ "ILL", .SIGILL },       .{ "TRAP", .SIGTRAP }, .{ "ABRT", .SIGABRT },
+        .{ "BUS", .SIGBUS },       .{ "FPE", .SIGFPE },   .{ "KILL", .SIGKILL },
+        .{ "USR1", .SIGUSR1 },     .{ "SEGV", .SIGSEGV }, .{ "USR2", .SIGUSR2 },
+        .{ "PIPE", .SIGPIPE },     .{ "ALRM", .SIGALRM }, .{ "TERM", .SIGTERM },
+        .{ "CHLD", .SIGCHLD },     .{ "CONT", .SIGCONT }, .{ "STOP", .SIGSTOP },
+        .{ "TSTP", .SIGTSTP },     .{ "TTIN", .SIGTTIN }, .{ "TTOU", .SIGTTOU },
+        .{ "URG", .SIGURG },       .{ "XCPU", .SIGXCPU }, .{ "XFSZ", .SIGXFSZ },
+        .{ "VTALRM", .SIGVTALRM }, .{ "PROF", .SIGPROF }, .{ "WINCH", .SIGWINCH },
+        .{ "IO", .SIGIO },         .{ "PWR", .SIGPWR },   .{ "SYS", .SIGSYS },
+    };
+    var entries: []const Entry = &.{};
+    for (candidates) |pair| {
+        if (@hasDecl(SIG, pair[0])) {
+            entries = entries ++ &[_]Entry{.{ .num = @field(SIG, pair[0]), .name = pair[1] }};
+        }
+    }
+    break :blk entries;
+};
+
+/// Build a list of signal name strings for each signal bit set in `mask`.
+pub fn signalMaskToList(mask: u64) !Handle {
+    const list = try objutil.newListWithCapacity(@popCount(mask));
+    errdefer list.decrRefCount();
+    inline for (signal_name_map) |entry| {
+        if (mask & (@as(u64, 1) << entry.num) != 0) {
+            const str = Heap.local_heap.getInternedString(entry.name);
+            objutil.listAppendAssumeCapacity(list, str.peek().*);
+        }
+    }
+    return list;
 }
 
 pub fn nextRandomFloat(interp: *Interp) f64 {

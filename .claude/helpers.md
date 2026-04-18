@@ -64,7 +64,7 @@ anything that might already exist.
 - `listAppendAssumeCapacity(list, item)` -- Infallible append; caller pre-allocated capacity and did ref-counting.
 
 ### Dicts
-- `newDictWithCapacity(len)` -- Allocate a dict with pre-reserved key/value pair slots (`len` must be even).
+- `newDictWithCapacity(heap, len)` -- Allocate a dict with pre-reserved key/value pair slots (`len` must be even).
 - `newDict(heap, handles)` -- Allocate a dict from a slice of alternating key/value handles.
 - `shimmerToDict(det, provided_handle, new_dict)` -- Shimmer to `.dict`; `new_dict` set if object moved.
 - `dictItems(handle)` -- Slice over all key/value objects in a dict.
@@ -87,6 +87,7 @@ anything that might already exist.
 - `dictLookupRecursively(det, provided_dict, keys)` -- Nested dict lookup along a key path.
 
 ### References & misc
+- `integerObject(value)` -- Build a raw `Heap.Object` for an integer without allocating (no Handle, no heap needed).
 - `followIfRef(handle)` -- If handle is a `.reference`, return the target; otherwise return as-is.
 - `getSourceInfo(handle)` -- Return `SourceInfo` if the handle has `.source` tag, else null.
 - `setSourceInfo(handle, source_info)` -- Attach source location metadata to an object.
@@ -193,6 +194,7 @@ anything that might already exist.
 - `heap.getExtraData(index)` -- Return `*ExtraDataValue` for an `ExtraData` index.
 - `heap.destroyExtraData(index)` -- Free an `ExtraData` slot.
 - `heap.getInternedString(string)` -- Return the handle for a compile-time-interned string.
+- `heap.internedStringRef(string)` -- Return an interned string as a raw `.reference` `Object` (no extra allocation; useful when building object arrays).
 
 ### Lifecycle
 - `Heap.init(heap)` -- Initialize a heap (called by `initLocalHeap`).
@@ -333,6 +335,7 @@ anything that might already exist.
 
 ### Variables
 - `setVariableTo(interp, name, handle)` -- Set a variable by name to a handle, handling upvar links.
+- `setVariableSilent(interp, name, handle)` -- Like `setVariableTo` but skips error reporting (passes `null` for `det`); use when the caller handles errors itself.
 - `setVariableToObject(interp, name, obj)` -- Set a variable to a raw `Heap.Object` (lower-level than `setVariableTo`).
 - `getVariable(interp, provided_name)` -- Look up a variable; returns `OptionalHandle` (.none if unset).
 - `getVariableOrError(interp, name)` -- Look up a variable; returns `EvalError` if unset.
@@ -379,5 +382,14 @@ anything that might already exist.
 - `testExpectScriptResult(interp, expected, script)` -- Assert `script` evaluates to `expected` string.
 - `testExpectScriptError(interp, expected_error, expected_str, script)` -- Assert `script` yields a specific error and message.
 
+### Error handling
+- `setErrorStack(interp, script)` -- Capture the current call stack into `interp.stack_trace` (no-op if already set).
+- `buildOptsDict(interp, code, level, override_error_code)` -- Build the `-code`/`-level`/`-errorstack`/`-errorcode` opts dict for `[catch]`/`[try]`; clears `stack_trace` and `pending_error_code` after consuming them.
+
+### Signals
+- `checkSignal(interp)` -- Return true if a signal is pending and signal handling is active (`signal_depth > 0`).
+- `signalMaskToList(mask)` -- Build a list of signal name strings (e.g. `"SIGINT"`) for each bit set in `mask`.
+
 ### Misc
+- `narrowToEvalError(result)` -- Comptime: narrow any error-union or error-set to `EvalError`; useful in command implementations that call internal functions with wider error sets.
 - `nextRandomFloat(interp)` -- Advance the interpreter's PRNG and return the next `f64` in [0, 1).

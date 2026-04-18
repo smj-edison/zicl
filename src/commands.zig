@@ -8,7 +8,7 @@ const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
-fn addMulHelper(interp: *Interp, args: []const Handle, comptime operator: enum { add, mul }) Interp.Error!void {
+fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
         var result: i64 = 0;
@@ -74,7 +74,7 @@ const IntegerOrFloat = union(enum) {
     int: i64,
     float: f64,
 };
-fn subDivHelper(interp: *Interp, args: []const Handle, comptime operator: enum { sub, div }) Interp.Error!void {
+fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, div }) Interp.Error!void {
     if (args.len == 2) {
         // The arity = 2 case is different. For [- x] returns -x,
         // while [/ x] returns 1/x.
@@ -86,16 +86,15 @@ fn subDivHelper(interp: *Interp, args: []const Handle, comptime operator: enum {
             }
 
             var new_handle: OptionalHandle = .none;
-            defer new_handle.decrOptional();
             const as_int = objutil.integerGet(null, args[1], &new_handle) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.IntegerOverflow, error.BadInteger => {
                     // Try parsing it as a float if it's not an integer.
-                    var arg = args[1].borrow();
-                    defer arg.decrRefCount();
-                    break :blk .{ .float = try interp.getFloat(&arg) };
+                    assert(new_handle == .none);
+                    break :blk .{ .float = try interp.getFloat(&args[1]) };
                 },
             };
+            args[1].swapIfNew(new_handle);
 
             break :blk .{ .int = as_int };
         };
@@ -214,27 +213,25 @@ fn subDivHelper(interp: *Interp, args: []const Handle, comptime operator: enum {
     interp.setResultOwning(try objutil.newFloat(result));
 }
 
-pub fn addCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .add);
 }
 
-pub fn mulCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn mulCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try addMulHelper(interp, args, .mul);
 }
 
-pub fn subCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn subCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try subDivHelper(interp, args, .sub);
 }
 
-pub fn divCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn divCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try subDivHelper(interp, args, .div);
 }
 
-pub fn breakCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     if (args.len == 2) {
-        var level_arg = args[1].borrow();
-        defer level_arg.decrRefCount();
-        const level = try interp.getInteger(&level_arg);
+        const level = try interp.getInteger(&args[1]);
         if (level < 1) {
             try interp.setResultFormatted("break level \"{}\" lower than 1", .{level});
         } else if (level > std.math.maxInt(u32)) {
@@ -247,7 +244,7 @@ pub fn breakCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     return error.Break;
 }
 
-pub fn continueCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     if (args.len == 2) {
         var level_arg = args[1].borrow();
         defer level_arg.decrRefCount();
@@ -289,7 +286,7 @@ pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
         replace,
         update,
     };
-    const SubcommandEnum = objutil.TclEnum(SubcommandName, "dict_subcommand");
+    const SubcommandEnum = objutil.TclEnum(SubcommandName, "dict subcommand", false);
 
     var det: objutil.ErrorDetails = undefined;
     var new_enum: OptionalHandle = .none;
@@ -320,7 +317,7 @@ pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
                 if ((try interp.getVariable(&var_name)).toHandle()) |val| {
                     break :blk val;
                 } else {
-                    const new_variable_dict = try objutil.newDictWithCapacity(2);
+                    const new_variable_dict = try objutil.newDictWithCapacity(Heap.local_heap, 2);
                     defer new_variable_dict.decrRefCount();
                     try interp.setVariableTo(&var_name, new_variable_dict);
                     break :blk (try interp.getVariable(&var_name)).toHandle().?;
@@ -614,38 +611,42 @@ pub fn setCmd(interp: *Interp, args: []const Handle) !void {
         interp.setResult(try interp.getVariableOrError(&var_name));
     } else {
         try interp.setVariableTo(&var_name, args[2]);
+        // Return the stored value (may differ from args[2] after upvar follow).
+        interp.setResult(try interp.getVariableOrError(&var_name));
     }
 }
 
 /// [apply] - invoke a closure value directly without binding it to a name.
 /// Unlike Tcl's [apply], the lambda must be a Zicl closure object or its
 /// serialized string form, a raw {argList body} list is not supported.
-pub fn applyCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const closure_and_key = try interp.getClosure(args[1]);
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
-    try interp.callClosure(closure_and_key.closure, closure_and_key.cache_key, args[1..]);
+    try Interp.narrowToEvalError(interp.callClosure(
+        closure_and_key.closure,
+        closure_and_key.cache_key,
+        args[1..],
+    ));
 }
 
 /// [fn] - creates a closure capturing the current scope and sets it as a
 /// variable in the current scope.
-pub fn fnCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
-    var fn_name: ?Handle, var arglist, const body = blk: {
+pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const fn_name: ?*Handle, const arglist, const body = blk: {
         if (args.len == 4) {
-            break :blk .{ args[1].borrow(), args[2].borrow(), args[3] };
+            break :blk .{ &args[1], &args[2], args[3] };
         } else {
-            break :blk .{ @as(?Handle, null), args[1].borrow(), args[2] };
+            break :blk .{ null, &args[1], args[2] };
         }
     };
-    defer if (fn_name) |val| val.decrRefCount();
-    defer arglist.decrRefCount();
 
     // Shimmer to list via the interp helper, which handles the case where
     // the handle can't be shimmered in place.
-    try interp.shimmerToList(&arglist);
+    try interp.shimmerToList(arglist);
 
     var det: objutil.ErrorDetails = undefined;
-    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist));
+    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist.*));
     defer parsed_args.deinit();
 
     // Capture the current scope.
@@ -655,7 +656,7 @@ pub fn fnCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     // Build a non-owning closure descriptor. createClosureObject borrows
     // all fields, so we don't need to borrow here.
     const closure_obj = try Interp.createClosureObject(.{
-        .args = arglist,
+        .args = arglist.*,
         .body = body,
         .name = if (fn_name) |val| val.toOptional() else .none,
         .scope = scope.toOptional(),
@@ -667,12 +668,515 @@ pub fn fnCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     });
     defer closure_obj.decrRefCount();
 
-    if (fn_name) |*val| {
+    if (fn_name) |val| {
         try interp.setVariableTo(val, closure_obj);
         interp.setResult(try interp.getVariableOrError(val));
     } else {
         interp.setResult(closure_obj);
     }
+}
+
+fn buildErrorOptions(
+    interp: *Interp,
+    exit_code: Interp.ReturnCode,
+    stack_trace: OptionalHandle,
+    error_code: OptionalHandle,
+    during: OptionalHandle,
+) error{OutOfMemory}!Handle {
+    const options = try objutil.newListWithCapacity(10);
+    defer options.decrRefCount();
+
+    // The return code surfaced to the caller.
+    const visible_code: i64 = code: {
+        // .return is an internal return type, so it should never be surfaced to the callee.
+        if (exit_code == .@"return") {
+            if (interp.return_propagate.return_at_end) |to_return| {
+                break :code @intFromEnum(Interp.ReturnCode.fromError(to_return));
+            } else {
+                break :code @intFromEnum(@as(Interp.ReturnCode, .ok));
+            }
+        } else {
+            break :code @intFromEnum(exit_code);
+        }
+    };
+
+    objutil.listAppendAssumeCapacity(options, Heap.local_heap.internedStringRef(.@"-code"));
+    objutil.listAppendAssumeCapacity(options, objutil.integerObject(visible_code));
+
+    objutil.listAppendAssumeCapacity(options, Heap.local_heap.internedStringRef(.@"-level"));
+    objutil.listAppendAssumeCapacity(options, objutil.integerObject(interp.return_propagate.left_to_go));
+
+    if (exit_code == .@"error") {
+        if (stack_trace.toHandle()) |val| {
+            objutil.listAppendAssumeCapacity(options, Heap.local_heap.internedStringRef(.@"-errorstack"));
+            objutil.listAppendAssumeCapacity(options, val.reference());
+        }
+
+        if (error_code.toHandle()) |val| {
+            objutil.listAppendAssumeCapacity(options, Heap.local_heap.internedStringRef(.@"-errorcode"));
+            objutil.listAppendAssumeCapacity(options, val.reference());
+        }
+    }
+
+    if (during.toHandle()) |val| {
+        objutil.listAppendAssumeCapacity(options, Heap.local_heap.internedStringRef(.@"-during"));
+        objutil.listAppendAssumeCapacity(options, val.reference());
+    }
+
+    objutil.shimmerToDict(null, options, undefined) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+
+    return options;
+}
+
+fn buildErrorOptionsBestEffort(
+    interp: *Interp,
+    exit_code: Interp.ReturnCode,
+    stack_trace: OptionalHandle,
+    error_code: OptionalHandle,
+    during: OptionalHandle,
+) Handle {
+    return buildErrorOptions(interp, exit_code, stack_trace, error_code, during) catch {
+        return Heap.local_heap.oom_error_options_dict.?.borrow();
+    };
+}
+
+/// Implements both [catch] and [try].
+fn catchTryHelper(
+    interp: *Interp,
+    mode: enum { @"catch", @"try" },
+    args: []Handle,
+) Interp.Error!void {
+    // Make sure to clear the last pending error code, if it exists.
+    interp.pending_error_code.swapWithNone();
+    interp.pending_error_during.swapWithNone();
+
+    // If we catch an return code and it's in this set, we propagate it up instead of returning it.
+    var to_propagate = std.EnumSet(Interp.ReturnCode).initEmpty();
+    // By default these return codes are ignored, e.g. propagated.
+    to_propagate.insert(.exit);
+    to_propagate.insert(.signal);
+
+    // The caller may have specified a different set of codes to propagate/catch. The
+    // format is -no"code", or -"code". For example, -nobreak would propagate break,
+    // while -signal would catch a signal return code. This loop sorts out all these flags.
+    var arg_index: usize = 1;
+    while (arg_index < args.len) : (arg_index += 1) {
+        const str_value = try args[arg_index].getString();
+
+        if (std.mem.eql(u8, str_value, "--")) {
+            arg_index += 1; // Advance to just after `--`.
+            break;
+        }
+
+        if (str_value[0] != '-') break; // Not a flag.
+
+        if (str_value.len >= 3 and std.mem.eql(u8, str_value[0..3], "-no")) {
+            if (Interp.ReturnCodeEnum.map.get(str_value[3..])) |val| {
+                to_propagate.insert(val);
+            } else return error.WrongUsage;
+        } else {
+            if (Interp.ReturnCodeEnum.map.get(str_value[1..])) |val| {
+                to_propagate.insert(val);
+            } else return error.WrongUsage;
+        }
+    }
+    to_propagate.remove(.ok); // Not a valid code to deal with.
+
+    // Make sure there's at least another argument after the flags.
+    if (args.len - arg_index < 1) return error.WrongUsage;
+
+    const script = args[arg_index];
+    arg_index += 1;
+    const exit_code: Interp.ReturnCode = blk: {
+        if (!to_propagate.contains(.signal)) interp.signal_depth += 1;
+        defer {
+            if (!to_propagate.contains(.signal)) interp.signal_depth -= 1;
+        }
+
+        if (interp.checkSignal()) {
+            // If a signal was set, don't evaluate the code, just
+            // set the return code to .signal.
+            break :blk .signal;
+        } else {
+            if (interp.evalObject(script)) {
+                // Evaluated just fine.
+                break :blk .ok;
+            } else |err| {
+                break :blk Interp.ReturnCode.fromError(err);
+            }
+        }
+    };
+    var error_code = interp.pending_error_code;
+    interp.pending_error_code = .none;
+    defer error_code.decrOptional();
+    const stack_trace = interp.stack_trace;
+    interp.stack_trace = .none;
+    defer stack_trace.decrOptional();
+
+    // In this next section, we need to find if there's a script that we need to run
+    // to handle the associated error. The following logic determines what branch
+    // (if any) applies, and whether there's a `finally` branch.
+
+    // You may ask: why do we have `branch_matched` and `handler_script`? Well, we support
+    // Tcl's fall-through logic, where you can have `-` as the body of your script, and
+    // it'll fall through until it hits an actual implementation.
+    //
+    // If `branch_matched` is true, but `handler_script` is null, it means we've hit a
+    // branch but haven't found its script yet.
+    var branch_matched = false;
+    var handler_script: ?Handle = null;
+    var finally_script: ?Handle = null;
+    var message_var_name: ?Handle = null;
+    var options_var_name: ?Handle = null;
+
+    if (mode == .@"try") {
+        // For [try], we need to find either a matching `on` or a matching `trap`.
+        // We also need to see if there's a `finally`. If we find a matching branch,
+        // we set `handler_script`, as well as `message_var_name` and `options_var_name`
+        // if present. We also set `finally_script` if there's a `finally` branch.
+        const TryOptions = objutil.TclEnum(enum { on, trap, finally }, "try options", false);
+
+        outer: while (arg_index < args.len) {
+            const option = TryOptions.getInPlace(null, &args[arg_index]) catch return error.WrongUsage;
+            switch (option) {
+                .on => {
+                    if (args.len - arg_index < 4) return error.WrongUsage;
+                    const on_params = args[arg_index..][0..4];
+                    arg_index += 4;
+
+                    // Already found a match, so skip this branch.
+                    if (handler_script != null) continue;
+
+                    if (branch_matched) {
+                        // Fall through logic.
+                    } else {
+                        const match_against = Interp.ReturnCodeEnum.getInPlace(null, &on_params[1]) catch return error.WrongUsage;
+                        if (exit_code != match_against) {
+                            // Didn't match what we're looking for.
+                            continue;
+                        }
+                    }
+
+                    // If we got here, it means we either matched, or are falling through.
+                    if (try Heap.stringEquals(on_params[3], "-")) {
+                        // If the script is `-`, it means fall through.
+                        branch_matched = true;
+                        continue;
+                    }
+
+                    handler_script = on_params[3];
+
+                    const vars_to_bind_len = try interp.getListLength(&on_params[2]);
+                    if (vars_to_bind_len > 0) message_var_name = objutil.listItem(on_params[2], 0);
+                    if (vars_to_bind_len > 1) options_var_name = objutil.listItem(on_params[2], 1);
+                },
+                .trap => {
+                    if (args.len - arg_index < 4) return error.WrongUsage;
+                    const trap_params = args[arg_index..][0..4];
+                    arg_index += 4;
+
+                    // Already found a match, so skip this branch.
+                    if (handler_script != null) continue;
+
+                    if (branch_matched) {
+                        // Fall through logic.
+                    } else {
+                        // Don't check the trap if no error was reported.
+                        if (exit_code != .@"error") continue;
+
+                        if (error_code.toHandleRef()) |code| {
+                            const code_len = try interp.getListLength(code);
+                            const match_code = &trap_params[1]; // Error code to match against.
+                            const match_code_len = try interp.getListLength(match_code);
+
+                            // If the code we're wanting to check is longer than the returned
+                            // error code, it obviously doesn't match.
+                            if (match_code_len > code_len) continue;
+
+                            for (0..match_code_len) |i| {
+                                const code_item = objutil.listItem(code.*, @intCast(i));
+                                const match_item = objutil.listItem(match_code.*, @intCast(i));
+                                if (!try Heap.checkIfEqual(code_item, match_item)) {
+                                    // Not the same, since this item wasn't the same.
+                                    continue :outer;
+                                }
+                            }
+                        }
+                    }
+
+                    // If we got here, it means we either matched, or are falling through.
+                    if (try Heap.stringEquals(trap_params[3], "-")) {
+                        // If the script is `-`, it means fall through.
+                        branch_matched = true;
+                        continue;
+                    }
+
+                    handler_script = trap_params[3];
+
+                    const vars_to_bind_len = try interp.getListLength(&trap_params[2]);
+                    if (vars_to_bind_len > 0) message_var_name = objutil.listItem(trap_params[2], 0);
+                    if (vars_to_bind_len > 1) options_var_name = objutil.listItem(trap_params[2], 1);
+                },
+                .finally => {
+                    if (args.len - arg_index != 2) return error.WrongUsage;
+                    const finally_params = args[arg_index..][0..2];
+                    arg_index += 2;
+
+                    finally_script = finally_params[1];
+                    if (try Heap.stringEquals(finally_script.?, "-")) return error.WrongUsage;
+                },
+            }
+        }
+    } else {
+        if (args.len - arg_index > 0) {
+            message_var_name = args[arg_index];
+            arg_index += 1;
+        }
+        if (args.len - arg_index > 0) {
+            options_var_name = args[arg_index];
+            arg_index += 1;
+        }
+    }
+
+    if (to_propagate.contains(exit_code)) {
+        // Not caught, so we'll propagate it.
+        if (finally_script) |val| {
+            // Use `try` here, since according to Tcl, an error in `finally` should
+            // replace the original error.
+            try interp.evalObject(val);
+        }
+        return exit_code.toError();
+    }
+
+    if (!to_propagate.contains(.signal) and exit_code == .signal) {
+        // Construct the signal result here, instead of wherever the signal
+        // originated from.
+        assert(interp.signal != 0);
+        const signal_list = try Interp.signalMaskToList(interp.signal);
+        interp.setResultOwning(signal_list);
+        interp.signal = 0;
+    }
+
+    if (message_var_name) |var_name| if ((try var_name.getString()).len > 0) {
+        var new_var_name = var_name.borrow();
+        defer new_var_name.decrRefCount();
+
+        const current_error = interp.result;
+        try interp.setVariableTo(&new_var_name, current_error);
+    };
+
+    var options_dict: OptionalHandle = .none;
+    defer options_dict.decrOptional();
+
+    if (options_var_name) |var_name| if ((try var_name.getString()).len > 0) {
+        var new_var_name = var_name.borrow();
+        defer new_var_name.decrRefCount();
+
+        if (options_dict == .none) {
+            const options = buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none);
+            options_dict = options.toOptional();
+        }
+
+        try interp.setVariableTo(&new_var_name, options_dict.toHandle().?);
+    };
+
+    var script_result: Interp.EvalError!void = exit_code.toError();
+    if (handler_script) |handler| {
+        // Now that we've set up the message and options variables,
+        // the handler will have the variables it needs to run.
+        if (interp.evalObject(handler)) {
+            script_result = {};
+        } else |err| {
+            // We still need to run the finally block, which is why
+            // we can't use `try` in this scenario.
+            script_result = err;
+
+            if (options_dict == .none) {
+                const options = buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none);
+                options_dict = options.toOptional();
+            }
+
+            interp.pending_error_during.swapRef(options_dict.toHandle().?.borrow());
+            options_dict.swapRef(buildErrorOptionsBestEffort(
+                interp,
+                Interp.ReturnCode.fromError(err),
+                interp.stack_trace,
+                interp.pending_error_code,
+                options_dict,
+            ));
+        }
+    }
+
+    if (finally_script) |finally| {
+        // Save the previous result, so if the `finally` runs successfully,
+        // we restore the previous result.
+        const previous_result = interp.result.borrow();
+        defer previous_result.decrRefCount();
+
+        if (interp.evalObject(finally)) {
+            interp.setResult(previous_result);
+        } else |err| {
+            script_result = err;
+
+            if (options_dict == .none) {
+                const options = buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none);
+                options_dict = options.toOptional();
+            }
+
+            interp.pending_error_during.swapRef(options_dict.toHandle().?.borrow());
+        }
+    }
+
+    switch (mode) {
+        .@"catch" => {
+            try interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromError(script_result)));
+            return;
+        },
+        .@"try" => {
+            return script_result;
+        },
+    }
+}
+
+/// [catch script ?resultVar? ?optsVar?]
+pub fn catchCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    return catchTryHelper(interp, .@"catch", args);
+}
+
+/// [try script ?handler ...? ?finally body?]
+pub fn tryCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    return catchTryHelper(interp, .@"try", args);
+}
+
+/// [error message ?errorCode?]
+pub fn errorCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    interp.setResult(args[1]);
+
+    if (args.len >= 3) {
+        // Store the error code so [catch]/[try] can pick it up.
+        interp.pending_error_code.swapRef(args[2].borrow());
+    }
+
+    return error.EvalError;
+}
+
+/// [return ?-option value ...? ?result?]
+///
+/// Supported options: -code, -level, -errorcode.
+pub fn returnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    var code: Interp.ReturnCode = .@"return";
+    var level: u32 = 1;
+
+    const Flags = objutil.TclEnum(enum { @"-code", @"-level", @"-errorcode" }, "[return] flags", false);
+
+    var i: usize = 1;
+    while (i + 1 < args.len) {
+        const flag = &args[i];
+        const value = &args[i + 1];
+
+        const flag_value = Flags.getInPlace(null, flag) catch null;
+
+        if (flag_value) |val| switch (val) {
+            .@"-code" => {
+                var det: objutil.ErrorDetails = undefined;
+                code = try interp.wrapError(&det, Interp.ReturnCodeEnum.getInPlace(&det, value));
+                i += 2;
+            },
+            .@"-level" => {
+                var level_handle = value.borrow();
+                defer level_handle.decrRefCount();
+                const level_i64 = try interp.getInteger(&level_handle);
+                if (level_i64 < 0 or level_i64 > std.math.maxInt(u32)) {
+                    try interp.setResultFormatted("bad -level value \"{}\"", .{level_i64});
+                    return error.EvalError;
+                }
+                level = @intCast(level_i64);
+                i += 2;
+            },
+            .@"-errorcode" => {
+                interp.pending_error_code.swapWithNone();
+                interp.pending_error_code = value.borrow().toOptional();
+                i += 2;
+            },
+        } else {
+            // Remaining arg has the return value.
+            break;
+        }
+    }
+
+    // If there's a trailing result value, set it; otherwise keep current result.
+    if (i < args.len) {
+        interp.setResult(args[i]);
+    }
+
+    // -level 0 means "don't propagate, just set the result."
+    if (level == 0) return;
+
+    // `evalObjectInner` decrements `left_to_go` each time PropagateResult bubbles up
+    // one eval level. Starting at `level` means it lands exactly `level` frames up.
+    interp.return_propagate.left_to_go = level;
+
+    return code.toError();
+}
+
+/// [errorinfo optsDict]
+///
+/// Lazily generates the human-readable error info string from an opts dict.
+pub fn errorinfoCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+    var opts = args[1].borrow();
+    defer opts.decrRefCount();
+    var new_opts: OptionalHandle = .none;
+    defer new_opts.swapWithNone();
+
+    const heap = Heap.local_heap;
+    var det: objutil.ErrorDetails = undefined;
+
+    // Pull out -errorstack from the dict (may not be present).
+    const stack_val = try interp.getDictValueRecursively(
+        &opts,
+        &new_opts,
+        &.{heap.getInternedString(.@"-errorstack")},
+    );
+    opts.swapIfNew(new_opts);
+
+    if (stack_val.toHandle() == null) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    const stack = stack_val.toHandle().?;
+    defer stack.decrRefCount();
+
+    // The stack is a flat list: {name file line args ...} repeated.
+    var stack_list = stack.borrow();
+    defer stack_list.decrRefCount();
+    try interp.shimmerToList(&stack_list);
+    const len = objutil.listLengthRaw(stack_list);
+
+    // Each frame is 4 items: name, file, line, args.
+    if (len == 0 or @mod(len, 4) != 0) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(Heap.global_gpa);
+
+    _ = &det;
+    var frame: usize = 0;
+    while (frame < len / 4) : (frame += 1) {
+        const base = frame * 4;
+        const name_str = try objutil.listItem(stack_list, @intCast(base)).getString();
+        const file_str = try objutil.listItem(stack_list, @intCast(base + 1)).getString();
+        const line_str = try objutil.listItem(stack_list, @intCast(base + 2)).getString();
+        if (frame > 0) try buf.appendSlice(Heap.global_gpa, "\n");
+        try buf.writer(Heap.global_gpa).print("    at {s} ({s}:{s})", .{ name_str, file_str, line_str });
+    }
+
+    interp.setResultOwning(try objutil.newString(heap, buf.items));
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
@@ -683,7 +1187,12 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("append", .{ .to_call = appendCmd, .description = "varName ?value ...?", .min_arity = 1 });
     try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
+    try interp.registerCommand("catch", .{ .to_call = catchCmd, .description = "script ?resultVar? ?optsVar?", .min_arity = 1, .max_arity = 3 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
+    try interp.registerCommand("error", .{ .to_call = errorCmd, .description = "message ?errorCode?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("errorinfo", .{ .to_call = errorinfoCmd, .description = "optsDict", .min_arity = 1, .max_arity = 1 });
+    try interp.registerCommand("return", .{ .to_call = returnCmd, .description = "?-option value ...? ?result?", .min_arity = 0 });
+    try interp.registerCommand("try", .{ .to_call = tryCmd, .description = "script ?handler ...? ?finally body?", .min_arity = 1 });
     try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("expr", .{ .to_call = exprCmd, .description = "expression", .min_arity = 1, .max_arity = 1 });
     try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
@@ -706,6 +1215,76 @@ pub fn testStart(ta: std.mem.Allocator) !Interp {
 pub fn testFinish(interp: *Interp) void {
     interp.deinit();
     Heap.testFinish();
+}
+
+test "catch and error" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Basic catch -- normal return gives code 0.
+    try interp.testExpectScriptResult("0",
+        \\ catch { set x 42 }
+    );
+
+    // Catch an error -- code 1.
+    try interp.testExpectScriptResult("1",
+        \\ catch { error "boom" }
+    );
+
+    // Capture result variable.
+    try interp.testExpectScriptResult("boom",
+        \\ catch { error "boom" } msg
+        \\ set msg
+    );
+
+    // Capture opts variable and check -code.
+    try interp.testExpectScriptResult("1",
+        \\ catch { error "boom" } msg opts
+        \\ dict get $opts -code
+    );
+
+    // [error] with a custom error code.
+    try interp.testExpectScriptResult("MY CODE",
+        \\ catch { error "boom" {MY CODE} } msg opts
+        \\ dict get $opts -errorcode
+    );
+}
+
+test "try command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // try with on handler matching error.
+    try interp.testExpectScriptResult("caught: boom",
+        \\ try {
+        \\   error "boom"
+        \\ } on err {msg} {
+        \\   set msg "caught: $msg"
+        \\ }
+    );
+
+    // try with finally.
+    try interp.testExpectScriptResult("done",
+        \\ set x "not done"
+        \\ try { set x done } finally { set x done }
+        \\ set x
+    );
+
+    // try with on ok handler.
+    try interp.testExpectScriptResult("ok result",
+        \\ try { set result "ok result" } on ok {val} { set val }
+    );
+}
+
+test "return command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Basic return from a function.
+    try interp.testExpectScriptResult("42",
+        \\ fn getval {} { return 42; set x 99 }
+        \\ getval
+    );
 }
 
 test "fn command" {

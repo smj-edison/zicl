@@ -78,6 +78,9 @@ objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
 interned_strings: std.EnumArray(InternedString, Heap.Handle),
+/// Preallocated fallback used by `[catch]` when a script OOMs and building
+/// the real opts dict also OOMs. Pinned at init; released via `freeOomOptsDict`.
+oom_error_options_dict: ?Handle,
 
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
@@ -122,6 +125,47 @@ pub const InternedString = enum {
     scope,
     name,
     @"division by zero",
+    // Error handling.
+    NONE,
+    @"ZICL OOM",
+    @"ZICL LOOKUP VARNAME",
+    @"out of memory",
+    @"-code",
+    @"-level",
+    @"-errorstack",
+    @"-errorcode",
+    @"-during",
+    // Signal names, for use in the signal mask list.
+    SIGHUP,
+    SIGINT,
+    SIGQUIT,
+    SIGILL,
+    SIGTRAP,
+    SIGABRT,
+    SIGBUS,
+    SIGFPE,
+    SIGKILL,
+    SIGUSR1,
+    SIGSEGV,
+    SIGUSR2,
+    SIGPIPE,
+    SIGALRM,
+    SIGTERM,
+    SIGCHLD,
+    SIGCONT,
+    SIGSTOP,
+    SIGTSTP,
+    SIGTTIN,
+    SIGTTOU,
+    SIGURG,
+    SIGXCPU,
+    SIGXFSZ,
+    SIGVTALRM,
+    SIGPROF,
+    SIGWINCH,
+    SIGIO,
+    SIGPWR,
+    SIGSYS,
 };
 
 const interned_string_count = std.enums.values(InternedString).len;
@@ -685,6 +729,12 @@ pub const OptionalHandle = enum(HandleBacking) {
         if (optional != .none) {
             return @bitCast(@as(HandleBacking, @intFromEnum(optional)));
         } else return null;
+    }
+
+    pub fn fromHandle(handle: ?Handle) OptionalHandle {
+        if (handle) |val| {
+            return val.toOptional();
+        } else return .none;
     }
 
     pub fn getIndex(optional: OptionalHandle) OptionalIndex {
@@ -1357,6 +1407,7 @@ fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Hand
 }
 
 fn createInternedStrings(heap: *Heap) !void {
+    @setEvalBranchQuota(10000);
     const values = comptime blk: {
         break :blk std.enums.values(InternedString);
     };
@@ -1475,6 +1526,15 @@ pub fn init(heap: *Heap) !void {
 
     // Create all the interned strings.
     try heap.createInternedStrings();
+
+    const oom_dict = try createOomErrorOptionsDict(heap);
+    // Pin so it stays immutable.
+    oom_dict.incrRefCount();
+    heap.oom_error_options_dict = oom_dict;
+    errdefer {
+        oom_dict.decrRefCount();
+        oom_dict.decrRefCount();
+    }
 }
 
 fn clearParsedScripts(self: *Heap) void {
@@ -1516,6 +1576,9 @@ pub fn deinit(heap: *Heap) void {
         freeObjectBackingInner(interned);
     }
 
+    // Clean up the OOM error dict.
+    heap.deinitOomErrorOptions();
+
     // Be sure to free the specialty objects and strings.
     assert(special_object_count == 2);
     heap.object_tracking.freeFromOwningThread(0, 0);
@@ -1541,6 +1604,13 @@ pub fn deinit(heap: *Heap) void {
     heap.* = undefined;
 }
 
+fn deinitOomErrorOptions(heap: *Heap) void {
+    if (heap.oom_error_options_dict) |dict| {
+        dict.decrRefCount();
+        dict.decrRefCount();
+    }
+}
+
 pub inline fn heapId(self: *Heap) HeapId {
     return @intCast(self - &heaps);
 }
@@ -1561,6 +1631,10 @@ pub fn emptyHandle(self: *Heap) Handle {
 
 pub fn getInternedString(heap: *Heap, string: InternedString) Heap.Handle {
     return heap.interned_strings.get(string);
+}
+
+pub fn internedStringRef(heap: *Heap, string: InternedString) Heap.Object {
+    return heap.getInternedString(string).reference();
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -2150,7 +2224,9 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
     }
 }
 
-// TODO might be worthwhile doing something like Jim's compared string type.
+// TODO PERF might be worthwhile doing something like Jim's compared string type.
+// Though, it might make things worse, since there's some cases where `stringEquals`
+// compares against a script, and it's probably unwise to churn scripts.
 pub fn stringEquals(handle: Handle, value: []const u8) !bool {
     const bytes = try handle.getString();
     return std.mem.eql(u8, bytes, value);
@@ -2642,9 +2718,25 @@ pub fn initLocalHeap() !void {
         const new_heap = &heaps[slot_index];
         try new_heap.init();
         local_heap = new_heap;
+        errdefer new_heap.deinit();
     } else {
         return error.OutOfMemory;
     }
+}
+
+fn createOomErrorOptionsDict(heap: *Heap) !Handle {
+    const zero = try objutil.newInteger(heap, 0);
+    defer zero.decrRefCount();
+    const one = try objutil.newInteger(heap, 1);
+    defer one.decrRefCount();
+
+    const pairs = [_]Handle{
+        heap.getInternedString(.@"-code"),      one,
+        heap.getInternedString(.@"-level"),     zero,
+        heap.getInternedString(.@"-errorcode"), heap.getInternedString(.@"ZICL OOM"),
+    };
+
+    return objutil.newDict(heap, &pairs);
 }
 
 pub fn deinitAll() void {
@@ -2788,9 +2880,10 @@ pub fn leakCheck(heap: *Heap) !bool {
 }
 
 pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
-    // Make sure to free any parsed scripts, as they're allowed to leak (they
-    // have references to heap objects, so it will cause a false positive).
+    // Make sure to free any parsed scripts and system fixtures before scanning,
+    // as they're allowed to leak (they have references to heap objects, causing false positives).
     heap.clearParsedScripts();
+    heap.deinitOomErrorOptions();
 
     // Go through once to print the summary, then print each individual trace.
     const skip_count = special_object_count + interned_string_count;
