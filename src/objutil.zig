@@ -678,7 +678,7 @@ pub fn enumNames(comptime T: type, comptime joiner: []const u8) []const u8 {
     return comptime blk: {
         var result: []const u8 = @tagName(std.enums.values(T)[0]);
         for (std.enums.values(T)[1..]) |value| {
-            result = &(result[0..].* ++ joiner.* ++ @tagName(value).*);
+            result = &(result[0..].* ++ joiner[0..].* ++ @tagName(value).*);
         }
 
         break :blk result;
@@ -1267,7 +1267,14 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
         .list => try newListWithCapacity(new_len),
         .dict => blk: {
             const new_dict = try newDictWithCapacity(Heap.local_heap, new_len);
-            new_dict.getDictExtraData().parent_link = provided_handle.getDictExtraData().parent_link.borrowOptional();
+            errdefer new_dict.decrRefCount();
+            if (provided_handle.getDictExtraData().parent_link.toHandle()) |parent_link| {
+                try dictSetLink(new_dict, parent_link);
+                // `dictSetLink` generates a table for the dict to make sure there's
+                // no duplicates, but we haven't added any items to `new_dict` yet,
+                // so we need to invalidate the table so it's generated correctly later.
+                dictInvalidateTable(new_dict);
+            }
             break :blk new_dict;
         },
         else => unreachable,
@@ -1589,14 +1596,14 @@ pub fn dictItemFollowRefs(dict: Handle, index: u32) Handle {
     return collectionItemFollowRefs(dict, index, dict.peek().body.dict.len);
 }
 
-pub fn dictItemLength(handle: Handle) u32 {
-    assert(handle.tag() == .dict);
-    return handle.peek().body.dict.len;
+pub fn dictItemLength(dict: Handle) u32 {
+    dict.assert(dict.tag() == .dict);
+    return dict.peek().body.dict.len;
 }
 
-pub fn dictPairLengthRaw(handle: Handle) u32 {
-    assert(handle.tag() == .dict);
-    return handle.peek().body.dict.len / 2;
+pub fn dictPairLengthRaw(dict: Handle) u32 {
+    dict.assert(dict.tag() == .dict);
+    return dict.peek().body.dict.len / 2;
 }
 
 /// Length in pairs (total length / 2).
@@ -1702,6 +1709,22 @@ fn dictHasDuplicatesRaw(dict: Handle) !bool {
     const len = dict.peek().body.dict.len;
     assert(table.size * 2 <= len);
     return table.size * 2 != len;
+}
+
+/// Note: this generates the dict's table when checking for duplicates.
+pub fn dictSetLink(dict: Handle, link: Handle) error{OutOfMemory}!void {
+    dict.assert(dict.canMutate());
+    dict.assert(!(try dictHasDuplicatesRaw(dict))); // Can't link a dictionary with duplicates.
+
+    const extra_data = dict.getDictExtraData();
+    extra_data.parent_link.swapWithNone();
+    extra_data.parent_link = link.borrow().toOptional();
+
+    dict.invalidateString(); // String needs to be regenerated since it's linked.
+}
+
+pub fn dictSetLinkIfPresent(dict: Handle, link: OptionalHandle) error{OutOfMemory}!void {
+    if (link.toHandle()) |handle| try dictSetLink(dict, handle);
 }
 
 /// Removes duplicate entries. Assumes handle is a dict. If the caller needs to track
@@ -1899,7 +1922,6 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
             } else {
                 const original_len = dict.peek().body.dict.len;
                 const new_length = original_len + 2;
-                try table.ensureTotalCapacity(Heap.global_gpa, new_length / 2);
 
                 // Key doesn't exist, so append both key and value.
                 const len_before_resize = dict.peek().body.dict.len;
@@ -1939,7 +1961,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                 // Only put the key in the table if the table exists. It'll be discovered
                 // when the table is generated if not.
                 if (dictMaybeGetTable(dict)) |new_table| {
-                    new_table.putAssumeCapacity(new_key_handle, new_value_index);
+                    try new_table.put(Heap.global_gpa, new_key_handle, new_value_index);
                 }
 
                 // Need to add a new pair.
@@ -2020,6 +2042,8 @@ pub fn dictPutRecursively(
     keys: []const Handle,
     value: Heap.Object,
 ) !Handle {
+    assert(new_dict.* == .none);
+
     var value_taken = false;
     errdefer if (!value_taken) {
         var value_mut = value;
@@ -2148,6 +2172,64 @@ pub fn dictLookupRecursively(
 /// Assumes `handle` is a dict.
 pub fn dictPut(dict: Handle, key: Handle, value: Handle) !DictAndValueResult {
     return dictPutInner(dict, key, value.dupOrRef());
+}
+
+pub fn dictFlatten(provided_dict: Handle) !OptionalHandle {
+    const extra_data = provided_dict.getDictExtraData();
+
+    if (extra_data.parent_link.toHandle()) |parent_link| {
+        var new_dict = try dictFlatten(parent_link);
+        var to_add_to = if (new_dict.toHandle()) |handle| handle else try Heap.local_heap.duplicate(parent_link);
+        errdefer to_add_to.decrRefCount();
+
+        var pair_i: u32 = 0;
+        while (pair_i < provided_dict.peek().body.dict.len / 2) : (pair_i += 1) {
+            const put_result = try dictPut(
+                to_add_to,
+                dictItemFollowRefs(provided_dict, pair_i * 2),
+                dictItemFollowRefs(provided_dict, pair_i * 2 + 1),
+            );
+            if (put_result.new_dict.toHandle()) |new| {
+                to_add_to.swap(new);
+            }
+        }
+
+        return to_add_to.toOptional();
+    } else {
+        return .none; // No need to flatten.
+    }
+}
+
+fn testDictFlatten(ta: std.mem.Allocator) !void {
+    defer Heap.testFinish();
+    const heap = try Heap.testStart(ta, testing.io);
+
+    const key_foo = try newString(heap, "foo");
+    defer key_foo.decrRefCount();
+    const value1 = try newString(heap, "1");
+    defer value1.decrRefCount();
+    const key_bar = try newString(heap, "bar");
+    defer key_bar.decrRefCount();
+    const value2 = try newString(heap, "2");
+    defer value2.decrRefCount();
+    const key_baz = try newString(heap, "baz");
+    defer key_baz.decrRefCount();
+    const value3 = try newString(heap, "3");
+    defer value3.decrRefCount();
+
+    const dict1 = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
+    defer dict1.decrRefCount();
+
+    const dict2 = try newDict(heap, &.{ key_foo, value2, key_baz, value3 });
+    defer dict2.decrRefCount();
+
+    try dictSetLink(dict2, dict1);
+
+    const result = try dictFlatten(dict2);
+    defer result.decrOptional();
+}
+test "dict flatten" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDictFlatten, .{});
 }
 
 const DictAndRemovedResult = struct { new_dict: OptionalHandle, did_remove: bool };

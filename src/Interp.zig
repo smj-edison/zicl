@@ -1245,7 +1245,9 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
     // Found upvars if we made it to this point, so we need
     // to duplicate everything, and follow any upvars.
     const new_dict = try objutil.newDictWithCapacity(Heap.local_heap, pairs * 2);
-    new_dict.getDictExtraData().parent_link = frame.variables.getDictExtraData().parent_link;
+    errdefer new_dict.decrRefCount();
+    try objutil.dictSetLinkIfPresent(new_dict, frame.variables.getDictExtraData().parent_link);
+
     for (0..pairs) |i_usize| {
         const i: u32 = @intCast(i_usize);
         const key = objutil.dictItem(frame.variables, i * 2);
@@ -1321,7 +1323,7 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
 
     if (signature.scope.toHandle()) |scope| {
         // Safe since vars_handle is freshly allocated.
-        vars_handle.getDictExtraData().parent_link = scope.borrow().toOptional();
+        try objutil.dictSetLink(vars_handle, scope);
     }
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;

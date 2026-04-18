@@ -2471,68 +2471,12 @@ fn generateDictString(handle: Handle) ![:0]u8 {
         return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
     }
 
-    // This uses an array hash map, so insertion order is maintained. This
-    // means that if we go through it in reverse order, we'll get oldest
-    // to newest (since we descend starting at newest and go down to oldest).
-    var keys_used = std.ArrayHashMapUnmanaged(Handle, Handle, struct {
-        pub fn hash(ctx: @This(), key: Handle) u32 {
-            _ = ctx;
-            const str = key.getString() catch unreachable;
-            return std.array_hash_map.hashString(str);
-        }
+    // Delegate to `dictFlatten`, which produces the correctly ordered merged dict,
+    // then stringify the result as a plain (no parent link) dict.
+    const flat = (try objutil.dictFlatten(handle)).toHandle() orelse unreachable;
+    defer flat.decrRefCount();
 
-        pub fn eql(ctx: @This(), a: Handle, b: Handle, b_index: usize) bool {
-            _ = ctx;
-            _ = b_index;
-            return checkIfEqual(a, b) catch unreachable;
-        }
-    }, true).empty;
-    defer keys_used.deinit(global_gpa);
-
-    // Traverse all linked dicts.
-    var current_dict = handle;
-    var depth: u64 = 0;
-    while (true) {
-        // Make sure to reverse the order we go through the dictionary,
-        // so when we reverse again at the end, everything will be in the
-        // correct order.
-        depth += 1;
-        var item_index = objutil.dictItemLength(current_dict);
-        while (item_index > 0) {
-            item_index -= 2;
-
-            const key = objutil.dictItemFollowRefs(current_dict, item_index);
-            const value = objutil.dictItemFollowRefs(current_dict, item_index + 1);
-
-            _ = try key.getString(); // Make sure it has a string rep.
-            const entry = try keys_used.getOrPut(global_gpa, key);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = value;
-            }
-        }
-
-        if (current_dict.getDictExtraData().parent_link.toHandle()) |next| {
-            current_dict = next;
-        } else break;
-    }
-
-    const item_count: u32 = @intCast(keys_used.entries.len * 2);
-    const merged_handle = try objutil.newListWithCapacity(item_count);
-    defer merged_handle.decrRefCount();
-    merged_handle.peek().body.list.len = item_count;
-    const items = objutil.listItems(merged_handle);
-
-    var pair_index = keys_used.entries.len;
-    while (pair_index > 0) {
-        pair_index -= 1;
-        const entry = keys_used.entries.get(pair_index);
-        const reflected_pair_index = keys_used.entries.len - pair_index - 1;
-        items[reflected_pair_index * 2] = entry.key.reference();
-        items[reflected_pair_index * 2 + 1] = entry.value.reference();
-    }
-
-    const result = try getListString(merged_handle.getHeap(), merged_handle.index + 1, item_count);
-    return result;
+    return try getListString(flat.getHeap(), flat.index + 1, flat.peek().body.dict.len);
 }
 
 const StringDetails = union(enum) {
