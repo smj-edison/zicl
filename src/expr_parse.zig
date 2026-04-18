@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 
 const Tokenizer = @import("Tokenizer.zig");
 // Used to store parsed strings.
@@ -790,7 +790,7 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
 
 test "expr parsing" {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator);
+    const heap = try Heap.testStart(testing.allocator, testing.io);
 
     // Left associativity.
     try testExprParse(heap, "1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");

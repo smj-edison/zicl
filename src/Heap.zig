@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = std.mem;
 const testing = std.testing;
 const builtin = @import("builtin");
 const math = std.math;
@@ -39,9 +40,10 @@ pub const HeapSettings = struct {
 };
 const cfg: HeapSettings = .{};
 
-var debugging_gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{}){} else undefined;
+var debugging_buffer: [1024 * 1024]u8 = undefined;
+var debugging_gpa = if (builtin.mode == .Debug) memutil.RingBufferAllocator.init(debugging_buffer[0..]) else undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
-var debug_gpa = if (builtin.mode == .Debug) debugging_gpa.allocator() else memutil.null_allocator;
+var debug_gpa: Allocator = undefined;
 /// Set this right before doing an operation that may cause a panic. The runtime will dump its
 /// traces on panic if set.
 pub threadlocal var last_touched: ?Handle = null;
@@ -50,17 +52,18 @@ pub const GlobalHeapState = struct {
     initialized: bool = false,
     /// Use to lock `custom_types` or `script_metadata` when adding or removing
     /// (no need to lock when using).
-    mutex: memutil.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     next_open_heap: usize = 0,
     /// Used to turn some panics into useful messages.
     running_leak_check: bool = false,
 };
+
 pub var state: GlobalHeapState = .{};
 pub var global_gpa: std.mem.Allocator = undefined;
+pub var global_io: std.Io = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
-pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
-
 pub threadlocal var local_heap: *Heap = undefined;
+pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
 
 const Heap = @This();
 
@@ -69,9 +72,9 @@ const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_
 const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
 /// Used to create and destroy extra data.
-extra_data_mutex: memutil.Mutex = .{},
+extra_data_mutex: std.Io.Mutex,
 /// Used for locking when adding trace info.
-trace_mutex: memutil.Mutex = .{},
+trace_mutex: std.Io.Mutex,
 
 object_tracking: ObjectTracker,
 objects: ObjectList,
@@ -455,25 +458,30 @@ pub const Tag = enum(u5) {
     custom_type,
 };
 
-pub const Body = packed union {
-    none: void,
-    invalid: void,
+pub const Body = packed union(u64) {
+    const Empty = packed struct { padding: u64 = 0 };
+
+    none: Empty,
+    invalid: Empty,
     /// Used internally in places where a value needs to be temporarily marked.
-    marked: void,
+    marked: Empty,
     /// List index.
-    index: ListIndex,
+    index: packed struct { data: ListIndex, padding: u30 = 0 },
     integer: i64,
     float: f64,
-    bool: bool,
+    bool: packed struct { data: bool, padding: u63 = 0 },
     string: packed struct {
         utf8_length: u32,
         length_determined: bool,
+        padding: u31 = 0,
     },
     source: packed struct {
         extra_data: ExtraData,
+        padding: u32 = 0,
     },
     list: packed struct {
         len: u32,
+        padding: u32 = 0,
     },
     /// Items of the dictionary are stored directly after, similar to a list.
     /// Keys and values alternate. Allows for duplicate keys when shimmering
@@ -530,6 +538,7 @@ pub const Body = packed union {
     },
     closure: packed struct {
         extra_data: ExtraData,
+        padding: u32 = 0,
     },
     custom_type: packed struct {
         type_id: u32,
@@ -609,9 +618,9 @@ pub const ExtraDataValue = union(enum) {
 pub const IndexError = error{BadIndex};
 /// Tcl list index. Indexes are inclusive both for start and end in Tcl. Additionally,
 /// an index may be relative, such as "end" or "end-1".
-pub const ListIndex = packed struct {
+pub const ListIndex = packed struct(u34) {
     u: packed union {
-        index: u32,
+        index: packed struct { data: u32, padding: u1 = 0 },
         end_offset: i33,
     },
     /// Whether this is a relative index, such as "end", "end-1", "end+5", etc.
@@ -1024,7 +1033,7 @@ pub const Handle = packed struct(HandleBacking) {
             // TODO PERF I should probably benchmark whether it's faster
             // to check the metadata, or just to do an acquire load.
             if (options.threading and handle.getMetadata().cross_thread) {
-                const head = @atomicLoad(Object.Head, &handle.peek().head, .acquire);
+                const head = @atomicLoad(Object.Head, @as(*Object.Head, @ptrCast(&handle.peek().head)), .acquire);
                 break :blk head.str;
             } else {
                 break :blk handle.peek().head.str;
@@ -1082,7 +1091,7 @@ pub const Handle = packed struct(HandleBacking) {
                 break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.float}, 0);
             },
             .bool => {
-                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
+                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{@intFromBool(obj.body.bool.data)}, 0);
             },
             .list => {
                 const list = obj.body.list;
@@ -1216,6 +1225,7 @@ pub const Handle = packed struct(HandleBacking) {
         switch (handle.getStringDetails()) {
             .empty => {
                 return comptime blk: {
+                    @setEvalBranchQuota(10000);
                     break :blk memutil.hashBytes("");
                 };
             },
@@ -1248,10 +1258,14 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn trace(handle: Handle, comptime fmt: []const u8, args: anytype) void {
         if (options.trace_mem) {
-            handle.getHeap().trace_mutex.lock();
-            defer handle.getHeap().trace_mutex.unlock();
+            // We need to create the message before locking the mutex, since `allocPrint` may
+            // call `getString`, which in turn traces setting the string.
+            const msg = std.fmt.allocPrint(debug_gpa, "\n" ++ fmt, args) catch unreachable;
+
+            handle.getHeap().trace_mutex.lockUncancelable(global_io);
+            defer handle.getHeap().trace_mutex.unlock(global_io);
             const trace_field = &handle.getHeap().objects.items(.trace)[handle.index];
-            trace_field.addAddr(@returnAddress(), std.fmt.allocPrint(debug_gpa, "\n" ++ fmt, args) catch unreachable);
+            trace_field.addAddr(@returnAddress(), msg);
         }
     }
 
@@ -1435,8 +1449,11 @@ pub fn init(heap: *Heap) !void {
     // Clean up if we hit an error.
     errdefer heap.* = undefined;
 
+    heap.trace_mutex = .init;
+    heap.extra_data_mutex = .init;
+
     // Init objects.
-    heap.object_tracking = try .init(global_gpa, cfg.object_heap_order);
+    heap.object_tracking = try .init(global_gpa, global_io, cfg.object_heap_order);
     errdefer if (heap.object_tracking.deinit() == .leaked) {
         std.debug.print("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
     };
@@ -1463,7 +1480,7 @@ pub fn init(heap: *Heap) !void {
     }
 
     // Init strings.
-    heap.string_tracking = try .init(global_gpa, cfg.string_heap_order);
+    heap.string_tracking = try .init(global_gpa, global_io, cfg.string_heap_order);
     errdefer if (heap.string_tracking.deinit() == .leaked) {
         std.debug.print("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
     };
@@ -1672,7 +1689,7 @@ pub fn splitAlloc(self: *Heap, index: u32, new_order: u5) void {
 
 test "split allocations" {
     defer Heap.testFinish();
-    var heap = try Heap.testStart(testing.allocator);
+    var heap = try Heap.testStart(testing.allocator, testing.io);
 
     const index = try heap.createObjects(8);
     heap.splitAlloc(index, 1);
@@ -2578,7 +2595,8 @@ pub const LongString = struct {
     utf8_length: u64 = std.math.maxInt(u64),
     hash: struct {
         value: ?u256 = null,
-        mutex: memutil.Mutex = .{},
+        // TODO PERF this probably can be done with acquire/release, the mutex is a bit overkill.
+        mutex: std.Io.Mutex = .init,
     } = .{},
     ref_count: usize = 1,
 
@@ -2591,8 +2609,8 @@ pub const LongString = struct {
     }
 
     pub fn getHash(self: *align(align_amt) LongString) u256 {
-        self.hash.mutex.lock();
-        defer self.hash.mutex.unlock();
+        self.hash.mutex.lockUncancelable(global_io);
+        defer self.hash.mutex.unlock(global_io);
 
         if (self.hash.value) |hash| {
             return hash;
@@ -2651,8 +2669,8 @@ pub const LongString = struct {
 pub fn createExtraData(self: *Heap) !ExtraData {
     // TODO PERF make a fast case where this uses a heap-local list of
     // available extra data.
-    self.extra_data_mutex.lock();
-    defer self.extra_data_mutex.unlock();
+    self.extra_data_mutex.lockUncancelable(global_io);
+    defer self.extra_data_mutex.unlock(global_io);
 
     const new_index = try self.extra.create(heapBackingAlloc());
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
@@ -2685,16 +2703,22 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
         .none => {},
     }
 
-    self.extra_data_mutex.lock();
-    defer self.extra_data_mutex.unlock();
+    self.extra_data_mutex.lockUncancelable(global_io);
+    defer self.extra_data_mutex.unlock(global_io);
 
     self.getExtraData(index).* = undefined;
     self.extra.destroy(@intFromEnum(index));
 }
 
-pub fn initGlobals(gpa: Allocator) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
+    global_io = io;
+
+    if (builtin.mode == .Debug) {
+        debug_gpa = debugging_gpa.allocator();
+    }
+
+    state.mutex.lockUncancelable(global_io);
+    defer state.mutex.unlock(global_io);
 
     global_gpa = gpa;
     custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
@@ -2705,8 +2729,8 @@ pub fn initGlobals(gpa: Allocator) !void {
 
 pub fn initLocalHeap() !void {
     const slot_index = blk: {
-        state.mutex.lock();
-        defer state.mutex.unlock();
+        state.mutex.lockUncancelable(global_io);
+        defer state.mutex.unlock(global_io);
 
         assert(state.initialized);
 
@@ -2717,9 +2741,9 @@ pub fn initLocalHeap() !void {
     };
     errdefer {
         // Roll back heap index if it failed to initialize correctly.
-        state.mutex.lock();
+        state.mutex.lockUncancelable(global_io);
         state.next_open_heap -= 1;
-        state.mutex.unlock();
+        state.mutex.unlock(global_io);
     }
 
     if (slot_index < cfg.max_heaps) {
@@ -2756,10 +2780,10 @@ fn createOomErrorOptionsDict(heap: *Heap) !Handle {
 }
 
 pub fn deinitAll() void {
-    state.mutex.lock();
+    state.mutex.lockUncancelable(global_io);
     const heap_count = state.next_open_heap;
     state.next_open_heap = 0;
-    state.mutex.unlock();
+    state.mutex.unlock(global_io);
 
     // Deinit heaps without holding the mutex, as they may lock.
     for (heaps[0..heap_count]) |*heap| {
@@ -2767,12 +2791,12 @@ pub fn deinitAll() void {
     }
 
     // Deinit global state.
-    state.mutex.lock();
+    state.mutex.lockUncancelable(global_io);
     if (state.initialized) {
         custom_types.deinit(global_gpa);
         state.initialized = false;
     }
-    state.mutex.unlock();
+    state.mutex.unlock(global_io);
 }
 
 pub fn createCustomType(custom_type: CustomType) ?*CustomType {
@@ -2791,7 +2815,7 @@ pub fn createCustomType(custom_type: CustomType) ?*CustomType {
 test "object duplication" {
     const ta = std.testing.allocator;
     defer Heap.testFinish();
-    var heap = try Heap.testStart(ta);
+    var heap = try Heap.testStart(ta, std.testing.io);
 
     // Number object.
     const obj = try heap.createObject();
@@ -2817,7 +2841,7 @@ test "object duplication" {
 test "get string" {
     const ta = std.testing.allocator;
     defer Heap.testFinish();
-    var heap = try Heap.testStart(ta);
+    var heap = try Heap.testStart(ta, testing.io);
 
     const obj = try heap.createObject();
     defer obj.decrRefCount();
@@ -2865,18 +2889,18 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
     return after_sub == 0;
 }
 
-pub fn testStart(gpa: Allocator) !*Heap {
-    try initGlobals(gpa);
+pub fn testStart(gpa: Allocator, io: std.Io) !*Heap {
+    try initGlobals(gpa, io);
     try initLocalHeap();
 
     return local_heap;
 }
 
 pub fn leakCheckAll() void {
-    state.mutex.lock();
+    state.mutex.lockUncancelable(global_io);
     state.running_leak_check = true;
     const heap_count = state.next_open_heap;
-    state.mutex.unlock();
+    state.mutex.unlock(global_io);
 
     var leaked = false;
     for (heaps[0..heap_count]) |*heap| {
@@ -2956,14 +2980,14 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
 }
 
 // Dot rendering is 95% LLM generated.
-fn escapeDotString(str: []const u8, writer: *std.Io.Writer) !void {
+fn escapeDotString(str: []const u8) !void {
     for (str) |c| switch (c) {
-        '"', '\\' => try writer.print("\\{c}", .{c}),
-        '\n' => try writer.writeAll("\\n"),
-        '\r' => try writer.writeAll("\\r"),
-        '\t' => try writer.writeAll("\\t"),
-        0...8, 11...12, 14...31, 127 => try writer.print("\\x{X:0>2}", .{c}),
-        else => try writer.writeByte(c),
+        '"', '\\' => std.debug.print("\\{c}", .{c}),
+        '\n' => std.debug.print("\\n", .{}),
+        '\r' => std.debug.print("\\r", .{}),
+        '\t' => std.debug.print("\\t", .{}),
+        0...8, 11...12, 14...31, 127 => std.debug.print("\\x{X:0>2}", .{c}),
+        else => std.debug.print("{c}", .{c}),
     };
 }
 
@@ -2984,20 +3008,20 @@ fn getTagColor(tag: Tag) []const u8 {
     };
 }
 
-fn renderDotNodeLabel(stderr: *std.Io.Writer, handle: Handle, index: u32, max_str_len: u32) !void {
+fn renderDotNodeLabel(handle: Handle, index: u32, max_str_len: u32) !void {
     const str = handle.getString() catch "oom";
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
-    try stderr.print("idx: {} | ", .{index});
-    try stderr.print("{s} | ", .{@tagName(handle.tag())});
-    try stderr.print("rc: {} | ", .{handle.debugRefCount()});
-    try stderr.writeAll("\\\"");
-    try escapeDotString(truncated_str, stderr);
-    if (str.len > max_str_len) try stderr.writeAll("...");
-    try stderr.writeAll("\\\"");
+    std.debug.print("idx: {} | ", .{index});
+    std.debug.print("{s} | ", .{@tagName(handle.tag())});
+    std.debug.print("rc: {} | ", .{handle.debugRefCount()});
+    std.debug.print("\\\"", .{});
+    try escapeDotString(truncated_str);
+    if (str.len > max_str_len) std.debug.print("...", .{});
+    std.debug.print("\\\"", .{});
 }
 
-fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle, index: u32) !void {
+fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
     const obj = handle.peek();
 
     // Get the allocation size to include unallocated slots in the subgraph.
@@ -3015,34 +3039,34 @@ fn renderCollectionSubgraph(heap: *Heap, stderr: *std.Io.Writer, handle: Handle,
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
     // Subgraph header.
-    try stderr.print("  subgraph cluster_{} {{\n", .{index});
-    try stderr.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.debugRefCount(), used_len, allocated_len });
-    try escapeDotString(truncated_str, stderr);
-    if (str.len > max_str_len) try stderr.writeAll("...");
-    try stderr.writeAll("\";\n");
-    try stderr.print("    style=outlined;\n", .{});
-    try stderr.print("    fillcolor=\"{s}\";\n", .{if (handle.tag() == .list) "lightblue1" else "lightgreen1"});
-    try stderr.writeAll("    node [style=filled];\n\n");
+    std.debug.print("  subgraph cluster_{} {{\n", .{index});
+    std.debug.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.debugRefCount(), used_len, allocated_len });
+    try escapeDotString(truncated_str);
+    if (str.len > max_str_len) std.debug.print("...", .{});
+    std.debug.print("\";\n", .{});
+    std.debug.print("    style=outlined;\n", .{});
+    std.debug.print("    fillcolor=\"{s}\";\n", .{if (handle.tag() == .list) "lightblue1" else "lightgreen1"});
+    std.debug.print("    node [style=filled];\n\n", .{});
 
     // Collection head node.
-    try stderr.print("    obj{} [label=\"{{", .{index});
-    try stderr.print("HEAD | idx: {} | ", .{index});
-    try stderr.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.debugRefCount(), getTagColor(handle.tag()) });
+    std.debug.print("    obj{} [label=\"{{", .{index});
+    std.debug.print("HEAD | idx: {} | ", .{index});
+    std.debug.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.debugRefCount(), getTagColor(handle.tag()) });
 
     // Collection items (all allocated slots, including unused ones).
     for (0..allocated_len) |offset| {
         const item_idx = index + 1 + offset;
         const item_handle = heap.getHandle(@intCast(item_idx));
 
-        try stderr.print("    obj{} [label=\"{{", .{item_idx});
-        try renderDotNodeLabel(stderr, item_handle, @intCast(item_idx), max_str_len);
-        try stderr.print("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.tag())});
+        std.debug.print("    obj{} [label=\"{{", .{item_idx});
+        try renderDotNodeLabel(item_handle, @intCast(item_idx), max_str_len);
+        std.debug.print("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.tag())});
     }
 
-    try stderr.writeAll("  }\n\n");
+    std.debug.print("  }}\n\n", .{});
 }
 
-fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32) !void {
+fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
     const obj = handle.peek();
 
     switch (handle.tag()) {
@@ -3050,7 +3074,7 @@ fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32)
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
                 const item_handle = objutil.listItem(handle, @intCast(item_idx));
-                try w.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
+                std.debug.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
             }
         },
         .dict => {
@@ -3059,33 +3083,33 @@ fn renderObjectEdges(heap: *Heap, w: *std.Io.Writer, handle: Handle, index: u32)
                 const key_handle = objutil.dictItem(handle, item_idx);
                 const val_handle = objutil.dictItem(handle, item_idx + 1);
 
-                try w.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
-                try w.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
+                std.debug.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
+                std.debug.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
             }
         },
         .reference => {
             const ref_handle = obj.body.reference;
-            try w.print("  obj{} -> obj{} [label=\"ref\", color=red];\n", .{ index, ref_handle.index });
+            std.debug.print("  obj{} -> obj{} [label=\"ref\", color=red];\n", .{ index, ref_handle.index });
         },
         .source => {
             if (objutil.getSourceInfo(handle).?.file_name.toHandle()) |file_name| {
-                try w.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name.index });
+                std.debug.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name.index });
             }
         },
         .cached_local_var => {
-            try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
+            std.debug.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
         },
         .cached_lexical_var => {
             const lexical_variable = heap.getExtraData(obj.body.cached_lexical_var.extra_data).lexical_variable;
-            try w.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, lexical_variable.ref.index });
+            std.debug.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, lexical_variable.ref.index });
         },
         .dict_sugar => {
-            try w.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.dict_name_index });
-            try w.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.path_index });
+            std.debug.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.dict_name_index });
+            std.debug.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.path_index });
         },
         .upvar_link => {
             const upvar_link = obj.body.upvar_link;
-            try w.print(
+            std.debug.print(
                 "  obj{} -> obj{} [label=\"linked_name\"];\n",
                 .{ index, upvar_link.linked_name },
             );
@@ -3100,10 +3124,6 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
     std.debug.print("  node [shape=record];\n", .{});
     std.debug.print("  compound=true;\n\n", .{});
 
-    var buf: [1]u8 = @splat(0);
-    var stderr = std.debug.lockStderrWriter(&buf);
-    defer std.debug.unlockStdErr();
-
     // First pass: output collections as subgraphs with their items grouped.
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (!metadata.in_use) continue;
@@ -3111,7 +3131,7 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         const handle = heap.getHandle(@intCast(i));
 
         if (handle.tag() == .list or handle.tag() == .dict) {
-            try renderCollectionSubgraph(heap, stderr, handle, @intCast(i));
+            try renderCollectionSubgraph(heap, handle, @intCast(i));
         }
     }
 
@@ -3125,20 +3145,20 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         if (handle.tag() == .list or handle.tag() == .dict) continue;
         if (!handle.isAllocHead()) continue;
 
-        try stderr.print("  obj{} [label=\"{{", .{i});
-        try renderDotNodeLabel(stderr, handle, @intCast(i), 60);
-        try stderr.print("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(handle.tag())});
+        std.debug.print("  obj{} [label=\"{{", .{i});
+        try renderDotNodeLabel(handle, @intCast(i), 60);
+        std.debug.print("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(handle.tag())});
     }
 
-    try stderr.writeAll("\n");
+    std.debug.print("\n", .{});
 
     // Third pass: output all edges.
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (!metadata.in_use) continue;
-        try renderObjectEdges(heap, stderr, heap.getHandle(@intCast(i)), @intCast(i));
+        try renderObjectEdges(heap, heap.getHandle(@intCast(i)), @intCast(i));
     }
 
-    try stderr.print("}}\n", .{});
+    std.debug.print("}}\n", .{});
 }
 
 pub export fn dumpLastTouchedTrace() void {
@@ -3148,8 +3168,8 @@ pub export fn dumpLastTouchedTrace() void {
     }
 
     if (last_touched) |val| {
-        val.getHeap().trace_mutex.lock();
-        defer val.getHeap().trace_mutex.unlock();
+        val.getHeap().trace_mutex.lockUncancelable(global_io);
+        defer val.getHeap().trace_mutex.unlock(global_io);
 
         std.debug.print("== Last touched details ==\n\n", .{});
         val.getHeap().objects.get(val.index).trace.dump();

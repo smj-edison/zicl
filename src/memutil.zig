@@ -12,20 +12,6 @@ const Allocator = mem.Allocator;
 
 const options = @import("options");
 
-/// Mutex, or DummyMutex if single threaded.
-pub const Mutex = if (options.threading) std.Thread.Mutex else DummyMutex;
-const DummyMutex = struct {
-    fn lock(self: *DummyMutex) void {
-        _ = self;
-    }
-    fn tryLock(self: *DummyMutex) void {
-        _ = self;
-    }
-    fn unlock(self: *DummyMutex) void {
-        _ = self;
-    }
-};
-
 /// Uses blake3 to make a hash that, in theory, should never
 /// overlap with any other byte string.
 pub fn hashBytes(bytes: []const u8) u256 {
@@ -115,18 +101,20 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
     return struct {
         gpa: Allocator,
+        io: std.Io,
         // TODO: make this one data structure
         free_lists: [cfg.max_order]FreeList,
         alloc_count: [cfg.max_order]usize,
         pools: [cfg.max_pool_order][cfg.pool_size]u32,
         pools_len: [cfg.max_pool_order]usize,
-        mutex: Mutex = .{},
+        mutex: std.Io.Mutex = .init,
 
         const Self = @This();
 
-        pub fn init(gpa: Allocator, initial_capacity: usize) error{OutOfMemory}!Self {
+        pub fn init(gpa: Allocator, io: std.Io, initial_capacity: usize) error{OutOfMemory}!Self {
             var new_alloc: Self = .{
                 .gpa = gpa,
+                .io = io,
                 .free_lists = undefined,
                 .alloc_count = @splat(0),
                 .pools = @splat(@splat(0)),
@@ -150,9 +138,9 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
         // Not threadsafe.
         pub fn deinit(self: *Self) enum { normal, leaked } {
-            // FIXME why does this panic if I use defer?
-            self.mutex.lock();
-            self.mutex.unlock();
+            // Synchronize state.
+            self.mutex.lockUncancelable(self.io);
+            self.mutex.unlock(self.io);
 
             self.drainPool();
 
@@ -189,8 +177,8 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             // 2 ** (current_order - new_order)
             const new_block_count = @as(u32, 1) << (current_order - new_order);
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             self.alloc_count[current_order] -= 1;
             errdefer self.alloc_count[current_order] += 1;
@@ -199,14 +187,14 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
         }
 
         pub fn allocFromAnyThread(self: *Self, requested_order: u5) !u32 {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.allocOnMainList(requested_order);
         }
 
         pub fn freeFromAnyThread(self: *Self, index: u32, order: u5) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.freeOnMainList(index, order);
         }
 
@@ -217,8 +205,8 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             } else |_| {}
 
             // We still need to lock if another thread is using this allocator right now.
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.allocOnMainList(requested_order);
         }
 
@@ -232,8 +220,8 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
             // We should transfer the pool over to the main list, since there wasn't any room
             // left on the pool.
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.drainPool();
             self.freeOnMainList(index, order);
         }
@@ -395,7 +383,7 @@ const TestAlloc = BuddyUnmanaged(.{
 test "buddy allocator" {
     const ta = std.testing.allocator;
 
-    var alloc = try TestAlloc.init(ta, 16);
+    var alloc = try TestAlloc.init(ta, testing.io, 16);
     defer if (alloc.deinit() == .leaked) @panic("Found leaks");
 
     try expectEqual(0, try alloc.allocFromAnyThread(0));
@@ -432,7 +420,7 @@ const BlockTestAlloc = BuddyUnmanaged(.{
     .pool_size = 0,
 });
 test "block splitting" {
-    var alloc = try BlockTestAlloc.init(testing.allocator, 16);
+    var alloc = try BlockTestAlloc.init(testing.allocator, testing.io, 16);
     defer if (alloc.deinit() == .leaked) @panic("Found leaks");
 
     // Make sure enough space was allocated on the free list for any split blocks.
@@ -443,8 +431,8 @@ test "block splitting" {
 
     var block_i: u32 = 0;
     while (block_i < (8 * getOrderSize(4))) : (block_i += 2) {
-        // Increment by 2 in order to hit every other block--the maximum amount
-        // of fragmentation.
+        // Increment by 2 in order to hit every other block, which is the maximum amount
+        // of fragmentation a buddy allocator can have.
         alloc.freeFromAnyThread(block_i, 0);
     }
 
@@ -490,6 +478,86 @@ test "virtual memory" {
     array[1 << 30] = 10;
     vmemUnmap(array);
 }
+
+/// Note, this will hand out allocations that potentially alias. Really only useful for debugging.
+pub const RingBufferAllocator = struct {
+    buffer: []u8,
+    end_index: usize,
+
+    pub fn init(buffer: []u8) RingBufferAllocator {
+        return .{
+            .buffer = buffer,
+            .end_index = 0,
+        };
+    }
+
+    pub fn allocator(self: *RingBufferAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn calculateOffset(self: *RingBufferAllocator, n: usize, alignment: mem.Alignment) ?struct { alloc_at: [*]u8, new_end: usize } {
+        const ptr_align = alignment.toByteUnits();
+        const adjust_off = mem.alignPointerOffset(self.buffer.ptr + self.end_index, ptr_align) orelse return null;
+        const adjusted_index = self.end_index + adjust_off;
+        const new_end_index = adjusted_index + n;
+        if (new_end_index > self.buffer.len) return null;
+
+        return .{
+            .alloc_at = self.buffer.ptr + adjusted_index,
+            .new_end = new_end_index,
+        };
+    }
+
+    pub fn alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RingBufferAllocator = @ptrCast(@alignCast(ctx));
+        _ = ra;
+
+        if (self.calculateOffset(n, alignment)) |val| {
+            self.end_index = val.new_end;
+            return val.alloc_at;
+        } else {
+            // Wrap the buffer around.
+            self.end_index = 0;
+            if (self.calculateOffset(n, alignment)) |val| {
+                self.end_index = val.new_end;
+                return val.alloc_at;
+            } else return null;
+        }
+    }
+
+    pub fn resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_size: usize, return_address: usize) bool {
+        _ = ctx;
+        _ = buf;
+        _ = alignment;
+        _ = new_size;
+        _ = return_address;
+        return false;
+    }
+
+    pub fn remap(ctx: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = return_address;
+        return null;
+    }
+
+    pub fn free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_address: usize) void {
+        _ = ctx;
+        _ = buf;
+        _ = alignment;
+        _ = return_address;
+    }
+};
 
 pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
     // Heavily inspired by std.heap.MemoryPool

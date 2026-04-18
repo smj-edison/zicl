@@ -34,15 +34,15 @@ pub fn isPunct(c: u8) bool {
 }
 
 fn toTitlecaseUtf8(cp: u21) u21 {
-    return uucode.get(.simple_titlecase_mapping, cp) orelse uucode.get(.simple_uppercase_mapping) orelse cp;
+    return uucode.get(.simple_titlecase_mapping, cp);
 }
 
 fn toUppercaseUtf8(cp: u21) u21 {
-    return uucode.get(.simple_uppercase_mapping, cp) orelse cp;
+    return uucode.get(.simple_uppercase_mapping, cp);
 }
 
 fn toLowercaseUtf8(cp: u21) u21 {
-    return uucode.get(.simple_lowercase_mapping, cp) orelse cp;
+    return uucode.get(.simple_lowercase_mapping, cp);
 }
 
 pub const toTitle = if (use_utf8) toTitlecaseUtf8 else std.ascii.toUpper;

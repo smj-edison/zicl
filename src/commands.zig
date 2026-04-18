@@ -1172,7 +1172,7 @@ pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         const file_str = try objutil.listItem(stack_list, @intCast(base + 1)).getString();
         const line_str = try objutil.listItem(stack_list, @intCast(base + 2)).getString();
         if (frame > 0) try buf.appendSlice(Heap.global_gpa, "\n");
-        try buf.writer(Heap.global_gpa).print("    at {s} ({s}:{s})", .{ name_str, file_str, line_str });
+        try buf.print(Heap.global_gpa, "    at {s} ({s}:{s})", .{ name_str, file_str, line_str });
     }
 
     interp.setResultOwning(try objutil.newString(heap, buf.items));
@@ -1204,7 +1204,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
     errdefer Heap.testFinish();
-    _ = try Heap.testStart(ta);
+    _ = try Heap.testStart(ta, testing.io);
     var interp = try Interp.init();
     errdefer interp.deinit();
     try registerCoreCommands(&interp);

@@ -5,5 +5,5 @@ zig-pkg
 
 graph.svg
 perf.data
-per.data.old
+perf.data.old
 scratch

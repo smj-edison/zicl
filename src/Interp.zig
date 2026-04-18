@@ -632,7 +632,7 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
 }
 fn testVariables(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
     var interp = try Interp.init();
     defer interp.deinit();
 
@@ -676,7 +676,7 @@ test "variables" {
 
 fn testVariableLink(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
     var interp = try Interp.init();
     defer interp.deinit();
 
@@ -2156,7 +2156,7 @@ pub fn getBoolFromExpression(interp: *Interp, handle: *Handle) !bool {
 
 test "eval expression" {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator);
+    const heap = try Heap.testStart(testing.allocator, testing.io);
     var interp = try Interp.init();
     defer interp.deinit();
 
@@ -2705,7 +2705,7 @@ pub fn removeDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const 
 
 test "recursive dict keys" {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator);
+    const heap = try Heap.testStart(testing.allocator, testing.io);
     var interp = try Interp.init();
     defer interp.deinit();
 
@@ -2740,7 +2740,7 @@ test "recursive dict keys" {
 
 fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
     // var interp = try Interp.init();
     // defer interp.deinit();
     _ = heap;

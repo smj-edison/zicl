@@ -764,7 +764,7 @@ test "enum mapping" {
 
 test "tcl enum" {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator);
+    const heap = try Heap.testStart(testing.allocator, testing.io);
 
     const MyEnum = enum { foo, bar, baz };
     const MyTclEnum = TclEnum(MyEnum, "myenum", true);
@@ -847,7 +847,7 @@ pub fn stringIs(
 
 fn testStringIs(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
 
     var str = try newString(heap, "abcdefg");
     defer str.decrRefCount();
@@ -1316,7 +1316,7 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
 
 fn testLists(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
 
     var det: ErrorDetails = undefined;
 
@@ -2121,7 +2121,7 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
 
 fn testDicts(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
 
     const key_foo = try newString(heap, "foo");
     defer key_foo.decrRefCount();
@@ -2261,7 +2261,7 @@ pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
 
 fn testSourceInfo(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
 
     var obj = try heap.createObject();
     defer obj.decrRefCount();
@@ -2546,7 +2546,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 }
 
 fn testScriptParsing(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
     const script1 = try newString(heap,
@@ -2597,7 +2597,7 @@ pub fn getScript(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap.Par
 }
 
 fn testScriptShimmering(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
     var script = try newString(heap,
@@ -2726,7 +2726,7 @@ pub fn getExpression(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap
 }
 
 fn testExpressions(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta);
+    const heap = try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
     var expr1 = try newString(heap, "1 + 2 * 3 + 4");
@@ -2753,7 +2753,7 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle
 
         try handle.prepareToShimmer();
         handle.peek().head.tag = .bool;
-        handle.peek().body.bool = new_value;
+        handle.peek().body.bool = .{ .data = new_value };
         return;
     }
 
@@ -2780,10 +2780,10 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle
 
     try handle.prepareToShimmer();
     handle.peek().head.tag = .bool;
-    handle.peek().body.bool = new_value;
+    handle.peek().body.bool = .{ .data = new_value };
 }
 
 pub fn getBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !bool {
     try shimmerToBoolean(det, provided_handle, new_handle);
-    return new_handle.orElse(provided_handle).peek().body.bool;
+    return new_handle.orElse(provided_handle).peek().body.bool.data;
 }
