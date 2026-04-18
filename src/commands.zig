@@ -684,7 +684,6 @@ fn buildErrorOptions(
     during: OptionalHandle,
 ) error{OutOfMemory}!Handle {
     const options = try objutil.newListWithCapacity(10);
-    defer options.decrRefCount();
 
     // The return code surfaced to the caller.
     const visible_code: i64 = code: {
@@ -723,10 +722,12 @@ fn buildErrorOptions(
         objutil.listAppendAssumeCapacity(options, val.reference());
     }
 
-    objutil.shimmerToDict(null, options, undefined) catch |err| switch (err) {
+    var new_dict: OptionalHandle = .none;
+    objutil.shimmerToDict(null, options, &new_dict) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => unreachable,
     };
+    assert(new_dict == .none);
 
     return options;
 }
@@ -1258,7 +1259,7 @@ test "try command" {
     try interp.testExpectScriptResult("caught: boom",
         \\ try {
         \\   error "boom"
-        \\ } on err {msg} {
+        \\ } on error {msg} {
         \\   set msg "caught: $msg"
         \\ }
     );

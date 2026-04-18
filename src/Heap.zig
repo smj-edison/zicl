@@ -1608,6 +1608,7 @@ fn deinitOomErrorOptions(heap: *Heap) void {
     if (heap.oom_error_options_dict) |dict| {
         dict.decrRefCount();
         dict.decrRefCount();
+        heap.oom_error_options_dict = null;
     }
 }
 

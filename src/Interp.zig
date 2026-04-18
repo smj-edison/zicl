@@ -1176,17 +1176,17 @@ pub fn setResultFloat(interp: *Interp, value: f64) !void {
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     const bytes_handle = try objutil.newString(Heap.local_heap, bytes);
-    interp.setResult(bytes_handle);
+    interp.setResultOwning(bytes_handle);
 }
 
 pub fn setResultInterned(interp: *Interp, interned: Heap.InternedString) void {
-    interp.setResult(Heap.local_heap.getInternedString(interned));
+    interp.setResultOwning(Heap.local_heap.getInternedString(interned));
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
     const fmt_handle = try objutil.newStringFmt(Heap.local_heap, fmt, args);
 
-    interp.setResult(fmt_handle);
+    interp.setResultOwning(fmt_handle);
 }
 
 pub fn setEmptyResult(interp: *Interp) void {
