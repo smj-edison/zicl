@@ -554,6 +554,27 @@ pub fn setVariableLinkInner(
     }
 }
 
+pub fn unsetVariableInner(
+    interp: *Interp,
+    det: ?*objutil.ErrorDetails,
+    call_frame_idx: u32,
+    name: Handle,
+) !void {
+    const frame = &interp.call_frames.items[call_frame_idx];
+    const vars = &frame.variables;
+    const remove_result = try objutil.dictRemove(vars.*, name);
+    if (!remove_result.did_remove) {
+        assert(remove_result.new_dict == .none);
+        if (det) |details| details.* = .{
+            .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
+        };
+        return error.VariableNotFound;
+    }
+
+    vars.swapIfNew(remove_result.new_dict);
+    frame.call_epoch = interp.nextCallEpoch();
+}
+
 /// Resolves to the variable's value. Must be called with a heap-native name.
 pub fn getVariableInner(
     interp: *Interp,
@@ -2612,6 +2633,17 @@ pub fn getVariableOrError(interp: *Interp, name: *Handle) !Handle {
     var det: objutil.ErrorDetails = undefined;
     const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, interp.currentCallFrameIndex(), name.*));
     return var_value;
+}
+
+pub fn unsetVariable(interp: *Interp, name: *Handle) !void {
+    try interp.ensureShimmerable(name);
+    var det: objutil.ErrorDetails = undefined;
+    try interp.wrapError(&det, interp.unsetVariableInner(&det, interp.currentCallFrameIndex(), name.*));
+}
+
+pub fn unsetVariableSilent(interp: *Interp, name: *Handle) !void {
+    try interp.ensureShimmerable(name);
+    try interp.unsetVariableInner(null, interp.currentCallFrameIndex(), name.*);
 }
 
 pub fn getDictValue(interp: *Interp, dict: Handle, key: Handle) Interp.Error!struct {

@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout.writeAll("Welcome to Zicl!\n");
 
     var line_read = try std.ArrayList(u8).initCapacity(init.gpa, 1024);
+    defer line_read.deinit(init.gpa);
     while (true) {
         try stdout.writeAll("> ");
         try stdout.flush();

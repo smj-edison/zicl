@@ -383,10 +383,8 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     }
 }
 
-pub fn exprCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
-    var expr = args[1].borrow();
-    defer expr.decrRefCount();
-    const result = try (try interp.evalExpressionInPlace(&expr)).toObject();
+pub fn exprCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const result = try (try interp.evalExpressionInPlace(&args[1])).toObject();
     defer result.decrRefCount();
     interp.setResult(result);
 }
@@ -413,14 +411,12 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
     return .none;
 }
 
-pub fn forCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     // Do the initialization.
     try interp.evalObject(args[1]);
 
     // Check condition.
-    var expr = args[2].borrow();
-    defer expr.decrRefCount();
-    while (try interp.getBoolFromExpression(&expr)) {
+    while (try interp.getBoolFromExpression(&args[2])) {
         // Evaluate body.
         switch (try propagateLoopControl(interp, interp.evalObject(args[4]))) {
             .@"break" => {
@@ -468,7 +464,7 @@ test "loop commands" {
 }
 
 /// [puts]
-pub fn putsCmd(interp: *Interp, args: []const Handle) !void {
+pub fn putsCmd(interp: *Interp, args: []Handle) !void {
     if (args.len == 3) {
         const first_arg_str = try args[1].getString();
         if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
@@ -485,16 +481,15 @@ pub fn putsCmd(interp: *Interp, args: []const Handle) !void {
 }
 
 /// [if]
-pub fn ifCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
+pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     var remaining_args = args[1..];
     while (true) {
         // Need a condition and a body after.
         if (remaining_args.len < 2) return error.WrongUsage;
 
         // Check condition.
-        var cond = remaining_args[0].borrow();
-        defer cond.decrRefCount();
-        if (try interp.getBoolFromExpression(&cond)) {
+        const cond = &remaining_args[0];
+        if (try interp.getBoolFromExpression(cond)) {
             // Evaluate true branch.
             try interp.evalObject(remaining_args[1]);
             return;
@@ -531,20 +526,17 @@ pub fn ifCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
 }
 
 /// [incr]
-pub fn incrCmd(interp: *Interp, args: []const Handle) !void {
+pub fn incrCmd(interp: *Interp, args: []Handle) !void {
     var increment_by: i64 = 1;
 
     if (args.len == 3) {
         // There's an amount provided to increment by.
-        var increment_handle = args[2].borrow();
-        defer increment_handle.decrRefCount();
-        increment_by = try interp.getInteger(&increment_handle);
+        increment_by = try interp.getInteger(&args[2]);
     }
 
-    var var_name = args[1].borrow();
-    defer var_name.decrRefCount();
+    const var_name = &args[1];
 
-    if ((try interp.getVariable(&var_name)).toHandle()) |val| {
+    if ((try interp.getVariable(var_name)).toHandle()) |val| {
         const contents = try interp.getIntegerNoShimmer(val);
         const new_contents = std.math.add(i64, contents, increment_by) catch {
             var det: objutil.ErrorDetails = undefined;
@@ -558,28 +550,28 @@ pub fn incrCmd(interp: *Interp, args: []const Handle) !void {
             val.peek().body = .{ .integer = new_contents };
             interp.setResult(val);
         } else {
-            try interp.setVariableToObject(&var_name, .{
+            try interp.setVariableToObject(var_name, .{
                 .head = .{ .str = Heap.Object.null_string, .tag = .integer },
                 .body = .{ .integer = new_contents },
             });
-            interp.setResult((interp.getVariable(&var_name) catch unreachable).toHandle().?);
+            interp.setResult((interp.getVariable(var_name) catch unreachable).toHandle().?);
         }
     } else {
-        try interp.setVariableToObject(&var_name, .{
+        try interp.setVariableToObject(var_name, .{
             .head = .{ .str = Heap.Object.null_string, .tag = .integer },
             .body = .{ .integer = increment_by },
         });
-        interp.setResult((try interp.getVariable(&var_name)).toHandle().?);
+        interp.setResult((try interp.getVariable(var_name)).toHandle().?);
     }
 }
 
 /// [append]
-pub fn appendCmd(interp: *Interp, args: []const Handle) !void {
+pub fn appendCmd(interp: *Interp, args: []Handle) !void {
     // Get the variable's value if it exists, or else use an empty string.
-    var var_name = args[1].borrow();
-    defer var_name.decrRefCount();
+    const var_name = &args[1];
+
     const var_value: []const u8 = blk: {
-        if ((try interp.getVariable(&var_name)).toHandle()) |val| {
+        if ((try interp.getVariable(var_name)).toHandle()) |val| {
             break :blk try val.getString();
         } else {
             break :blk "";
@@ -588,10 +580,10 @@ pub fn appendCmd(interp: *Interp, args: []const Handle) !void {
 
     // Fast path: no values to append, just ensure the variable exists and return it.
     if (args.len == 2) {
-        if ((try interp.getVariable(&var_name)).toHandle()) |val| {
+        if ((try interp.getVariable(var_name)).toHandle()) |val| {
             interp.setResult(val);
         } else {
-            try interp.setVariableTo(&var_name, Heap.local_heap.emptyHandle());
+            try interp.setVariableTo(var_name, Heap.local_heap.emptyHandle());
             interp.setEmptyResult();
         }
         return;
@@ -618,23 +610,52 @@ pub fn appendCmd(interp: *Interp, args: []const Handle) !void {
         }
     }
 
-    try interp.setVariableTo(&var_name, result_str);
-    interp.setResult((try interp.getVariable(&var_name)).toHandle().?);
+    try interp.setVariableTo(var_name, result_str);
+    interp.setResult((try interp.getVariable(var_name)).toHandle().?);
 }
 
 /// [set]
-pub fn setCmd(interp: *Interp, args: []const Handle) !void {
-    var var_name = args[1].borrow();
-    defer var_name.decrRefCount();
+pub fn setCmd(interp: *Interp, args: []Handle) !void {
+    const var_name = &args[1];
 
     if (args.len == 2) {
         // Return the value.
-        interp.setResult(try interp.getVariableOrError(&var_name));
+        interp.setResult(try interp.getVariableOrError(var_name));
     } else {
-        try interp.setVariableTo(&var_name, args[2]);
+        try interp.setVariableTo(var_name, args[2]);
         // Return the stored value (may differ from args[2] after upvar follow).
-        interp.setResult(try interp.getVariableOrError(&var_name));
+        interp.setResult(try interp.getVariableOrError(var_name));
     }
+}
+
+pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
+    var should_complain = true;
+
+    var i: usize = 1;
+    while (i < args.len) {
+        if (try Heap.stringEquals(args[i], "--")) {
+            i += 1;
+            break;
+        } else if (try Heap.stringEquals(args[i], "-nocomplain")) {
+            should_complain = false;
+            i += 1;
+            continue;
+        } else break;
+    }
+
+    if (should_complain) {
+        while (i < args.len) : (i += 1) {
+            try interp.unsetVariable(&args[i]);
+        }
+    } else {
+        while (i < args.len) : (i += 1) {
+            interp.unsetVariableSilent(&args[i]) catch |err| switch (err) {
+                error.VariableNotFound => {},
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
+    }
+    try interp.unsetVariable(&args[1]);
 }
 
 /// [apply] - invoke a closure value directly without binding it to a name.
@@ -1215,6 +1236,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("unset", .{ .to_call = unsetCmd, .description = "?-nocomplain? ?--? ?varName ...?", .min_arity = 0 });
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
