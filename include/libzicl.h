@@ -3,11 +3,8 @@
 #include <stdint.h>
 
 /* Opaque handle to a heap object. ZICL_HANDLE_NONE (zero) is the null sentinel. */
-typedef struct
-{
-    uint64_t _opaque;
-} ZiclHandle;
-#define ZICL_HANDLE_NONE ((ZiclHandle){0})
+typedef uint64_t ZiclHandle;
+#define ZICL_NULL_HANDLE ((ZiclHandle)0)
 
 typedef enum ZiclReturnCode
 {
