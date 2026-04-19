@@ -4,28 +4,25 @@ const Heap = @import("Heap.zig");
 const Interp = @import("Interp.zig");
 const commands = @import("commands.zig");
 
-pub fn main() !void {
-    var alloc = std.heap.DebugAllocator(.{}).init;
-    const gpa = alloc.allocator();
-
+pub fn main(init: std.process.Init) !void {
     defer Heap.deinitAll();
-    try Heap.initGlobals(gpa);
+    try Heap.initGlobals(init.gpa, init.io);
     try Heap.initLocalHeap();
     var interp = try Interp.init();
     defer interp.deinit();
     try commands.registerCoreCommands(&interp);
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     var stdin_buffer: [1024]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+    var stdin_reader = std.Io.File.stdin().reader(init.io, &stdin_buffer);
 
     const stdout = &stdout_writer.interface;
     const stdin = &stdin_reader.interface;
 
     try stdout.writeAll("Welcome to Zicl!\n");
 
-    var line_read = try std.ArrayList(u8).initCapacity(gpa, 1024);
+    var line_read = try std.ArrayList(u8).initCapacity(init.gpa, 1024);
     while (true) {
         try stdout.writeAll("> ");
         try stdout.flush();
@@ -42,16 +39,16 @@ pub fn main() !void {
             };
 
             if (std.mem.indexOfScalarPos(u8, stdin.buffer[0..stdin.end], stdin.seek, '\n')) |end| {
-                try line_read.appendSlice(gpa, stdin.buffer[stdin.seek..end]);
+                try line_read.appendSlice(init.gpa, stdin.buffer[stdin.seek..end]);
                 stdin.toss(end - stdin.seek + 1);
                 break;
             } else {
-                try line_read.appendSlice(gpa, stdin.buffered());
+                try line_read.appendSlice(init.gpa, stdin.buffered());
                 stdin.tossBuffered();
             }
         }
 
-        const str_handle = try objutil.newString(Heap.local_heap, line_read.items);
+        const str_handle = try objutil.newString(line_read.items);
         defer str_handle.decrRefCount();
         interp.evalObject(str_handle) catch |err| {
             std.debug.print("Error code: {s}\n", .{@errorName(err)});

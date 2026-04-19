@@ -358,7 +358,7 @@ pub const Parse = struct {
             },
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try objutil.newString(p.heap, p.source[loc.start..loc.end]);
+                const handle = try objutil.newStringInner(p.heap, p.source[loc.start..loc.end]);
                 errdefer handle.decrRefCount();
 
                 return try p.addNode(.{
@@ -379,7 +379,7 @@ pub const Parse = struct {
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                const command_handle = try objutil.newString(p.heap, p.source[loc.start..loc.end]);
+                const command_handle = try objutil.newStringInner(p.heap, p.source[loc.start..loc.end]);
                 errdefer command_handle.decrRefCount();
 
                 // Be sure to save the source info.
@@ -398,7 +398,7 @@ pub const Parse = struct {
             .keyword_true,
             => {
                 const loc = p.tokenLoc(p.nextToken());
-                var string_handle = try objutil.newString(p.heap, p.source[loc.start..loc.end]);
+                var string_handle = try objutil.newStringInner(p.heap, p.source[loc.start..loc.end]);
                 errdefer string_handle.decrRefCount();
 
                 return try p.addNode(.{

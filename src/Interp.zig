@@ -141,7 +141,7 @@ pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) w
 
 fn variableNotFoundError(det: ?*objutil.ErrorDetails, var_name: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try objutil.newStringFmt(Heap.local_heap, "can't read \"{s}\": no such variable", .{var_name}),
+        .message = try objutil.newStringFmt("can't read \"{s}\": no such variable", .{var_name}),
     };
 
     return error.VariableNotFound;
@@ -279,7 +279,7 @@ fn ensureValidVariableType(
     // Does it contain double colons anywhere?
     const double_colons = std.mem.indexOf(u8, var_name, "::");
     if (double_colons) |start_at| {
-        const dict_name = try objutil.newString(Heap.local_heap, var_name[0..start_at]);
+        const dict_name = try objutil.newString(var_name[0..start_at]);
         errdefer dict_name.decrRefCount();
 
         var dict_path = try objutil.newList(&.{});
@@ -291,7 +291,7 @@ fn ensureValidVariableType(
             if (var_name[i] == ':' and var_name[i + 1] == ':') {
                 if (last_path_start) |val| {
                     const path_section = var_name[val..(i - 1)];
-                    const path_section_handle = try objutil.newString(Heap.local_heap, path_section);
+                    const path_section_handle = try objutil.newString(path_section);
                     defer path_section_handle.decrRefCount();
 
                     var new_dict_path: OptionalHandle = .none;
@@ -379,7 +379,7 @@ pub fn setVariableInner(
                         error.OutOfMemory => return error.OutOfMemory,
                         error.BadDict => {
                             if (det) |details| details.* = .{
-                                .message = try objutil.newStringFmt(
+                                .message = try objutil.newStringFmtInner(
                                     Heap.local_heap,
                                     "variable \"{f}\" is not a valid dictionary",
                                     .{dict_name},
@@ -474,7 +474,7 @@ pub fn setVariableLinkInner(
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) |_| {
         // Variable already exists.
         if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt(Heap.local_heap, "variable \"{s}\" already exists", .{name_bytes}),
+            .message = try objutil.newStringFmt("variable \"{s}\" already exists", .{name_bytes}),
         };
 
         return error.VariableAlreadyExists;
@@ -487,7 +487,7 @@ pub fn setVariableLinkInner(
 
     if (name.tag() == .dict_sugar) {
         if (det) |details| details.* = .{
-            .message = try objutil.newString(Heap.local_heap, "cannot create an upvar name that has dict sugar"),
+            .message = try objutil.newString("cannot create an upvar name that has dict sugar"),
         };
         return error.DictSugarInUpvarName;
     }
@@ -503,7 +503,7 @@ pub fn setVariableLinkInner(
                 // we managed to find ourselves when traversing the upvar
                 // chain. Obviously, we can't let this happen.
                 if (det) |details| details.* = .{
-                    .message = try objutil.newString(Heap.local_heap, "can't upvar from variable to itself"),
+                    .message = try objutil.newString("can't upvar from variable to itself"),
                 };
                 return error.CircularUpvar;
             }
@@ -537,7 +537,7 @@ pub fn setVariableLinkInner(
             }
         }
 
-        const target_name_duped = try objutil.newString(Heap.local_heap, target_name_bytes);
+        const target_name_duped = try objutil.newString(target_name_bytes);
 
         interp.setVariableInner(null, call_frame_idx, name, .{
             .head = .{ .str = Heap.Object.null_string, .tag = .upvar_link },
@@ -603,7 +603,7 @@ pub fn getVariableInner(
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt(
+                        .message = try objutil.newStringFmtInner(
                             Heap.local_heap,
                             "variable \"{f}\" is not a valid dictionary",
                             .{dict_name},
@@ -636,28 +636,28 @@ fn testVariables(ta: std.mem.Allocator) !void {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var str_foo = try objutil.newString(heap, "foo");
+    var str_foo = try objutil.newStringInner(heap, "foo");
     defer str_foo.decrRefCount();
 
     // Make sure it doesn't resolve to anything.
     try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
 
-    const str_value = try objutil.newString(heap, "value");
+    const str_value = try objutil.newStringInner(heap, "value");
     defer str_value.decrRefCount();
     try interp.setVariableTo(&str_foo, str_value);
 
     const cached_lookup_value = (try interp.resolveVariable(0, str_foo)).?.local_variable.target;
     try testing.expectEqualStrings("value", try cached_lookup_value.getString());
     // Also try resolving the value from a new string.
-    var str2_foo = try objutil.newString(heap, "foo");
+    var str2_foo = try objutil.newStringInner(heap, "foo");
     defer str2_foo.decrRefCount();
     const lookup_value = (try interp.resolveVariable(0, str2_foo)).?.local_variable.target;
     try testing.expectEqualStrings("value", try lookup_value.getString());
 
     // Next, we test dict sugar.
-    var str_foo_bar = try objutil.newString(heap, "foo::bar");
+    var str_foo_bar = try objutil.newStringInner(heap, "foo::bar");
     defer str_foo_bar.decrRefCount();
-    var str_baz = try objutil.newString(heap, "baz");
+    var str_baz = try objutil.newStringInner(heap, "baz");
     defer str_baz.decrRefCount();
 
     // Make sure trying to read a dict value fails when it's not a dict.
@@ -681,15 +681,15 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
     defer interp.deinit();
 
     // Create a variable `foo` containing `value`, then upvar `bar` to `foo`.
-    var str_foo = try objutil.newString(heap, "foo");
+    var str_foo = try objutil.newStringInner(heap, "foo");
     defer str_foo.decrRefCount();
 
     try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
-    const str_value = try objutil.newString(heap, "value");
+    const str_value = try objutil.newStringInner(heap, "value");
     defer str_value.decrRefCount();
     try interp.setVariableTo(&str_foo, str_value);
 
-    var str_bar = try objutil.newString(heap, "bar");
+    var str_bar = try objutil.newStringInner(heap, "bar");
     defer str_bar.decrRefCount();
     try interp.setVariableLinkInner(null, 0, str_bar, 0, str_foo);
 
@@ -698,7 +698,7 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("value", try lookup_value.getString());
 
     // Modify `foo` through `bar`.
-    const str_new_value = try objutil.newString(heap, "new value");
+    const str_new_value = try objutil.newStringInner(heap, "new value");
     defer str_new_value.decrRefCount();
     try interp.setVariableInner(null, 0, str_bar, str_new_value.reference());
     lookup_value = try interp.getVariableInner(null, 0, str_foo);
@@ -766,7 +766,7 @@ pub const NativeCommand = struct {
 
 fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
-        .message = try objutil.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
+        .message = try objutil.newStringFmt("wrong # args: should be \"{s}\"", .{command_usage}),
     };
 
     return Error.WrongUsage;
@@ -779,7 +779,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeComma
         .call_info = .{ .zig = call_info },
     });
 
-    var var_name = try objutil.newString(Heap.local_heap, name);
+    var var_name = try objutil.newString(name);
     defer var_name.decrRefCount();
 
     const var_name_escaped = try objutil.newList(&.{var_name});
@@ -788,7 +788,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeComma
     defer combined.deinit(Heap.global_gpa);
     try combined.appendSlice(Heap.global_gpa, "nativefn ");
     try combined.appendSlice(Heap.global_gpa, try var_name_escaped.getString());
-    const var_value = try objutil.newString(Heap.local_heap, combined.items);
+    const var_value = try objutil.newString(combined.items);
 
     try interp.setVariableToObject(&var_name, var_value.referenceTakeOwnership());
 
@@ -799,12 +799,12 @@ pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeComma
 pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closure {
     if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..8], "closure ")) {
         if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure: \"{s}\"", .{bytes}),
+            .message = try objutil.newStringFmt("not a valid closure: \"{s}\"", .{bytes}),
         };
         return error.BadClosure;
     }
 
-    const closure_value = try objutil.newString(Heap.local_heap, bytes[8..]);
+    const closure_value = try objutil.newString(bytes[8..]);
     defer closure_value.decrRefCount();
 
     var new_handle: OptionalHandle = .none;
@@ -812,7 +812,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure: \"{s}\"", .{bytes}),
+                .message = try objutil.newStringFmt("not a valid closure: \"{s}\"", .{bytes}),
             };
             return error.BadClosure;
         },
@@ -829,7 +829,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure implementation: \"{s}\"", .{bytes}),
+                        .message = try objutil.newStringFmt("not a valid closure implementation: \"{s}\"", .{bytes}),
                     };
                     return error.BadClosure;
                 },
@@ -838,7 +838,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
 
             if (objutil.listLengthRaw(impl) != 2) {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure implementation: \"{s}\"", .{bytes}),
+                    .message = try objutil.newStringFmt("not a valid closure implementation: \"{s}\"", .{bytes}),
                 };
                 return error.BadClosure;
             }
@@ -846,7 +846,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
             break :blk .{ objutil.listItem(impl, 0), objutil.listItem(impl, 1) };
         } else {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "closure missing implementation: \"{s}\"", .{bytes}),
+                .message = try objutil.newStringFmt("closure missing implementation: \"{s}\"", .{bytes}),
             };
             return error.BadClosure;
         }
@@ -859,7 +859,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "closure args is not a valid list: \"{f}\"", .{args}),
+                .message = try objutil.newStringFmt("closure args is not a valid list: \"{f}\"", .{args}),
             };
             return error.BadClosure;
         },
@@ -909,7 +909,7 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
     for (0..arg_list_len) |i| {
         if (args_parameter_found) {
             if (det) |details| details.* = .{
-                .message = try objutil.newString(Heap.local_heap, "parameter after 'args' not allowed"),
+                .message = try objutil.newString("parameter after 'args' not allowed"),
             };
             return error.BadClosure;
         }
@@ -921,7 +921,7 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg_raw}),
+                    .message = try objutil.newStringFmt("too many fields in argument specifier \"{f}\"", .{arg_raw}),
                 };
                 return error.BadClosure;
             },
@@ -931,12 +931,12 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
 
         if (arg_len == 0) {
             if (det) |details| details.* = .{
-                .message = try objutil.newString(Heap.local_heap, "argument with no name"),
+                .message = try objutil.newString("argument with no name"),
             };
             return error.BadClosure;
         } else if (arg_len > 2) {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg}),
+                .message = try objutil.newStringFmt("too many fields in argument specifier \"{f}\"", .{arg}),
             };
             return error.BadClosure;
         } else if (arg_len == 2) {
@@ -947,7 +947,7 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
 
             if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newString(Heap.local_heap, "'args' must be a required parameter"),
+                    .message = try objutil.newString("'args' must be a required parameter"),
                 };
                 return error.BadClosure;
             }
@@ -966,7 +966,7 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
         } else {
             if (optional_values != null) {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newString(Heap.local_heap, "required parameter after optional parameter not allowed"),
+                    .message = try objutil.newString("required parameter after optional parameter not allowed"),
                 };
                 return error.BadClosure;
             }
@@ -1175,7 +1175,7 @@ pub fn setResultFloat(interp: *Interp, value: f64) !void {
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
-    const bytes_handle = try objutil.newString(Heap.local_heap, bytes);
+    const bytes_handle = try objutil.newString(bytes);
     interp.setResultOwning(bytes_handle);
 }
 
@@ -1184,7 +1184,7 @@ pub fn setResultInterned(interp: *Interp, interned: Heap.InternedString) void {
 }
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
-    const fmt_handle = try objutil.newStringFmt(Heap.local_heap, fmt, args);
+    const fmt_handle = try objutil.newStringFmt(fmt, args);
 
     interp.setResultOwning(fmt_handle);
 }
@@ -1261,7 +1261,7 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadDict => {
                     if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt(
+                        .message = try objutil.newStringFmtInner(
                             Heap.local_heap,
                             "failed to capture the variable \"{f}\", as it was an upvar that pointed at nothing",
                             .{key},
@@ -1478,7 +1478,7 @@ fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32
             // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
             const command = interp.global_commands.getPtr(bytes[9..]) orelse {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "invalid native command name \"{s}\"", .{bytes[9..]}),
+                    .message = try objutil.newStringFmt("invalid native command name \"{s}\"", .{bytes[9..]}),
                 };
                 return error.CommandNotFound;
             };
@@ -1491,7 +1491,7 @@ fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound, error.BadDict => {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "invalid command name \"{f}\"", .{name}),
+                .message = try objutil.newStringFmt("invalid command name \"{f}\"", .{name}),
             };
             return error.CommandNotFound;
         },
@@ -2162,7 +2162,7 @@ test "eval expression" {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var expr = try objutil.newString(heap, "5 + 10");
+    var expr = try objutil.newStringInner(heap, "5 + 10");
     defer expr.decrRefCount();
     var new_expr: OptionalHandle = .none;
     const result = try interp.evalExpression(expr, &new_expr);
@@ -2379,7 +2379,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
 }
 
 /// Return code values matching Tcl's convention.
-pub const ReturnCode = enum(u3) {
+pub const ReturnCode = enum(u8) {
     ok = 0,
     @"error" = 1,
     @"return" = 2,
@@ -2713,13 +2713,13 @@ test "recursive dict keys" {
 
     var dict = try objutil.newDict(heap, &.{});
     defer dict.decrRefCount();
-    var key_foo = try objutil.newString(heap, "foo");
+    var key_foo = try objutil.newStringInner(heap, "foo");
     defer key_foo.decrRefCount();
-    var key_bar = try objutil.newString(heap, "bar");
+    var key_bar = try objutil.newStringInner(heap, "bar");
     defer key_bar.decrRefCount();
-    var key_baz = try objutil.newString(heap, "baz");
+    var key_baz = try objutil.newStringInner(heap, "baz");
     defer key_baz.decrRefCount();
-    const value_qux = try objutil.newString(heap, "qux");
+    const value_qux = try objutil.newStringInner(heap, "qux");
     defer value_qux.decrRefCount();
 
     _ = try interp.putDictValueRecursively(&dict, &[_]Handle{ key_foo, key_bar, key_baz }, value_qux);
@@ -2842,7 +2842,7 @@ test "recursive dict removal" {
 }
 
 fn testRunScript(interp: *Interp, script: []const u8) !Handle {
-    var script_handle = try objutil.newString(Heap.local_heap, script);
+    var script_handle = try objutil.newString(script);
     defer script_handle.decrRefCount();
     try interp.evalObject(script_handle);
     return interp.result;

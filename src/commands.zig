@@ -368,10 +368,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 }
             };
 
-            const result = try interp.wrapError(
-                &det,
-                objutil.dictRemoveRecursively(&det, dict, args[3..args.len]),
-            );
+            const result = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, dict, args[3..args.len]));
 
             if (result.new_dict.toHandle()) |new| {
                 defer new.decrRefCount();
@@ -1193,7 +1190,7 @@ pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         try buf.print(Heap.global_gpa, "    at {s} ({s}:{s})", .{ name_str, file_str, line_str });
     }
 
-    interp.setResultOwning(try objutil.newString(heap, buf.items));
+    interp.setResultOwning(try objutil.newStringInner(heap, buf.items));
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
@@ -1238,7 +1235,7 @@ test "commands" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
-    var script = try objutil.newString(Heap.local_heap,
+    var script = try objutil.newStringInner(Heap.local_heap,
         \\ dict set x a 10
         \\ puts [dict get $x a 5]
     );

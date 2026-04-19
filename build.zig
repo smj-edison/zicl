@@ -61,6 +61,25 @@ pub fn build(b: *std.Build) void {
     const run_exe = b.addRunArtifact(exe);
     run_step.dependOn(&run_exe.step);
 
+    // libzicl
+    const lz_mod = b.createModule(.{
+        .root_source_file = b.path("src/libzicl.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lz_mod.addImport("uucode", uucode_dep.module("uucode"));
+    lz_mod.addImport("options", options_mod);
+
+    const lz = b.addLibrary(.{
+        .name = "zicl",
+        .linkage = .static,
+        .root_module = lz_mod,
+        .use_llvm = use_llvm,
+    });
+    lz_mod.link_libc = true;
+    lz.installHeader(b.path("include/libzicl.h"), "libzicl.h");
+    b.installArtifact(lz);
+
     // tests
     const tests = b.addTest(.{
         .name = "zicl-test",

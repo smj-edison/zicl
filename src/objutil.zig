@@ -89,7 +89,7 @@ pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) 
 }
 
 /// Copies provided string.
-pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
+pub fn newStringInner(heap: *Heap, bytes: []const u8) !Handle {
     var handle = try heap.createObject();
     errdefer handle.decrRefCount();
 
@@ -101,7 +101,11 @@ pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
     return handle;
 }
 
-pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
+pub fn newString(bytes: []const u8) !Handle {
+    return newStringInner(Heap.local_heap, bytes);
+}
+
+pub fn newStringFmtInner(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
     const new_count = std.fmt.count(fmt, args);
     const str = try newStringToFill(heap, new_count);
     // Don't try setting the string of an empty object.
@@ -111,6 +115,10 @@ pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handl
     assert(written.len == new_count);
 
     return str;
+}
+
+pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
+    return newStringFmtInner(Heap.local_heap, fmt, args);
 }
 
 pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
@@ -229,11 +237,11 @@ pub fn integerOverflowError(det: ?*ErrorDetails, value: ?[]const u8) error{ OutO
     if (det) |details| {
         if (value) |val| {
             details.* = .{
-                .message = try newStringFmt(Heap.local_heap, "integer value \"{s}\" too big to be represented", .{val}),
+                .message = try newStringFmt("integer value \"{s}\" too big to be represented", .{val}),
             };
         } else {
             details.* = .{
-                .message = try newString(Heap.local_heap, "integer overflow"),
+                .message = try newString("integer overflow"),
             };
         }
     }
@@ -255,7 +263,7 @@ pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     } else |err| switch (err) {
         error.InvalidCharacter => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt(Heap.local_heap, "expected integer but got \"{s}\"", .{bytes}),
+                .message = try newStringFmt("expected integer but got \"{s}\"", .{bytes}),
             };
             return error.BadInteger;
         },
@@ -303,7 +311,7 @@ pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     } else |err| switch (err) {
         error.InvalidCharacter => {
             if (det) |details| details.* = .{
-                .message = try newStringFmt(Heap.local_heap, "expected floating-point number but got \"{s}\"", .{bytes}),
+                .message = try newStringFmt("expected floating-point number but got \"{s}\"", .{bytes}),
             };
             return error.BadFloat;
         },
@@ -363,7 +371,7 @@ pub const Range = struct {
 /// Sets the details to a bad index message, and returns error.BadIndex.
 fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
     if (det) |details| details.* = .{
-        .message = try newStringFmt("bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
+        .message = try newStringFmtInner("bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
     return error.BadIndex;
@@ -637,7 +645,7 @@ pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     if (start == 0) {
         return str;
     } else {
-        return try newString(bytes[start..]);
+        return try newStringInner(bytes[start..]);
     }
 }
 
@@ -651,7 +659,7 @@ pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     if (end == bytes.len) {
         return str;
     } else {
-        return try newString(bytes[0..end]);
+        return try newStringInner(bytes[0..end]);
     }
 }
 
@@ -666,7 +674,7 @@ pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     if (start == 0 and end == bytes.len) {
         return str;
     } else {
-        return try newString(bytes[start..end]);
+        return try newStringInner(bytes[start..end]);
     }
 }
 
@@ -739,7 +747,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8, include_numbers: bool) t
                 return val;
             } else {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(Heap.local_heap, "bad {s} \"{f}\": must be {s}", .{ enum_name, handle, names }),
+                    .message = try newStringFmt("bad {s} \"{f}\": must be {s}", .{ enum_name, handle, names }),
                 };
 
                 return error.BadEnumVariant;
@@ -769,11 +777,11 @@ test "tcl enum" {
     const MyEnum = enum { foo, bar, baz };
     const MyTclEnum = TclEnum(MyEnum, "myenum", true);
 
-    var foo_str = try newString(heap, "foo");
+    var foo_str = try newStringInner(heap, "foo");
     defer foo_str.decrRefCount();
-    var one_str = try newString(heap, "1");
+    var one_str = try newStringInner(heap, "1");
     defer one_str.decrRefCount();
-    var bad_str = try newString(heap, "bad");
+    var bad_str = try newStringInner(heap, "bad");
     defer bad_str.decrRefCount();
 
     var new_handle: OptionalHandle = .none;
@@ -786,7 +794,7 @@ test "tcl enum" {
 }
 
 fn generateSubcommandUsage(comptime Enum: type, args: []Handle) !Handle {
-    return try newStringFmt(
+    return try newStringFmtInner(
         Heap.local_heap,
         "Usage: \"{f} command ... \", where command is one of: {s}",
         .{ args[0], enumNames(Enum, ", ") },
@@ -831,7 +839,7 @@ pub fn SubcommandParser(
         pub fn parse(det: ?*ErrorDetails, args: []Handle) !Enum {
             if (args.len < 2) {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(Heap.local_heap,
+                    .message = try newStringFmt(
                         \\wrong # args: should be "{f} command ..."
                         \\Use "{f} -help ?command?" for help
                     , .{ args[0], args[0] }),
@@ -849,7 +857,7 @@ pub fn SubcommandParser(
                     if (NameToEnum.get(subcommand_queried)) |val| {
                         const subcommand = EnumToSubcommand.get(val);
                         if (det) |details| details.* = .{
-                            .message = try newStringFmt(Heap.local_heap,
+                            .message = try newStringFmt(
                                 \\Usage: "{f} {s} {s}"
                             , .{ args[0], subcommand_queried, subcommand.usage }),
                         };
@@ -863,14 +871,14 @@ pub fn SubcommandParser(
             }
 
             if (try Heap.stringEquals(args[1], "-commands")) {
-                if (det) |details| details.* = .{ .message = try newString(Heap.local_heap, space_joined_names) };
+                if (det) |details| details.* = .{ .message = try newString(space_joined_names) };
                 return error.UsageHelp;
             }
 
             const subcommand_name = try args[1].getString();
             const subcommand_enum = NameToEnum.get(subcommand_name) orelse {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(Heap.local_heap,
+                    .message = try newStringFmt(
                         \\{f}, unknown command "{f}": should be {s}
                     , .{ args[0], args[1], space_joined_names }),
                 };
@@ -888,7 +896,7 @@ pub fn SubcommandParser(
             };
             if (!correct_arg_count) {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(Heap.local_heap,
+                    .message = try newStringFmt(
                         \\wrong # args: should be "{s}"
                     , .{subcommand.usage}),
                 };
@@ -908,15 +916,15 @@ test "subcommand parser" {
     defer Heap.testFinish();
     const heap = try Heap.testStart(testing.allocator, testing.io);
 
-    var base_str = try newString(heap, "base");
+    var base_str = try newStringInner(heap, "base");
     defer base_str.decrRefCount();
-    var foo_str = try newString(heap, "foo");
+    var foo_str = try newStringInner(heap, "foo");
     defer foo_str.decrRefCount();
-    var arg1_str = try newString(heap, "arg1");
+    var arg1_str = try newStringInner(heap, "arg1");
     defer arg1_str.decrRefCount();
-    var arg2_str = try newString(heap, "arg2");
+    var arg2_str = try newStringInner(heap, "arg2");
     defer arg2_str.decrRefCount();
-    var arg3_str = try newString(heap, "arg3");
+    var arg3_str = try newStringInner(heap, "arg3");
     defer arg3_str.decrRefCount();
 
     var args = [_]Handle{ base_str, foo_str, arg1_str, arg2_str };
@@ -990,13 +998,13 @@ fn testStringIs(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
     const heap = try Heap.testStart(ta, testing.io);
 
-    var str = try newString(heap, "abcdefg");
+    var str = try newStringInner(heap, "abcdefg");
     defer str.decrRefCount();
-    var str2 = try newString(heap, "abcdefg123");
+    var str2 = try newStringInner(heap, "abcdefg123");
     defer str2.decrRefCount();
-    var class = try newString(heap, "alpha");
+    var class = try newStringInner(heap, "alpha");
     defer class.decrRefCount();
-    var bad_class = try newString(heap, "bad_class");
+    var bad_class = try newStringInner(heap, "bad_class");
     defer bad_class.decrRefCount();
     var det: ErrorDetails = undefined;
 
@@ -1021,14 +1029,14 @@ test "string is" {
 
 pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
     const message = switch (err) {
-        error.CharactersAfterCloseBrace => try newString(heap, "extra characters after close-brace"),
-        error.MissingCloseBrace => try newString(heap, "missing close-brace"),
-        error.MissingCloseBracket => try newString(heap, "unmatched \"[\""),
-        error.MissingCloseQuote => try newString(heap, "missing quote"),
-        error.TrailingBackslash => try newString(heap, "no character after \\"),
-        error.FunctionMissingParentheses => try newString(heap, "function missing parentheses"),
-        error.NotOperator => try newString(heap, "not operator"),
-        error.NotNumber => try newString(heap, "not number"),
+        error.CharactersAfterCloseBrace => try newStringInner(heap, "extra characters after close-brace"),
+        error.MissingCloseBrace => try newStringInner(heap, "missing close-brace"),
+        error.MissingCloseBracket => try newStringInner(heap, "unmatched \"[\""),
+        error.MissingCloseQuote => try newStringInner(heap, "missing quote"),
+        error.TrailingBackslash => try newStringInner(heap, "no character after \\"),
+        error.FunctionMissingParentheses => try newStringInner(heap, "function missing parentheses"),
+        error.NotOperator => try newStringInner(heap, "not operator"),
+        error.NotNumber => try newStringInner(heap, "not number"),
         error.NotVariable => unreachable,
     };
 
@@ -1469,9 +1477,9 @@ fn testLists(ta: std.mem.Allocator) !void {
     var det: ErrorDetails = undefined;
 
     // Simple case: two objects in a list
-    const obj1 = try newString(heap, "object 1");
+    const obj1 = try newStringInner(heap, "object 1");
     defer obj1.decrRefCount();
-    const obj2 = try newString(heap, "object 2");
+    const obj2 = try newStringInner(heap, "object 2");
     defer obj2.decrRefCount();
     var list1 = try newList(&.{ obj1, obj2 });
     defer list1.decrRefCount();
@@ -1483,7 +1491,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     // But it should have an identical string
     try testing.expectEqualStrings("object 1", try listItem(list1, 0).getString());
 
-    const to_append = try newString(heap, "appended item");
+    const to_append = try newStringInner(heap, "appended item");
     defer to_append.decrRefCount();
 
     var new_list: OptionalHandle = .none;
@@ -1491,7 +1499,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     list1.swapAndClear(&new_list);
     try testing.expectEqualStrings("appended item", try listItem(list1, 2).getString());
 
-    var string_list = try newString(heap,
+    var string_list = try newStringInner(heap,
         \\item1 {item 2} item\ 3
     );
     defer string_list.decrRefCount();
@@ -1558,7 +1566,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     if (@mod(len, 2) == 1) {
         // Unmatched key.
         if (det) |details| details.* = .{
-            .message = try newStringFmt(
+            .message = try newStringFmtInner(
                 Heap.local_heap,
                 "Missing value to go with key when converting \"{f}\" to a dictionary.",
                 .{shimmerable},
@@ -2143,7 +2151,7 @@ pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: [
         return .{ .new_dict = new_dict, .did_remove = child_remove_result.did_remove };
     } else {
         if (det) |details| details.* = .{
-            .message = try newStringFmt(
+            .message = try newStringFmtInner(
                 Heap.local_heap,
                 "key \"{f}\" not known in dictionary \"{f}\"",
                 .{ keys[0], provided_dict },
@@ -2217,17 +2225,17 @@ fn testDictFlatten(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
     const heap = try Heap.testStart(ta, testing.io);
 
-    const key_foo = try newString(heap, "foo");
+    const key_foo = try newStringInner(heap, "foo");
     defer key_foo.decrRefCount();
-    const value1 = try newString(heap, "1");
+    const value1 = try newStringInner(heap, "1");
     defer value1.decrRefCount();
-    const key_bar = try newString(heap, "bar");
+    const key_bar = try newStringInner(heap, "bar");
     defer key_bar.decrRefCount();
-    const value2 = try newString(heap, "2");
+    const value2 = try newStringInner(heap, "2");
     defer value2.decrRefCount();
-    const key_baz = try newString(heap, "baz");
+    const key_baz = try newStringInner(heap, "baz");
     defer key_baz.decrRefCount();
-    const value3 = try newString(heap, "3");
+    const value3 = try newStringInner(heap, "3");
     defer value3.decrRefCount();
 
     const dict1 = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
@@ -2354,21 +2362,21 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
     const heap = try Heap.testStart(ta, testing.io);
 
-    const key_foo = try newString(heap, "foo");
+    const key_foo = try newStringInner(heap, "foo");
     defer key_foo.decrRefCount();
-    const value1 = try newString(heap, "1");
+    const value1 = try newStringInner(heap, "1");
     defer value1.decrRefCount();
-    const key_bar = try newString(heap, "bar");
+    const key_bar = try newStringInner(heap, "bar");
     defer key_bar.decrRefCount();
-    const value2 = try newString(heap, "2");
+    const value2 = try newStringInner(heap, "2");
     defer value2.decrRefCount();
 
     const dict1 = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
     defer dict1.decrRefCount();
 
-    const good_key = try newString(heap, "foo");
+    const good_key = try newStringInner(heap, "foo");
     defer good_key.decrRefCount();
-    const bad_key = try newString(heap, "bogus");
+    const bad_key = try newStringInner(heap, "bogus");
     defer bad_key.decrRefCount();
 
     try testing.expectEqualStrings("1", try (try dictLookupFollowRefs(dict1, good_key)).toHandle().?.getString());
@@ -2378,7 +2386,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     var new_dict: OptionalHandle = .none;
     defer new_dict.swapWithNone();
 
-    var dict_with_duplicates = try newString(heap, "foo 5 bar 10 foo 15");
+    var dict_with_duplicates = try newStringInner(heap, "foo 5 bar 10 foo 15");
     defer dict_with_duplicates.decrRefCount();
     const dup_len = try dictPairLength(null, dict_with_duplicates, &new_dict);
     dict_with_duplicates.swapAndClear(&new_dict);
@@ -2394,9 +2402,9 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Dict put testing.
     var dict_for_put = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
     defer dict_for_put.decrRefCount();
-    const key3 = try newString(heap, "baz");
+    const key3 = try newStringInner(heap, "baz");
     defer key3.decrRefCount();
-    const value3 = try newString(heap, "3");
+    const value3 = try newStringInner(heap, "3");
     defer value3.decrRefCount();
 
     try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
@@ -2497,7 +2505,7 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     var obj = try heap.createObject();
     defer obj.decrRefCount();
 
-    const file_name = try newString(heap, "test_file.tcl");
+    const file_name = try newStringInner(heap, "test_file.tcl");
     defer file_name.decrRefCount();
 
     try setSourceInfo(obj, .{ .file_name = file_name.toOptional(), .line_no = 42 });
@@ -2510,7 +2518,7 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     try testing.expectEqualSlices(u8, "test_file.tcl", try obj.getSourceExtraData().file_name.toHandle().?.getString());
     try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
-    const obj2 = try newString(heap, "hello");
+    const obj2 = try newStringInner(heap, "hello");
     defer obj2.decrRefCount();
 
     const empty_info = getSourceInfo(obj2);
@@ -2780,7 +2788,7 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
     const heap = try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
-    const script1 = try newString(heap,
+    const script1 = try newStringInner(heap,
         \\ set x 5
         \\ set y $x[set x]
     );
@@ -2831,7 +2839,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     const heap = try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
-    var script = try newString(heap,
+    var script = try newStringInner(heap,
         \\ set foo 5
         \\ set y $foo[set foo]
     );
@@ -2859,7 +2867,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     try testing.expectEqual(parsed1.tags.items.ptr, parsed2.tags.items.ptr);
 
     // A different script gets its own cache entry.
-    var script2 = try newString(heap, "set x 5");
+    var script2 = try newStringInner(heap, "set x 5");
     defer script2.decrRefCount();
 
     const cache_key2 = try script2.getHash();
@@ -2903,7 +2911,7 @@ pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpressi
 
     if (tokens.len == 0) {
         if (det) |details| details.* = .{
-            .message = try newString(Heap.local_heap, "empty expression"),
+            .message = try newString("empty expression"),
         };
         return error.ParseError;
     }
@@ -2926,7 +2934,7 @@ pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpressi
                         parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
                         const rendered_error = try aw.toOwnedSlice();
                         defer Heap.global_gpa.free(rendered_error);
-                        const err_on_heap = try newString(Heap.local_heap, rendered_error);
+                        const err_on_heap = try newString(rendered_error);
                         errdefer err_on_heap.decrRefCount();
 
                         details.* = .{
@@ -2960,7 +2968,7 @@ fn testExpressions(ta: std.mem.Allocator) !void {
     const heap = try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
-    var expr1 = try newString(heap, "1 + 2 * 3 + 4");
+    var expr1 = try newStringInner(heap, "1 + 2 * 3 + 4");
     defer expr1.decrRefCount();
 
     const parsed = try getExpression(null, expr1, try expr1.getHash());
@@ -2998,7 +3006,7 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle
             else => {
                 // Finally, give up.
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt(Heap.local_heap, "expected boolean but got \"{f}\"", .{provided_handle}),
+                    .message = try newStringFmt("expected boolean but got \"{f}\"", .{provided_handle}),
                 };
                 return error.BadBoolean;
             },
