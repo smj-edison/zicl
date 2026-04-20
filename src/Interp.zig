@@ -139,14 +139,6 @@ pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) w
     }
 }
 
-fn variableNotFoundError(det: ?*objutil.ErrorDetails, var_name: []const u8) !void {
-    if (det) |details| details.* = .{
-        .message = try objutil.newStringFmt("can't read \"{s}\": no such variable", .{var_name}),
-    };
-
-    return error.VariableNotFound;
-}
-
 /// Resolves to the variable's value, if any. Does not account for dict sugar.
 fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: Handle) !?Heap.VariableValue {
     const var_dict = interp.call_frames.items[var_call_frame].variables;
@@ -214,7 +206,10 @@ fn reshimmerToVariable(
             },
         }
     } else {
-        return variableNotFoundError(det, var_name);
+        if (det) |details| details.* = .{
+            .message = try objutil.newStringFmt("can't read \"{s}\": no such variable", .{var_name}),
+        };
+        return error.VariableNotFound;
     }
 }
 
@@ -227,6 +222,7 @@ fn ensureValidVariableType(
     name: Handle,
 ) error{ OutOfMemory, VariableNotFound }!void {
     assert(name.getHeap() == Heap.local_heap);
+    assert(name.canShimmer());
 
     const call_frame = interp.call_frames.items[var_call_frame];
 
@@ -361,32 +357,19 @@ pub fn setVariableInner(
         value_mut.deinitSingle(Heap.local_heap);
     };
 
-    name.assert(name.getHeap() == Heap.local_heap);
-    name.assert(name.canShimmer());
-
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
         switch (name.tag()) {
             .dict_sugar => {
                 const dict_sugar = name.peek().body.dict_sugar;
                 const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
                 const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
-                const path_len = objutil.listLengthRaw(dict_path);
 
                 var resolved_dict = blk: {
                     if (interp.getVariableInner(null, call_frame_idx, dict_name)) |dict| {
                         break :blk dict.borrow();
                     } else |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.BadDict => {
-                            if (det) |details| details.* = .{
-                                .message = try objutil.newStringFmtInner(
-                                    Heap.local_heap,
-                                    "variable \"{f}\" is not a valid dictionary",
-                                    .{dict_name},
-                                ),
-                            };
-                            return error.BadDict;
-                        },
+                        error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
                         error.VariableNotFound => {
                             // If it's not found, then we'll just create it.
                             break :blk try objutil.newDict(Heap.local_heap, &.{});
@@ -395,11 +378,8 @@ pub fn setVariableInner(
                 };
                 defer resolved_dict.decrRefCount();
 
-                var keys = try std.ArrayList(Handle).initCapacity(Heap.global_gpa, path_len);
+                var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
                 defer keys.deinit(Heap.global_gpa);
-                for (0..path_len) |i| {
-                    keys.appendAssumeCapacity(objutil.listItem(dict_path, @intCast(i)));
-                }
 
                 var new_dict: OptionalHandle = .none;
                 value_taken = true;
@@ -409,7 +389,7 @@ pub fn setVariableInner(
                 };
                 resolved_dict.swapIfNew(new_dict);
 
-                try interp.setVariableInner(null, call_frame_idx, dict_name, resolved_dict.reference());
+                try interp.setVariableInner(det, call_frame_idx, dict_name, resolved_dict.reference());
             },
             .cached_local_var => {
                 const cached_var = &name.peek().body.cached_local_var;
@@ -418,7 +398,7 @@ pub fn setVariableInner(
                     const upvar_link = var_value.peek().body.upvar_link;
                     // Set the value through the linked name in the linked frame.
                     try interp.setVariableInner(
-                        null,
+                        det,
                         upvar_link.call_frame,
                         Heap.local_heap.getHandle(upvar_link.linked_name),
                         value,
@@ -560,19 +540,89 @@ pub fn unsetVariableInner(
     call_frame_idx: u32,
     name: Handle,
 ) !void {
-    const frame = &interp.call_frames.items[call_frame_idx];
-    const vars = &frame.variables;
-    const remove_result = try objutil.dictRemove(vars.*, name);
-    if (!remove_result.did_remove) {
-        assert(remove_result.new_dict == .none);
-        if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
-        };
-        return error.VariableNotFound;
-    }
+    try interp.ensureValidVariableType(det, call_frame_idx, name);
 
-    vars.swapIfNew(remove_result.new_dict);
-    frame.call_epoch = interp.nextCallEpoch();
+    switch (name.tag()) {
+        .dict_sugar => {
+            const dict_sugar = name.peek().body.dict_sugar;
+            const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
+            const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
+
+            if (interp.getVariableInner(null, call_frame_idx, dict_name)) |dict| {
+                // Build keys from the path list elements.
+                var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
+                defer keys.deinit(Heap.global_gpa);
+
+                const remove_result = objutil.dictRemoveRecursively(det, dict, keys.items) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        if (det) |details| details.* = .{
+                            .message = try objutil.newStringFmt("can't unset \"{f}\": no such element in dictionary", .{name}),
+                        };
+                        return error.VariableNotFound;
+                    },
+                };
+                if (!remove_result.did_remove) {
+                    assert(remove_result.new_dict == .none);
+                    if (det) |details| details.* = .{
+                        .message = try objutil.newStringFmt("can't unset \"{f}\": no such element in dictionary", .{name}),
+                    };
+                    return error.VariableNotFound;
+                } else if (remove_result.new_dict.toHandle()) |new_dict| {
+                    try interp.setVariableInner(det, call_frame_idx, dict_name, new_dict.referenceTakeOwnership());
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    if (det) |details| details.* = .{
+                        .message = try objutil.newStringFmt("can't unset \"{f}\": no such element in dictionary", .{name}),
+                    };
+                    return error.VariableNotFound;
+                },
+            }
+        },
+        .cached_local_var => {
+            const cached_var = &name.peek().body.cached_local_var;
+            const var_value = Heap.local_heap.getHandle(cached_var.cached_index);
+            if (var_value.tag() == .upvar_link) {
+                const upvar_link = var_value.peek().body.upvar_link;
+                const linked_name = Heap.local_heap.getHandle(upvar_link.linked_name);
+                // Unset the value through the linked name in the linked frame.
+                try interp.unsetVariableInner(det, upvar_link.call_frame, linked_name);
+                return;
+            }
+
+            const call_frame = &interp.call_frames.items[call_frame_idx];
+            const remove_result = try objutil.dictRemove(call_frame.variables, name);
+            if (!remove_result.did_remove) {
+                assert(remove_result.new_dict == .none);
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
+                };
+                return error.VariableNotFound;
+            } else if (remove_result.new_dict.toHandle()) |new_dict| {
+                call_frame.variables.swap(new_dict);
+            }
+
+            call_frame.call_epoch = interp.nextCallEpoch();
+        },
+        .cached_lexical_var => {
+            const call_frame = &interp.call_frames.items[call_frame_idx];
+            const remove_result = try objutil.dictRemove(call_frame.variables, name);
+            if (!remove_result.did_remove) {
+                assert(remove_result.new_dict == .none);
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
+                };
+                return error.VariableNotFound;
+            } else if (remove_result.new_dict.toHandle()) |new_dict| {
+                call_frame.variables.swap(new_dict);
+            }
+
+            call_frame.call_epoch = interp.nextCallEpoch();
+        },
+        else => unreachable,
+    }
 }
 
 /// Resolves to the variable's value. Must be called with a heap-native name.
@@ -608,16 +658,12 @@ pub fn getVariableInner(
             const dict_sugar = name.peek().body.dict_sugar;
             const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
             const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
-            const path_len = objutil.listLengthRaw(dict_path);
 
             var resolved_dict = (try interp.getVariableInner(det, call_frame_idx, dict_name)).borrow();
             defer resolved_dict.decrRefCount();
 
-            var keys = try std.ArrayList(Handle).initCapacity(Heap.global_gpa, path_len);
+            var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
             defer keys.deinit(Heap.global_gpa);
-            for (0..path_len) |i| {
-                keys.appendAssumeCapacity(objutil.listItem(dict_path, @intCast(i)));
-            }
 
             var new_dict: OptionalHandle = .none;
             const result = objutil.dictLookupRecursively(null, resolved_dict, &new_dict, keys.items) catch |err| switch (err) {

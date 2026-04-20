@@ -912,6 +912,14 @@ pub const Handle = packed struct(HandleBacking) {
         }
     }
 
+    pub fn swapIntermediate(ref: *Handle, provided_handle: Handle, maybe_new: OptionalHandle) void {
+        if (maybe_new.toHandle()) |new| {
+            const old = ref.*;
+            ref.* = new;
+            if (old != provided_handle) old.decrRefCount();
+        }
+    }
+
     pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
         return handle.getHeap().getLocalMetadata(handle.index);
     }
@@ -941,6 +949,9 @@ pub const Handle = packed struct(HandleBacking) {
     pub fn referenceTakeOwnership(handle: Handle) Object {
         // Make sure we're never making a reference to a reference.
         handle.assert(handle.tag() != .reference);
+        // .upvar_link can't be referenced either, since it always
+        // needs to be stored directly.
+        handle.assert(handle.tag() != .upvar_link);
 
         return .{
             // References are guaranteed to always have a null representation.
@@ -1993,6 +2004,17 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
     if (tag == .reference) {
         // We can't reference a reference, so we'll create a new reference.
         return handle.peek().body.reference.reference();
+    } else if (tag == .upvar_link) {
+        handle.assert(Heap.local_heap == handle.getHeap());
+        const upvar_link = handle.peek().body.upvar_link;
+        const linked_name = Heap.local_heap.getHandle(upvar_link.linked_name);
+        return .{
+            .head = .{ .str = Heap.Object.null_string, .tag = .upvar_link },
+            .body = .{ .upvar_link = .{
+                .call_frame = upvar_link.call_frame,
+                .linked_name = linked_name.borrow().index,
+            } },
+        };
     } else if (handle.peek().head.str == Object.null_string and tag == .float or tag == .integer) {
         // We can't just use a number if it has a string rep, because the string may
         // be different than how the number will be rendered.

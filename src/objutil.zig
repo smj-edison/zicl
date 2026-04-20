@@ -1470,6 +1470,15 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
     listItem(list, current_len).peek().* = object;
 }
 
+pub fn listToHandles(gpa: std.mem.Allocator, list: Handle) !std.ArrayList(Handle) {
+    const list_len = listLengthRaw(list);
+    var handles = try std.ArrayList(Handle).initCapacity(gpa, list_len);
+    for (0..list_len) |i| {
+        handles.appendAssumeCapacity(listItem(list, @intCast(i)));
+    }
+    return handles;
+}
+
 fn testLists(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
     const heap = try Heap.testStart(ta, testing.io);
@@ -2150,14 +2159,7 @@ pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: [
 
         return .{ .new_dict = new_dict, .did_remove = child_remove_result.did_remove };
     } else {
-        if (det) |details| details.* = .{
-            .message = try newStringFmtInner(
-                Heap.local_heap,
-                "key \"{f}\" not known in dictionary \"{f}\"",
-                .{ keys[0], provided_dict },
-            ),
-        };
-        return error.MissingDictKey;
+        return .{ .new_dict = new_dict, .did_remove = false };
     }
 }
 
@@ -2255,6 +2257,7 @@ test "dict flatten" {
 
 const DictAndRemovedResult = struct { new_dict: OptionalHandle, did_remove: bool };
 /// Returns true if the value was removed, or false if the value doesn't exist.
+/// Always merges parent links.
 pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     assert(provided_dict.tag() == .dict);
 

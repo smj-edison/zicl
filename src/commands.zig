@@ -650,12 +650,11 @@ pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
     } else {
         while (i < args.len) : (i += 1) {
             interp.unsetVariableSilent(&args[i]) catch |err| switch (err) {
-                error.VariableNotFound => {},
+                error.VariableNotFound, error.BadDict => {},
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
     }
-    try interp.unsetVariable(&args[1]);
 }
 
 /// [apply] - invoke a closure value directly without binding it to a name.
