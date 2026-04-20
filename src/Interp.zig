@@ -34,6 +34,10 @@ global_commands: CommandHashTable,
 eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
+/// Depth of [unknown] calls. Used to catch infinite recursion.
+unknown_depth: usize,
+/// String containing `unknown`. Used to cached unknown lookup.
+unknown_str: Handle,
 /// If this is greater than 0, it means we're catching and handling
 /// signals. Otherwise signals are ignored. This gets incremented
 /// when running [catch -signal].
@@ -557,7 +561,7 @@ pub fn unsetVariableInner(
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
                         if (det) |details| details.* = .{
-                            .message = try objutil.newStringFmt("can't unset \"{f}\": no such element in dictionary", .{name}),
+                            .message = try objutil.newStringFmt("can't unset \"{s}\": no such element in dictionary", .{try name.getString()}),
                         };
                         return error.VariableNotFound;
                     },
@@ -565,7 +569,7 @@ pub fn unsetVariableInner(
                 if (!remove_result.did_remove) {
                     assert(remove_result.new_dict == .none);
                     if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt("can't unset \"{f}\": no such element in dictionary", .{name}),
+                        .message = try objutil.newStringFmt("can't unset \"{s}\": no such element in dictionary", .{try name.getString()}),
                     };
                     return error.VariableNotFound;
                 } else if (remove_result.new_dict.toHandle()) |new_dict| {
@@ -1578,16 +1582,44 @@ pub fn getCommand(
     return interp.getCommandInner(det, call_frame_idx, new_handle.orElse(provided_handle));
 }
 
-fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
+fn invokeUnknown(interp: *Interp, args: []Handle) !void {
+    _ = interp.getVariableInner(null, 0, interp.unknown_str) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.VariableNotFound => {
+            interp.setResult(try objutil.newStringFmt("invalid command name \"{f}\"", .{args[0]}));
+            return error.EvalError;
+        },
+        error.BadDict => unreachable,
+    };
+
+    if (interp.unknown_depth > 50) {
+        try interp.setResultString("infinite recursion in [unknown]");
+        return error.EvalError;
+    }
+
+    interp.unknown_depth += 1;
+    defer interp.unknown_depth -= 1;
+
+    var new_args = std.ArrayList(Handle).empty;
+    defer new_args.deinit(Heap.global_gpa);
+    interp.unknown_str.incrRefCount();
+    defer interp.unknown_str.decrRefCount();
+    try new_args.append(Heap.global_gpa, interp.unknown_str);
+    try new_args.appendSlice(Heap.global_gpa, args[1..]);
+
+    try interp.invokeCommand(0, new_args.items);
+}
+
+fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) (Error || error{InfiniteRecursion})!void {
     var new_command: OptionalHandle = .none;
     var det: objutil.ErrorDetails = undefined;
     const command_or_closure = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EvalError => return error.EvalError,
         error.CommandNotFound => {
-            // TODO invoke jim unknown
-            std.debug.print("Tried to call command: {s}\n", .{args[0].getString() catch "<oom>"});
-            @panic("unimplemented");
+            det.message.decrRefCount();
+            try interp.invokeUnknown(args);
+            return;
         },
     };
     args[0].swapIfNew(new_command);
@@ -2370,17 +2402,15 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
                 resultant_word.swapIfNew(new_list);
                 // Free the list backing without running destructors, since we're going to steal the items
                 // directly from the list.
-                defer Heap.freeObjectBacking(resultant_word);
+                defer resultant_word.decrRefCount();
 
                 if (len > 1) {
                     // Expanded into multiple tokens, so we'll need to resize args.
                     args = try args_alloc.realloc(args, args.len - 1 + len);
                 }
 
-                assert(resultant_word.canMutate());
                 for (0..len) |list_idx| {
-                    // Steal each object from the list.
-                    args[args_written] = try Heap.steal(objutil.listItem(resultant_word, @intCast(list_idx)));
+                    args[args_written] = objutil.listItemFollowRefs(resultant_word, @intCast(list_idx)).borrow();
                     args_written += 1;
                 }
             } else {
@@ -2495,6 +2525,9 @@ pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
 }
 
 pub fn init() !Interp {
+    const unknown_str = try objutil.newString("unknown");
+    errdefer unknown_str.decrRefCount();
+
     var new_interp: Interp = .{
         .result = Heap.local_heap.emptyHandle(),
         .eval_frames = .empty,
@@ -2505,6 +2538,8 @@ pub fn init() !Interp {
         .eval_depth = 0,
         .max_eval_depth = 1000,
         .max_call_depth = 1000,
+        .unknown_depth = 0,
+        .unknown_str = unknown_str,
         .stack_trace = .none,
         .pending_error_code = .none,
         .pending_error_during = .none,
@@ -2533,6 +2568,7 @@ pub fn deinit(interp: *Interp) void {
     interp.result.decrRefCount();
     interp.stack_trace.decrOptional();
     interp.pending_error_code.decrOptional();
+    interp.unknown_str.decrRefCount();
     interp.global_commands.deinit(Heap.global_gpa);
 
     // Deinit all frames.

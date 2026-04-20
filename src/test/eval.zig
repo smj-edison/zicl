@@ -120,3 +120,27 @@ test "stack trace line number correct dedup" {
     try testing.expectEqual(count_before_bar + 2, Heap.local_heap.parsed_scripts.mapping.count());
     try testing.expectEqualStrings("bar {} 5 {/ 1 0} {} {} 7 {}", try traceString(&interp));
 }
+
+test "unknown" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    try interp.testExpectScriptResult(
+        "foo bar",
+        \\ fn unknown {args} { return $args }
+        \\ badfunction foo bar
+        ,
+    );
+}
+
+test "arg expansion" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    try interp.testExpectScriptResult(
+        "bar baz",
+        \\ fn foo {args} { return $args }
+        \\ foo bar baz
+        ,
+    );
+}

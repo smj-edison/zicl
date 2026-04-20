@@ -469,7 +469,7 @@ pub fn putsCmd(interp: *Interp, args: []Handle) !void {
         const first_arg_str = try args[1].getString();
         if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
             try interp.setResultString("The second argument must be -nonewline");
-            return Interp.Error.EvalError;
+            return error.EvalError;
         } else {
             const to_print = try args[2].getString();
             std.debug.print("{s}", .{to_print});

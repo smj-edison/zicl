@@ -812,7 +812,7 @@ pub const Handle = packed struct(HandleBacking) {
         self: Handle,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
-        const str = getString(self) catch "<oom string>";
+        const str = getString(self) catch return error.WriteFailed;
         try writer.writeAll(str);
     }
 
