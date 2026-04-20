@@ -60,3 +60,26 @@ test "append return value" {
         \\ set y
     );
 }
+
+test "concat command" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // No args returns empty string.
+    try interp.testExpectScriptResult("", "concat");
+
+    // Single string arg is returned as-is (modulo whitespace trimming).
+    try interp.testExpectScriptResult("hello", "concat hello");
+    try interp.testExpectScriptResult("hello", "concat {  hello  }");
+
+    // Multiple string args are trimmed and joined with a space.
+    try interp.testExpectScriptResult("a b c", "concat a b c");
+    try interp.testExpectScriptResult("a b c", "concat {  a  } {  b  } {  c  }");
+
+    // Empty args are dropped.
+    try interp.testExpectScriptResult("a b", "concat a {} b");
+
+    // All-list path: result is the concatenated list.
+    try interp.testExpectScriptResult("1 2 3 4", "concat {1 2} {3 4}");
+    try interp.testExpectScriptResult("1 2 3", "concat {1 2 3} {}");
+}

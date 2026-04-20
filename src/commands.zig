@@ -614,6 +614,51 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
     interp.setResult((try interp.getVariable(var_name)).toHandle().?);
 }
 
+pub fn concatCmd(interp: *Interp, args: []Handle) !void {
+    const to_concat = args[1..];
+    if (to_concat.len == 0) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    // If all the objects are lists, we can do a fast path.
+    not_all_lists: {
+        for (to_concat) |arg| {
+            if (arg.tag() != .list) break :not_all_lists;
+        }
+
+        var total: u32 = 0;
+        for (to_concat) |arg| total += objutil.listLengthRaw(arg);
+
+        const result = try objutil.newListWithCapacity(total);
+        errdefer result.decrRefCount();
+        for (to_concat) |arg| {
+            for (0..objutil.listLengthRaw(arg)) |i| {
+                objutil.listAppendAssumeCapacity(result, objutil.listItem(arg, @intCast(i)).dupOrRef());
+            }
+        }
+
+        interp.setResultOwning(result);
+        return;
+    }
+
+    // String path: trim each arg and join with single spaces.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(Heap.global_gpa);
+
+    var first_nonempty = true;
+    for (to_concat) |arg| {
+        const raw = try arg.getString();
+        const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        if (!first_nonempty) try buf.append(Heap.global_gpa, ' ');
+        try buf.appendSlice(Heap.global_gpa, trimmed);
+        first_nonempty = false;
+    }
+
+    try interp.setResultString(buf.items);
+}
+
 /// [set]
 pub fn setCmd(interp: *Interp, args: []Handle) !void {
     const var_name = &args[1];
@@ -1222,6 +1267,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
     try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("catch", .{ .to_call = catchCmd, .description = "script ?resultVar? ?optsVar?", .min_arity = 1, .max_arity = 3 });
+    try interp.registerCommand("concat", .{ .to_call = concatCmd, .description = "?arg ...?", .min_arity = 0 });
     try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
     try interp.registerCommand("error", .{ .to_call = errorCmd, .description = "message ?errorCode?", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("errorinfo", .{ .to_call = errorinfoCmd, .description = "optsDict", .min_arity = 1, .max_arity = 1 });
