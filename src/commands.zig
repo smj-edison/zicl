@@ -6,6 +6,7 @@ const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
+const stringutil = @import("stringutil.zig");
 const Interp = @import("Interp.zig");
 
 fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
@@ -286,12 +287,9 @@ pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
         replace,
         update,
     };
-    const SubcommandEnum = objutil.TclEnum(SubcommandName, "dict subcommand", false);
-
-    var det: objutil.ErrorDetails = undefined;
-    var new_enum: OptionalHandle = .none;
-    defer new_enum.decrOptional();
-    const subcommand: SubcommandName = try interp.wrapError(&det, SubcommandEnum.get(&det, args[1], &new_enum));
+    var sub = args[1].borrow();
+    defer sub.decrRefCount();
+    const subcommand = try interp.getEnum(objutil.TclEnum(SubcommandName, "dict subcommand", false), &sub);
 
     switch (subcommand) {
         .get => {
@@ -326,6 +324,7 @@ pub fn dictCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
 
             const new_value = try Heap.local_heap.dupOrReference(args[args.len - 1]);
             var new_dict: OptionalHandle = .none;
+            var det: objutil.ErrorDetails = undefined;
             _ = try interp.wrapError(
                 &det,
                 objutil.dictPutRecursively(&det, dict, &new_dict, args[3..(args.len - 1)], new_value),
@@ -1466,6 +1465,713 @@ pub fn errorinfoCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
     interp.setResultOwning(try objutil.newString(heap, buf.items));
 }
 
+/// [while]
+pub fn whileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    var expr = args[1].borrow();
+    defer expr.decrRefCount();
+    while (try interp.getBoolFromExpression(&expr)) {
+        switch (try propagateLoopControl(interp, interp.evalObject(args[2]))) {
+            .@"break" => break,
+            .@"continue" => {},
+            .none => {},
+        }
+    }
+    interp.setEmptyResult();
+}
+
+/// [lrepeat] -- builds a list by repeating elements.
+pub fn lrepeatCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const count = try interp.getInteger(&args[1]);
+    if (count < 0) {
+        try interp.setResultString("bad count: must be integer >= 0");
+        return error.EvalError;
+    }
+
+    if (count == 0 or args.len == 2) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    const elem_count = args.len - 2;
+    const total: u32 = @intCast(@as(usize, @intCast(count)) * elem_count);
+    var result = try objutil.newListWithCapacity(total);
+    defer result.decrRefCount();
+    for (0..@intCast(count)) |_| {
+        for (args[2..]) |elem| {
+            _ = try interp.listAppend(&result, elem);
+        }
+    }
+    interp.setResultOwning(result.borrow());
+}
+
+/// [split] -- splits a string at any character in `splitChars`.
+pub fn splitCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const str_bytes = try args[1].getString();
+    if (str_bytes.len == 0) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    const heap = Heap.local_heap;
+    var result = try objutil.newListWithCapacity(8);
+    defer result.decrRefCount();
+
+    if (args.len == 3) {
+        const split_bytes = try args[2].getString();
+        if (split_bytes.len == 0) {
+            // Empty split chars: each codepoint becomes its own element.
+            var it = stringutil.Iterator.init(str_bytes);
+            while (true) {
+                const before = it.i;
+                if (it.next() == null) break;
+                const elem = try objutil.newString(heap, str_bytes[before..it.i]);
+                defer elem.decrRefCount();
+                _ = try interp.listAppend(&result, elem);
+            }
+        } else {
+            // Split on any codepoint found in `split_bytes`.
+            var seg_start: usize = 0;
+            var str_it = stringutil.Iterator.init(str_bytes);
+            while (true) {
+                const str_before = str_it.i;
+                const str_cp = str_it.next() orelse {
+                    const elem = try objutil.newString(heap, str_bytes[seg_start..]);
+                    defer elem.decrRefCount();
+                    _ = try interp.listAppend(&result, elem);
+                    break;
+                };
+                var split_it = stringutil.Iterator.init(split_bytes);
+                const matched = while (split_it.next()) |split_cp| {
+                    if (str_cp == split_cp) break true;
+                } else false;
+                if (matched) {
+                    const elem = try objutil.newString(heap, str_bytes[seg_start..str_before]);
+                    defer elem.decrRefCount();
+                    _ = try interp.listAppend(&result, elem);
+                    seg_start = str_it.i;
+                }
+            }
+        }
+    } else {
+        // Default: split on whitespace, collapsing runs (like Tcl).
+        var seg_start: usize = 0;
+        var in_ws = true;
+        for (str_bytes, 0..) |c, i| {
+            const is_ws = c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0c' or c == '\x0b';
+            if (is_ws) {
+                if (!in_ws) {
+                    const elem = try objutil.newString(heap, str_bytes[seg_start..i]);
+                    defer elem.decrRefCount();
+                    _ = try interp.listAppend(&result, elem);
+                }
+                in_ws = true;
+            } else {
+                if (in_ws) seg_start = i;
+                in_ws = false;
+            }
+        }
+        if (!in_ws) {
+            const elem = try objutil.newString(heap, str_bytes[seg_start..]);
+            defer elem.decrRefCount();
+            _ = try interp.listAppend(&result, elem);
+        }
+    }
+
+    interp.setResultOwning(result.borrow());
+}
+
+/// [string] -- string subcommand dispatch.
+pub fn stringCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const Subcmd = enum {
+        cat,
+        compare,
+        equal,
+        first,
+        index,
+        is,
+        last,
+        length,
+        @"match",
+        range,
+        repeat,
+        replace,
+        reverse,
+        tolower,
+        totitle,
+        toupper,
+        trim,
+        trimleft,
+        trimright,
+    };
+
+    if (args.len < 2) return error.WrongUsage;
+    var sub = args[1].borrow();
+    defer sub.decrRefCount();
+
+    const heap = Heap.local_heap;
+    const subcmd = try interp.getEnum(objutil.TclEnum(Subcmd, "subcommand", true), &sub);
+
+    switch (subcmd) {
+        .cat => {
+            var total_len: usize = 0;
+            for (args[2..]) |a| total_len += (try a.getString()).len;
+            const out = try objutil.newStringToFill(heap, total_len);
+            errdefer out.decrRefCount();
+            if (total_len > 0) {
+                const buf = Heap.getStringMut(out) catch unreachable;
+                var pos: usize = 0;
+                for (args[2..]) |a| {
+                    const s = try a.getString();
+                    @memcpy(buf[pos .. pos + s.len], s);
+                    pos += s.len;
+                }
+            }
+            interp.setResultOwning(out);
+        },
+        .length => {
+            if (args.len != 3) return error.WrongUsage;
+            var new_len: OptionalHandle = .none;
+            defer new_len.swapWithNone();
+            const cp_len = try objutil.getCodepointLength(args[2], &new_len);
+            try interp.setResultInteger(@intCast(cp_len));
+        },
+        .tolower => {
+            if (args.len != 3) return error.WrongUsage;
+            interp.setResultOwning(try objutil.stringCaseConversion(args[2], .lower));
+        },
+        .toupper => {
+            if (args.len != 3) return error.WrongUsage;
+            interp.setResultOwning(try objutil.stringCaseConversion(args[2], .upper));
+        },
+        .totitle => {
+            if (args.len != 3) return error.WrongUsage;
+            interp.setResultOwning(try objutil.stringCaseConversion(args[2], .title));
+        },
+        .trim => {
+            if (args.len < 3 or args.len > 4) return error.WrongUsage;
+            const default_ws = if (args.len < 4) try objutil.newString(heap, " \t\n\r\x0b\x0c") else heap.emptyHandle();
+            defer if (args.len < 4) default_ws.decrRefCount();
+            const trim_chars = if (args.len == 4) args[3] else default_ws;
+            interp.setResultOwning(try objutil.stringTrim(args[2], trim_chars));
+        },
+        .trimleft => {
+            if (args.len < 3 or args.len > 4) return error.WrongUsage;
+            const default_ws = if (args.len < 4) try objutil.newString(heap, " \t\n\r\x0b\x0c") else heap.emptyHandle();
+            defer if (args.len < 4) default_ws.decrRefCount();
+            const trim_chars = if (args.len == 4) args[3] else default_ws;
+            interp.setResultOwning(try objutil.stringTrimLeft(args[2], trim_chars));
+        },
+        .trimright => {
+            if (args.len < 3 or args.len > 4) return error.WrongUsage;
+            const default_ws = if (args.len < 4) try objutil.newString(heap, " \t\n\r\x0b\x0c") else heap.emptyHandle();
+            defer if (args.len < 4) default_ws.decrRefCount();
+            const trim_chars = if (args.len == 4) args[3] else default_ws;
+            interp.setResultOwning(try objutil.stringTrimRight(args[2], trim_chars));
+        },
+        .range => {
+            if (args.len != 5) return error.WrongUsage;
+            var new_start: OptionalHandle = .none;
+            defer new_start.swapWithNone();
+            var new_end: OptionalHandle = .none;
+            defer new_end.swapWithNone();
+            // Pass null for det -- BadIndex is caught internally and treated as empty.
+            const out = try objutil.stringRange(null, args[2], args[3], &new_start, args[4], &new_end);
+            interp.setResultOwning(out);
+        },
+        .index => {
+            if (args.len != 4) return error.WrongUsage;
+            var new_idx: OptionalHandle = .none;
+            defer new_idx.swapWithNone();
+            var det: objutil.ErrorDetails = undefined;
+            // BadIndex means a negative integer was given; that's out-of-bounds, not an error.
+            const idx = objutil.getIndex(&det, args[3], &new_idx) catch |err| switch (err) {
+                error.BadIndex => {
+                    det.message.decrRefCount();
+                    interp.setEmptyResult();
+                    return;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            const str_bytes = try args[2].getString();
+            var new_str_len: OptionalHandle = .none;
+            defer new_str_len.swapWithNone();
+            const cp_len = try objutil.getCodepointLength(args[2], &new_str_len);
+            const abs_i = idx.asAbsoluteIndex(@intCast(cp_len));
+            if (abs_i < 0 or abs_i >= cp_len) {
+                interp.setEmptyResult();
+                return;
+            }
+            const abs: usize = @intCast(abs_i);
+            const byte_start = stringutil.cpIndex(str_bytes, abs) orelse str_bytes.len;
+            var it = stringutil.Iterator.init(str_bytes[byte_start..]);
+            _ = it.next();
+            const out = try objutil.newString(heap, str_bytes[byte_start .. byte_start + it.i]);
+            interp.setResultOwning(out);
+        },
+        .compare, .equal => {
+            var case_insensitive = false;
+            var max_len: ?usize = null;
+            var pos: usize = 2;
+            while (pos < args.len -| 2) {
+                const opt = try args[pos].getString();
+                if (std.mem.eql(u8, opt, "-nocase")) {
+                    case_insensitive = true;
+                    pos += 1;
+                } else if (std.mem.eql(u8, opt, "-length")) {
+                    pos += 1;
+                    if (pos >= args.len) return error.WrongUsage;
+                    const n = try interp.getInteger(&args[pos]);
+                    if (n > 0) max_len = @intCast(n);
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if (args.len - pos < 2) return error.WrongUsage;
+            var s1: []const u8 = try args[pos].getString();
+            var s2: []const u8 = try args[pos + 1].getString();
+            if (max_len) |ml| {
+                s1 = s1[0..@min(s1.len, ml)];
+                s2 = s2[0..@min(s2.len, ml)];
+            }
+            const order = stringutil.compare(s1, s2, case_insensitive);
+            if (subcmd == .equal) {
+                try interp.setResultInteger(if (order == .eq) 1 else 0);
+            } else {
+                try interp.setResultInteger(switch (order) {
+                    .lt => -1,
+                    .eq => 0,
+                    .gt => 1,
+                });
+            }
+        },
+        .@"match" => {
+            var case_insensitive = false;
+            var pos: usize = 2;
+            if (pos < args.len and std.mem.eql(u8, try args[pos].getString(), "-nocase")) {
+                case_insensitive = true;
+                pos += 1;
+            }
+            if (args.len - pos < 2) return error.WrongUsage;
+            const matched = try objutil.globMatch(args[pos], args[pos + 1], case_insensitive);
+            try interp.setResultInteger(if (matched) 1 else 0);
+        },
+        .is => {
+            if (args.len < 4 or args.len > 5) return error.WrongUsage;
+            var strict = false;
+            var str_arg: Handle = undefined;
+            if (args.len == 5) {
+                const opt = try args[3].getString();
+                if (!std.mem.eql(u8, opt, "-strict")) return error.WrongUsage;
+                strict = true;
+                str_arg = args[4];
+            } else {
+                str_arg = args[3];
+            }
+            var new_class: OptionalHandle = .none;
+            defer new_class.swapWithNone();
+            var det: objutil.ErrorDetails = undefined;
+            const result = try interp.wrapError(&det, objutil.stringIs(&det, str_arg, args[2], &new_class, strict));
+            try interp.setResultInteger(if (result) 1 else 0);
+        },
+        .first => {
+            if (args.len < 4 or args.len > 5) return error.WrongUsage;
+            const needle = try args[2].getString();
+            const haystack = try args[3].getString();
+            var start_cp: usize = 0;
+            if (args.len == 5) {
+                var new_idx: OptionalHandle = .none;
+                defer new_idx.swapWithNone();
+                var det: objutil.ErrorDetails = undefined;
+                const idx = try interp.wrapError(&det, objutil.getIndex(&det, args[4], &new_idx));
+                var new_cp_len: OptionalHandle = .none;
+                defer new_cp_len.swapWithNone();
+                const cp_len = try objutil.getCodepointLength(args[3], &new_cp_len);
+                const abs_i = idx.asAbsoluteIndex(@intCast(cp_len));
+                start_cp = if (abs_i >= 0) @intCast(abs_i) else 0;
+            }
+            if (stringutil.findFirstOccurrence(needle, haystack, start_cp)) |byte_pos| {
+                var it = stringutil.Iterator.init(haystack[0..byte_pos]);
+                var cp_pos: usize = 0;
+                while (it.next()) |_| cp_pos += 1;
+                try interp.setResultInteger(@intCast(cp_pos));
+            } else {
+                try interp.setResultInteger(-1);
+            }
+        },
+        .last => {
+            if (args.len < 4 or args.len > 5) return error.WrongUsage;
+            const needle = try args[2].getString();
+            var haystack: []const u8 = try args[3].getString();
+            if (args.len == 5) {
+                var new_idx: OptionalHandle = .none;
+                defer new_idx.swapWithNone();
+                var det: objutil.ErrorDetails = undefined;
+                const idx = try interp.wrapError(&det, objutil.getIndex(&det, args[4], &new_idx));
+                var new_cp_len2: OptionalHandle = .none;
+                defer new_cp_len2.swapWithNone();
+                const cp_len = try objutil.getCodepointLength(args[3], &new_cp_len2);
+                const abs_i = idx.asAbsoluteIndex(@intCast(cp_len));
+                const abs: usize = if (abs_i >= 0) @min(@as(usize, @intCast(abs_i)), cp_len -| 1) else 0;
+                const byte_end = stringutil.cpIndex(haystack, abs + 1) orelse haystack.len;
+                haystack = haystack[0..byte_end];
+            }
+            if (stringutil.findLastOccurrence(needle, haystack)) |byte_pos| {
+                var it = stringutil.Iterator.init(haystack[0..byte_pos]);
+                var cp_pos: usize = 0;
+                while (it.next()) |_| cp_pos += 1;
+                try interp.setResultInteger(@intCast(cp_pos));
+            } else {
+                try interp.setResultInteger(-1);
+            }
+        },
+        .replace => {
+            if (args.len < 5 or args.len > 6) return error.WrongUsage;
+            var new_start: OptionalHandle = .none;
+            defer new_start.swapWithNone();
+            var new_end: OptionalHandle = .none;
+            defer new_end.swapWithNone();
+            const to_insert = if (args.len == 6) args[5] else heap.emptyHandle();
+            var det: objutil.ErrorDetails = undefined;
+            const out = try interp.wrapError(&det, objutil.stringReplace(
+                &det, args[2], args[3], &new_start, args[4], &new_end, to_insert.toOptional(),
+            ));
+            interp.setResultOwning(out);
+        },
+        .repeat => {
+            if (args.len != 4) return error.WrongUsage;
+            const count = try interp.getInteger(&args[3]);
+            if (count <= 0) {
+                interp.setEmptyResult();
+                return;
+            }
+            const s = try args[2].getString();
+            const total = s.len * @as(usize, @intCast(count));
+            const out = try objutil.newStringToFill(heap, total);
+            errdefer out.decrRefCount();
+            if (total > 0) {
+                const buf = Heap.getStringMut(out) catch unreachable;
+                for (0..@intCast(count)) |i| {
+                    @memcpy(buf[i * s.len .. (i + 1) * s.len], s);
+                }
+            }
+            interp.setResultOwning(out);
+        },
+        .reverse => {
+            if (args.len != 3) return error.WrongUsage;
+            const s = try args[2].getString();
+            const out = try objutil.newStringToFill(heap, s.len);
+            errdefer out.decrRefCount();
+            if (s.len > 0) {
+                const buf = Heap.getStringMut(out) catch unreachable;
+                // Collect codepoint byte slices and write them in reverse order.
+                var cps: std.ArrayList([]const u8) = .empty;
+                defer cps.deinit(Heap.global_gpa);
+                var it = stringutil.Iterator.init(s);
+                var prev_i: usize = 0;
+                while (it.next()) |_| {
+                    try cps.append(Heap.global_gpa, s[prev_i..it.i]);
+                    prev_i = it.i;
+                }
+                var write_pos: usize = 0;
+                var k: usize = cps.items.len;
+                while (k > 0) {
+                    k -= 1;
+                    @memcpy(buf[write_pos .. write_pos + cps.items[k].len], cps.items[k]);
+                    write_pos += cps.items[k].len;
+                }
+            }
+            interp.setResultOwning(out);
+        },
+    }
+}
+
+/// [lsearch] -- searches a list for a matching element.
+pub fn lsearchCmd(interp: *Interp, args: []Handle) !void {
+    const MatchMode = enum { exact, glob };
+
+    var mode = MatchMode.glob;  // Default is glob per Tcl spec.
+    var nocase = false;
+    var opt_not = false;
+    var opt_all = false;
+    var opt_inline = false;
+    var arg_pos: usize = 1;
+
+    while (arg_pos < args.len -| 2) {
+        const opt = try args[arg_pos].getString();
+        if (std.mem.eql(u8, opt, "-exact")) {
+            mode = .exact;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-glob")) {
+            mode = .glob;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-nocase")) {
+            nocase = true;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-not")) {
+            opt_not = true;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-all")) {
+            opt_all = true;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-inline")) {
+            opt_inline = true;
+            arg_pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    if (args.len - arg_pos < 2) return error.WrongUsage;
+    const list_handle = &args[arg_pos];
+    const pattern = args[arg_pos + 1];
+
+    try interp.shimmerToList(list_handle);
+    const len = objutil.listLengthRaw(list_handle.*);
+    const pattern_str = try pattern.getString();
+
+    var results = try objutil.newListWithCapacity(4);
+    defer results.decrRefCount();
+
+    var i: u32 = 0;
+    while (i < len) : (i += 1) {
+        const item = objutil.listItemFollowRefs(list_handle.*, i);
+        const item_str = try item.getString();
+        const matched: bool = switch (mode) {
+            .exact => stringutil.compare(item_str, pattern_str, nocase) == .eq,
+            .glob => try objutil.globMatch(pattern, item, nocase),
+        };
+
+        if (matched != opt_not) {
+            if (!opt_all) {
+                if (opt_inline) {
+                    interp.setResult(item);
+                } else {
+                    try interp.setResultInteger(i);
+                }
+                return;
+            }
+            if (opt_inline) {
+                _ = try interp.listAppend(&results, item);
+            } else {
+                const idx_handle = try objutil.newInteger(Heap.local_heap, i);
+                defer idx_handle.decrRefCount();
+                _ = try interp.listAppend(&results, idx_handle);
+            }
+        }
+    }
+
+    if (!opt_all) {
+        if (opt_inline) {
+            interp.setEmptyResult();
+        } else {
+            try interp.setResultInteger(-1);
+        }
+        return;
+    }
+
+    interp.setResultOwning(results.borrow());
+}
+
+/// Tcl dictionary comparison: numeric substrings compare numerically, rest case-insensitively.
+fn dictCompare(a: []const u8, b: []const u8) std.math.Order {
+    var ia: usize = 0;
+    var ib: usize = 0;
+
+    while (ia < a.len and ib < b.len) {
+        const ca = a[ia];
+        const cb = b[ib];
+
+        if (std.ascii.isDigit(ca) and std.ascii.isDigit(cb)) {
+            // Parse and compare numeric substrings.
+            const a_start = ia;
+            const b_start = ib;
+            while (ia < a.len and std.ascii.isDigit(a[ia])) ia += 1;
+            while (ib < b.len and std.ascii.isDigit(b[ib])) ib += 1;
+            // Compare as integers by length first (after trimming leading zeros).
+            var a_num = a[a_start..ia];
+            var b_num = b[b_start..ib];
+            while (a_num.len > 1 and a_num[0] == '0') a_num = a_num[1..];
+            while (b_num.len > 1 and b_num[0] == '0') b_num = b_num[1..];
+            if (a_num.len != b_num.len) return std.math.order(a_num.len, b_num.len);
+            const cmp = std.mem.order(u8, a_num, b_num);
+            if (cmp != .eq) return cmp;
+        } else {
+            const la = std.ascii.toLower(ca);
+            const lb = std.ascii.toLower(cb);
+            if (la != lb) return std.math.order(la, lb);
+            ia += 1;
+            ib += 1;
+        }
+    }
+
+    return std.math.order(ia, ib);
+}
+
+/// [lsort] -- sorts a list.
+pub fn lsortCmd(interp: *Interp, args: []Handle) !void {
+    const SortType = enum { ascii, integer, real, nocase, dictionary };
+
+    var sort_type = SortType.ascii;
+    var decreasing = false;
+    var unique = false;
+    var index_arg: ?Handle = null;
+    var arg_pos: usize = 1;
+
+    while (arg_pos < args.len -| 1) {
+        const opt = try args[arg_pos].getString();
+        if (std.mem.eql(u8, opt, "-ascii")) {
+            sort_type = .ascii;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-integer")) {
+            sort_type = .integer;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-real")) {
+            sort_type = .real;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-nocase")) {
+            sort_type = .nocase;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-dictionary")) {
+            sort_type = .dictionary;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-increasing")) {
+            decreasing = false;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-decreasing")) {
+            decreasing = true;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-unique")) {
+            unique = true;
+            arg_pos += 1;
+        } else if (std.mem.eql(u8, opt, "-index")) {
+            arg_pos += 1;
+            if (arg_pos >= args.len -| 1) return error.WrongUsage;
+            index_arg = args[arg_pos];
+            arg_pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    if (arg_pos >= args.len) return error.WrongUsage;
+    const list_handle = &args[arg_pos];
+    try interp.shimmerToList(list_handle);
+    const len = objutil.listLengthRaw(list_handle.*);
+    if (len <= 1) {
+        interp.setResult(list_handle.*);
+        return;
+    }
+
+    var indices = try std.ArrayList(u32).initCapacity(Heap.global_gpa, len);
+    defer indices.deinit(Heap.global_gpa);
+    for (0..len) |i| indices.appendAssumeCapacity(@intCast(i));
+
+    const SortCtx = struct {
+        list: Handle,
+        sort_type: SortType,
+        decreasing: bool,
+        index_arg: ?Handle,
+        err: ?anyerror = null,
+
+        fn getKey(ctx: *@This(), item: Handle) Handle {
+            const idx_handle = ctx.index_arg orelse return item;
+            var item_copy = item.borrow();
+            defer item_copy.decrRefCount();
+            var new_item: OptionalHandle = .none;
+            objutil.shimmerToList(null, item_copy, &new_item) catch |err| {
+                new_item.swapWithNone();
+                ctx.err = err;
+                return item;
+            };
+            item_copy.swapIfNew(new_item);
+            var new_dummy: OptionalHandle = .none;
+            var det: objutil.ErrorDetails = undefined;
+            const list_idx = objutil.getIndex(&det, idx_handle, &new_dummy) catch |err| {
+                new_dummy.swapWithNone();
+                ctx.err = err;
+                return item;
+            };
+            new_dummy.swapWithNone();
+            const n = objutil.listLengthRaw(item_copy);
+            const abs = list_idx.asAbsoluteIndex(n);
+            return if (abs >= 0 and abs < n)
+                objutil.listItemFollowRefs(item_copy, @intCast(abs))
+            else
+                item;
+        }
+
+        fn lessThan(ctx: *@This(), a_idx: u32, b_idx: u32) bool {
+            if (ctx.err != null) return false;
+            const a_key = ctx.getKey(objutil.listItemFollowRefs(ctx.list, a_idx));
+            const b_key = ctx.getKey(objutil.listItemFollowRefs(ctx.list, b_idx));
+            const order: std.math.Order = blk: {
+                switch (ctx.sort_type) {
+                    .ascii => {
+                        const a_str = a_key.getString() catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        const b_str = b_key.getString() catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        break :blk stringutil.compare(a_str, b_str, false);
+                    },
+                    .nocase => {
+                        const a_str = a_key.getString() catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        const b_str = b_key.getString() catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        break :blk stringutil.compare(a_str, b_str, true);
+                    },
+                    .integer => {
+                        var new_a: OptionalHandle = .none;
+                        defer new_a.swapWithNone();
+                        var new_b: OptionalHandle = .none;
+                        defer new_b.swapWithNone();
+                        const av = objutil.integerGet(null, a_key, &new_a) catch { ctx.err = error.BadInteger; break :blk .eq; };
+                        const bv = objutil.integerGet(null, b_key, &new_b) catch { ctx.err = error.BadInteger; break :blk .eq; };
+                        break :blk std.math.order(av, bv);
+                    },
+                    .real => {
+                        var new_a: OptionalHandle = .none;
+                        defer new_a.swapWithNone();
+                        var new_b: OptionalHandle = .none;
+                        defer new_b.swapWithNone();
+                        const av = objutil.floatGet(null, a_key, &new_a) catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        const bv = objutil.floatGet(null, b_key, &new_b) catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        break :blk std.math.order(av, bv);
+                    },
+                    .dictionary => {
+                        const a_str = a_key.getString() catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        const b_str = b_key.getString() catch { ctx.err = error.OutOfMemory; break :blk .eq; };
+                        break :blk dictCompare(a_str, b_str);
+                    },
+                }
+            };
+            return if (ctx.decreasing) order == .gt else order == .lt;
+        }
+    };
+    var sort_ctx = SortCtx{
+        .list = list_handle.*,
+        .sort_type = sort_type,
+        .decreasing = decreasing,
+        .index_arg = index_arg,
+    };
+    std.sort.pdq(u32, indices.items, &sort_ctx, SortCtx.lessThan);
+    if (sort_ctx.err) |err| return Interp.narrowToEvalError(err);
+
+    var result = try objutil.newListWithCapacity(len);
+    defer result.decrRefCount();
+    var prev_str: ?[]const u8 = null;
+    for (indices.items) |orig_idx| {
+        const item = objutil.listItemFollowRefs(list_handle.*, orig_idx);
+        if (unique) {
+            const key_str = try item.getString();
+            if (prev_str) |ps| {
+                if (std.mem.eql(u8, ps, key_str)) continue;
+            }
+            prev_str = key_str;
+        }
+        _ = try interp.listAppend(&result, item);
+    }
+
+    interp.setResultOwning(result.borrow());
+}
+
 pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
     try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
@@ -1498,8 +2204,14 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try interp.registerCommand("lreplace", .{ .to_call = lreplaceCmd, .description = "list first last ?element ...?", .min_arity = 3 });
     try interp.registerCommand("lreverse", .{ .to_call = lreverseCmd, .description = "list", .min_arity = 1, .max_arity = 1 });
     try interp.registerCommand("lset", .{ .to_call = lsetCmd, .description = "varName ?index ...? newValue", .min_arity = 2 });
+    try interp.registerCommand("lrepeat", .{ .to_call = lrepeatCmd, .description = "count ?value ...?", .min_arity = 1 });
+    try interp.registerCommand("lsearch", .{ .to_call = lsearchCmd, .description = "?options? list pattern", .min_arity = 2 });
+    try interp.registerCommand("lsort", .{ .to_call = lsortCmd, .description = "?options? list", .min_arity = 1 });
     try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
     try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("split", .{ .to_call = splitCmd, .description = "string ?splitChars?", .min_arity = 1, .max_arity = 2 });
+    try interp.registerCommand("string", .{ .to_call = stringCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
+    try interp.registerCommand("while", .{ .to_call = whileCmd, .description = "condition body", .min_arity = 2, .max_arity = 2 });
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {

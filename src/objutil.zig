@@ -60,10 +60,9 @@ pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) 
     assert(handle.tag() == .string);
 
     // See if we already calculated the utf8 length.
-    switch (Heap.getStringDetails(handle)) {
+    switch (handle.getStringDetails()) {
         .long => |long_str| {
-            const current_len = long_str.getUtf8Length();
-            if (current_len != std.math.maxInt(u64)) return current_len;
+            if (long_str.getUtf8Length()) |current_len| return current_len;
 
             // String length hasn't been computed yet, so compute now.
             const utf8_length = stringutil.codepointLength(long_str.getString());
@@ -77,13 +76,13 @@ pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) 
                 const bytes = try handle.getString();
                 const utf8_length = stringutil.codepointLength(bytes);
                 handle.peek().body.string = .{
-                    .utf8_length = utf8_length, // Cache utf8 length.
+                    .utf8_length = @intCast(utf8_length), // Cache utf8 length.
                     .length_determined = true,
                 };
                 return utf8_length;
             }
         },
-        .empty => 0,
+        .empty => return 0,
         .null => unreachable,
     }
 }
@@ -323,7 +322,7 @@ pub fn shimmerToFloat(det: ?*ErrorDetails, provided_handle: Handle, new_handle: 
     handle.peek().body.float = value;
 }
 
-pub fn floatGet(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !i64 {
+pub fn floatGet(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !f64 {
     try shimmerToFloat(det, provided_handle, new_handle);
     const handle = new_handle.orElse(provided_handle);
     return handle.peek().body.float;
@@ -443,6 +442,8 @@ pub fn getIndex(det: ?*ErrorDetails, handle: Handle, new_handle: *OptionalHandle
 }
 
 /// Creates a substring of the passed in string. Used in `[string range]`.
+/// Unlike list operations, negative integer indices clamp to 0 (start) or yield an empty
+/// range (end), per Tcl's string range semantics.
 pub fn stringRange(
     det: ?*ErrorDetails,
     str: Handle,
@@ -454,25 +455,49 @@ pub fn stringRange(
     errdefer new_start.swapWithNone();
     errdefer new_end.swapWithNone();
 
-    const codepoint_len = try getCodepointLength(str);
-    const bytes = str.getString();
+    var new_str_cp: OptionalHandle = .none;
+    defer new_str_cp.swapWithNone();
+    const codepoint_len = try getCodepointLength(str, &new_str_cp);
+    const bytes = try str.getString();
+    const cp_u32: u32 = @intCast(codepoint_len);
 
-    const start_index = try getIndex(det, start, new_start);
-    const end_index = try getIndex(det, end, new_end);
+    // Resolve start: negative integers clamp to 0.
+    const abs_start: usize = blk: {
+        const idx = getIndex(det, start, new_start) catch |err| switch (err) {
+            error.BadIndex => break :blk 0,
+            else => |e| return e,
+        };
+        const abs = idx.asAbsoluteIndex(cp_u32);
+        if (abs < 0) break :blk 0;
+        break :blk @min(@as(usize, @intCast(abs)), codepoint_len);
+    };
 
-    const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
+    // Resolve end: negative integers yield -1 so the range comparison produces empty.
+    const abs_end_incl: i64 = blk: {
+        const idx = getIndex(det, end, new_end) catch |err| switch (err) {
+            error.BadIndex => break :blk -1,
+            else => |e| return e,
+        };
+        break :blk idx.asAbsoluteIndex(cp_u32);
+    };
 
-    // cpIndex is generic across ASCII and UTF-8.
-    const byte_start = stringutil.cpIndex(bytes, range.start);
-    const byte_end = stringutil.cpIndex(bytes, range.end);
+    if (@as(i64, @intCast(abs_start)) > abs_end_incl) {
+        return newString(Heap.local_heap, "");
+    }
 
-    return try newStringWithCodepointLen(
-        bytes[byte_start..byte_end],
-        range.end - range.start,
+    // Clamp end to the last valid index and convert to exclusive upper bound.
+    const abs_end: usize = @min(
+        @as(usize, @intCast(abs_end_incl)),
+        if (codepoint_len > 0) codepoint_len - 1 else 0,
     );
+
+    const byte_start = stringutil.cpIndex(bytes, abs_start) orelse bytes.len;
+    const byte_end = stringutil.cpIndex(bytes, abs_end + 1) orelse bytes.len;
+
+    return try newString(Heap.local_heap, bytes[byte_start..byte_end]);
 }
 
-/// Removes from `start` to `end`, optionally inserting `to_insert`.
+/// Removes from `start` to `end` (inclusive), optionally inserting `to_insert`.
 pub fn stringReplace(
     det: ?*ErrorDetails,
     str: Handle,
@@ -481,79 +506,42 @@ pub fn stringReplace(
     end: Handle,
     new_end: *OptionalHandle,
     to_insert: OptionalHandle,
-) Handle {
+) !Handle {
     errdefer new_start.swapWithNone();
     errdefer new_end.swapWithNone();
 
-    const codepoint_len = try getCodepointLength(str);
-    const bytes = str.*.getString();
+    var new_str_cp: OptionalHandle = .none;
+    defer new_str_cp.swapWithNone();
+    const codepoint_len = try getCodepointLength(str, &new_str_cp);
+    const bytes = try str.getString();
 
     const start_index = try getIndex(det, start, new_start);
     const end_index = try getIndex(det, end, new_end);
 
-    const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
+    const range = Range.fromIndexes(@intCast(codepoint_len), start_index, end_index);
 
-    const byte_start = stringutil.cpIndex(bytes, range.start);
-    const byte_end = stringutil.cpIndex(bytes, range.end);
+    const byte_start = stringutil.cpIndex(bytes, range.start) orelse bytes.len;
+    // `range.end` is exclusive, so the byte we remove up to is one before it.
+    const byte_end = stringutil.cpIndex(bytes, range.end) orelse bytes.len;
 
-    const replaced: Handle = blk: {
-        // Is there anything to insert?
-        if (to_insert) |val| {
-            const to_insert_bytes = try val.getString();
+    const insert_bytes: []const u8 = if (to_insert.toHandle()) |val| try val.getString() else "";
+    const new_len = byte_start + insert_bytes.len + (bytes.len - byte_end);
 
-            // Figure out how long the new string needs to be.
-            const up_to_range_len = byte_start;
-            const to_insert_len = to_insert_bytes.len;
-            // Tcl ranges are inclusive, so `- 1` is needed.
-            const after_range_len = bytes.len - byte_end - 1;
-
-            const new_str = newStringToFill(up_to_range_len + to_insert_len + after_range_len);
-            const new_bytes = Heap.getStringMut(new_str) catch |err| {
-                switch (err) {
-                    error.NotMutable => {
-                        // Empty strings aren't mutable, so we'll just return the empty string.
-                        assert(new_str.peek().str == Heap.Object.empty_string);
-                        break :blk new_str;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                }
-            };
-
-            @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
-            @memcpy(new_bytes[up_to_range_len..][0..to_insert_len], to_insert_bytes);
-            @memcpy(new_bytes[(up_to_range_len + to_insert_len)..], bytes[(byte_end + 1)..]);
-
-            break :blk new_str;
-        } else {
-            // Figure out how long the new string needs to be.
-            const up_to_range_len = byte_start;
-            // Tcl ranges are inclusive, so `- 1` is needed.
-            const after_range_len = bytes.len - byte_end - 1;
-
-            const new_str = try newStringToFill(up_to_range_len + after_range_len);
-            const new_bytes = Heap.getStringMut(new_str) catch |err| {
-                switch (err) {
-                    error.NotMutable => {
-                        // Empty strings aren't mutable, so we'll just return the empty string.
-                        assert(new_str.peek().str == Heap.Object.empty_string);
-                        break :blk new_str;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                }
-            };
-
-            @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
-            @memcpy(new_bytes[up_to_range_len..], bytes[(byte_end + 1)..]);
-
-            break :blk new_str;
-        }
+    const new_str = try newStringToFill(Heap.local_heap, new_len);
+    errdefer new_str.decrRefCount();
+    const new_bytes = Heap.getStringMut(new_str) catch |err| switch (err) {
+        error.NotMutable => {
+            assert(new_len == 0);
+            return new_str;
+        },
+        else => |e| return e,
     };
 
-    return .{
-        .new_start = new_start,
-        .new_end = new_end,
-        .replaced = replaced,
-    };
+    @memcpy(new_bytes[0..byte_start], bytes[0..byte_start]);
+    @memcpy(new_bytes[byte_start..][0..insert_bytes.len], insert_bytes);
+    @memcpy(new_bytes[byte_start + insert_bytes.len ..], bytes[byte_end..]);
+
+    return new_str;
 }
 
 /// Upper/lower/title case conversion.
@@ -580,18 +568,19 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
                 }
             };
 
-            new_len += std.unicode.utf8ByteSequenceLength(converted);
+            new_len += std.unicode.utf8ByteSequenceLength(@intCast(converted)) catch unreachable;
             is_first_char = false;
         }
 
-        const new_str = try newStringToFill(new_len);
+        const new_str = try newStringToFill(Heap.local_heap, new_len);
         errdefer new_str.decrRefCount();
-        const new_bytes = try Heap.getStringMut(new_str) catch |err| switch (err) {
+        const new_bytes = Heap.getStringMut(new_str) catch |err| switch (err) {
             error.NotMutable => {
                 // Empty strings aren't mutable, so we'll just return the empty string.
-                assert(new_str.peek().str == Heap.Object.empty_string);
+                assert(new_len == 0);
                 return new_str;
             },
+            else => |e| return e,
         };
 
         // Now go through and write all the bytes.
@@ -616,15 +605,18 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
 
             is_first_char = false;
         }
+
+        return new_str;
     } else {
         const new_len = bytes.len;
-        const new_str = try newStringToFill(new_len);
-        const new_bytes = try Heap.getStringMut(new_str) catch |err| switch (err) {
+        const new_str = try newStringToFill(Heap.local_heap, new_len);
+        const new_bytes = Heap.getStringMut(new_str) catch |err| switch (err) {
             // Empty strings aren't mutable, so we'll just return the empty string.
             error.NotMutable => {
-                assert(new_str.peek().str == Heap.Object.empty_string);
+                assert(new_len == 0);
                 return new_str;
             },
+            else => |e| return e,
         };
 
         for (bytes, new_bytes) |old_char, *new_char| {
@@ -639,7 +631,7 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
     }
 }
 
-/// Creates a new string if there was anything to trim.
+/// Always returns an owned handle with leading trim chars removed.
 pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try str.getString();
     const trim_chars_bytes = try trim_chars.getString();
@@ -647,13 +639,13 @@ pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     const start = stringutil.trimLeft(bytes, trim_chars_bytes);
 
     if (start == 0) {
-        return str;
+        return str.borrow();
     } else {
-        return try newString(bytes[start..]);
+        return try newString(Heap.local_heap, bytes[start..]);
     }
 }
 
-/// Creates a new string if there was anything to trim, else passes `str` through.
+/// Always returns an owned handle with trailing trim chars removed.
 pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try str.getString();
     const trim_chars_bytes = try trim_chars.getString();
@@ -661,13 +653,13 @@ pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     const end = stringutil.trimRight(bytes, trim_chars_bytes);
 
     if (end == bytes.len) {
-        return str;
+        return str.borrow();
     } else {
-        return try newString(bytes[0..end]);
+        return try newString(Heap.local_heap, bytes[0..end]);
     }
 }
 
-/// Creates a new string if there was anything to trim, else passes `str` through.
+/// Always returns an owned handle with leading and trailing trim chars removed.
 pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try str.getString();
     const trim_chars_bytes = try trim_chars.getString();
@@ -676,9 +668,9 @@ pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     const end = stringutil.trimRight(bytes, trim_chars_bytes);
 
     if (start == 0 and end == bytes.len) {
-        return str;
+        return str.borrow();
     } else {
-        return try newString(bytes[start..end]);
+        return try newString(Heap.local_heap, bytes[start..end]);
     }
 }
 

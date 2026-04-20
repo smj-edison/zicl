@@ -2492,6 +2492,16 @@ pub fn wrapShimmerFn(
     handle.swapIfNew(new_handle);
 }
 
+/// Shimmer `handle` to an enum value using a pre-constructed `TclEnum` type.
+/// Equivalent to `TclEnumType.get` with `det` and `new_handle` managed locally.
+pub fn getEnum(interp: *Interp, comptime TclEnumType: type, handle: *Handle) !TclEnumType.variants {
+    var det: objutil.ErrorDetails = undefined;
+    var new_handle: OptionalHandle = .none;
+    const result = try interp.wrapError(&det, TclEnumType.get(&det, handle.*, &new_handle));
+    handle.swapIfNew(new_handle);
+    return result;
+}
+
 /// Replaces `handle` in-place. Use `objutil.shimmerToInteger` if you need finer-grained
 /// control.
 pub fn getInteger(interp: *Interp, handle: *Handle) !i64 {

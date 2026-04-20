@@ -34,7 +34,7 @@ pub fn isPunct(c: u8) bool {
 }
 
 fn toTitlecaseUtf8(cp: u21) u21 {
-    return uucode.get(.simple_titlecase_mapping, cp) orelse uucode.get(.simple_uppercase_mapping) orelse cp;
+    return uucode.get(.simple_titlecase_mapping, cp) orelse uucode.get(.simple_uppercase_mapping, cp) orelse cp;
 }
 
 fn toUppercaseUtf8(cp: u21) u21 {
@@ -100,16 +100,18 @@ pub fn compare(a: []const u8, b: []const u8, case_insensitive: bool) std.math.Or
     var b_iter = Iterator.init(b);
 
     while (true) {
-        const a_cp = condUpper(a_iter.next(), case_insensitive);
-        const b_cp = condUpper(b_iter.next(), case_insensitive);
+        const a_raw = a_iter.next();
+        const b_raw = b_iter.next();
 
-        if (a_cp != null and b_cp != null) {
-            const order = std.math.order(u21, a_cp.?, b_cp.?);
+        if (a_raw != null and b_raw != null) {
+            const a_cp = condUpper(a_raw.?, case_insensitive);
+            const b_cp = condUpper(b_raw.?, case_insensitive);
+            const order = std.math.order(a_cp, b_cp);
             if (order != .eq) return order;
         } else {
-            if (a_cp == null and b_cp != null) return .lt;
-            if (a_cp == null and b_cp == null) return .eq;
-            if (a_cp != null and b_cp == null) return .gt;
+            if (a_raw == null and b_raw != null) return .lt;
+            if (a_raw == null and b_raw == null) return .eq;
+            if (a_raw != null and b_raw == null) return .gt;
         }
     }
 
@@ -197,17 +199,20 @@ pub fn findCodepoint(str: []const u8, cp: u21) ?usize {
 
 /// Returns the new left-most index in bytes, after trimming. Returns 0
 /// if there was nothing to trim.
-pub fn trimLeft(str: []const u8, trim_chars: []u8) usize {
+pub fn trimLeft(str: []const u8, trim_chars: []const u8) usize {
     var iter = Iterator.init(str);
 
-    outer: while (iter.next()) |cp_to_check| {
-        // Check this codepoint against all the trim_chars codepoints
+    outer: while (true) {
+        const pos = iter.i;
+        const cp_to_check = iter.next() orelse break;
         var trim_char_iter = Iterator.init(trim_chars);
         while (trim_char_iter.next()) |check_against| {
             if (cp_to_check == check_against) {
                 continue :outer;
             }
-        } else break;
+        }
+        // Not a trim char -- return the byte position before this codepoint.
+        return pos;
     }
 
     return iter.i;
@@ -226,17 +231,17 @@ fn reverseNext(iter: *Iterator) ?Codepoint {
             } else if (iter.bytes[iter.i] & 0xE0 == 0xC0) {
                 // Two byte codepoint
                 if (iter.bytes.len - iter.i > 2) {
-                    return std.unicode.utf8Decode2(iter.bytes[iter.i..(iter.i + 2)]);
+                    return std.unicode.utf8Decode2(iter.bytes[iter.i..][0..2].*) catch 0xFFFD;
                 } else return 0xFFFD; // 0xFFFD = replacement character
             } else if (iter.bytes[iter.i] & 0xF0 == 0xE0) {
                 // Three byte codepoint
                 if (iter.bytes.len - iter.i > 3) {
-                    return std.unicode.utf8Decode3(iter.bytes[iter.i..(iter.i + 3)]);
+                    return std.unicode.utf8Decode3(iter.bytes[iter.i..][0..3].*) catch 0xFFFD;
                 } else return 0xFFFD;
             } else if (iter.bytes[iter.i] & 0xF8 == 0xF0) {
                 // Four byte codepoint
                 if (iter.bytes.len - iter.i > 4) {
-                    return std.unicode.utf8Decode4(iter.bytes[iter.i..(iter.i + 4)]);
+                    return std.unicode.utf8Decode4(iter.bytes[iter.i..][0..4].*) catch 0xFFFD;
                 } else return 0xFFFD;
             } else return 0xFFFD; // 0xFFFD = replacement character
         } else return null;
@@ -255,7 +260,7 @@ pub fn trimRight(str: []const u8, trim_chars: []const u8) usize {
     iter.i = str.len;
 
     var len = iter.i;
-    outer: while (reverseNext(iter)) |cp_to_check| : (len = iter.i) {
+    outer: while (reverseNext(&iter)) |cp_to_check| : (len = iter.i) {
         // Check this codepoint against all the trim_chars codepoints
         var trim_char_iter = Iterator.init(trim_chars);
         while (trim_char_iter.next()) |check_against| {
