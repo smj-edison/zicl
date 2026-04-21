@@ -285,7 +285,7 @@ fn ensureValidVariableType(
         var dict_path = try objutil.newList(&.{});
         errdefer dict_path.decrRefCount();
 
-        var last_path_start: ?usize = 0;
+        var last_path_start: ?usize = null;
         var i = start_at;
         while (i < var_name.len) : (i += 1) {
             if (var_name[i] == ':' and var_name[i + 1] == ':') {
@@ -1271,6 +1271,26 @@ pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anyty
 
 pub fn setEmptyResult(interp: *Interp) void {
     interp.freeLastResult();
+}
+
+pub fn makeErrorMessage(interp: *Interp) !Handle {
+    const st = interp.stack_trace.toHandle() orelse return error.NoStackTrace;
+    const err_msg = try interp.result.getString();
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(Heap.global_gpa);
+    try buf.appendSlice(Heap.global_gpa, err_msg);
+
+    // Stack trace is a flat list: {name file line args} repeated per frame.
+    const n_items = objutil.listLengthRaw(st);
+    var i: u32 = 0;
+    while (i < n_items) : (i += 4) {
+        const file = objutil.listItemFollowRefs(st, i + 1);
+        const line = objutil.listItemFollowRefs(st, i + 2);
+        buf.print(Heap.global_gpa, "\n    at {f}:{f}", .{ file, line }) catch return error.OutOfMemory;
+    }
+
+    return try objutil.newString(buf.items);
 }
 
 /// Call frame.

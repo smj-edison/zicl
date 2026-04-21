@@ -614,6 +614,24 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
     interp.setResult((try interp.getVariable(var_name)).toHandle().?);
 }
 
+pub fn lappendCmd(interp: *Interp, args: []Handle) !void {
+    var list = blk: {
+        if ((try interp.getVariable(&args[1])).toHandle()) |val| {
+            break :blk val.borrow();
+        } else {
+            break :blk try objutil.newListWithCapacity(0);
+        }
+    };
+    defer list.decrRefCount();
+
+    for (args[2..]) |item| {
+        _ = try interp.listAppend(&list, item);
+    }
+
+    try interp.setVariableTo(&args[1], list);
+    interp.setResult(list);
+}
+
 pub fn concatCmd(interp: *Interp, args: []Handle) !void {
     const to_concat = args[1..];
     if (to_concat.len == 0) {
@@ -1295,6 +1313,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
+    try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, 2, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);

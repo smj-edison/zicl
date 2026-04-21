@@ -19,6 +19,8 @@ typedef struct Zicl_Interp Zicl_Interp;
 
 typedef int (*Zicl_CCommandFn)(Zicl_Interp *interp, int argc, Zicl_Handle *argv);
 
+void Zicl_SetPanicFd(int fd);
+
 int Zicl_InitGlobals(void);
 int Zicl_InitLocalHeap(void);
 void Zicl_DeinitAll(void);
@@ -48,13 +50,22 @@ Zicl_Handle Zicl_NewDict(Zicl_Handle *handles, int n_handles);
 /* Source functions */
 const char *Zicl_SourceGetFilename(Zicl_Handle source);
 int Zicl_SourceGetLine(Zicl_Handle source);
+int Zicl_SourceSetInfo(Zicl_Handle handle, const char *filename, int line_no);
 
 /* Interpreter functions */
 int Zicl_CreateCommand(Zicl_Interp *interp, const char *name, Zicl_CCommandFn command);
 int Zicl_EvalObject(Zicl_Interp *interp, Zicl_Handle script);
+int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
 Zicl_Handle Zicl_GetResult(Zicl_Interp *interp);
-int Zicl_SetResult(Zicl_Interp *interp, Zicl_Handle handle);
+void Zicl_SetResult(Zicl_Interp *interp, Zicl_Handle handle);
+void Zicl_SetResultOwning(Zicl_Interp *interp, Zicl_Handle handle);
 int Zicl_SetResultString(Zicl_Interp *interp, const char *str, int len);
 int Zicl_SetResultBool(Zicl_Interp *interp, int value);
+int Zicl_SetResultInt(Zicl_Interp *interp, long value);
+void Zicl_SetEmptyResult(Zicl_Interp *interp);
+int Zicl_MakeErrorMessage(Zicl_Interp *interp);
+void Zicl_IncrSignalDepth(Zicl_Interp *interp);
+void Zicl_DecrSignalDepth(Zicl_Interp *interp);
+uint64_t Zicl_GetSigmask(Zicl_Interp *interp);
 Zicl_Handle Zicl_GetScriptBeingEvaluated(Zicl_Interp *interp);
 

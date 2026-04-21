@@ -31,12 +31,12 @@ const need_simple = switch (builtin.zig_backend) {
     else => false,
 };
 
-extern fn dumpLastTouchedTrace() void;
+extern fn dumpLastTouchedTrace(fd: i32) void;
 
 pub const panic = std.debug.FullPanic(panicFn);
 pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
-    dumpLastTouchedTrace();
+    dumpLastTouchedTrace(-1);
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
 

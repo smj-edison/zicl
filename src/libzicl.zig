@@ -9,6 +9,77 @@ const narrowError = Interp.narrowError;
 const ReturnCode = Interp.ReturnCode;
 const commands = @import("commands.zig");
 
+// Allow user to change the default logging fd.
+pub const panic = std.debug.FullPanic(ziclPanic);
+pub const std_options: std.Options = .{ .logFn = ziclLog };
+
+// Mirrors debug.zig's threadlocal panic_stage to guard against recursive panics.
+threadlocal var zicl_panic_stage: usize = 0;
+// Lock this to avoid multiple threads writing to panic_fd at the same time.
+var debug_mutex: std.Io.Mutex = .init;
+
+fn getLoggingFile() std.Io.File {
+    const fd = panic_fd.load(.monotonic);
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+pub fn ziclLog(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const io = Heap.global_io;
+
+    debug_mutex.lockUncancelable(io);
+    defer debug_mutex.unlock(io);
+
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+
+    const file = getLoggingFile();
+    var buffer: [64]u8 = undefined;
+    var file_writer = file.writerStreaming(io, &buffer);
+    const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
+    std.log.defaultLogFileTerminal(level, scope, format, args, terminal) catch {};
+    terminal.writer.flush() catch {};
+}
+
+var panic_fd: std.atomic.Value(i32) = .init(std.posix.STDERR_FILENO);
+export fn Zicl_SetPanicFd(fd: c_int) callconv(.c) void {
+    panic_fd.store(fd, .monotonic);
+}
+
+extern fn dumpLastTouchedTrace(fd: i32) void;
+
+fn ziclPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    // No unlock: abort() terminates the process, serializing output without deadlock risk.
+    debug_mutex.lockUncancelable(Heap.global_io);
+    const fd = panic_fd.load(.monotonic);
+    const panic_file = getLoggingFile();
+    switch (zicl_panic_stage) {
+        0 => {
+            zicl_panic_stage = 1;
+            dumpLastTouchedTrace(fd);
+            var file_writer = panic_file.writerStreaming(Heap.global_io, &.{});
+            const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
+            const thread_id = std.Thread.getCurrentId();
+            file_writer.interface.print("thread {d} panic: {s}\n", .{ thread_id, msg }) catch {};
+            std.debug.writeCurrentStackTrace(.{
+                .first_address = first_trace_addr orelse @returnAddress(),
+                .allow_unsafe_unwind = true,
+            }, terminal) catch {};
+        },
+        1 => {
+            zicl_panic_stage = 2;
+            std.Io.File.writeStreamingAll(panic_file, Heap.global_io, "aborting due to recursive panic\n") catch {};
+        },
+        else => {},
+    }
+    std.process.abort();
+}
+
 fn errorToOptional(result: anyerror!Handle) OptionalHandle {
     if (result) |handle| {
         return handle.toOptional();
@@ -102,6 +173,24 @@ export fn Zicl_SourceGetLine(source: Handle) callconv(.c) c_int {
     } else return -1;
 }
 
+/// Attaches source location to a handle so that evaluation errors report the
+/// correct file and line. The `filename` string is heap-allocated and owned
+/// by the source extra-data; `destroyExtraData` releases it.
+export fn Zicl_SourceSetInfo(handle: Handle, filename: [*:0]const u8, line_no: c_int) callconv(.c) ReturnCode {
+    const file_handle = objutil.newString(std.mem.span(filename)) catch return .oom;
+    // `file_handle` starts at refcount 1. `setSourceInfo` borrows it without
+    // incrementing, so that single count is owned by the extra-data. When the
+    // extra-data is destroyed or replaced, it calls `decrOptional()` to release it.
+    objutil.setSourceInfo(handle, .{
+        .file_name = file_handle.toOptional(),
+        .line_no = @intCast(line_no),
+    }) catch {
+        file_handle.decrRefCount();
+        return .oom;
+    };
+    return .ok;
+}
+
 // Global init functions.
 var global_threaded: std.Io.Threaded = undefined;
 export fn Zicl_InitGlobals() callconv(.c) c_int {
@@ -172,6 +261,10 @@ export fn Zicl_SetResult(interp: *Interp, handle: Handle) callconv(.c) void {
     interp.setResult(handle);
 }
 
+export fn Zicl_SetResultOwning(interp: *Interp, handle: Handle) callconv(.c) void {
+    interp.setResultOwning(handle);
+}
+
 export fn Zicl_SetResultString(interp: *Interp, str: [*:0]const u8, len: c_int) ReturnCode {
     const bytes = if (len < 0) std.mem.span(str) else str[0..@intCast(len)];
     interp.setResultString(bytes) catch |err| return ReturnCode.fromError(err);
@@ -181,4 +274,36 @@ export fn Zicl_SetResultString(interp: *Interp, str: [*:0]const u8, len: c_int) 
 export fn Zicl_SetResultBool(interp: *Interp, value: c_int) ReturnCode {
     interp.setResultBoolean(value != 0) catch |err| return ReturnCode.fromError(err);
     return .ok;
+}
+
+export fn Zicl_SetResultInt(interp: *Interp, value: c_long) callconv(.c) ReturnCode {
+    interp.setResultInteger(value) catch |err| return ReturnCode.fromError(err);
+    return .ok;
+}
+
+export fn Zicl_SetEmptyResult(interp: *Interp) callconv(.c) void {
+    interp.setEmptyResult();
+}
+
+export fn Zicl_MakeErrorMessage(interp: *Interp) callconv(.c) ReturnCode {
+    const msg = interp.makeErrorMessage() catch |err| return ReturnCode.fromError(narrowError(err));
+    interp.setResultOwning(msg);
+    return .ok;
+}
+
+/// Increments the signal depth, deferring Tcl signal delivery during C
+/// callbacks that should not be interrupted.
+export fn Zicl_IncrSignalDepth(interp: *Interp) callconv(.c) void {
+    interp.signal_depth += 1;
+}
+
+/// Decrements the signal depth, re-enabling Tcl signal delivery.
+export fn Zicl_DecrSignalDepth(interp: *Interp) callconv(.c) void {
+    interp.signal_depth -= 1;
+}
+
+/// Returns the pending signal bitmask. Non-zero means at least one signal is
+/// waiting to be delivered.
+export fn Zicl_GetSigmask(interp: *Interp) callconv(.c) u64 {
+    return interp.signal;
 }

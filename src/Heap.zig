@@ -40,10 +40,10 @@ pub const HeapSettings = struct {
 };
 const cfg: HeapSettings = .{};
 
-var debugging_buffer: [1024 * 1024]u8 = undefined;
-var debugging_gpa = if (builtin.mode == .Debug) memutil.RingBufferAllocator.init(debugging_buffer[0..]) else undefined;
+threadlocal var debugging_buffer: [1024 * 1024]u8 = undefined;
+threadlocal var debugging_gpa: if (builtin.mode == .Debug) memutil.RingBufferAllocator else void = undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
-var debug_gpa: Allocator = undefined;
+threadlocal var debug_gpa: Allocator = undefined;
 /// Set this right before doing an operation that may cause a panic. The runtime will dump its
 /// traces on panic if set.
 pub threadlocal var last_touched: ?Handle = null;
@@ -2726,10 +2726,6 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
 pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     global_io = io;
 
-    if (builtin.mode == .Debug) {
-        debug_gpa = debugging_gpa.allocator();
-    }
-
     state.mutex.lockUncancelable(global_io);
     defer state.mutex.unlock(global_io);
 
@@ -2741,6 +2737,11 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
 }
 
 pub fn initLocalHeap() !void {
+    if (builtin.mode == .Debug) {
+        debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer[0..]);
+        debug_gpa = debugging_gpa.allocator();
+    }
+
     const slot_index = blk: {
         state.mutex.lockUncancelable(global_io);
         defer state.mutex.unlock(global_io);
@@ -3174,20 +3175,54 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
     std.debug.print("}}\n", .{});
 }
 
-pub export fn dumpLastTouchedTrace() void {
+fn printLastTouchedTrace(terminal: std.Io.Terminal) !void {
+    const w = terminal.writer;
     if (!options.trace_mem) {
-        std.debug.print("WARNING: no trace collected as it was disabled in options.\n\n", .{});
+        try terminal.setColor(.yellow);
+        try w.print("WARNING: no trace collected as it was disabled in options.\n\n", .{});
         return;
     }
 
+    try terminal.setColor(.reset);
     if (last_touched) |val| {
         val.getHeap().trace_mutex.lockUncancelable(global_io);
         defer val.getHeap().trace_mutex.unlock(global_io);
 
-        std.debug.print("== Last touched details ==\n\n", .{});
-        val.getHeap().objects.get(val.index).trace.dump();
-        std.debug.print("== End of last touched details ==\n\n", .{});
+        try w.writeAll("== Last touched details ==\n\n");
+
+        const trace = val.getHeap().objects.get(val.index).trace;
+        const end = @min(trace.index, trace.addrs.len);
+        for (trace.addrs[0..end], 0..) |frames_array, i| {
+            try w.print("{s}:\n", .{trace.notes[i]});
+            var frames_array_mutable = frames_array;
+            const frames = mem.sliceTo(frames_array_mutable[0..], 0);
+            const len = @min(trace.index, frames.len);
+            const stack_trace: std.debug.StackTrace = .{
+                .return_addresses = frames[0..len],
+                .skipped = if (len < frames.len) .none else .unknown,
+            };
+            std.debug.writeStackTrace(&stack_trace, terminal) catch return;
+        }
+        if (trace.index > end) {
+            w.print("{d} more traces not shown; consider increasing trace size\n", .{
+                trace.index - end,
+            }) catch return;
+        }
+        try w.writeAll("== End of last touched details ==\n\n");
     } else {
-        std.debug.print("No last leaked object\n", .{});
+        try w.writeAll("No last leaked object\n");
+    }
+}
+
+pub export fn dumpLastTouchedTrace(fd: i32) void {
+    if (fd >= 0) {
+        const file: std.Io.File = .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
+        var file_writer = file.writerStreaming(Heap.global_io, &.{});
+        const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
+        printLastTouchedTrace(terminal) catch {};
+    } else {
+        const stderr = std.debug.lockStderr(&.{}).terminal();
+        defer std.debug.unlockStderr();
+        printLastTouchedTrace(stderr) catch {};
     }
 }
