@@ -776,7 +776,7 @@ fn buildErrorOptions(
         // .return is an internal return type, so it should never be surfaced to the callee.
         if (exit_code == .@"return") {
             if (interp.return_propagate.return_at_end) |to_return| {
-                break :code @intFromEnum(Interp.ReturnCode.fromError(to_return));
+                break :code @intFromEnum(Interp.ReturnCode.fromErrorUnion(to_return));
             } else {
                 break :code @intFromEnum(@as(Interp.ReturnCode, .ok));
             }
@@ -892,7 +892,7 @@ fn catchTryHelper(
                 // Evaluated just fine.
                 break :blk .ok;
             } else |err| {
-                break :blk Interp.ReturnCode.fromError(err);
+                break :blk Interp.ReturnCode.fromErrorUnion(err);
             }
         }
     };
@@ -1070,7 +1070,7 @@ fn catchTryHelper(
         try interp.setVariableTo(&new_var_name, options_dict.toHandle().?);
     };
 
-    var script_result: Interp.EvalError!void = exit_code.toError();
+    var script_result: Interp.Error!void = exit_code.toError();
     if (handler_script) |handler| {
         // Now that we've set up the message and options variables,
         // the handler will have the variables it needs to run.
@@ -1089,7 +1089,7 @@ fn catchTryHelper(
             interp.pending_error_during.swapRef(options_dict.toHandle().?.borrow());
             options_dict.swapRef(buildErrorOptionsBestEffort(
                 interp,
-                Interp.ReturnCode.fromError(err),
+                Interp.ReturnCode.fromErrorUnion(err),
                 interp.stack_trace,
                 interp.pending_error_code,
                 options_dict,
@@ -1119,7 +1119,7 @@ fn catchTryHelper(
 
     switch (mode) {
         .@"catch" => {
-            try interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromError(script_result)));
+            try interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromErrorUnion(script_result)));
             return;
         },
         .@"try" => {
@@ -1258,30 +1258,48 @@ pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     interp.setResultOwning(try objutil.newStringInner(heap, buf.items));
 }
 
+fn registerCommand(
+    interp: *Interp,
+    name: []const u8,
+    to_call: Interp.CommandFn,
+    description: []const u8,
+    min_arity: usize,
+    max_arity: ?usize,
+    stride: ?usize,
+) !void {
+    try interp.registerCommand(name, .{
+        .call_info = .{ .zig = to_call },
+        .description = description,
+        .min_arity = min_arity,
+        .max_arity = max_arity,
+        .multiple_of = stride,
+    });
+}
+
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("*", .{ .to_call = mulCmd, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("+", .{ .to_call = addCmd, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("-", .{ .to_call = subCmd, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("/", .{ .to_call = divCmd, .description = "?number ...?", .min_arity = 1 });
-    try interp.registerCommand("append", .{ .to_call = appendCmd, .description = "varName ?value ...?", .min_arity = 1 });
-    try interp.registerCommand("apply", .{ .to_call = applyCmd, .description = "lambda ?arg ...?", .min_arity = 1 });
-    try interp.registerCommand("break", .{ .to_call = breakCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
-    try interp.registerCommand("catch", .{ .to_call = catchCmd, .description = "script ?resultVar? ?optsVar?", .min_arity = 1, .max_arity = 3 });
-    try interp.registerCommand("concat", .{ .to_call = concatCmd, .description = "?arg ...?", .min_arity = 0 });
-    try interp.registerCommand("continue", .{ .to_call = continueCmd, .description = "?level?", .min_arity = 0, .max_arity = 1 });
-    try interp.registerCommand("error", .{ .to_call = errorCmd, .description = "message ?errorCode?", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("errorinfo", .{ .to_call = errorinfoCmd, .description = "optsDict", .min_arity = 1, .max_arity = 1 });
-    try interp.registerCommand("return", .{ .to_call = returnCmd, .description = "?-option value ...? ?result?", .min_arity = 0 });
-    try interp.registerCommand("try", .{ .to_call = tryCmd, .description = "script ?handler ...? ?finally body?", .min_arity = 1 });
-    try interp.registerCommand("dict", .{ .to_call = dictCmd, .description = "subcommand ?arg ...?", .min_arity = 1 });
-    try interp.registerCommand("expr", .{ .to_call = exprCmd, .description = "expression", .min_arity = 1, .max_arity = 1 });
-    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
-    try interp.registerCommand("for", .{ .to_call = forCmd, .description = "start test next body", .min_arity = 4, .max_arity = 4 });
-    try interp.registerCommand("if", .{ .to_call = ifCmd, .description = "condition trueBody ?elseif ...? ?else falseBody?", .min_arity = 2 });
-    try interp.registerCommand("incr", .{ .to_call = incrCmd, .description = "varName key ?increment?", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("puts", .{ .to_call = putsCmd, .description = "?-nonewline? string", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
-    try interp.registerCommand("unset", .{ .to_call = unsetCmd, .description = "?-nocomplain? ?--? ?varName ...?", .min_arity = 0 });
+    try registerCommand(interp, "*", mulCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "+", addCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "-", subCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "/", divCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "append", appendCmd, "varName ?value ...?", 1, null, null);
+    try registerCommand(interp, "apply", applyCmd, "lambda ?arg ...?", 1, null, null);
+    try registerCommand(interp, "break", breakCmd, "?level?", 0, 1, null);
+    try registerCommand(interp, "catch", catchCmd, "script ?resultVar? ?optsVar?", 1, 3, null);
+    try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null, null);
+    try registerCommand(interp, "continue", continueCmd, "?level?", 0, 1, null);
+    try registerCommand(interp, "dict", dictCmd, "subcommand ?arg ...?", 1, null, null);
+    try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2, null);
+    try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
+    try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
+    try registerCommand(interp, "fn", fnCmd, "name argList body", 2, 3, null);
+    try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
+    try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
+    try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
+    try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
+    try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
+    try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
+    try registerCommand(interp, "try", tryCmd, "script ?handler ...? ?finally body?", 1, null, null);
+    try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null, null);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {

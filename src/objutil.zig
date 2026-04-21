@@ -60,7 +60,7 @@ pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) 
     assert(handle.tag() == .string);
 
     // See if we already calculated the utf8 length.
-    switch (Heap.getStringDetails(handle)) {
+    switch (handle.getStringDetails()) {
         .long => |long_str| {
             const current_len = long_str.getUtf8Length();
             if (current_len != std.math.maxInt(u64)) return current_len;
@@ -1675,7 +1675,7 @@ pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
 }
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
-pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
+pub fn newDictInner(heap: *Heap, handles: []const Handle) !Handle {
     const dict = try newDictWithCapacity(heap, @intCast(handles.len));
     errdefer dict.decrRefCount();
     dict.peek().body.dict.len = @intCast(handles.len);
@@ -1687,6 +1687,11 @@ pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
     }
 
     return dict;
+}
+
+/// Caller is responsible that `handles` has handles.len % 2 == 0.
+pub fn newDict(handles: []const Handle) !Handle {
+    return newDictInner(Heap.local_heap, handles);
 }
 
 /// Asserts `dict` is a .dict.
@@ -2240,10 +2245,10 @@ fn testDictFlatten(ta: std.mem.Allocator) !void {
     const value3 = try newStringInner(heap, "3");
     defer value3.decrRefCount();
 
-    const dict1 = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
+    const dict1 = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
     defer dict1.decrRefCount();
 
-    const dict2 = try newDict(heap, &.{ key_foo, value2, key_baz, value3 });
+    const dict2 = try newDictInner(heap, &.{ key_foo, value2, key_baz, value3 });
     defer dict2.decrRefCount();
 
     try dictSetLink(dict2, dict1);
@@ -2374,7 +2379,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const value2 = try newStringInner(heap, "2");
     defer value2.decrRefCount();
 
-    const dict1 = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
+    const dict1 = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
     defer dict1.decrRefCount();
 
     const good_key = try newStringInner(heap, "foo");
@@ -2403,7 +2408,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
 
     // Dict put testing.
-    var dict_for_put = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
+    var dict_for_put = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
     defer dict_for_put.decrRefCount();
     const key3 = try newStringInner(heap, "baz");
     defer key3.decrRefCount();
@@ -2421,7 +2426,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("3", try (try dictLookupFollowRefs(dict_for_put, key3)).toHandle().?.getString());
 
     // Dict remove testing.
-    var dict_for_remove = try newDict(heap, &.{ key_foo, value1, key_bar, value2, key_foo, value3 });
+    var dict_for_remove = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2, key_foo, value3 });
     defer dict_for_remove.decrRefCount();
     const remove_result = try dictRemove(dict_for_remove, key_foo);
     dict_for_remove.swapIfNew(remove_result.new_dict);
@@ -2429,7 +2434,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("bar 2", try dict_for_remove.getString());
 
     // Test dict edge cases.
-    var dict_edge_cases = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
+    var dict_edge_cases = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
     defer dict_edge_cases.decrRefCount();
 
     // Try using a value as a key, and a key as the value while not shared (this is to check
@@ -3028,4 +3033,11 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle
 pub fn getBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !bool {
     try shimmerToBoolean(det, provided_handle, new_handle);
     return new_handle.orElse(provided_handle).peek().body.bool.data;
+}
+
+pub fn newBoolean(value: bool) !Handle {
+    const handle = try Heap.local_heap.createObject();
+    handle.peek().head.tag = .bool;
+    handle.peek().body.bool = .{ .data = value };
+    return handle;
 }

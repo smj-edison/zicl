@@ -62,6 +62,7 @@ anything that might already exist.
 - `listAppendObject(det, provided_list, new_list, item)` -- Append a raw `Heap.Object`; takes ownership.
 - `listAppend(det, provided_list, new_list, item)` -- Append a handle, duplicating/referencing as needed.
 - `listAppendAssumeCapacity(list, item)` -- Infallible append; caller pre-allocated capacity and did ref-counting.
+- `listToHandles(gpa, list)` -- Collect all item handles from a list into a newly allocated `ArrayList` (caller owns the list).
 
 ### Dicts
 - `newDictWithCapacity(heap, len)` -- Allocate a dict with pre-reserved key/value pair slots (`len` must be even).
@@ -85,6 +86,9 @@ anything that might already exist.
 - `dictRemove(provided_dict, key)` -- Remove a key; returns `DictAndRemovedResult`.
 - `dictRemoveRecursively(det, provided_dict, keys)` -- Nested dict remove along a key path.
 - `dictLookupRecursively(det, provided_dict, keys)` -- Nested dict lookup along a key path.
+- `dictSetLink(dict, link)` -- Set a parent-scope upvar link on a mutable dict (for variable scoping chains).
+- `dictSetLinkIfPresent(dict, link)` -- Call `dictSetLink` only if `link` is non-null.
+- `dictFlatten(provided_dict)` -- Recursively merge a linked-dict chain into a single flat dict; returns `.none` if nothing changed.
 
 ### References & misc
 - `integerObject(value)` -- Build a raw `Heap.Object` for an integer without allocating (no Handle, no heap needed).
@@ -97,6 +101,8 @@ anything that might already exist.
 - `enumNames(T)` -- Comptime: return enum variant names joined by `", "`.
 - `EnumMapping(T)` -- Comptime: build a string-to-enum lookup table type.
 - `TclEnum(T, enum_name)` -- Comptime: generate a Tcl-facing enum type with a `.get` shimmer function.
+- `SubcommandParser(Enum, subcommands)` -- Comptime: build a subcommand dispatcher type with usage/arity validation and `-help` support.
+  - `.parse(det, args)` -- Dispatch to the matching subcommand enum variant, validating argument count.
 
 ### Scripts & expressions
 - `parseScript(det, handle)` -- Parse a Tcl script from a string handle (not cached).
@@ -142,6 +148,9 @@ anything that might already exist.
 - `handle.getClosureExtraData()` -- Access the `.closure` extra data pointer.
 - `handle.trace(fmt, args)` -- Append a trace entry (only when `trace_mem` is enabled).
 - `handle.assert(ok)` -- Assert with automatic trace dump on failure.
+- `handle.swapIntermediate(provided_handle, maybe_new)` -- Like `swapIfNew`, but releases the old only if it differs from `provided_handle` (safe when ref and provided may alias).
+- `handle.dupOrRef()` -- Duplicate or create a `.reference` using the local heap (shorthand for `local_heap.dupOrReference(handle)`).
+- `handle.makeCrossthread()` -- Recursively mark a handle and all its children as cross-thread safe.
 
 ### OptionalHandle operations
 - `optional.toHandle()` -- Convert to `?Handle`.
@@ -154,6 +163,7 @@ anything that might already exist.
 - `optional.orEmpty()` -- Return contained handle if non-null, else the empty handle.
 - `optional.borrowOptional()` -- Borrow the contained handle (nop if none).
 - `optional.decrOptional()` -- Decrement ref count if non-null.
+- `optional.makeCrossthread()` -- Mark the contained handle (if any) as cross-thread safe.
 
 ### Heap-level operations
 - `Heap.ensureMutableOrDup(handle, new_handle)` -- Duplicate if the handle cannot be mutated in-place.
@@ -339,6 +349,8 @@ anything that might already exist.
 - `setVariableToObject(interp, name, obj)` -- Set a variable to a raw `Heap.Object` (lower-level than `setVariableTo`).
 - `getVariable(interp, provided_name)` -- Look up a variable; returns `OptionalHandle` (.none if unset).
 - `getVariableOrError(interp, name)` -- Look up a variable; returns `EvalError` if unset.
+- `unsetVariable(interp, name)` -- Unset a variable, reporting an error via the interpreter if it does not exist.
+- `unsetVariableSilent(interp, name)` -- Unset a variable, silently succeeding if it does not exist.
 
 ### Dict helpers (interp-aware wrappers)
 - `getDictValue(interp, dict, key)` -- Look up `key` in `dict`; returns struct with value and shimmer handle.

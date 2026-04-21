@@ -71,7 +71,7 @@ prng: std.Random.DefaultPrng,
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) ReturnCode;
 
 pub const EvalError = error{
     OutOfMemory,
@@ -86,7 +86,7 @@ pub const Error = EvalError || error{
     WrongUsage,
 };
 
-fn narrowError(err: anyerror) EvalError {
+pub fn narrowError(err: anyerror) EvalError {
     return switch (err) {
         error.Break => error.Break,
         error.Continue => error.Continue,
@@ -376,7 +376,7 @@ pub fn setVariableInner(
                         error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
                         error.VariableNotFound => {
                             // If it's not found, then we'll just create it.
-                            break :blk try objutil.newDict(Heap.local_heap, &.{});
+                            break :blk try objutil.newDictInner(Heap.local_heap, &.{});
                         },
                     }
                 };
@@ -781,28 +781,17 @@ test "variable link" {
 }
 
 pub const NativeCommand = struct {
-    pub const ZigCommand = struct {
-        to_call: *const CommandFn,
-        description: ?[]const u8 = "",
-        min_arity: usize = 0,
-        max_arity: ?usize = null,
-        /// If the command argument length needs to be a multiple of some
-        /// amount, set this. A good example is `dict create`, as it needs
-        /// an even number of arguments.
-        multiple_of: ?usize = null,
-    };
-
-    pub const CCommand = extern struct {
-        to_call: *const CCommandFn,
-        description: ?[*:0]u8,
-        min_arity: c_int = 0,
-        max_arity: c_int = -1,
-        multiple_of: c_int = -1,
-    };
+    description: ?[]const u8 = "",
+    min_arity: usize = 0,
+    max_arity: ?usize = null,
+    /// If the command argument length needs to be a multiple of some
+    /// amount, set this. A good example is `dict create`, as it needs
+    /// an even number of arguments.
+    multiple_of: ?usize = null,
 
     call_info: union(enum) {
-        zig: ZigCommand,
-        c: CCommand,
+        zig: *const CommandFn,
+        c: *const CCommandFn,
     },
 
     /// Returns a string containing all the usage information. Allocates the string
@@ -814,24 +803,38 @@ pub const NativeCommand = struct {
         // Write command name.
         aw.writer.writeAll(command_name) catch return error.OutOfMemory;
 
-        switch (command.call_info) {
-            .zig => |call_info| {
-                if (call_info.description) |description| {
-                    aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
-                } else {
-                    aw.writer.writeAll(" ...") catch return error.OutOfMemory;
-                }
-            },
-            .c => |call_info| {
-                if (call_info.description) |description| {
-                    aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
-                } else {
-                    aw.writer.writeAll(" ...") catch return error.OutOfMemory;
-                }
-            },
+        if (command.description) |description| {
+            aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
+        } else {
+            aw.writer.writeAll(" ...") catch return error.OutOfMemory;
         }
 
         return try aw.toOwnedSlice();
+    }
+
+    pub fn minArity(command: NativeCommand) usize {
+        switch (command.call_info) {
+            .zig => |info| return info.min_arity,
+            .c => |info| return @intCast(info.min_arity),
+        }
+    }
+
+    pub fn maxArity(command: NativeCommand) ?usize {
+        switch (command.call_info) {
+            .zig => |info| return info.max_arity,
+            .c => |info| if (info.max_arity >= 0) {
+                return @intCast(info.max_arity);
+            } else return null,
+        }
+    }
+
+    pub fn multipleOf(command: NativeCommand) ?usize {
+        switch (command.call_info) {
+            .zig => |info| return info.multiple_of,
+            .c => |info| if (info.multiple_of >= 0) {
+                return @intCast(info.multiple_of);
+            } else return null,
+        }
     }
 };
 
@@ -845,10 +848,8 @@ fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u
 
 /// `name` should be a static variable guaranteed to exist as long as the
 /// interpreter exists.
-pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeCommand.ZigCommand) !void {
-    try interp.global_commands.put(Heap.global_gpa, name, .{
-        .call_info = .{ .zig = call_info },
-    });
+pub fn registerCommand(interp: *Interp, name: []const u8, command: NativeCommand) !void {
+    try interp.global_commands.put(Heap.global_gpa, name, command);
 
     var var_name = try objutil.newString(name);
     defer var_name.decrRefCount();
@@ -1196,20 +1197,24 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
 }
 
 fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
-    const signature = command.call_info.zig;
-
     const arg_count = args.len - 1;
     wrong_arg_count: {
         // Check arg count.
-        if (arg_count < signature.min_arity) break :wrong_arg_count;
-        if (signature.max_arity) |max_arity| {
+        if (arg_count < command.min_arity) break :wrong_arg_count;
+        if (command.max_arity) |max_arity| {
             if (arg_count > max_arity) break :wrong_arg_count;
         }
-        if (signature.multiple_of) |multiple_of| {
+        if (command.multiple_of) |multiple_of| {
             if (@mod(arg_count, multiple_of) != 0) break :wrong_arg_count;
         }
 
-        try command.call_info.zig.to_call(interp, args);
+        switch (command.call_info) {
+            .zig => |to_call| try to_call(interp, args),
+            .c => |to_call| {
+                try ReturnCode.toError(to_call(interp, @intCast(args.len), args.ptr));
+            },
+        }
+
         return;
     }
 
@@ -1248,6 +1253,10 @@ pub fn setResultFloat(interp: *Interp, value: f64) !void {
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     const bytes_handle = try objutil.newString(bytes);
     interp.setResultOwning(bytes_handle);
+}
+
+pub fn setResultBoolean(interp: *Interp, value: bool) !void {
+    interp.setResultOwning(try objutil.newBoolean(value));
 }
 
 pub fn setResultInterned(interp: *Interp, interned: Heap.InternedString) void {
@@ -1376,18 +1385,20 @@ const EvalFrame = struct {
     /// how parsed scripts are stored). Combine with `source_info.line_no`
     /// to recover the absolute line at error-reporting time.
     current_line: u32,
+    /// The object currently being evaluated.
+    currently_evaluating: Handle,
 };
 
-fn currentEvalFrameIndex(interp: *Interp) u32 {
+pub fn currentEvalFrameIndex(interp: *Interp) u32 {
     return @intCast(interp.eval_frames.items.len - 1);
 }
 
-fn currentEvalFrame(interp: *Interp) *EvalFrame {
+pub fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentEvalFrameIndex()];
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
-    const vars_handle = try objutil.newDict(Heap.local_heap, &.{});
+    const vars_handle = try objutil.newDictInner(Heap.local_heap, &.{});
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
@@ -1413,11 +1424,12 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
     return @intCast(new_call_frame_idx);
 }
 
-fn pushEvalFrame(interp: *Interp) !u32 {
+fn pushEvalFrame(interp: *Interp, script: Handle) !u32 {
     try interp.eval_frames.append(Heap.global_gpa, .{
         .call_frame = interp.currentCallFrameIndex(),
         .args = &.{},
         .current_line = 1,
+        .currently_evaluating = script,
     });
     return interp.currentEvalFrameIndex();
 }
@@ -2343,7 +2355,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
 
     // TODO implement JIM_OPTIMIZATION speedups
 
-    _ = try interp.pushEvalFrame();
+    _ = try interp.pushEvalFrame(script);
     defer interp.popEvalFrame();
 
     // Used for allocating the arguments passed into a command call.
@@ -2485,24 +2497,30 @@ pub const ReturnCode = enum(u8) {
     signal = 5,
     exit = 6,
     oom = 7,
+    usage = 8,
 
-    pub fn fromError(value: EvalError!void) ReturnCode {
+    pub fn fromErrorUnion(value: Error!void) ReturnCode {
         if (value) {
             return .ok;
         } else |err| {
-            return switch (err) {
-                error.EvalError => .@"error",
-                error.PropagateResult => .@"return",
-                error.Break => .@"break",
-                error.Continue => .@"continue",
-                error.Signal => .signal,
-                error.Exit => .exit,
-                error.OutOfMemory => .oom,
-            };
+            return ReturnCode.fromError(err);
         }
     }
 
-    pub fn toError(self: ReturnCode) EvalError!void {
+    pub fn fromError(err: Error) ReturnCode {
+        return switch (err) {
+            error.EvalError => .@"error",
+            error.PropagateResult => .@"return",
+            error.Break => .@"break",
+            error.Continue => .@"continue",
+            error.Signal => .signal,
+            error.Exit => .exit,
+            error.OutOfMemory => .oom,
+            error.WrongUsage => .usage,
+        };
+    }
+
+    pub fn toError(self: ReturnCode) Error!void {
         switch (self) {
             .ok => return,
             .@"error" => return error.EvalError,
@@ -2512,6 +2530,7 @@ pub const ReturnCode = enum(u8) {
             .signal => return error.Signal,
             .exit => return error.Exit,
             .oom => return error.OutOfMemory,
+            .usage => return error.WrongUsage,
         }
     }
 };
@@ -2522,6 +2541,33 @@ pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
     interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try script.getHash();
     return evalObjectInner(interp, script, cache_key);
+}
+
+pub fn evalFile(interp: *Interp, filename: []const u8) EvalError!void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        Heap.global_io,
+        filename,
+        Heap.global_gpa,
+        .unlimited,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try interp.setResultFormatted("couldn't read file \"{s}\": {}", .{ filename, err });
+            return;
+        },
+    };
+    defer Heap.global_gpa.free(bytes);
+
+    const filename_handle = try objutil.newString(filename);
+    defer filename_handle.decrRefCount();
+    const script = try objutil.newString(bytes);
+    defer script.decrRefCount();
+    try objutil.setSourceInfo(script, .{
+        .file_name = filename_handle.toOptional(),
+        .line_no = 1,
+    });
+
+    try interp.evalObject(script);
 }
 
 pub fn init() !Interp {
@@ -2619,6 +2665,11 @@ pub fn getFloat(interp: *Interp, handle: *Handle) !f64 {
 pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
     var det: objutil.ErrorDetails = undefined;
     return interp.wrapError(&det, objutil.floatGetNoShimmer(&det, handle));
+}
+
+pub fn getBoolean(interp: *Interp, handle: *Handle) !bool {
+    try interp.wrapShimmerFn(handle, objutil.shimmerToBoolean);
+    return handle.peek().body.bool.data;
 }
 
 /// Shimmers a handle to a list, updating it in place if a duplicate was
@@ -2825,7 +2876,7 @@ test "recursive dict keys" {
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var dict = try objutil.newDict(heap, &.{});
+    var dict = try objutil.newDictInner(heap, &.{});
     defer dict.decrRefCount();
     var key_foo = try objutil.newStringInner(heap, "foo");
     defer key_foo.decrRefCount();

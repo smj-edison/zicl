@@ -785,6 +785,10 @@ pub const OptionalHandle = enum(HandleBacking) {
         return ref.orElse(Heap.local_heap.emptyHandle());
     }
 
+    pub fn makeCrossthread(ref: OptionalHandle) !void {
+        if (ref.toHandle()) |val| try val.makeCrossthread();
+    }
+
     pub fn borrowOptional(ref: OptionalHandle) OptionalHandle {
         if (ref.toHandle()) |val| val.incrRefCount();
         return ref;
@@ -1265,6 +1269,51 @@ pub const Handle = packed struct(HandleBacking) {
         // We don't save the hash when it's not a long string, since
         // it should be pretty cheap to compute it again.
         return memutil.hashBytes(try handle.getString());
+    }
+
+    pub fn makeCrossthread(handle: Handle) !void {
+        switch (handle.tag()) {
+            .none,
+            .index,
+            .integer,
+            .float,
+            .bool,
+            .string,
+            .source,
+            => {},
+            .list => {
+                for (0..objutil.listLengthRaw(handle)) |i| {
+                    try objutil.listItem(handle, @intCast(i)).makeCrossthread();
+                }
+            },
+            .dict => {
+                for (0..objutil.dictItemLength(handle)) |i| {
+                    try objutil.dictItem(handle, @intCast(i)).makeCrossthread();
+                }
+                // Make sure it has a generated table before sharing.
+                _ = try objutil.dictGetTable(handle);
+            },
+            .reference => {
+                try handle.peek().body.reference.makeCrossthread();
+            },
+            .closure => {
+                const closure = handle.getClosureExtraData();
+                try closure.args.makeCrossthread();
+                try closure.body.makeCrossthread();
+                try closure.name.makeCrossthread();
+                try closure.optional_values.makeCrossthread();
+                try closure.scope.makeCrossthread();
+            },
+            .custom_type => @panic("unimplemented"),
+            .cached_local_var,
+            .upvar_link,
+            .dict_sugar,
+            .parsed_script_command,
+            .invalid,
+            .marked,
+            => unreachable,
+        }
+        handle.getMetadata().cross_thread = true;
     }
 
     pub fn trace(handle: Handle, comptime fmt: []const u8, args: anytype) void {
@@ -2732,7 +2781,7 @@ fn createOomErrorOptionsDict(heap: *Heap) !Handle {
         heap.getInternedString(.@"-errorcode"), heap.getInternedString(.@"ZICL OOM"),
     };
 
-    const new_dict = try objutil.newDict(heap, &pairs);
+    const new_dict = try objutil.newDictInner(heap, &pairs);
     errdefer new_dict.decrRefCount();
 
     // Make sure it has a dict and a string rep, so it's useful in an

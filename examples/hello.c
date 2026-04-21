@@ -3,30 +3,30 @@
 #include "libzicl.h"
 
 int main(void) {
-    assert(ziclInitGlobals() == 0);
-    assert(ziclInitLocalHeap() == 0);
+    assert(Zicl_InitGlobals() == 0);
+    assert(Zicl_InitLocalHeap() == 0);
 
-    ZiclInterp *interp = ziclInterpCreate();
+    Zicl_Interp *interp = Zicl_CreateInterp();
     assert(interp);
 
     const char *script = "set x 40; + $x 2";
-    ZiclHandle handle = ziclNewString(script, -1);
-    assert(handle != ZICL_NULL_HANDLE);
+    Zicl_Handle handle = Zicl_NewString(script, -1);
+    assert(handle);
 
-    ZiclReturnCode rc = ziclEvalObject(interp, handle);
-    ziclDecrRefCount(handle);
+    int rc = Zicl_EvalObject(interp, handle);
+    Zicl_DecrRefCount(handle);
     if (rc != ZICL_OK) goto err;
 
-    const char *result = ziclString(ziclGetResult(interp));
+    const char *result = Zicl_String(Zicl_GetResult(interp));
     printf("result: %s\n", result ? result : "(null)");
 
-    ziclInterpDestroy(interp);
-    ziclDeinitAll();
+    Zicl_InterpDestroy(interp);
+    Zicl_DeinitAll();
     return 0;
 
 err:
     fprintf(stderr, "eval failed with code %d\n", rc);
-    ziclInterpDestroy(interp);
-    ziclDeinitAll();
+    Zicl_InterpDestroy(interp);
+    Zicl_DeinitAll();
     return 1;
 }
