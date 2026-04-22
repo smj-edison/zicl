@@ -2034,6 +2034,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
             // to restore it anymore.
             old_value.deinitSingle(Heap.local_heap);
 
+            new_dict.orElse(provided_dict).invalidateString();
             return .{ .new_dict = new_dict, .new_value = dictItem(dict, new_index) };
         },
         .appended_pair => |state| {
@@ -2064,6 +2065,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                 }
             };
 
+            new_dict.orElse(provided_dict).invalidateString();
             return .{ .new_dict = new_dict, .new_value = dictItem(dict, new_index) };
         },
     };

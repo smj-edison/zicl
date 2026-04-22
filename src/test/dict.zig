@@ -36,3 +36,14 @@ test "dict commands" {
         \\ dict get $foo bar baz
     );
 }
+
+test "dict sugar" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    try interp.testExpectScriptResult("a b y 10",
+        \\ set x {a b}
+        \\ set x::y 10
+        \\ set x
+    );
+}

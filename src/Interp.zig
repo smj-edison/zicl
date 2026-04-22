@@ -663,8 +663,7 @@ pub fn getVariableInner(
             const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
             const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
 
-            var resolved_dict = (try interp.getVariableInner(det, call_frame_idx, dict_name)).borrow();
-            defer resolved_dict.decrRefCount();
+            const resolved_dict = try interp.getVariableInner(det, call_frame_idx, dict_name);
 
             var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
             defer keys.deinit(Heap.global_gpa);
@@ -683,9 +682,10 @@ pub fn getVariableInner(
                     return error.BadDict;
                 },
             };
-            resolved_dict.swapIfNew(new_dict);
 
-            try interp.setVariableInner(det, call_frame_idx, dict_name, dict_name.reference());
+            if (new_dict.toHandle()) |new| {
+                try interp.setVariableInner(det, call_frame_idx, dict_name, new.referenceTakeOwnership());
+            }
 
             if (result.toHandle()) |val| return val else return error.VariableNotFound;
         },
@@ -1317,11 +1317,11 @@ const CallFrame = struct {
     }
 };
 
-fn currentCallFrameIndex(interp: *Interp) u32 {
+pub fn currentCallFrameIndex(interp: *Interp) u32 {
     return @intCast(interp.call_frames.items.len - 1);
 }
 
-fn currentCallFrame(interp: *Interp) *CallFrame {
+pub fn currentCallFrame(interp: *Interp) *CallFrame {
     return &interp.call_frames.items[interp.currentCallFrameIndex()];
 }
 
