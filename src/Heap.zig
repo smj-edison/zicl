@@ -258,12 +258,13 @@ pub const ParsedScript = struct {
             switch (token) {
                 .start_of_command => {
                     line = value.body.parsed_script_command.line;
-                    std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.parsed_script_command });
+                    std.log.debug(formatting ++ "{}", .{ i, line, @tagName(token), value.body.parsed_script_command });
                 },
-                .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
+                .start_of_word => std.log.debug(formatting ++ "{}", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
                     const item = objutil.listItem(script.values, @intCast(i));
-                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), item.getString() catch "<oom string>" });
+                    const str = item.getString() catch "<oom string>";
+                    std.log.debug(formatting ++ "{s}", .{ i, line, @tagName(token), str });
                 },
             }
         }

@@ -7,6 +7,7 @@ const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
+const ioutil = @import("ioutil.zig");
 
 fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
@@ -325,6 +326,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         },
         .set => {
             const var_name = &args[2];
+            const keys = args[3..(args.len - 1)];
 
             const dict = blk: {
                 if ((try interp.getVariable(var_name)).toHandle()) |val| {
@@ -337,11 +339,16 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 }
             };
 
+            if (keys.len == 0) {
+                interp.setResult(dict);
+                return;
+            }
+
             const new_value = args[args.len - 1].dupOrRef();
             var new_dict: OptionalHandle = .none;
             _ = try interp.wrapError(
                 &det,
-                objutil.dictPutRecursively(&det, dict, &new_dict, args[3..(args.len - 1)], new_value),
+                objutil.dictPutRecursively(&det, dict, &new_dict, keys, new_value),
             );
 
             if (new_dict.toHandle()) |new| {
@@ -465,19 +472,38 @@ test "loop commands" {
 
 /// [puts]
 pub fn putsCmd(interp: *Interp, args: []Handle) !void {
-    if (args.len == 3) {
-        const first_arg_str = try args[1].getString();
-        if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
-            try interp.setResultString("The second argument must be -nonewline");
-            return error.EvalError;
+    const to_print, const print_newline = blk: {
+        if (args.len == 3) {
+            const first_arg_str = try args[1].getString();
+            if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
+                try interp.setResultString("The second argument must be -nonewline");
+                return error.EvalError;
+            } else {
+                break :blk .{ try args[2].getString(), false };
+            }
         } else {
-            const to_print = try args[2].getString();
-            std.debug.print("{s}", .{to_print});
+            break :blk .{ try args[1].getString(), true };
         }
-    } else {
-        const to_print = try args[1].getString();
-        std.debug.print("{s}\n", .{to_print});
+    };
+
+    const stdout = ioutil.lockStdout();
+    defer ioutil.unlockStdout();
+    var buf: [64]u8 = undefined;
+    var writer = stdout.writer(Heap.global_io, &buf);
+    writer.interface.print("{s}", .{to_print}) catch {
+        try interp.setResultFormatted("failed to print: {}", .{writer.err.?});
+        return error.EvalError;
+    };
+    if (print_newline) {
+        writer.interface.writeAll("\n") catch {
+            try interp.setResultFormatted("failed to print: {}", .{writer.err.?});
+            return error.EvalError;
+        };
     }
+    writer.flush() catch {
+        try interp.setResultFormatted("failed to print: {}", .{writer.err.?});
+        return error.EvalError;
+    };
 }
 
 /// [if]
@@ -778,6 +804,10 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     } else {
         interp.setResult(closure_obj);
     }
+}
+
+pub fn sourceCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    try interp.evalFile(try args[1].getString());
 }
 
 fn buildErrorOptions(
@@ -1317,6 +1347,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
+    try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
     try registerCommand(interp, "try", tryCmd, "script ?handler ...? ?finally body?", 1, null, null);
     try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null, null);
 }

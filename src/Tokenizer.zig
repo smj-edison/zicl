@@ -594,9 +594,12 @@ pub fn nextBracedStringToken(self: *Tokenizer) !Token {
                 }
             },
             '\\' => {
-                // we intentionally don't check for "\\n", because tcl's curly brace
-                // \n escape makes serialization of programs a pain (plus it's a rather
-                // big gotcha)
+                // Skip the character after the backslash so \{ and \} don't
+                // affect brace counting. Standard Tcl: a brace preceded by an
+                // odd number of backslashes is not counted. We intentionally do
+                // not implement the \<newline> -> space substitution inside
+                // braces, because it makes serialization of programs a pain.
+                if (!self.atEnd()) self.advance(1);
             },
             else => {},
         }

@@ -8,6 +8,7 @@ const Interp = @import("Interp.zig");
 const narrowError = Interp.narrowError;
 const ReturnCode = Interp.ReturnCode;
 const commands = @import("commands.zig");
+const ioutil = @import("ioutil.zig");
 
 // Allow user to change the default logging fd.
 pub const panic = std.debug.FullPanic(ziclPanic);
@@ -15,13 +16,6 @@ pub const std_options: std.Options = .{ .logFn = ziclLog };
 
 // Mirrors debug.zig's threadlocal panic_stage to guard against recursive panics.
 threadlocal var zicl_panic_stage: usize = 0;
-// Lock this to avoid multiple threads writing to panic_fd at the same time.
-var debug_mutex: std.Io.Mutex = .init;
-
-fn getLoggingFile() std.Io.File {
-    const fd = panic_fd.load(.monotonic);
-    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
-}
 
 pub fn ziclLog(
     comptime level: std.log.Level,
@@ -31,13 +25,12 @@ pub fn ziclLog(
 ) void {
     const io = Heap.global_io;
 
-    debug_mutex.lockUncancelable(io);
-    defer debug_mutex.unlock(io);
+    const file = ioutil.lockStderr();
+    defer ioutil.unlockStderr();
 
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
 
-    const file = getLoggingFile();
     var buffer: [64]u8 = undefined;
     var file_writer = file.writerStreaming(io, &buffer);
     const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
@@ -45,9 +38,11 @@ pub fn ziclLog(
     terminal.writer.flush() catch {};
 }
 
-var panic_fd: std.atomic.Value(i32) = .init(std.posix.STDERR_FILENO);
-export fn Zicl_SetPanicFd(fd: c_int) callconv(.c) void {
-    panic_fd.store(fd, .monotonic);
+export fn Zicl_SetGlobalStdout(fd: c_int) callconv(.c) void {
+    ioutil.global_stdout_fd.store(fd, .monotonic);
+}
+export fn Zicl_SetGlobalStderr(fd: c_int) callconv(.c) void {
+    ioutil.global_stderr_fd.store(fd, .monotonic);
 }
 
 extern fn dumpLastTouchedTrace(fd: i32) void;
@@ -55,14 +50,12 @@ extern fn dumpLastTouchedTrace(fd: i32) void;
 fn ziclPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
     // No unlock: abort() terminates the process, serializing output without deadlock risk.
-    debug_mutex.lockUncancelable(Heap.global_io);
-    const fd = panic_fd.load(.monotonic);
-    const panic_file = getLoggingFile();
+    const file = ioutil.lockStderr();
     switch (zicl_panic_stage) {
         0 => {
             zicl_panic_stage = 1;
-            dumpLastTouchedTrace(fd);
-            var file_writer = panic_file.writerStreaming(Heap.global_io, &.{});
+            dumpLastTouchedTrace(file.handle);
+            var file_writer = file.writerStreaming(Heap.global_io, &.{});
             const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
             const thread_id = std.Thread.getCurrentId();
             file_writer.interface.print("thread {d} panic: {s}\n", .{ thread_id, msg }) catch {};
@@ -73,7 +66,7 @@ fn ziclPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
         },
         1 => {
             zicl_panic_stage = 2;
-            std.Io.File.writeStreamingAll(panic_file, Heap.global_io, "aborting due to recursive panic\n") catch {};
+            std.Io.File.writeStreamingAll(file, Heap.global_io, "aborting due to recursive panic\n") catch {};
         },
         else => {},
     }

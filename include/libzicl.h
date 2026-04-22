@@ -19,7 +19,8 @@ typedef struct Zicl_Interp Zicl_Interp;
 
 typedef int (*Zicl_CCommandFn)(Zicl_Interp *interp, int argc, Zicl_Handle *argv);
 
-void Zicl_SetPanicFd(int fd);
+void Zicl_SetGlobalStdout(int fd);
+void Zicl_SetGlobalStderr(int fd);
 
 int Zicl_InitGlobals(void);
 int Zicl_InitLocalHeap(void);

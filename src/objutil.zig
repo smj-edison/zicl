@@ -2606,7 +2606,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     if (options.token_debugging) {
         for (tokens.items, 0..) |token, i| {
-            std.debug.print("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"\n", .{
+            std.log.debug("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"", .{
                 i,
                 token.loc.line_no,
                 @tagName(token.tag),
@@ -2785,7 +2785,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         .values = new_token_values,
     };
     if (options.token_debugging) {
-        std.debug.print("Dumping tokens\n", .{});
+        std.log.debug("Dumping tokens\n", .{});
         parsed_script.printTokens();
     }
 
