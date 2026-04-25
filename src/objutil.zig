@@ -1155,7 +1155,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
         new_handle.swapRef(new_list);
 
         for (tokens.items, 0..) |token, i| {
-            const item = listItem(new_list, @intCast(i));
+            const item = listItemNoFollow(new_list, @intCast(i));
 
             if (token.tag == .simple_string) {
                 // Normal string, so no escaping needed.
@@ -1242,7 +1242,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             // split this collection and create a new one.
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItem(provided_handle, @intCast(current_len - freed_count + to_free));
+                const to_free_handle = listItemNoFollow(provided_handle, @intCast(current_len - freed_count + to_free));
                 if (to_free_handle.isShared()) break :new_collection_needed;
             }
 
@@ -1326,7 +1326,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
                     },
                     .body = undefined,
                 };
-                old_item.trace("Object stolen", .{});
+                old_item.trace("Object transferred", .{});
             }
         }
 
@@ -1388,14 +1388,14 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
 }
 
 /// Assumes provided handle is a list.
-pub fn listItem(handle: Handle, index: u32) Handle {
+pub fn listItemNoFollow(handle: Handle, index: u32) Handle {
     assert(handle.tag() == .list);
 
     return collectionItem(handle, index, handle.peek().body.list.len);
 }
 
 /// Assumes provided handle is a list.
-pub fn listItemFollowRefs(handle: Handle, index: u32) Handle {
+pub fn listItem(handle: Handle, index: u32) Handle {
     assert(handle.tag() == .list);
 
     return collectionItemFollowRefs(handle, index, handle.peek().body.list.len);
@@ -1421,7 +1421,7 @@ pub fn listSetObject(det: ?*ErrorDetails, provided_list: Handle, new_list: *Opti
     if (index > len) return error.OutOfBounds;
 
     const mutatable_list: OptionalHandle = blk: {
-        if (!provided_list.canMutate() or listItem(provided_list, index).isShared()) {
+        if (!provided_list.canMutate() or listItemNoFollow(provided_list, index).isShared()) {
             break :blk (try provided_list.getHeap().duplicate(provided_list)).toOptional();
         }
         break :blk .none;
@@ -1431,7 +1431,7 @@ pub fn listSetObject(det: ?*ErrorDetails, provided_list: Handle, new_list: *Opti
     const list = new_list.orElse(provided_list);
 
     // We know that this index is now safe to modify.
-    const item = listItem(list, index);
+    const item = listItemNoFollow(list, index);
     assert(!item.isShared());
 
     item.invalidateBoth(); // Clear the last value.
@@ -1455,7 +1455,7 @@ pub fn listAppend(det: ?*ErrorDetails, provided_list: Handle, new_list: *Optiona
     errdefer new_list.swapWithNone();
     const item_obj = provided_list.getHeap().dupOrReference(item);
     const index = try listAppendObject(det, provided_list, new_list, item_obj);
-    return listItem(new_list.orElse(provided_list), index);
+    return listItemNoFollow(new_list.orElse(provided_list), index);
 }
 
 /// `list` must be mutable.
@@ -1467,14 +1467,14 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
     list.assert(current_len < memutil.getOrderSize(list.getMetadata().order) - 1); // -1 for list head.
     list.peek().body.list.len += 1;
 
-    listItem(list, current_len).peek().* = object;
+    listItemNoFollow(list, current_len).peek().* = object;
 }
 
 pub fn listToHandles(gpa: std.mem.Allocator, list: Handle) !std.ArrayList(Handle) {
     const list_len = listLengthRaw(list);
     var handles = try std.ArrayList(Handle).initCapacity(gpa, list_len);
     for (0..list_len) |i| {
-        handles.appendAssumeCapacity(listItem(list, @intCast(i)));
+        handles.appendAssumeCapacity(listItemNoFollow(list, @intCast(i)));
     }
     return handles;
 }
@@ -1498,7 +1498,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     // The object should have been copied when being moved into the list
     try testing.expect(obj1.peek() != &items[0]);
     // But it should have an identical string
-    try testing.expectEqualStrings("object 1", try listItem(list1, 0).getString());
+    try testing.expectEqualStrings("object 1", try listItemNoFollow(list1, 0).getString());
 
     const to_append = try newStringInner(heap, "appended item");
     defer to_append.decrRefCount();
@@ -1506,7 +1506,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     var new_list: OptionalHandle = .none;
     _ = try listAppend(&det, list1, &new_list, to_append);
     list1.swapAndClear(&new_list);
-    try testing.expectEqualStrings("appended item", try listItem(list1, 2).getString());
+    try testing.expectEqualStrings("appended item", try listItemNoFollow(list1, 2).getString());
 
     var string_list = try newStringInner(heap,
         \\item1 {item 2} item\ 3
@@ -1516,9 +1516,9 @@ fn testLists(ta: std.mem.Allocator) !void {
     try shimmerToList(&det, string_list, &new_list);
     try testing.expect(string_list != new_list.toHandle());
     string_list.swapAndClear(&new_list);
-    try testing.expectEqualStrings("item1", try listItem(string_list, 0).getString());
-    try testing.expectEqualStrings("item 2", try listItem(string_list, 1).getString());
-    try testing.expectEqualStrings("item 3", try listItem(string_list, 2).getString());
+    try testing.expectEqualStrings("item1", try listItemNoFollow(string_list, 0).getString());
+    try testing.expectEqualStrings("item 2", try listItemNoFollow(string_list, 1).getString());
+    try testing.expectEqualStrings("item 3", try listItemNoFollow(string_list, 2).getString());
 }
 
 test "lists" {
@@ -2181,10 +2181,10 @@ pub fn dictLookupRecursively(
 
     if (keys.len == 0) return new_dict.orElse(provided_dict).toOptional();
     if (keys.len == 1) {
-        return try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0]);
+        return try dictLookupFollowLinks(new_dict.orElse(provided_dict), keys[0]);
     }
 
-    if ((try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0])).toHandle()) |child_dict| {
+    if ((try dictLookupFollowLinks(new_dict.orElse(provided_dict), keys[0])).toHandle()) |child_dict| {
         var new_child: OptionalHandle = .none;
         const child_result = try dictLookupRecursively(det, child_dict, &new_child, keys[1..]);
         if (new_child.toHandle()) |new| {
@@ -2746,7 +2746,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                         );
                         new_token_values.swapIfNew(append_result);
 
-                        const item_handle = listItem(new_token_values, str_idx);
+                        const item_handle = listItemNoFollow(new_token_values, str_idx);
                         try setStringFromEscaped(item_handle, bytes[token.loc.start..token.loc.end]);
 
                         break :blk item_handle;
@@ -2762,7 +2762,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                         );
                         new_token_values.swapIfNew(append_result);
 
-                        const item_handle = listItem(new_token_values, str_idx);
+                        const item_handle = listItemNoFollow(new_token_values, str_idx);
                         try Heap.setString(item_handle, bytes[token.loc.start..token.loc.end]);
 
                         break :blk item_handle;
@@ -2891,7 +2891,7 @@ test "script shimmering" {
 
 fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer.Token.Tag, value: []const u8) !void {
     try testing.expectEqual(tag, script.tags.items[index]);
-    try testing.expectEqualStrings(value, try listItem(script.values, index).getString());
+    try testing.expectEqualStrings(value, try listItemNoFollow(script.values, index).getString());
 }
 
 pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpression {

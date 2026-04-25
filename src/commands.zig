@@ -386,6 +386,43 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 interp.setResult(dict);
             }
         },
+        .merge => {
+            const dicts = args[2..];
+
+            if (dicts.len == 0) {
+                interp.setResultOwning(try objutil.newDictWithCapacity(Heap.local_heap, 0));
+                return;
+            }
+
+            // Make sure everything is a dict.
+            for (dicts) |*d| try interp.shimmerToDict(d);
+
+            if (dicts.len == 1) {
+                interp.setResult(dicts[0]);
+                return;
+            }
+
+            // the name "merge" is a little misleading, since under the hood
+            // it's actually implemented as linked dictionaries. This is to
+            // allow prototype construction by the usual prototype chain
+            // approach. The rightmost argument takes the highest priority, the
+            // next rightmost argument has second priority, all the way down to
+            // the first argument, which is the end of the chain.
+            var current_top: Handle = try Heap.local_heap.duplicate(dicts[1]);
+            errdefer current_top.decrRefCount();
+            try objutil.dictSetLink(current_top, dicts[0]);
+
+            for (dicts[2..]) |dict| {
+                const child = try Heap.local_heap.duplicate(dict);
+                errdefer child.decrRefCount();
+                const prev = current_top;
+                try objutil.dictSetLink(child, prev);
+                prev.decrRefCount(); // dictSetLink borrowed prev, so we need to release our ref.
+                current_top = child;
+            }
+
+            interp.setResultOwning(current_top);
+        },
         else => @panic("unimplemented"),
     }
 }
@@ -760,9 +797,42 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     ));
 }
 
-/// [fn] - creates a closure capturing the current scope and sets it as a
-/// variable in the current scope.
-pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
+    if (interp.currentCallFrameIndex() == 0) {
+        interp.setResultString("tailcall can only be called from a proc or lambda");
+        return error.EvalError;
+    } else if (args.len >= 2) {
+        // Make sure that if the command doesn't exist, we throw the error here, so
+        // it doesn't mysteriously show up at a untracable spot up the call stack.
+        var det: objutil.ErrorDetails = undefined;
+        var new_handle: OptionalHandle = .none;
+        _ = interp.getCommand(&det, interp.currentCallFrameIndex() - 1, args[1], &new_handle) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                interp.setResultOwning(det.message);
+                return error.EvalError;
+            },
+        };
+        args[1].swapIfNew(new_handle);
+
+        var tailcall_args = std.ArrayList(Handle).empty;
+        // `args[1..]` includes the name of the command to run.
+        try tailcall_args.appendSlice(Heap.global_gpa, args[1..]);
+        assert(interp.currentCallFrame().tailcall == null);
+        interp.currentCallFrame().tailcall = .{
+            .args = tailcall_args.items,
+        };
+        return error.Tailcall;
+    } else {
+        interp.setResultString("no function provided");
+        return error.EvalError;
+    }
+}
+
+/// `closureHelper` is a helper function that implements [fn] and [method] logic. This function
+/// parses the closure, captures the scope, and (if provided) sets the function name in the local
+/// scope.
+fn closureHelper(interp: *Interp, args: []Handle, mode: enum { function, method }) Interp.Error!void {
     const fn_name: ?*Handle, const arglist, const body = blk: {
         if (args.len == 4) {
             break :blk .{ &args[1], &args[2], args[3] };
@@ -794,6 +864,7 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         .optional_arity = parsed_args.optional_arity,
         .optional_values = parsed_args.optional_values,
         .has_args_parameter = parsed_args.has_args_parameter,
+        .is_method = mode == .method,
         .cache_id = Heap.nextCacheId(),
     });
     defer closure_obj.decrRefCount();
@@ -804,6 +875,14 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     } else {
         interp.setResult(closure_obj);
     }
+}
+
+pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    return closureHelper(interp, args, .function);
+}
+
+pub fn methodCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    return closureHelper(interp, args, .method);
 }
 
 pub fn sourceCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -1339,7 +1418,8 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2, null);
     try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
-    try registerCommand(interp, "fn", fnCmd, "name argList body", 2, 3, null);
+    try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3, null);
+    try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
     try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);

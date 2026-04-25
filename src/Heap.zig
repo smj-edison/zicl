@@ -124,6 +124,7 @@ const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullH
 pub const InternedString = enum {
     @"apply lambdaExpr",
     @"fn",
+    method,
     impl,
     scope,
     name,
@@ -675,6 +676,8 @@ pub const Closure = struct {
     /// Whether `args` is provided as an argument name. `args`, if present, is always
     /// the last argument name.
     has_args_parameter: bool,
+    /// Whether this is a method. If so, `self` is injected as the first variable at call time.
+    is_method: bool,
     /// Unique identifier for cache keying.
     cache_id: u64,
 
@@ -688,6 +691,7 @@ pub const Closure = struct {
             .optional_arity = closure.optional_arity,
             .optional_values = closure.optional_values.borrowOptional(),
             .has_args_parameter = closure.has_args_parameter,
+            .is_method = closure.is_method,
             .cache_id = closure.cache_id,
         };
     }
@@ -844,6 +848,12 @@ pub const Handle = packed struct(HandleBacking) {
     /// Must be shimmerable.
     pub fn prepareToShimmer(handle: Handle) !void {
         handle.assert(handle.canShimmer());
+        // `.reference` objects delegate `getString()` to their target without storing
+        // their own string representation. Shimmering them would leave the new tag without
+        // a string representation, which violates the invariant that every object that
+        // is not `.none` must have a string rep. Callers should follow the reference
+        // first if they intend to shimmer the target.
+        handle.assert(handle.tag() != .reference);
         // Make sure the object has a string rep before we free its body. That is, if
         // it has a string rep. `.none` objects are brand new, so they obviously don't
         // have a string rep yet.
@@ -977,6 +987,10 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn dupOrRef(handle: Handle) Object {
         return local_heap.dupOrReference(handle);
+    }
+
+    pub fn duplicate(handle: Handle) !Handle {
+        return local_heap.duplicate(handle);
     }
 
     pub fn invalidateBoth(handle: Handle) void {
@@ -1148,11 +1162,11 @@ pub const Handle = packed struct(HandleBacking) {
                 const impl_val = try objutil.newList(&.{ args_spec, closure.body });
                 defer impl_val.decrRefCount();
 
-                // Build the outer list: fn ?name <name>? impl <impl> ?scope <scope>?
+                // Build the outer list: fn|method ?name <name>? impl <impl> ?scope <scope>?
                 const outer = try objutil.newListWithCapacity(7);
                 defer outer.decrRefCount();
 
-                objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.@"fn"));
+                objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(if (closure.is_method) .method else .@"fn"));
 
                 if (closure.name.toHandle()) |name_handle| {
                     objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.name));
@@ -1222,6 +1236,7 @@ pub const Handle = packed struct(HandleBacking) {
             .cached_local_var,
             .cached_lexical_var,
             => {
+                last_touched = handle;
                 std.debug.panic("{} should always have a string representation", .{obj.head.tag});
             },
         };
@@ -1284,7 +1299,7 @@ pub const Handle = packed struct(HandleBacking) {
             => {},
             .list => {
                 for (0..objutil.listLengthRaw(handle)) |i| {
-                    try objutil.listItem(handle, @intCast(i)).makeCrossthread();
+                    try objutil.listItemNoFollow(handle, @intCast(i)).makeCrossthread();
                 }
             },
             .dict => {
@@ -1571,6 +1586,8 @@ pub fn init(heap: *Heap) !void {
     errdefer heap.parsed_scripts.deinit(global_gpa);
     heap.parsed_exprs = try .initWithCapacity(global_gpa, cfg.cache_size);
     errdefer heap.parsed_exprs.deinit(global_gpa);
+    heap.parsed_closures = try .initWithCapacity(global_gpa, cfg.cache_size);
+    errdefer heap.parsed_closures.deinit(global_gpa);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
@@ -1632,6 +1649,12 @@ fn clearParsedScripts(self: *Heap) void {
         parsed_expr.expr.deinit();
     }
     self.parsed_exprs.clearRetainingCapacity();
+
+    var parsed_closure_iter = self.parsed_closures.valueIterator();
+    while (parsed_closure_iter.next()) |entry| {
+        entry.closure.deinit();
+    }
+    self.parsed_closures.clearRetainingCapacity();
 }
 
 pub fn deinit(heap: *Heap) void {
@@ -1639,6 +1662,7 @@ pub fn deinit(heap: *Heap) void {
     heap.clearParsedScripts();
     heap.parsed_scripts.deinit(global_gpa);
     heap.parsed_exprs.deinit(global_gpa);
+    heap.parsed_closures.deinit(global_gpa);
 
     for ((special_object_count + interned_string_count)..heap.objects.len) |i| {
         const metadata = heap.objects.get(i).metadata;
@@ -3088,7 +3112,7 @@ fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
         .list => {
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
-                const item_handle = objutil.listItem(handle, @intCast(item_idx));
+                const item_handle = objutil.listItemNoFollow(handle, @intCast(item_idx));
                 std.debug.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
             }
         },

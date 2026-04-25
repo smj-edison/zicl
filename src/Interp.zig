@@ -84,6 +84,7 @@ pub const EvalError = error{
 };
 pub const Error = EvalError || error{
     WrongUsage,
+    Tailcall,
 };
 
 pub fn narrowError(err: anyerror) EvalError {
@@ -136,6 +137,9 @@ pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) w
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
+            if (det.message.heap != 0) {
+                std.debug.print("err: {}\n", .{err});
+            }
             // This error should have error details, if it's not OOM.
             interp.setResultOwning(det.message);
             return error.EvalError;
@@ -307,9 +311,6 @@ fn ensureValidVariableType(
                 last_path_start = i + 1;
             }
         }
-
-        // Make sure the dict name exists.
-        try interp.reshimmerToVariable(det, var_call_frame, dict_name);
 
         try name.prepareToShimmer();
         name.peek().head.tag = .dict_sugar;
@@ -687,7 +688,14 @@ pub fn getVariableInner(
                 try interp.setVariableInner(det, call_frame_idx, dict_name, new.referenceTakeOwnership());
             }
 
-            if (result.toHandle()) |val| return val else return error.VariableNotFound;
+            if (result.toHandle()) |val| {
+                return val;
+            } else {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt("can't read \"{f}\": no such variable", .{name}),
+                };
+                return error.VariableNotFound;
+            }
         },
         else => unreachable,
     }
@@ -868,87 +876,113 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: NativeCommand
 }
 
 pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closure {
-    if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..8], "closure ")) {
+    const is_method, const prefix_len = blk: {
+        if (bytes.len > 3 and std.mem.eql(u8, bytes[0..3], "fn "))
+            break :blk .{ false, @as(usize, 3) };
+        if (bytes.len > 7 and std.mem.eql(u8, bytes[0..7], "method "))
+            break :blk .{ true, @as(usize, 7) };
         if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt("not a valid closure: \"{s}\"", .{bytes}),
+            .message = try objutil.newStringFmt("not a valid function: \"{s}\"", .{bytes}),
         };
         return error.BadClosure;
-    }
+    };
 
-    const closure_value = try objutil.newString(bytes[8..]);
+    var closure_value = try objutil.newString(bytes[prefix_len..]);
     defer closure_value.decrRefCount();
 
-    var new_handle: OptionalHandle = .none;
-    objutil.shimmerToDict(null, closure_value, &new_handle) catch |err| switch (err) {
+    var dict_new: OptionalHandle = .none;
+    objutil.shimmerToDict(null, closure_value, &dict_new) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt("not a valid closure: \"{s}\"", .{bytes}),
+                .message = try objutil.newStringFmt("not a valid function: \"{s}\"", .{bytes}),
             };
             return error.BadClosure;
         },
     };
-    assert(new_handle == .none);
+    closure_value.swapIfNew(dict_new);
 
-    const name = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.name));
-    const impl_raw = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.impl));
-    const scope = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.scope));
+    const maybe_name = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.name));
+    const maybe_impl = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.impl));
+    const maybe_scope = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.scope));
 
-    const args, const body = blk: {
-        if (impl_raw.toHandle()) |impl| {
-            objutil.shimmerToList(null, impl, &new_handle) catch |err| switch (err) {
+    var args, const body = blk: {
+        if (maybe_impl.toHandle()) |impl| {
+            var impl_new: OptionalHandle = .none;
+            defer impl_new.decrOptional();
+            objutil.shimmerToList(null, impl, &impl_new) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt("not a valid closure implementation: \"{s}\"", .{bytes}),
+                        .message = try objutil.newStringFmt("not a valid function implementation: \"{s}\"", .{bytes}),
                     };
                     return error.BadClosure;
                 },
             };
-            assert(new_handle == .none);
+            const impl_as_list = impl_new.orElse(impl);
 
-            if (objutil.listLengthRaw(impl) != 2) {
+            if (objutil.listLengthRaw(impl_as_list) != 2) {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt("not a valid closure implementation: \"{s}\"", .{bytes}),
+                    .message = try objutil.newStringFmt("not a valid function implementation: \"{s}\"", .{bytes}),
                 };
                 return error.BadClosure;
             }
 
-            break :blk .{ objutil.listItem(impl, 0), objutil.listItem(impl, 1) };
+            break :blk .{ objutil.listItem(impl_as_list, 0).borrow(), objutil.listItem(impl_as_list, 1).borrow() };
         } else {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt("closure missing implementation: \"{s}\"", .{bytes}),
+                .message = try objutil.newStringFmt("function missing implementation: \"{s}\"", .{bytes}),
             };
             return error.BadClosure;
         }
     };
+    defer args.decrRefCount();
+    defer body.decrRefCount();
 
     // Make sure args is a list.
-    var args_new: OptionalHandle = .none;
-    errdefer args_new.swapWithNone();
-    objutil.shimmerToList(null, args, &args_new) catch |err| switch (err) {
+    var new_args: OptionalHandle = .none;
+    objutil.shimmerToList(null, args, &new_args) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt("closure args is not a valid list: \"{f}\"", .{args}),
+                .message = try objutil.newStringFmt("function args is not a valid list: \"{f}\"", .{args}),
             };
             return error.BadClosure;
         },
     };
-    const args_list = args_new.orElse(args);
+    args.swapIfNew(new_args);
 
-    const parsed_args = try parseClosureArgList(det, args_list);
+    // Make sure scope is a dict.
+    var new_scope: OptionalHandle = .none;
+    defer new_scope.decrOptional();
+    const scope_as_dict: OptionalHandle = blk: {
+        if (maybe_scope.toHandle()) |scope| {
+            objutil.shimmerToDict(null, scope, &new_scope) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    if (det) |details| details.* = .{
+                        .message = try objutil.newStringFmt("function scope is not a valid dict: \"{f}\"", .{args}),
+                    };
+                    return error.OutOfMemory;
+                },
+                else => return error.BadClosure,
+            };
+            break :blk new_scope.orElse(scope).toOptional();
+        } else break :blk .none;
+    };
+
+    const parsed_args = try parseClosureArgList(det, args);
     errdefer parsed_args.deinit();
 
     return .{
-        .args = args_list.borrow(),
+        .args = args.borrow(),
         .body = body.borrow(),
-        .name = name.borrowOptional(),
-        .scope = scope.borrowOptional(),
+        .name = maybe_name.borrowOptional(),
+        .scope = scope_as_dict.borrowOptional(),
         .required_arity = parsed_args.required_arity,
         .optional_arity = parsed_args.optional_arity,
         .optional_values = parsed_args.optional_values,
         .has_args_parameter = parsed_args.has_args_parameter,
+        .is_method = is_method,
         .cache_id = Heap.nextCacheId(),
     };
 }
@@ -1284,8 +1318,8 @@ pub fn makeErrorMessage(interp: *Interp) !Handle {
     const n_items = objutil.listLengthRaw(st);
     var i: u32 = 0;
     while (i < n_items) : (i += 4) {
-        const file = objutil.listItemFollowRefs(st, i + 1);
-        const line = objutil.listItemFollowRefs(st, i + 2);
+        const file = objutil.listItem(st, i + 1);
+        const line = objutil.listItem(st, i + 2);
         buf.print(Heap.global_gpa, "\n    at {f}:{f}", .{ file, line }) catch return error.OutOfMemory;
     }
 
@@ -1502,7 +1536,7 @@ fn interpolateTokens(
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len)) |tag, value_index| {
-        if (interp.substituteOneToken(tag, objutil.listItemFollowRefs(value_list, @intCast(value_index)))) |new_value| {
+        if (interp.substituteOneToken(tag, objutil.listItem(value_list, @intCast(value_index)))) |new_value| {
             new_values.appendAssumeCapacity(new_value);
         } else |err| {
             // Due to the error, we're actually going to return early, after we take care
@@ -1617,7 +1651,7 @@ fn invokeUnknown(interp: *Interp, args: []Handle) !void {
     _ = interp.getVariableInner(null, 0, interp.unknown_str) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => {
-            interp.setResult(try objutil.newStringFmt("invalid command name \"{f}\"", .{args[0]}));
+            try interp.setResultFormatted("invalid command name \"{f}\"", .{args[0]});
             return error.EvalError;
         },
         error.BadDict => unreachable,
@@ -1666,6 +1700,7 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) (Error ||
     // Loop the calling section, as there may be a tailcall.
     var current_args = args;
     var tailcall_info: ?Tailcall = null;
+    defer if (tailcall_info) |info| Heap.global_gpa.free(info.args);
     while (true) {
         interp.currentEvalFrame().args = current_args;
         // TODO implement tracing.
@@ -1684,8 +1719,14 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) (Error ||
             }
         };
 
-        if (result) {
-            if (interp.currentCallFrame().tailcall) |tailcall| {
+        var tailcall_found = false;
+
+        result catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Tailcall => {
+                tailcall_found = true;
+                const tailcall = interp.currentCallFrame().tailcall.?;
+
                 // Be sure to free the previous tailcall.
                 if (tailcall_info) |prev_tailcall| {
                     for (prev_tailcall.args) |arg| arg.decrRefCount();
@@ -1695,17 +1736,14 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) (Error ||
                 tailcall_info = tailcall;
                 current_args = tailcall.args;
                 interp.currentCallFrame().tailcall = null;
-            } else {
-                tailcall_info = null;
-            }
-        } else |err| {
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return err,
-            }
-        }
+            },
+            else => return err,
+        };
 
-        if (tailcall_info == null) break;
+        if (tailcall_found == false) {
+            tailcall_info = null; // Avoid double free.
+            break;
+        }
     }
 }
 
@@ -2441,7 +2479,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
                 }
 
                 for (0..len) |list_idx| {
-                    args[args_written] = objutil.listItemFollowRefs(resultant_word, @intCast(list_idx)).borrow();
+                    args[args_written] = objutil.listItem(resultant_word, @intCast(list_idx)).borrow();
                     args_written += 1;
                 }
             } else {
@@ -2522,6 +2560,7 @@ pub const ReturnCode = enum(u8) {
     exit = 6,
     oom = 7,
     usage = 8,
+    tailcall = 9,
 
     pub fn fromErrorUnion(value: Error!void) ReturnCode {
         if (value) {
@@ -2541,6 +2580,7 @@ pub const ReturnCode = enum(u8) {
             error.Exit => .exit,
             error.OutOfMemory => .oom,
             error.WrongUsage => .usage,
+            error.Tailcall => .tailcall,
         };
     }
 
@@ -2555,6 +2595,7 @@ pub const ReturnCode = enum(u8) {
             .exit => return error.Exit,
             .oom => return error.OutOfMemory,
             .usage => return error.WrongUsage,
+            .tailcall => return error.Tailcall,
         }
     }
 };
@@ -2628,6 +2669,7 @@ pub fn init() !Interp {
         .optional_arity = 0,
         .optional_values = .none,
         .has_args_parameter = false,
+        .is_method = false,
         .cache_id = Heap.nextCacheId(),
     });
 
@@ -2694,6 +2736,15 @@ pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
 pub fn getBoolean(interp: *Interp, handle: *Handle) !bool {
     try interp.wrapShimmerFn(handle, objutil.shimmerToBoolean);
     return handle.peek().body.bool.data;
+}
+
+/// Shimmers a handle to a dict, updating it in place if a duplicate was
+/// created. Converts errors to EvalError via the interpreter result.
+pub fn shimmerToDict(interp: *Interp, handle: *Handle) !void {
+    var det: objutil.ErrorDetails = undefined;
+    var new_handle: OptionalHandle = .none;
+    try wrapError(interp, &det, objutil.shimmerToDict(&det, handle.*, &new_handle));
+    handle.swapIfNew(new_handle);
 }
 
 /// Shimmers a handle to a list, updating it in place if a duplicate was
@@ -3030,7 +3081,7 @@ test "recursive dict removal" {
     try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDictRemoval, .{});
 }
 
-fn testRunScript(interp: *Interp, script: []const u8) !Handle {
+pub fn testRunScript(interp: *Interp, script: []const u8) !Handle {
     var script_handle = try objutil.newString(script);
     defer script_handle.decrRefCount();
     try interp.evalObject(script_handle);
@@ -3038,7 +3089,13 @@ fn testRunScript(interp: *Interp, script: []const u8) !Handle {
 }
 
 pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []const u8) !void {
-    try testing.expectEqualStrings(expected, try (try testRunScript(interp, script)).getString());
+    const result = testRunScript(interp, script);
+    if (result) |success| {
+        try testing.expectEqualStrings(expected, try success.getString());
+    } else |err| {
+        std.debug.print("Test failed with zig error {} and error message \"{f}\"", .{ err, interp.result });
+        return err;
+    }
 }
 
 pub fn testExpectScriptError(interp: *Interp, expected_error: anyerror, expected_str: []const u8, script: []const u8) !void {

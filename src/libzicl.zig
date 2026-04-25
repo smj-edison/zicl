@@ -112,7 +112,7 @@ export fn Zicl_NewList(handles: ?[*]Handle, n_handles: c_int) callconv(.c) Optio
 }
 
 export fn Zicl_ListGetItem(list: Handle, index: u32) callconv(.c) Handle {
-    return objutil.listItemFollowRefs(list, index);
+    return objutil.listItem(list, index);
 }
 
 export fn Zicl_ListLength(interp: *Interp, list: *Handle) callconv(.c) c_int {
