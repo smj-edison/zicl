@@ -77,7 +77,7 @@ test "fn varargs" {
     );
 }
 
-test "fn stored in dict and called" {
+test "fn in dict" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
@@ -86,29 +86,29 @@ test "fn stored in dict and called" {
     try interp.testExpectScriptResult("7",
         \\ fn add {a b} { + $a $b }
         \\ set ops::add $add
-        \\ apply $ops::add 3 4
+        \\ ops::add 3 4
     );
 }
 
-test "fn string form is parseable by apply" {
+test "fn parsing" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
     // A manually-constructed fn string exercises parseClosure directly, since
-    // there is no .closure tag to shortcut through. This test would have failed
-    // before the parseClosure prefix was fixed from "closure " to "fn ".
+    // there is no .closure tag to shortcut through.
     try interp.testExpectScriptResult("30",
-        \\ apply {fn impl {{a b} {+ $a $b}} scope {+ {nativefn +}}} 10 20
+        \\ set foo {fn impl {{a b} {+ $a $b}} scope {+ {nativefn +}}}
+        \\ foo 10 20
     );
 }
 
-test "method named" {
+test "method as fn" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    try interp.testExpectScriptResult("done",
-        \\ method greet {self name} { return done }
-        \\ apply $greet {} fido
+    try interp.testExpectScriptResult("hello dave",
+        \\ method greet {self prepend} { return "$prepend $self::name" }
+        \\ greet {name dave} hello
     );
 }
 
@@ -116,19 +116,19 @@ test "method anonymous via apply" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    try interp.testExpectScriptResult("6",
-        \\ apply [method {self x} { + $x 1 }] {} 5
+    try interp.testExpectScriptResult("8",
+        \\ apply [method {self x} { + $self::current $x }] {current 5} 3
     );
 }
 
-test "method first param name is arbitrary" {
+test "method arbitrary self name" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    // The self-like parameter is just a normal first arg; any name is valid.
     try interp.testExpectScriptResult("fido",
-        \\ method getName {this} { dict get $this name }
-        \\ apply $getName {name fido}
+        \\ set Dog {name fido}
+        \\ method Dog::getName {this} { return $this::name }
+        \\ Dog::getName
     );
 }
 

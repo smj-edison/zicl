@@ -2509,7 +2509,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
 /// larger than `args`, and `args` should be `args_raw[1..]`. If called with a
 /// method, `args_raw[1]` will become `args_raw[0]`, opening up a space for the
 /// `self` parameter.
-fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle) CommandError!void {
+fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle, args_written: *usize) CommandError!void {
     const cmd_and_self = try interp.getCommandAndSelfParam(args.*);
     const command = if (cmd_and_self.command) |val| val else {
         // [unknown] was invoked, so there is no command to be had.
@@ -2525,6 +2525,7 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
         // the defer cleanup for args won't freak out.
         args_raw[1] = self;
         args.* = args_raw; // Include all the allocated args now.
+        args_written.* += 1;
     }
 
     // Be sure to update the eval frame's stored args.
@@ -2542,7 +2543,7 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
 
     try interp.invokeCommand(command, args.*);
 
-    if (maybe_self.toHandle()) |_| {
+    if (maybe_self.toHandle()) |old_self| {
         // Be sure to write back `self`.
 
         const call_frame = interp.currentCallFrameIndex();
@@ -2572,25 +2573,35 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
         };
         const dict_path = method_dict_path.getHeap().getHandle(dict_sugar.path_index);
 
-        var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
-        defer handles.deinit(Heap.global_gpa);
-        const all_but_last = handles.items[0..(handles.items.len - 1)];
+        if (objutil.listLengthRaw(dict_path) == 1) {
+            if (old_self != new_self) {
+                const new_self_obj = new_self.referenceTakeOwnership();
+                interp.setVariableInner(null, call_frame, dict_name, new_self_obj) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => unreachable,
+                };
+            }
+        } else {
+            var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
+            defer handles.deinit(Heap.global_gpa);
+            const all_but_last = handles.items[0..(handles.items.len - 1)];
 
-        var maybe_new_dict: OptionalHandle = .none;
-        _ = try interp.wrapError(&det, objutil.dictPutRecursively(
-            &det,
-            dict_resolved,
-            &maybe_new_dict,
-            all_but_last,
-            new_self.reference(),
-        ));
+            var maybe_new_dict: OptionalHandle = .none;
+            _ = try interp.wrapError(&det, objutil.dictPutRecursively(
+                &det,
+                dict_resolved,
+                &maybe_new_dict,
+                all_but_last,
+                new_self.reference(),
+            ));
 
-        if (maybe_new_dict.toHandle()) |new_dict| {
-            const new_dict_obj = new_dict.referenceTakeOwnership();
-            interp.setVariableInner(null, call_frame, dict_name, new_dict_obj) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => unreachable,
-            };
+            if (maybe_new_dict.toHandle()) |new_dict| {
+                const new_dict_obj = new_dict.referenceTakeOwnership();
+                interp.setVariableInner(null, call_frame, dict_name, new_dict_obj) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => unreachable,
+                };
+            }
         }
     }
 }
@@ -2689,7 +2700,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
 
         command_token_i = word_token_i;
 
-        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args);
+        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args, &args_written);
         interp.currentEvalFrame().args = args;
 
         // TODO actually check for signals.

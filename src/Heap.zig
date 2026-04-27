@@ -1361,8 +1361,9 @@ fn invalidateBothInner(handle: Handle) void {
 
 fn invalidateStringInner(handle: Handle) void {
     switch (handle.getStringDetails()) {
-        .null => handle.trace("Invalidate string (was null)", .{}),
-        .empty => handle.trace("Invalidate string (was empty)", .{}),
+        .null, .empty => {
+            // Don't print anything, else the traces get completely spammed.
+        },
         .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
         .long => |long_str| handle.trace("Invalidate string (was {s})", .{long_str.getString()}),
     }
