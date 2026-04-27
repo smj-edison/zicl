@@ -203,6 +203,13 @@ test "method returns updated self via apply" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
+    _ = try interp.testRunScript(
+        \\ set Dog::rename [method {self newName} {
+        \\   dict set self name $newName
+        \\ }]
+    );
+    std.debug.print("Variables: {f}\n", .{interp.currentCallFrame().variables});
+
     // The method receives the dict, updates it, and returns the new state.
     // The caller rebinds -- this is the manual form of what `doggo::rename rex`
     // will do automatically once method dispatch is implemented.

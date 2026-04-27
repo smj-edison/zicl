@@ -174,6 +174,7 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: Handle) !?Hea
     return null;
 }
 
+const no_variable_fmt_string = "can't read \"{s}\": no such variable";
 /// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name, so it can shimmer in place.
 fn reshimmerToVariable(
@@ -215,21 +216,58 @@ fn reshimmerToVariable(
         }
     } else {
         if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt("can't read \"{s}\": no such variable", .{var_name}),
+            .message = try objutil.newStringFmt(no_variable_fmt_string, .{var_name}),
         };
         return error.VariableNotFound;
     }
 }
 
-/// Ensures that this is a valid variable, dict sugar, or upvar. If not, it'll shimmer it to whichever one applies.
-/// Must be called with a heap-native variable name.
+const DictSugar = struct { name: Handle, path: Handle };
+fn parseDictSugar(var_name: [:0]const u8) error{OutOfMemory}!?DictSugar {
+    const double_colons = std.mem.indexOf(u8, var_name, "::");
+    const start_at = if (double_colons) |val| val else return null;
+
+    const dict_name = try objutil.newString(var_name[0..start_at]);
+    errdefer dict_name.decrRefCount();
+
+    var dict_path = try objutil.newList(&.{});
+    errdefer dict_path.decrRefCount();
+
+    var last_path_start: ?usize = null;
+    var i = start_at;
+    while (i <= var_name.len) : (i += 1) {
+        if (i == var_name.len or (var_name[i] == ':' and var_name[i + 1] == ':')) {
+            if (last_path_start) |val| {
+                const path_section = var_name[val..i];
+                const path_section_handle = try objutil.newString(path_section);
+                defer path_section_handle.decrRefCount();
+
+                var new_dict_path: OptionalHandle = .none;
+                _ = objutil.listAppend(null, dict_path, &new_dict_path, path_section_handle) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                dict_path.swapIfNew(new_dict_path);
+            }
+
+            // Keep advancing until we've passed the colon(s).
+            while (i < var_name.len and var_name[i + 1] == ':') i += 1;
+            last_path_start = i + 1;
+        }
+    }
+
+    return .{ .name = dict_name, .path = dict_path };
+}
+
+/// Ensures that this is a valid variable or upvar. If not, it'll shimmer it to whichever one applies.
+/// Returns an error if it's DictSugar, since that requires special handling and there's not a good
+/// way to handle it in the general case. Must be called with a heap-native variable name.
 fn ensureValidVariableType(
     interp: *Interp,
     det: ?*objutil.ErrorDetails,
     var_call_frame: u32,
     name: Handle,
-) error{ OutOfMemory, VariableNotFound }!void {
-    assert(name.getHeap() == Heap.local_heap);
+) error{ OutOfMemory, VariableNotFound, DictSugar }!void {
     assert(name.canShimmer());
 
     const call_frame = interp.call_frames.items[var_call_frame];
@@ -280,53 +318,28 @@ fn ensureValidVariableType(
     // We don't know whether this is a normal variable or dict sugar yet.
     const var_name = try name.getString();
 
-    // Does it contain double colons anywhere?
-    const double_colons = std.mem.indexOf(u8, var_name, "::");
-    if (double_colons) |start_at| {
-        const dict_name = try objutil.newString(var_name[0..start_at]);
-        errdefer dict_name.decrRefCount();
+    if (try parseDictSugar(var_name)) |dict_sugar| {
+        errdefer dict_sugar.name.decrRefCount();
+        errdefer dict_sugar.path.decrRefCount();
 
-        var dict_path = try objutil.newList(&.{});
-        errdefer dict_path.decrRefCount();
-
-        var last_path_start: ?usize = null;
-        var i = start_at;
-        while (i <= var_name.len) : (i += 1) {
-            if (i == var_name.len or (var_name[i] == ':' and var_name[i + 1] == ':')) {
-                if (last_path_start) |val| {
-                    const path_section = var_name[val..i];
-                    const path_section_handle = try objutil.newString(path_section);
-                    defer path_section_handle.decrRefCount();
-
-                    var new_dict_path: OptionalHandle = .none;
-                    _ = objutil.listAppend(det, dict_path, &new_dict_path, path_section_handle) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => unreachable,
-                    };
-                    dict_path.swapIfNew(new_dict_path);
-                }
-
-                // Keep advancing until we've passed the colon(s).
-                while (i < var_name.len and var_name[i + 1] == ':') i += 1;
-                last_path_start = i + 1;
-            }
-        }
+        // Make sure the dict that was referenced exists.
+        try interp.ensureValidVariableType(det, var_call_frame, dict_sugar.name);
 
         try name.prepareToShimmer();
         name.peek().head.tag = .dict_sugar;
         // Take ownership of `dict_name` and `dict_path`.
         name.peek().body.dict_sugar = .{
-            .dict_name_index = dict_name.index,
-            .path_index = dict_path.index,
+            .dict_name_index = dict_sugar.name.index,
+            .path_index = dict_sugar.path.index,
         };
     } else {
+        // Make sure the variable exists.
         try interp.reshimmerToVariable(det, var_call_frame, name);
     }
 }
 
-// Must be called with a heap-native variable name.
-fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
-    name.assert(name.getHeap() == Heap.local_heap);
+// Must be called with a heap-native variable name. Does not account for dict sugar.
+fn createVariableNotSugar(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
     name.assert(name.canShimmer());
 
     const call_frame = &interp.call_frames.items[call_frame_idx];
@@ -429,7 +442,7 @@ pub fn setVariableInner(
             .cached_lexical_var => {
                 // We can't mutate a lexical var, so we instead shadow it in the local scope.
                 value_taken = true;
-                try createVariable(interp, call_frame_idx, name, value);
+                try createVariableNotSugar(interp, call_frame_idx, name, value);
             },
             else => unreachable,
         }
@@ -437,7 +450,14 @@ pub fn setVariableInner(
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => {
             value_taken = true;
-            try createVariable(interp, call_frame_idx, name, value);
+            const var_name = try name.getString();
+            if (try parseDictSugar(var_name)) |dict_sugar| {
+                errdefer dict_sugar.name.decrRefCount();
+                errdefer dict_sugar.path.decrRefCount();
+
+                // Create a new dict
+            }
+            try createVariableNotSugar(interp, call_frame_idx, name, value);
         },
     }
 }
@@ -1602,7 +1622,12 @@ const CommandOrClosure = union(enum) {
 };
 
 /// `name` must be from the threadlocal heap.
-fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !CommandOrClosure {
+fn getCommandInner(
+    interp: *Interp,
+    det: ?*objutil.ErrorDetails,
+    call_frame: u32,
+    name: Handle,
+) !CommandOrClosure {
     if (interp.getVariableInner(null, call_frame, name)) |var_val| {
         if (var_val.tag() == .closure) {
             return .{ .closure = try interp.getClosure(var_val) };
@@ -1636,25 +1661,33 @@ fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32
 
 pub fn getCommand(
     interp: *Interp,
-    det: ?*objutil.ErrorDetails,
     call_frame_idx: u32,
-    provided_handle: Handle,
-    new_handle: *OptionalHandle,
+    handle: *Handle,
 ) !CommandOrClosure {
-    errdefer new_handle.swapWithNone();
-    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-
-    return interp.getCommandInner(det, call_frame_idx, new_handle.orElse(provided_handle));
+    try interp.ensureShimmerable(handle);
+    var det: objutil.ErrorDetails = undefined;
+    return interp.getCommandInner(&det, call_frame_idx, handle.*) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.CommandNotFound => {
+            interp.setResultOwning(det.message);
+            return error.CommandNotFound;
+        },
+        else => {
+            interp.setResultOwning(det.message);
+            return error.EvalError;
+        },
+    };
 }
 
 fn invokeUnknown(interp: *Interp, args: []Handle) !void {
-    _ = interp.getVariableInner(null, 0, interp.unknown_str) catch |err| switch (err) {
+    const unknown_cmd = interp.getCommand(0, &interp.unknown_str) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.VariableNotFound => {
+        error.CommandNotFound => {
+            // No [unknown] command exists, so we'll default to the "no command found" error.
             try interp.setResultFormatted("invalid command name \"{f}\"", .{args[0]});
             return error.EvalError;
         },
-        error.BadDict => unreachable,
+        error.EvalError => return error.EvalError,
     };
 
     if (interp.unknown_depth > 50) {
@@ -1672,23 +1705,11 @@ fn invokeUnknown(interp: *Interp, args: []Handle) !void {
     try new_args.append(Heap.global_gpa, interp.unknown_str);
     try new_args.appendSlice(Heap.global_gpa, args[1..]);
 
-    try interp.invokeCommand(0, new_args.items);
+    try interp.invokeCommand(unknown_cmd, new_args.items);
 }
 
-fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) (Error || error{InfiniteRecursion})!void {
-    var new_command: OptionalHandle = .none;
-    var det: objutil.ErrorDetails = undefined;
-    const command_or_closure = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.EvalError => return error.EvalError,
-        error.CommandNotFound => {
-            det.message.decrRefCount();
-            try interp.invokeUnknown(args);
-            return;
-        },
-    };
-    args[0].swapIfNew(new_command);
-
+const CommandError = Error || error{InfiniteRecursion};
+fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Handle) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.InfiniteRecursion;
@@ -2399,6 +2420,162 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
     return trace;
 }
 
+/// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
+fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?CommandOrClosure, self: OptionalHandle } {
+    const command = interp.getCommand(interp.currentCallFrameIndex(), &args[0]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EvalError => return error.EvalError,
+        error.CommandNotFound => {
+            // If the command name is unknown, we don't know if it's a method or not,
+            // so we'll pretend like it's a function and invoke [unknown] with the
+            // args passed in, and not inject self.
+            try interp.invokeUnknown(args);
+            return .{ .command = null, .self = .none };
+        },
+    };
+
+    const is_method = switch (command) {
+        .closure => |closure| closure.closure.is_method,
+        .command => false,
+    };
+    if (is_method) {
+        // `interp.getCommand` already made sure `args[0]` is a variable, so we can just
+        // check if it's .dict_sugar.
+        const method_dict_path = args[0];
+        if (method_dict_path.tag() != .dict_sugar) {
+            // Wasn't called with a dict path, so we treat it as a normal function call.
+            return .{ .command = command, .self = .none };
+        }
+        const dict_sugar = method_dict_path.peek().body.dict_sugar;
+
+        // Next, we need to find `self`, the second-to-last part of the dict path. For example, calling
+        // foo::bar would have foo as `self`, or foo::bar::baz would have foo::bar as `self`.
+        const dict_name = method_dict_path.getHeap().getHandle(dict_sugar.dict_name_index);
+        const dict_resolved = interp.getVariableInner(null, interp.currentCallFrameIndex(), dict_name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // This should always succeed, since when `interp.getCommand` was run earlier,
+            // it ensured that the dict sugar resolved to something.
+            else => unreachable,
+        };
+        const dict_path = method_dict_path.getHeap().getHandle(dict_sugar.path_index);
+
+        var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
+        defer handles.deinit(Heap.global_gpa);
+        const all_but_last = handles.items[0..(handles.items.len - 1)];
+
+        var maybe_new_dict: OptionalHandle = .none;
+        var det: objutil.ErrorDetails = undefined;
+        const maybe_self: OptionalHandle = try interp.wrapError(
+            &det,
+            objutil.dictLookupRecursively(&det, dict_resolved, &maybe_new_dict, all_but_last),
+        );
+        if (maybe_new_dict.toHandle()) |new_dict| {
+            interp.setVariableInner(
+                null,
+                interp.currentCallFrameIndex(),
+                dict_name,
+                new_dict.referenceTakeOwnership(),
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadDict => unreachable,
+            };
+        }
+
+        if (maybe_self.toHandle()) |self| {
+            return .{ .command = command, .self = self.borrow().toOptional() };
+        } else {
+            const var_name = try args[0].getString();
+            // Shave off the end, because we're looking up `self`, not the method in this case.
+            var ending = std.mem.lastIndexOf(u8, var_name, "::").?;
+            while (ending > 0 and var_name[ending - 1] == ':') ending -= 1;
+            try interp.setResultFormatted(no_variable_fmt_string, .{var_name[0..ending]});
+            return error.EvalError;
+        }
+    }
+
+    return .{ .command = command, .self = .none };
+}
+
+/// Takes care of populating the `self` parameter. `args_raw` should be one item
+/// larger than `args`, and `args` should be `args_raw[1..]`. If called with a
+/// method, `args_raw[1]` will become `args_raw[0]`, opening up a space for the
+/// `self` parameter.
+fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle) CommandError!void {
+    const cmd_and_self = try interp.getCommandAndSelfParam(args.*);
+    const command = if (cmd_and_self.command) |val| val else {
+        // [unknown] was invoked, so there is no command to be had.
+        return;
+    };
+    const maybe_self = cmd_and_self.self;
+
+    // If the command ended up being a method, we move the command name to the
+    // left, which opens up a hole for putting the `self` argument in.
+    if (maybe_self.toHandle()) |self| {
+        args_raw[0] = args_raw[1]; // Move command name to the left.
+        // Set `self` to the empty handle, so if we fail to find `self`
+        // the defer cleanup for args won't freak out.
+        args_raw[1] = self;
+        args.* = args_raw; // Include all the allocated args now.
+    }
+
+    // Be sure to update the eval frame's stored args.
+    interp.currentEvalFrame().args = args.*;
+
+    // Now that we've populated the arguments for this command, we'll go ahead and run it.
+    var log = std.ArrayList(u8).empty;
+    defer log.deinit(Heap.global_gpa);
+    log.print(Heap.global_gpa, "Calling command: ", .{}) catch {};
+    for (args.*) |arg| {
+        log.print(Heap.global_gpa, "{{{f}}} ", .{arg}) catch {};
+    }
+    log.print(Heap.global_gpa, "\n", .{}) catch {};
+    std.log.debug("{s}", .{log.items});
+
+    try interp.invokeCommand(command, args.*);
+
+    if (maybe_self.toHandle()) |_| {
+        // Be sure to write back `self`.
+
+        const call_frame = interp.currentCallFrameIndex();
+        const method_dict_path = args.*[0];
+        const new_self = args.*[1];
+
+        // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
+        var det: objutil.ErrorDetails = undefined;
+        try interp.wrapError(&det, interp.ensureValidVariableType(&det, call_frame, args.*[0]));
+        method_dict_path.assert(method_dict_path.tag() == .dict_sugar);
+        const dict_sugar = method_dict_path.peek().body.dict_sugar;
+
+        const dict_name = method_dict_path.getHeap().getHandle(dict_sugar.dict_name_index);
+        const dict_resolved = interp.getVariableInner(null, call_frame, dict_name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+        const dict_path = method_dict_path.getHeap().getHandle(dict_sugar.path_index);
+
+        var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
+        defer handles.deinit(Heap.global_gpa);
+        const all_but_last = handles.items[0..(handles.items.len - 1)];
+
+        var maybe_new_dict: OptionalHandle = .none;
+        _ = try interp.wrapError(&det, objutil.dictPutRecursively(
+            &det,
+            dict_resolved,
+            &maybe_new_dict,
+            all_but_last,
+            new_self.reference(),
+        ));
+
+        if (maybe_new_dict.toHandle()) |new_dict| {
+            const new_dict_obj = new_dict.referenceTakeOwnership();
+            interp.setVariableInner(null, call_frame, dict_name, new_dict_obj) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadDict => unreachable,
+            };
+        }
+    }
+}
+
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
@@ -2434,8 +2611,11 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         // This is not always the same as which word token we're on, as argument expansion
         // may write multiple arguments from one word.
         var args_written: usize = 0;
-        var args = try args_alloc.alloc(Handle, command_info.arg_count);
-        defer args_alloc.free(args);
+        // We allocate an extra argument in case we discover that the command name is a method.
+        var args_raw = try args_alloc.alloc(Handle, command_info.arg_count + 1);
+        defer args_alloc.free(args_raw);
+        // We may shift this back by one if we discover that the command name is a method.
+        var args = args_raw[1..];
         defer for (args[0..args_written]) |arg| arg.decrRefCount();
 
         // Populate the arguments by looping through each word of the command and
@@ -2490,29 +2670,14 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
 
         command_token_i = word_token_i;
 
-        // Now that we've populated the arguments for this command, we'll go ahead and run it.
-        var log = std.ArrayList(u8).empty;
-        defer log.deinit(Heap.global_gpa);
-        log.print(Heap.global_gpa, "Calling command: ", .{}) catch {};
-        for (args) |arg| {
-            log.print(Heap.global_gpa, "{{{s}}} ", .{try arg.getString()}) catch {};
-        }
-        log.print(Heap.global_gpa, "\n", .{}) catch {};
-        std.log.debug("{s}", .{log.items});
-
-        // `args` is stored in the eval frame so `buildErrorStack` can read it if this command
-        // fails. The slice is still live at that point (before the loop body `defer` frees it),
-        // mirroring Jim's `evalFrame->argv` pattern.
-        interp.currentEvalFrame().args = args[0..args_written];
-        defer interp.currentEvalFrame().args = &.{};
-
-        const cmd_result = interp.invokeCommand(interp.currentCallFrameIndex(), args);
+        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args);
+        interp.currentEvalFrame().args = args;
 
         // TODO actually check for signals.
         if (false) {
             return error.Signal;
         } else {
-            cmd_result catch |err| switch (err) {
+            command_result catch |err| switch (err) {
                 error.PropagateResult => {
                     interp.return_propagate.left_to_go -= 1;
                     if (interp.return_propagate.left_to_go == 0) {

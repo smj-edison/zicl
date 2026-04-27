@@ -1471,6 +1471,8 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
 }
 
 pub fn listToHandles(gpa: std.mem.Allocator, list: Handle) !std.ArrayList(Handle) {
+    // TODO PERF this shouldn't have to exist. Maybe instead of functions taking
+    // in []Handle, they take in []Object?
     const list_len = listLengthRaw(list);
     var handles = try std.ArrayList(Handle).initCapacity(gpa, list_len);
     for (0..list_len) |i| {

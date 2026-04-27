@@ -352,8 +352,10 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             );
 
             if (new_dict.toHandle()) |new| {
-                defer new.decrRefCount();
-                try interp.setVariableTo(var_name, new);
+                {
+                    defer new.decrRefCount();
+                    try interp.setVariableTo(var_name, new);
+                }
                 // TODO probably can do this faster than looking back up every time.
                 interp.setResult((try interp.getVariable(var_name)).toHandle().?);
             } else {
