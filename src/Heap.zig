@@ -848,11 +848,9 @@ pub const Handle = packed struct(HandleBacking) {
     /// Must be shimmerable.
     pub fn prepareToShimmer(handle: Handle) !void {
         handle.assert(handle.canShimmer());
-        // `.reference` objects delegate `getString()` to their target without storing
-        // their own string representation. Shimmering them would leave the new tag without
-        // a string representation, which violates the invariant that every object that
-        // is not `.none` must have a string rep. Callers should follow the reference
-        // first if they intend to shimmer the target.
+        // You should never be shimmering a reference directly. Instead, you should
+        // shimmer the object it points to. Might consider relaxing this in the future,
+        // but it can cause a lot of issues.
         handle.assert(handle.tag() != .reference);
         // Make sure the object has a string rep before we free its body. That is, if
         // it has a string rep. `.none` objects are brand new, so they obviously don't

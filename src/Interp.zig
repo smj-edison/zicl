@@ -183,7 +183,6 @@ fn reshimmerToVariable(
     var_call_frame: u32,
     name: Handle,
 ) error{ OutOfMemory, VariableNotFound }!void {
-    name.assert(name.getHeap() == Heap.local_heap);
     name.assert(name.canShimmer());
 
     const var_name = try name.getString();
@@ -220,43 +219,6 @@ fn reshimmerToVariable(
         };
         return error.VariableNotFound;
     }
-}
-
-const DictSugar = struct { name: Handle, path: Handle };
-fn parseDictSugar(var_name: [:0]const u8) error{OutOfMemory}!?DictSugar {
-    const double_colons = std.mem.indexOf(u8, var_name, "::");
-    const start_at = if (double_colons) |val| val else return null;
-
-    const dict_name = try objutil.newString(var_name[0..start_at]);
-    errdefer dict_name.decrRefCount();
-
-    var dict_path = try objutil.newList(&.{});
-    errdefer dict_path.decrRefCount();
-
-    var last_path_start: ?usize = null;
-    var i = start_at;
-    while (i <= var_name.len) : (i += 1) {
-        if (i == var_name.len or (var_name[i] == ':' and var_name[i + 1] == ':')) {
-            if (last_path_start) |val| {
-                const path_section = var_name[val..i];
-                const path_section_handle = try objutil.newString(path_section);
-                defer path_section_handle.decrRefCount();
-
-                var new_dict_path: OptionalHandle = .none;
-                _ = objutil.listAppend(null, dict_path, &new_dict_path, path_section_handle) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => unreachable,
-                };
-                dict_path.swapIfNew(new_dict_path);
-            }
-
-            // Keep advancing until we've passed the colon(s).
-            while (i < var_name.len and var_name[i + 1] == ':') i += 1;
-            last_path_start = i + 1;
-        }
-    }
-
-    return .{ .name = dict_name, .path = dict_path };
 }
 
 /// Ensures that this is a valid variable or upvar. If not, it'll shimmer it to whichever one applies.
@@ -307,8 +269,7 @@ fn ensureValidVariableType(
             }
         },
         .dict_sugar => {
-            const dict_name = name.getHeap().getHandle(name.peek().body.dict_sugar.dict_name_index);
-            try interp.ensureValidVariableType(det, var_call_frame, dict_name);
+            return error.DictSugar;
         },
         else => {
             // Fall through.
@@ -317,29 +278,14 @@ fn ensureValidVariableType(
 
     // We don't know whether this is a normal variable or dict sugar yet.
     const var_name = try name.getString();
+    if (std.mem.indexOf(u8, var_name, "::") != null) return error.DictSugar;
 
-    if (try parseDictSugar(var_name)) |dict_sugar| {
-        errdefer dict_sugar.name.decrRefCount();
-        errdefer dict_sugar.path.decrRefCount();
-
-        // Make sure the dict that was referenced exists.
-        try interp.ensureValidVariableType(det, var_call_frame, dict_sugar.name);
-
-        try name.prepareToShimmer();
-        name.peek().head.tag = .dict_sugar;
-        // Take ownership of `dict_name` and `dict_path`.
-        name.peek().body.dict_sugar = .{
-            .dict_name_index = dict_sugar.name.index,
-            .path_index = dict_sugar.path.index,
-        };
-    } else {
-        // Make sure the variable exists.
-        try interp.reshimmerToVariable(det, var_call_frame, name);
-    }
+    // Make sure the variable exists.
+    try interp.reshimmerToVariable(det, var_call_frame, name);
 }
 
 // Must be called with a heap-native variable name. Does not account for dict sugar.
-fn createVariableNotSugar(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
+fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Heap.Object) !void {
     name.assert(name.canShimmer());
 
     const call_frame = &interp.call_frames.items[call_frame_idx];
@@ -354,6 +300,59 @@ fn createVariableNotSugar(interp: *Interp, call_frame_idx: u32, name: Handle, va
     name.peek().body.cached_local_var = .{
         .call_epoch = call_frame.call_epoch,
         .cached_index = put_result.new_value.index,
+    };
+}
+
+const DictSugar = struct { name: Handle, path: Handle };
+fn parseDictSugar(var_name: [:0]const u8) error{OutOfMemory}!?DictSugar {
+    const double_colons = std.mem.indexOf(u8, var_name, "::");
+    const start_at = if (double_colons) |val| val else return null;
+
+    const dict_name = try objutil.newString(var_name[0..start_at]);
+    errdefer dict_name.decrRefCount();
+
+    var dict_path = try objutil.newList(&.{});
+    errdefer dict_path.decrRefCount();
+
+    var last_path_start: ?usize = null;
+    var i = start_at;
+    while (i <= var_name.len) : (i += 1) {
+        if (i == var_name.len or (var_name[i] == ':' and var_name[i + 1] == ':')) {
+            if (last_path_start) |val| {
+                const path_section = var_name[val..i];
+                const path_section_handle = try objutil.newString(path_section);
+                defer path_section_handle.decrRefCount();
+
+                var new_dict_path: OptionalHandle = .none;
+                _ = objutil.listAppend(null, dict_path, &new_dict_path, path_section_handle) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+                dict_path.swapIfNew(new_dict_path);
+            }
+
+            // Keep advancing until we've passed the colon(s).
+            while (i < var_name.len and var_name[i + 1] == ':') i += 1;
+            last_path_start = i + 1;
+        }
+    }
+
+    return .{ .name = dict_name, .path = dict_path };
+}
+
+/// This should only ever be called if you know that this variable is in dict sugar form.
+fn shimmerToDictSugarAssumeValid(name: Handle) error{OutOfMemory}!void {
+    if (name.tag() == .dict_sugar) return;
+
+    const dict_sugar = (try parseDictSugar(try name.getString())).?;
+    errdefer dict_sugar.name.decrRefCount();
+    errdefer dict_sugar.path.decrRefCount();
+
+    try name.prepareToShimmer();
+    name.peek().head.tag = .dict_sugar;
+    name.peek().body.dict_sugar = .{
+        .dict_name_index = dict_sugar.name.index,
+        .path_index = dict_sugar.path.index,
     };
 }
 
@@ -377,38 +376,6 @@ pub fn setVariableInner(
 
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
         switch (name.tag()) {
-            .dict_sugar => {
-                const dict_sugar = name.peek().body.dict_sugar;
-                const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
-                const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
-
-                var resolved_dict = blk: {
-                    if (interp.getVariableInner(null, call_frame_idx, dict_name)) |dict| {
-                        break :blk dict.borrow();
-                    } else |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
-                        error.VariableNotFound => {
-                            // If it's not found, then we'll just create it.
-                            break :blk try objutil.newDictInner(Heap.local_heap, &.{});
-                        },
-                    }
-                };
-                defer resolved_dict.decrRefCount();
-
-                var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
-                defer keys.deinit(Heap.global_gpa);
-
-                var new_dict: OptionalHandle = .none;
-                value_taken = true;
-                _ = objutil.dictPutRecursively(null, resolved_dict, &new_dict, keys.items, value) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => unreachable,
-                };
-                resolved_dict.swapIfNew(new_dict);
-
-                try interp.setVariableInner(det, call_frame_idx, dict_name, resolved_dict.reference());
-            },
             .cached_local_var => {
                 const cached_var = &name.peek().body.cached_local_var;
                 const var_value = Heap.local_heap.getHandle(cached_var.cached_index);
@@ -442,7 +409,7 @@ pub fn setVariableInner(
             .cached_lexical_var => {
                 // We can't mutate a lexical var, so we instead shadow it in the local scope.
                 value_taken = true;
-                try createVariableNotSugar(interp, call_frame_idx, name, value);
+                try createVariable(interp, call_frame_idx, name, value);
             },
             else => unreachable,
         }
@@ -450,14 +417,40 @@ pub fn setVariableInner(
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => {
             value_taken = true;
-            const var_name = try name.getString();
-            if (try parseDictSugar(var_name)) |dict_sugar| {
-                errdefer dict_sugar.name.decrRefCount();
-                errdefer dict_sugar.path.decrRefCount();
+            try createVariable(interp, call_frame_idx, name, value);
+        },
+        error.DictSugar => {
+            try shimmerToDictSugarAssumeValid(name);
+            const dict_sugar = name.peek().body.dict_sugar;
+            const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
+            const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
 
-                // Create a new dict
-            }
-            try createVariableNotSugar(interp, call_frame_idx, name, value);
+            var resolved_dict = blk: {
+                if (interp.getVariableInner(null, call_frame_idx, dict_name)) |dict| {
+                    break :blk dict.borrow();
+                } else |get_err| switch (get_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
+                    error.VariableNotFound => {
+                        // If it's not found, then we'll just create it.
+                        break :blk try objutil.newDictInner(Heap.local_heap, &.{});
+                    },
+                }
+            };
+            defer resolved_dict.decrRefCount();
+
+            var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
+            defer keys.deinit(Heap.global_gpa);
+
+            var maybe_new_dict: OptionalHandle = .none;
+            value_taken = true;
+            _ = objutil.dictPutRecursively(null, resolved_dict, &maybe_new_dict, keys.items, value) catch |put_err| switch (put_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
+            resolved_dict.swapIfNew(maybe_new_dict);
+
+            try interp.setVariableInner(det, call_frame_idx, dict_name, resolved_dict.reference());
         },
     }
 }
@@ -484,17 +477,16 @@ pub fn setVariableLinkInner(
 
         return error.VariableAlreadyExists;
     } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => {
             // Fall through.
         },
-        error.OutOfMemory => return error.OutOfMemory,
-    }
-
-    if (name.tag() == .dict_sugar) {
-        if (det) |details| details.* = .{
-            .message = try objutil.newString("cannot create an upvar name that has dict sugar"),
-        };
-        return error.DictSugarInUpvarName;
+        error.DictSugar => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newString("cannot create an upvar name that has dict sugar"),
+            };
+            return error.DictSugarInUpvarName;
+        },
     }
 
     // Check for cycles (only possible with `upvar 0`).
@@ -530,12 +522,17 @@ pub fn setVariableLinkInner(
                         obj_currently_checking = var_val.getHeap().getHandle(upvar_link.linked_name);
                     }
                 } else {
+                    // It's not pointing at a variable, so the chain is broken.
                     break;
                 }
             } else |err| switch (err) {
                 error.VariableNotFound => {
                     // If the target var doesn't exist, then of course the var name != nothing,
                     // so it's not equal to itself.
+                    break;
+                },
+                error.DictSugar => {
+                    // It's not pointing at a variable, so the chain is broken.
                     break;
                 },
                 error.OutOfMemory => return error.OutOfMemory,
@@ -565,10 +562,12 @@ pub fn unsetVariableInner(
     call_frame_idx: u32,
     name: Handle,
 ) !void {
-    try interp.ensureValidVariableType(det, call_frame_idx, name);
+    interp.ensureValidVariableType(det, call_frame_idx, name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.VariableNotFound => return error.VariableNotFound,
+        error.DictSugar => {
+            try shimmerToDictSugarAssumeValid(name);
 
-    switch (name.tag()) {
-        .dict_sugar => {
             const dict_sugar = name.peek().body.dict_sugar;
             const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
             const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
@@ -578,11 +577,14 @@ pub fn unsetVariableInner(
                 var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
                 defer keys.deinit(Heap.global_gpa);
 
-                const remove_result = objutil.dictRemoveRecursively(det, dict, keys.items) catch |err| switch (err) {
+                const remove_result = objutil.dictRemoveRecursively(det, dict, keys.items) catch |rerr| switch (rerr) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
                         if (det) |details| details.* = .{
-                            .message = try objutil.newStringFmt("can't unset \"{s}\": no such element in dictionary", .{try name.getString()}),
+                            .message = try objutil.newStringFmt(
+                                "can't unset \"{s}\": no such element in dictionary",
+                                .{try name.getString()},
+                            ),
                         };
                         return error.VariableNotFound;
                     },
@@ -590,13 +592,16 @@ pub fn unsetVariableInner(
                 if (!remove_result.did_remove) {
                     assert(remove_result.new_dict == .none);
                     if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt("can't unset \"{s}\": no such element in dictionary", .{try name.getString()}),
+                        .message = try objutil.newStringFmt(
+                            "can't unset \"{s}\": no such element in dictionary",
+                            .{try name.getString()},
+                        ),
                     };
                     return error.VariableNotFound;
                 } else if (remove_result.new_dict.toHandle()) |new_dict| {
                     try interp.setVariableInner(det, call_frame_idx, dict_name, new_dict.referenceTakeOwnership());
                 }
-            } else |err| switch (err) {
+            } else |get_err| switch (get_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     if (det) |details| details.* = .{
@@ -606,6 +611,9 @@ pub fn unsetVariableInner(
                 },
             }
         },
+    };
+
+    switch (name.tag()) {
         .cached_local_var => {
             const cached_var = &name.peek().body.cached_local_var;
             const var_value = Heap.local_heap.getHandle(cached_var.cached_index);
@@ -657,7 +665,46 @@ pub fn getVariableInner(
     call_frame_idx: u32,
     name: Handle,
 ) error{ OutOfMemory, VariableNotFound, BadDict }!Handle {
-    try interp.ensureValidVariableType(det, call_frame_idx, name);
+    interp.ensureValidVariableType(det, call_frame_idx, name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.VariableNotFound => return error.VariableNotFound,
+        error.DictSugar => {
+            try shimmerToDictSugarAssumeValid(name);
+
+            const dict_sugar = name.peek().body.dict_sugar;
+            const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
+            const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
+
+            const resolved_dict = try interp.getVariableInner(det, call_frame_idx, dict_name);
+
+            var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
+            defer keys.deinit(Heap.global_gpa);
+
+            var new_dict: OptionalHandle = .none;
+            const result = objutil.dictLookupRecursively(null, resolved_dict, &new_dict, keys.items) catch |lerr| switch (lerr) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    if (det) |details| details.* = .{
+                        .message = try objutil.newStringFmt("variable \"{f}\" is not a valid dictionary", .{dict_name}),
+                    };
+                    return error.BadDict;
+                },
+            };
+
+            if (new_dict.toHandle()) |new| {
+                try interp.setVariableInner(det, call_frame_idx, dict_name, new.referenceTakeOwnership());
+            }
+
+            if (result.toHandle()) |val| {
+                return val;
+            } else {
+                if (det) |details| details.* = .{
+                    .message = try objutil.newStringFmt("can't read \"{f}\": no such variable", .{name}),
+                };
+                return error.VariableNotFound;
+            }
+        },
+    };
 
     const name_obj = name.peek();
     const name_heap = name.getHeap();
@@ -678,44 +725,6 @@ pub fn getVariableInner(
         .cached_lexical_var => {
             const extra_data = name_heap.getExtraData(name_obj.body.cached_lexical_var.extra_data);
             return extra_data.lexical_variable.ref;
-        },
-        .dict_sugar => {
-            const dict_sugar = name.peek().body.dict_sugar;
-            const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
-            const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
-
-            const resolved_dict = try interp.getVariableInner(det, call_frame_idx, dict_name);
-
-            var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
-            defer keys.deinit(Heap.global_gpa);
-
-            var new_dict: OptionalHandle = .none;
-            const result = objutil.dictLookupRecursively(null, resolved_dict, &new_dict, keys.items) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmtInner(
-                            Heap.local_heap,
-                            "variable \"{f}\" is not a valid dictionary",
-                            .{dict_name},
-                        ),
-                    };
-                    return error.BadDict;
-                },
-            };
-
-            if (new_dict.toHandle()) |new| {
-                try interp.setVariableInner(det, call_frame_idx, dict_name, new.referenceTakeOwnership());
-            }
-
-            if (result.toHandle()) |val| {
-                return val;
-            } else {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt("can't read \"{f}\": no such variable", .{name}),
-                };
-                return error.VariableNotFound;
-            }
         },
         else => unreachable,
     }
@@ -2542,7 +2551,17 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
 
         // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
         var det: objutil.ErrorDetails = undefined;
-        try interp.wrapError(&det, interp.ensureValidVariableType(&det, call_frame, args.*[0]));
+        interp.ensureValidVariableType(&det, call_frame, args.*[0]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.VariableNotFound => {
+                interp.setResultOwning(det.message);
+                return error.EvalError;
+            },
+            error.DictSugar => {
+                // What we want.
+                try shimmerToDictSugarAssumeValid(args.*[0]);
+            },
+        };
         method_dict_path.assert(method_dict_path.tag() == .dict_sugar);
         const dict_sugar = method_dict_path.peek().body.dict_sugar;
 
