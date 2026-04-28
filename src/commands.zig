@@ -796,6 +796,7 @@ pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         closure_and_key.closure,
         closure_and_key.cache_key,
         args[1..],
+        false,
     ));
 }
 

@@ -137,9 +137,6 @@ pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) w
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            if (det.message.heap != 0) {
-                std.debug.print("err: {}\n", .{err});
-            }
             // This error should have error details, if it's not OOM.
             interp.setResultOwning(det.message);
             return error.EvalError;
@@ -1163,7 +1160,7 @@ pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
     }
 }
 
-pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
+pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle, called_as_method: bool) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -1256,6 +1253,23 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     }
 
     try interp.evalObjectInner(closure.body, cache_key);
+
+    // When called as a method, override the result with the current value of the self
+    // variable (the first parameter), so the caller can write it back to the outer scope.
+    // The call frame is still live here -- the defer { frame.deinit() } hasn't run yet.
+    if (called_as_method) {
+        const self_var_name = objutil.listItem(closure.args, 0);
+        if (interp.getVariableInner(null, call_frame_idx, self_var_name)) |updated_self| {
+            interp.setResult(updated_self);
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.VariableNotFound => {
+                try interp.setResultString("\"self\" was unset in method body");
+                return error.EvalError;
+            },
+            error.BadDict => unreachable,
+        }
+    }
 }
 
 fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
@@ -1714,11 +1728,11 @@ fn invokeUnknown(interp: *Interp, args: []Handle) !void {
     try new_args.append(Heap.global_gpa, interp.unknown_str);
     try new_args.appendSlice(Heap.global_gpa, args[1..]);
 
-    try interp.invokeCommand(unknown_cmd, new_args.items);
+    try interp.invokeCommand(unknown_cmd, new_args.items, false);
 }
 
 const CommandError = Error || error{InfiniteRecursion};
-fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Handle) CommandError!void {
+fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Handle, called_as_method: bool) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.InfiniteRecursion;
@@ -1744,7 +1758,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
                     break :blk interp.callNative(command, current_args);
                 },
                 .closure => |closure| {
-                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args);
+                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args, called_as_method);
                 },
             }
         };
@@ -2509,10 +2523,21 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
 /// larger than `args`, and `args` should be `args_raw[1..]`. If called with a
 /// method, `args_raw[1]` will become `args_raw[0]`, opening up a space for the
 /// `self` parameter.
-fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle, args_written: *usize) CommandError!void {
-    const cmd_and_self = try interp.getCommandAndSelfParam(args.*);
+fn invokeCommandMaybeMethod(
+    interp: *Interp,
+    args_raw: []Handle,
+    args: *[]Handle,
+    arg_snapshot: *std.ArrayList(Handle),
+) CommandError!void {
+    const cmd_and_self = interp.getCommandAndSelfParam(args.*) catch |err| {
+        arg_snapshot.*.appendSliceAssumeCapacity(args.*);
+        interp.currentEvalFrame().args = arg_snapshot.items;
+        return err;
+    };
     const command = if (cmd_and_self.command) |val| val else {
         // [unknown] was invoked, so there is no command to be had.
+        arg_snapshot.*.appendSliceAssumeCapacity(args.*);
+        interp.currentEvalFrame().args = arg_snapshot.items;
         return;
     };
     const maybe_self = cmd_and_self.self;
@@ -2525,11 +2550,12 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
         // the defer cleanup for args won't freak out.
         args_raw[1] = self;
         args.* = args_raw; // Include all the allocated args now.
-        args_written.* += 1;
     }
 
-    // Be sure to update the eval frame's stored args.
-    interp.currentEvalFrame().args = args.*;
+    // Be sure to set the args before invoking the command, since something
+    // like [info callframe] could view the callframe right away.
+    arg_snapshot.*.appendSliceAssumeCapacity(args.*);
+    interp.currentEvalFrame().args = arg_snapshot.items;
 
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
     var log = std.ArrayList(u8).empty;
@@ -2541,14 +2567,14 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
     log.print(Heap.global_gpa, "\n", .{}) catch {};
     std.log.debug("{s}", .{log.items});
 
-    try interp.invokeCommand(command, args.*);
+    try interp.invokeCommand(command, args.*, maybe_self.toHandle() != null);
 
-    if (maybe_self.toHandle()) |old_self| {
+    if (maybe_self.toHandle()) |_| {
         // Be sure to write back `self`.
 
         const call_frame = interp.currentCallFrameIndex();
         const method_dict_path = args.*[0];
-        const new_self = args.*[1];
+        const new_self = interp.result;
 
         // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
         var det: objutil.ErrorDetails = undefined;
@@ -2574,13 +2600,10 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
         const dict_path = method_dict_path.getHeap().getHandle(dict_sugar.path_index);
 
         if (objutil.listLengthRaw(dict_path) == 1) {
-            if (old_self != new_self) {
-                const new_self_obj = new_self.referenceTakeOwnership();
-                interp.setVariableInner(null, call_frame, dict_name, new_self_obj) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => unreachable,
-                };
-            }
+            interp.setVariableInner(null, call_frame, dict_name, new_self.reference()) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadDict => unreachable,
+            };
         } else {
             var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
             defer handles.deinit(Heap.global_gpa);
@@ -2596,8 +2619,7 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
             ));
 
             if (maybe_new_dict.toHandle()) |new_dict| {
-                const new_dict_obj = new_dict.referenceTakeOwnership();
-                interp.setVariableInner(null, call_frame, dict_name, new_dict_obj) catch |err| switch (err) {
+                interp.setVariableInner(null, call_frame, dict_name, new_dict.reference()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.BadDict => unreachable,
                 };
@@ -2609,7 +2631,6 @@ fn invokeCommandMaybeMethod(interp: *Interp, args_raw: []Handle, args: *[]Handle
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
-    std.debug.print("raw script: `{f}`\n", .{script});
     const parsed = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key));
     // Don't evaluate empty scripts.
     if (parsed.tags.items.len <= 1) return;
@@ -2638,70 +2659,85 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         command_token_i += 1; // Skip .script_command.
         interp.currentEvalFrame().current_line = command_info.line;
 
-        // This is not always the same as which word token we're on, as argument expansion
-        // may write multiple arguments from one word.
-        var args_written: usize = 0;
         // We allocate an extra argument in case we discover that the command name is a method.
         var args_raw = try args_alloc.alloc(Handle, command_info.arg_count + 1);
         defer args_alloc.free(args_raw);
         // We may shift this back by one if we discover that the command name is a method.
         var args = args_raw[1..];
-        defer for (args[0..args_written]) |arg| arg.decrRefCount();
 
-        // Populate the arguments by looping through each word of the command and
-        // substituting.
-        var word_token_i: u32 = command_token_i;
-        for (0..command_info.arg_count) |_| {
-            var word_parts: u32 = 1;
-            const argument_expansion = tags[word_token_i] == .argument_expansion;
-            if (tags[word_token_i] == .start_of_word or argument_expansion) {
-                word_parts = @intCast(values[word_token_i].body.integer);
-                word_token_i += 1;
-            }
+        {
+            // This is not always the same as which word token we're on, as argument expansion
+            // may write multiple arguments from one word.
+            var args_written: usize = 0;
+            errdefer for (args[0..args_written]) |arg| arg.decrRefCount();
 
-            var resultant_word: Handle = blk: {
-                if (word_parts == 1) {
-                    // Simple one-to-one substitution, so an easy case.
-                    const res = try interp.substituteOneToken(tags[word_token_i], objutil.listItem(parsed.values, word_token_i));
+            // Populate the arguments by looping through each word of the command and
+            // substituting.
+            var word_token_i: u32 = command_token_i;
+            for (0..command_info.arg_count) |_| {
+                var word_parts: u32 = 1;
+                const argument_expansion = tags[word_token_i] == .argument_expansion;
+                if (tags[word_token_i] == .start_of_word or argument_expansion) {
+                    word_parts = @intCast(values[word_token_i].body.integer);
                     word_token_i += 1;
-                    break :blk res;
+                }
+
+                var resultant_word: Handle = blk: {
+                    if (word_parts == 1) {
+                        // Simple one-to-one substitution, so an easy case.
+                        const res = try interp.substituteOneToken(
+                            tags[word_token_i],
+                            objutil.listItem(parsed.values, word_token_i),
+                        );
+                        word_token_i += 1;
+                        break :blk res;
+                    } else {
+                        // Helper function that'll interpolate all the word
+                        // parts and merge them into a string.
+                        const res = try interp.interpolateTokens(
+                            tags[word_token_i..][0..word_parts],
+                            parsed.values,
+                            word_token_i,
+                            word_parts,
+                            false,
+                        );
+                        word_token_i += word_parts;
+                        break :blk res;
+                    }
+                };
+
+                if (argument_expansion) {
+                    // Argument expansion, so we'll need to shimmer the result to a list.
+                    det = undefined;
+                    var new_list: OptionalHandle = .none;
+                    const len = try wrapError(interp, &det, objutil.listLength(&det, resultant_word, &new_list));
+                    resultant_word.swapIfNew(new_list);
+                    // Free the list backing without running destructors, since we're going to steal the items
+                    // directly from the list.
+                    defer resultant_word.decrRefCount();
+
+                    if (len > 1) {
+                        // Expanded into multiple tokens, so we'll need to resize args.
+                        args = try args_alloc.realloc(args, args.len - 1 + len);
+                    }
+
+                    for (0..len) |list_idx| {
+                        args[args_written] = objutil.listItem(resultant_word, @intCast(list_idx)).borrow();
+                        args_written += 1;
+                    }
                 } else {
-                    // Helper function that'll interpolate all the word parts and merge them into a string.
-                    const res = try interp.interpolateTokens(tags[word_token_i..][0..word_parts], parsed.values, word_token_i, word_parts, false);
-                    word_token_i += word_parts;
-                    break :blk res;
-                }
-            };
-
-            if (argument_expansion) {
-                // Argument expansion, so we'll need to shimmer the result to a list.
-                det = undefined;
-                var new_list: OptionalHandle = .none;
-                const len = try wrapError(interp, &det, objutil.listLength(&det, resultant_word, &new_list));
-                resultant_word.swapIfNew(new_list);
-                // Free the list backing without running destructors, since we're going to steal the items
-                // directly from the list.
-                defer resultant_word.decrRefCount();
-
-                if (len > 1) {
-                    // Expanded into multiple tokens, so we'll need to resize args.
-                    args = try args_alloc.realloc(args, args.len - 1 + len);
-                }
-
-                for (0..len) |list_idx| {
-                    args[args_written] = objutil.listItem(resultant_word, @intCast(list_idx)).borrow();
+                    args[args_written] = resultant_word;
                     args_written += 1;
                 }
-            } else {
-                args[args_written] = resultant_word;
-                args_written += 1;
             }
+
+            command_token_i = word_token_i;
         }
+        defer for (args) |arg| arg.decrRefCount();
 
-        command_token_i = word_token_i;
-
-        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args, &args_written);
-        interp.currentEvalFrame().args = args;
+        var arg_snapshot: std.ArrayList(Handle) = try .initCapacity(args_alloc, args_raw.len);
+        defer arg_snapshot.deinit(args_alloc);
+        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args, &arg_snapshot);
 
         // TODO actually check for signals.
         if (false) {

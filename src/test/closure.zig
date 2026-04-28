@@ -132,19 +132,17 @@ test "method arbitrary self name" {
     );
 }
 
-test "method reads and returns updated self" {
+test "method updates self" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    // The method receives the dict as its first arg, modifies it, and returns
-    // the updated copy. The caller decides whether to rebind.
     try interp.testExpectScriptResult("rex",
-        \\ method rename {self newName} {
-        \\   dict set self name $newName
+        \\ set doggo {name fido}
+        \\ method doggo::rename {self newName} {
+        \\   set self::name $newName
         \\ }
-        \\ set dog {name fido}
-        \\ set dog [apply $rename $dog rex]
-        \\ dict get $dog name
+        \\ doggo::rename rex
+        \\ dict get $doggo name
     );
 }
 
