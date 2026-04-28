@@ -953,7 +953,13 @@ pub const Handle = packed struct(HandleBacking) {
         handle.trace("Incr ref count of index {} (now {})", .{ handle.index, handle.refCount() });
     }
 
-    pub fn referenceTakeOwnership(handle: Handle) Object {
+    // TODO PERF might be worthwhile doing something like Jim's compared string type.
+    pub fn equalsString(handle: Handle, value: []const u8) !bool {
+        const bytes = try handle.getString();
+        return std.mem.eql(u8, bytes, value);
+    }
+
+    pub fn referenceOwning(handle: Handle) Object {
         // Make sure we're never making a reference to a reference.
         handle.assert(handle.tag() != .reference);
         // .upvar_link can't be referenced either, since it always
@@ -974,7 +980,7 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn reference(handle: Handle) Object {
         handle.incrRefCount();
-        return handle.referenceTakeOwnership();
+        return handle.referenceOwning();
     }
 
     pub fn dupOrRef(handle: Handle) Object {
@@ -1144,7 +1150,7 @@ pub const Handle = packed struct(HandleBacking) {
                         const opt_idx = i - closure.required_arity;
                         const default_val = objutil.listItem(opt_values.?, @intCast(opt_idx));
                         const spec = try objutil.newList(&.{ arg_name, default_val });
-                        arg_items[i] = spec.referenceTakeOwnership();
+                        arg_items[i] = spec.referenceOwning();
                     } else {
                         arg_items[i] = heap.dupOrReference(arg_name);
                     }
@@ -2329,12 +2335,6 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
     } else {
         return ptr.*;
     }
-}
-
-// TODO PERF might be worthwhile doing something like Jim's compared string type.
-pub fn stringEquals(handle: Handle, value: []const u8) !bool {
-    const bytes = try handle.getString();
-    return std.mem.eql(u8, bytes, value);
 }
 
 /// Copies provided string.

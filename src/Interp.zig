@@ -596,7 +596,7 @@ pub fn unsetVariableInner(
                     };
                     return error.VariableNotFound;
                 } else if (remove_result.new_dict.toHandle()) |new_dict| {
-                    try interp.setVariableInner(det, call_frame_idx, dict_name, new_dict.referenceTakeOwnership());
+                    try interp.setVariableInner(det, call_frame_idx, dict_name, new_dict.referenceOwning());
                 }
             } else |get_err| switch (get_err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -689,7 +689,7 @@ pub fn getVariableInner(
             };
 
             if (new_dict.toHandle()) |new| {
-                try interp.setVariableInner(det, call_frame_idx, dict_name, new.referenceTakeOwnership());
+                try interp.setVariableInner(det, call_frame_idx, dict_name, new.referenceOwning());
             }
 
             if (result.toHandle()) |val| {
@@ -895,7 +895,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: NativeCommand
     try combined.appendSlice(Heap.global_gpa, try var_name_escaped.getString());
     const var_value = try objutil.newString(combined.items);
 
-    try interp.setVariableToObject(&var_name, var_value.referenceTakeOwnership());
+    try interp.setVariableToObject(&var_name, var_value.referenceOwning());
 
     // FIXME need to handle this if it wraps around.
     interp.global_procedure_epoch += 1;
@@ -1076,7 +1076,7 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
                 optional_values = try objutil.newListWithCapacity(arg_list_len);
             }
 
-            if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
+            if (try objutil.listItem(arg, 0).equalsString("args")) {
                 if (det) |details| details.* = .{
                     .message = try objutil.newString("'args' must be a required parameter"),
                 };
@@ -2510,7 +2510,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
                 null,
                 interp.callFrameIdx(),
                 dict_name,
-                new_dict.referenceTakeOwnership(),
+                new_dict.referenceOwning(),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadDict => unreachable,

@@ -577,7 +577,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             return;
         }
 
-        if (try Heap.stringEquals(remaining_args[0], "else")) {
+        if (try remaining_args[0].equalsString("else")) {
             // There should only be one more argument, since there shouldn't
             // be anything after "else".
             if (remaining_args.len > 2) return error.WrongUsage;
@@ -585,7 +585,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             return;
         }
 
-        if (try Heap.stringEquals(remaining_args[0], "elseif")) {
+        if (try remaining_args[0].equalsString("elseif")) {
             // Keep going.
             remaining_args = remaining_args[1..];
             continue;
@@ -768,10 +768,10 @@ pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
 
     var i: usize = 1;
     while (i < args.len) {
-        if (try Heap.stringEquals(args[i], "--")) {
+        if (try args[i].equalsString("--")) {
             i += 1;
             break;
-        } else if (try Heap.stringEquals(args[i], "-nocomplain")) {
+        } else if (try args[i].equalsString("-nocomplain")) {
             should_complain = false;
             i += 1;
             continue;
@@ -1107,7 +1107,7 @@ fn catchTryHelper(
                     }
 
                     // If we got here, it means we either matched, or are falling through.
-                    if (try Heap.stringEquals(on_params[3], "-")) {
+                    if (try on_params[3].equalsString("-")) {
                         // If the script is `-`, it means fall through.
                         branch_matched = true;
                         continue;
@@ -1154,7 +1154,7 @@ fn catchTryHelper(
                     }
 
                     // If we got here, it means we either matched, or are falling through.
-                    if (try Heap.stringEquals(trap_params[3], "-")) {
+                    if (try trap_params[3].equalsString("-")) {
                         // If the script is `-`, it means fall through.
                         branch_matched = true;
                         continue;
@@ -1172,7 +1172,7 @@ fn catchTryHelper(
                     arg_index += 2;
 
                     finally_script = finally_params[1];
-                    if (try Heap.stringEquals(finally_script.?, "-")) return error.WrongUsage;
+                    if (try finally_script.?.equalsString("-")) return error.WrongUsage;
                 },
             }
         }

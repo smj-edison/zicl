@@ -849,7 +849,7 @@ pub fn SubcommandParser(
 
             // TODO PERF cache the subcommand lookup.
 
-            if (try Heap.stringEquals(args[1], "-help")) {
+            if (try args[1].equalsString("-help")) {
                 if (args.len >= 3) {
                     const subcommand_queried = try args[2].getString();
 
@@ -870,7 +870,7 @@ pub fn SubcommandParser(
                 return error.UsageHelp;
             }
 
-            if (try Heap.stringEquals(args[1], "-commands")) {
+            if (try args[1].equalsString("-commands")) {
                 if (det) |details| details.* = .{ .message = try newString(space_joined_names) };
                 return error.UsageHelp;
             }
@@ -1314,7 +1314,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             // as the list already has one ref count for owning the item.)
             if (old_item.isShared()) {
                 found_shared_items = true;
-                new_item.* = old_item.referenceTakeOwnership();
+                new_item.* = old_item.referenceOwning();
             } else {
                 new_item.* = old_item.peek().*;
                 // Be sure to "zero" out the old item after we steal it.
@@ -2090,7 +2090,7 @@ pub fn dictPutRecursively(
             const put_result = try dictPutInner(
                 new_dict.orElse(provided_dict),
                 keys[0],
-                new_child_dict.referenceTakeOwnership(),
+                new_child_dict.referenceOwning(),
             );
             new_dict.swapRefIfNew(put_result.new_dict);
             break :blk put_result.new_value;
@@ -2107,7 +2107,7 @@ pub fn dictPutRecursively(
         const put_result = try dictPutInner(
             new_dict.orElse(provided_dict),
             keys[0],
-            new_child.referenceTakeOwnership(),
+            new_child.referenceOwning(),
         );
         new_dict.swapRefIfNew(put_result.new_dict);
     }
@@ -2138,7 +2138,7 @@ pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: [
         if (child_remove_result.new_dict.toHandle()) |new_child| {
             errdefer new_child.decrRefCount();
             // The child dict was duplicated, so we need to replace the old reference with the new one.
-            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new_child.referenceTakeOwnership());
+            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new_child.referenceOwning());
             new_dict.swapRefIfNew(put_result.new_dict);
         }
 
@@ -2170,7 +2170,7 @@ pub fn dictLookupRecursively(
         if (new_child.toHandle()) |new| {
             errdefer new.decrRefCount();
             // The child dict changed, propagate back up.
-            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new.referenceTakeOwnership());
+            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new.referenceOwning());
             new_dict.swapRefIfNew(put_result.new_dict);
         }
         return child_result;
