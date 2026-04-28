@@ -2984,13 +2984,23 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
         if (metadata.in_use) {
             const handle = heap.getHandle(@intCast(i));
-            std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
-                handle.tag(),
-                i,
-                handle.getMetadata().order,
-                handle.debugRefCount(),
-                handle.getString() catch "oom",
-            });
+            const str = handle.getString();
+            if (str) |val| {
+                std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
+                    handle.tag(),
+                    i,
+                    handle.getMetadata().order,
+                    handle.debugRefCount(),
+                    val,
+                });
+            } else |_| {
+                std.debug.print("Leaked {}, index {}, order: {}, ref count {}, <oom>\n", .{
+                    handle.tag(),
+                    i,
+                    handle.getMetadata().order,
+                    handle.debugRefCount(),
+                });
+            }
         }
     }
 
@@ -3000,12 +3010,20 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
         for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
             if (metadata.in_use) {
                 const handle = heap.getHandle(@intCast(i));
-                std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
-                    handle.tag(),
-                    i,
-                    handle.debugRefCount(),
-                    handle.getString() catch "oom",
-                });
+                if (handle.getString()) |val| {
+                    std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
+                        handle.tag(),
+                        i,
+                        handle.debugRefCount(),
+                        val,
+                    });
+                } else |_| {
+                    std.debug.print("Trace for {}, index {}, ref count {}, <oom>\n", .{
+                        handle.tag(),
+                        i,
+                        handle.debugRefCount(),
+                    });
+                }
 
                 const trace = heap.objects.get(i).trace;
                 trace.dump();

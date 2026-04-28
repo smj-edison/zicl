@@ -1186,12 +1186,12 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     }
 
     // Check for infinite recursion.
-    if (interp.currentCallFrame().level >= interp.max_call_depth) {
+    if (interp.callFrame().level >= interp.max_call_depth) {
         try interp.setResultString("Too many nested calls. Infinite recursion?");
         return error.InfiniteRecursion;
     }
 
-    const parent_idx = interp.currentCallFrameIndex();
+    const parent_idx = interp.callFrameIdx();
     const call_frame_idx = try interp.pushCallFrame(parent_idx, args, closure);
     defer {
         var frame = interp.call_frames.pop().?;
@@ -1264,7 +1264,7 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
         }
     }
 
-    try interp.evalObjectInner(closure.body, cache_key);
+    try interp.evalObjectInner(call_frame_idx, closure.body, cache_key);
 
     // When called as a method, we write back `self` to `args[1]`, so that the
     // caller can update the new method.
@@ -1405,12 +1405,12 @@ const CallFrame = struct {
     }
 };
 
-pub fn currentCallFrameIndex(interp: *Interp) u32 {
-    return @intCast(interp.call_frames.items.len - 1);
+pub fn callFrameIdx(interp: *Interp) u32 {
+    return interp.currentEvalFrame().call_frame;
 }
 
-pub fn currentCallFrame(interp: *Interp) *CallFrame {
-    return &interp.call_frames.items[interp.currentCallFrameIndex()];
+pub fn callFrame(interp: *Interp) *CallFrame {
+    return &interp.call_frames.items[interp.callFrameIdx()];
 }
 
 /// Returns a dict containing this call frame's variables.
@@ -1472,7 +1472,7 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
 /// Returns a dict capturing the current call frame's variables.
 pub fn captureCurrentScope(interp: *Interp) !Handle {
     var det: objutil.ErrorDetails = undefined;
-    return try interp.wrapError(&det, interp.captureScope(&det, interp.currentCallFrameIndex()));
+    return try interp.wrapError(&det, interp.captureScope(&det, interp.callFrameIdx()));
 }
 
 fn nextCallEpoch(interp: *Interp) u32 {
@@ -1505,7 +1505,7 @@ pub fn currentEvalFrame(interp: *Interp) *EvalFrame {
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
-    const vars_handle = try objutil.newDictInner(Heap.local_heap, &.{});
+    const vars_handle = try objutil.newDictWithCapacity(Heap.local_heap, 0);
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
@@ -1531,9 +1531,9 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
     return @intCast(new_call_frame_idx);
 }
 
-fn pushEvalFrame(interp: *Interp, script: Handle) !u32 {
+fn pushEvalFrame(interp: *Interp, call_frame: u32, script: Handle) !u32 {
     try interp.eval_frames.append(Heap.global_gpa, .{
-        .call_frame = interp.currentCallFrameIndex(),
+        .call_frame = call_frame,
         .args = &.{},
         .current_line = 1,
         .currently_evaluating = script,
@@ -1555,7 +1555,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
             var det: objutil.ErrorDetails = undefined;
             const var_target: Handle = try interp.wrapError(
                 &det,
-                interp.getVariableInner(&det, interp.currentCallFrame().level, value),
+                interp.getVariableInner(&det, interp.callFrame().level, value),
             );
             return var_target.borrow();
         },
@@ -1563,8 +1563,8 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
             @panic("Expression sugar unimplemented");
         },
         .command_subst => {
-            const nested_cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try value.getHash();
-            try interp.evalObjectInner(value, nested_cache_key);
+            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHash();
+            try interp.evalObjectInner(interp.callFrameIdx(), value, nested_cache_key);
             return interp.result.borrow();
         },
         else => {
@@ -1782,7 +1782,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
             error.OutOfMemory => return error.OutOfMemory,
             error.Tailcall => {
                 tailcall_found = true;
-                const tailcall = interp.currentCallFrame().tailcall.?;
+                const tailcall = interp.callFrame().tailcall.?;
 
                 // Be sure to free the previous tailcall.
                 if (tailcall_info) |prev_tailcall| {
@@ -1792,7 +1792,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
 
                 tailcall_info = tailcall;
                 current_args = tailcall.args;
-                interp.currentCallFrame().tailcall = null;
+                interp.callFrame().tailcall = null;
             },
             else => return err,
         };
@@ -2139,8 +2139,8 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .integer => return .{ .int = node_data.integer },
         .float => return .{ .float = node_data.float },
         .command_subst => {
-            const nested_cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try node_data.object.getHash();
-            const result = interp.evalObjectInner(node_data.object, nested_cache_key);
+            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node_data.object.getHash();
+            const result = interp.evalObjectInner(interp.callFrameIdx(), node_data.object, nested_cache_key);
 
             if (result) {
                 return .{ .stack_handle = interp.result.borrow() };
@@ -2151,7 +2151,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .variable_subst => {
             // This should not change, since it should be a local heap object.
             var det: objutil.ErrorDetails = undefined;
-            const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, interp.currentCallFrameIndex(), node_data.object));
+            const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, interp.callFrameIdx(), node_data.object));
 
             return .{ .stack_handle = var_value.borrow() };
         },
@@ -2355,7 +2355,7 @@ pub fn evalExpression(interp: *Interp, handle: Handle, new_handle: *OptionalHand
     // hash, so identical expressions at different call sites get their
     // own cached variable lookups.
     var det: objutil.ErrorDetails = undefined;
-    const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try handle.getHash();
+    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try handle.getHash();
     const expr = try interp.wrapError(&det, objutil.getExpression(&det, handle, cache_key));
 
     return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
@@ -2458,7 +2458,7 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
 
 /// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
 fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?CommandOrClosure, self: OptionalHandle } {
-    const command = interp.getCommand(interp.currentCallFrameIndex(), &args[0], true) catch |err| switch (err) {
+    const command = interp.getCommand(interp.callFrameIdx(), &args[0], true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EvalError => return error.EvalError,
         error.CommandNotFound => {
@@ -2487,7 +2487,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
         // Next, we need to find `self`, the second-to-last part of the dict path. For example, calling
         // foo::bar would have foo as `self`, or foo::bar::baz would have foo::bar as `self`.
         const dict_name = method_dict_path.getHeap().getHandle(dict_sugar.dict_name_index);
-        const dict_resolved = interp.getVariableInner(null, interp.currentCallFrameIndex(), dict_name) catch |err| switch (err) {
+        const dict_resolved = interp.getVariableInner(null, interp.callFrameIdx(), dict_name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // This should always succeed, since when `interp.getCommand` was run earlier,
             // it ensured that the dict sugar resolved to something.
@@ -2508,7 +2508,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
         if (maybe_new_dict.toHandle()) |new_dict| {
             interp.setVariableInner(
                 null,
-                interp.currentCallFrameIndex(),
+                interp.callFrameIdx(),
                 dict_name,
                 new_dict.referenceTakeOwnership(),
             ) catch |err| switch (err) {
@@ -2585,7 +2585,7 @@ fn invokeCommandMaybeMethod(
     if (maybe_self.toHandle()) |_| {
         // Be sure to write back `self`.
 
-        const call_frame = interp.currentCallFrameIndex();
+        const call_frame = interp.callFrameIdx();
         const method_dict_path = args.*[0];
         // `self` is returned back through `args.*[1]`.
         const new_self = args.*[1];
@@ -2642,7 +2642,7 @@ fn invokeCommandMaybeMethod(
     }
 }
 
-pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
+pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
     const parsed = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key));
@@ -2654,7 +2654,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
 
     // TODO implement JIM_OPTIMIZATION speedups
 
-    _ = try interp.pushEvalFrame(script);
+    _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
     // Used for allocating the arguments passed into a command call.
@@ -2852,8 +2852,8 @@ pub const ReturnCodeEnum = objutil.TclEnum(Interp.ReturnCode, "return code", tru
 pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
-    const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try script.getHash();
-    return evalObjectInner(interp, script, cache_key);
+    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHash();
+    return evalObjectInner(interp, interp.callFrameIdx(), script, cache_key);
 }
 
 pub fn evalFile(interp: *Interp, filename: []const u8) EvalError!void {
@@ -2920,6 +2920,16 @@ pub fn init() !Interp {
         .is_method = false,
         .cache_id = Heap.nextCacheId(),
     });
+    errdefer new_interp.call_frames.deinit(Heap.global_gpa);
+    errdefer new_interp.call_frames.items[0].deinit();
+
+    _ = try new_interp.eval_frames.append(Heap.global_gpa, .{
+        .args = &.{},
+        .call_frame = 0,
+        .current_line = 0,
+        .currently_evaluating = Heap.local_heap.emptyHandle(),
+    });
+    errdefer new_interp.eval_frames.deinit(Heap.global_gpa);
 
     return new_interp;
 }
@@ -3033,7 +3043,7 @@ pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) !vo
     try Heap.ensureShimmerableOrDup(name.*, &new_name);
     name.swapIfNew(new_name);
     var det: objutil.ErrorDetails = undefined;
-    try interp.wrapError(&det, interp.setVariableInner(&det, interp.currentCallFrameIndex(), name.*, obj));
+    try interp.wrapError(&det, interp.setVariableInner(&det, interp.callFrameIdx(), name.*, obj));
 }
 
 pub fn setVariableSilent(interp: *Interp, name: *Handle, handle: Handle) !void {
@@ -3042,7 +3052,7 @@ pub fn setVariableSilent(interp: *Interp, name: *Handle, handle: Handle) !void {
     name.swapIfNew(new_name);
 
     const handle_to_obj = handle.dupOrRef();
-    try interp.setVariableInner(null, interp.currentCallFrameIndex(), name.*, handle_to_obj);
+    try interp.setVariableInner(null, interp.callFrameIdx(), name.*, handle_to_obj);
 }
 
 pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) !void {
@@ -3054,7 +3064,7 @@ pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) !void {
     var det: objutil.ErrorDetails = undefined;
     try interp.wrapError(&det, interp.setVariableInner(
         &det,
-        interp.currentCallFrameIndex(),
+        interp.callFrameIdx(),
         name.*,
         handle_to_obj,
     ));
@@ -3065,14 +3075,14 @@ pub fn getVariable(interp: *Interp, provided_name: *Handle) !OptionalHandle {
     try Heap.ensureShimmerableOrDup(provided_name.*, &new_name);
     provided_name.swapIfNew(new_name);
 
-    const value = interp.getVariableInner(null, interp.currentCallFrameIndex(), provided_name.*) catch |err| switch (err) {
+    const value = interp.getVariableInner(null, interp.callFrameIdx(), provided_name.*) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => return .none,
         error.BadDict => {
             // We normally don't capture the error message, but in this case we want the error,
             // so we'll just rerun it, this time with `det`.
             var det: objutil.ErrorDetails = undefined;
-            _ = interp.getVariableInner(&det, interp.currentCallFrameIndex(), provided_name.*) catch |inner_err| switch (inner_err) {
+            _ = interp.getVariableInner(&det, interp.callFrameIdx(), provided_name.*) catch |inner_err| switch (inner_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadDict => {},
                 else => unreachable,
@@ -3087,19 +3097,19 @@ pub fn getVariable(interp: *Interp, provided_name: *Handle) !OptionalHandle {
 pub fn getVariableOrError(interp: *Interp, name: *Handle) !Handle {
     try interp.ensureShimmerable(name);
     var det: objutil.ErrorDetails = undefined;
-    const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, interp.currentCallFrameIndex(), name.*));
+    const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, interp.callFrameIdx(), name.*));
     return var_value;
 }
 
 pub fn unsetVariable(interp: *Interp, name: *Handle) !void {
     try interp.ensureShimmerable(name);
     var det: objutil.ErrorDetails = undefined;
-    try interp.wrapError(&det, interp.unsetVariableInner(&det, interp.currentCallFrameIndex(), name.*));
+    try interp.wrapError(&det, interp.unsetVariableInner(&det, interp.callFrameIdx(), name.*));
 }
 
 pub fn unsetVariableSilent(interp: *Interp, name: *Handle) !void {
     try interp.ensureShimmerable(name);
-    try interp.unsetVariableInner(null, interp.currentCallFrameIndex(), name.*);
+    try interp.unsetVariableInner(null, interp.callFrameIdx(), name.*);
 }
 
 pub fn getDictValue(interp: *Interp, dict: Handle, key: Handle) Interp.Error!struct {

@@ -830,7 +830,7 @@ pub fn applymethodCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
-    if (interp.currentCallFrameIndex() == 0) {
+    if (interp.callFrameIdx() == 0) {
         interp.setResultString("tailcall can only be called from a proc or lambda");
         return error.EvalError;
     } else if (args.len >= 2) {
@@ -838,7 +838,7 @@ pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
         // it doesn't mysteriously show up at a untracable spot up the call stack.
         var det: objutil.ErrorDetails = undefined;
         var new_handle: OptionalHandle = .none;
-        _ = interp.getCommand(&det, interp.currentCallFrameIndex() - 1, args[1], &new_handle) catch |err| switch (err) {
+        _ = interp.getCommand(&det, interp.callFrameIdx() - 1, args[1], &new_handle) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 interp.setResultOwning(det.message);
@@ -850,8 +850,8 @@ pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
         var tailcall_args = std.ArrayList(Handle).empty;
         // `args[1..]` includes the name of the command to run.
         try tailcall_args.appendSlice(Heap.global_gpa, args[1..]);
-        assert(interp.currentCallFrame().tailcall == null);
-        interp.currentCallFrame().tailcall = .{
+        assert(interp.callFrame().tailcall == null);
+        interp.callFrame().tailcall = .{
             .args = tailcall_args.items,
         };
         return error.Tailcall;
