@@ -3228,7 +3228,7 @@ test "recursive dict keys" {
 
     // See if setting still works correctly.
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar, key_baz }, value_qux);
-    try testing.expectEqual(1, to_take.debugRefCount());
+    try testing.expectEqual(1, to_take.refCount());
 
     // Let's try some very cursed aliasing.
     _ = try interp.putDictValueRecursively(&dict, &.{ key_foo, key_bar }, objutil.dictItem(dict, 0));

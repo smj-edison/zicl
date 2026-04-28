@@ -867,32 +867,19 @@ pub const Handle = packed struct(HandleBacking) {
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
     }
 
-    /// Note: this has a very specific definition (is `ref_count` > 1 or is `cross_thread`).
-    /// You should probably be using `canMutate` or `canShimmer`, as they have slightly
-    /// different but important semantics.
-    pub fn isShared(handle: Handle) bool {
-        const obj_heap = handle.getHeap();
-        const metadata = obj_heap.getLocalMetadata(handle.index);
-
-        if (metadata.cross_thread) return true;
-        return obj_heap.getLocalRefCount(handle.index) > 1;
-    }
-
     pub fn canMutate(handle: Handle) bool {
         // Note: a crossthread object can _never_ mutate. A lot of asserts around
         // the codebase assume that `canMutate` means that an object is not crossthread.
 
         // Special objects can never be mutated.
-        if (handle.index < special_object_count) return false;
+        if (handle.index < special_object_count + interned_string_count) return false;
 
         const obj_heap = handle.getHeap();
         const metadata = obj_heap.getLocalMetadata(handle.index);
 
-        const mutable = metadata.mutable;
         const cross_thread = metadata.cross_thread;
         const multiple_refs = obj_heap.getLocalRefCount(handle.index) > 1;
 
-        if (!mutable) return false;
         if (cross_thread) return false;
         if (multiple_refs) return false;
         if (metadata.order > 1) {
@@ -937,9 +924,16 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.getHeap().getLocalMetadata(handle.index);
     }
 
-    /// This should not be used for checking if an object is shared, use `isShared` instead.
-    pub fn debugRefCount(handle: Handle) u32 {
+    /// This should not be used for checking if an object can shimmer, use `canShimmer` instead.
+    pub fn refCount(handle: Handle) u32 {
         return getLocalRefCount(handle.getHeap(), handle.index);
+    }
+
+    /// This is only for internal checks, you probably want `canMutate` instead for the full set
+    /// of asserts.
+    pub fn isShared(handle: Handle) bool {
+        if (handle.index < special_object_count + interned_string_count) return false;
+        return handle.getMetadata().cross_thread or handle.refCount() > 1;
     }
 
     pub fn borrow(handle: Handle) Handle {
@@ -950,13 +944,13 @@ pub const Handle = packed struct(HandleBacking) {
     pub fn incrRefCount(handle: Handle) void {
         if (handle.index < special_object_count + interned_string_count) return;
         // Make sure we never try to borrow a freed object.
-        handle.assert(handle.debugRefCount() > 0);
+        handle.assert(handle.refCount() > 0);
         handle.assert(handle.tag() != .reference);
 
         const metadata = handle.getMetadata();
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
 
-        handle.trace("Incr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() });
+        handle.trace("Incr ref count of index {} (now {})", .{ handle.index, handle.refCount() });
     }
 
     pub fn referenceTakeOwnership(handle: Handle) Object {
@@ -1017,13 +1011,13 @@ pub const Handle = packed struct(HandleBacking) {
         // We should never go below one for an item owned by another object.
         if (!handle.isAllocHead()) {
             if (handle.getMetadata().in_use) {
-                handle.assert(handle.debugRefCount() > 1);
+                handle.assert(handle.refCount() > 1);
             } else {
                 // If it's not in use, we want to fall through to the UAF panic.
             }
         }
 
-        handle.trace("Decr ref count of index {} (now {})", .{ handle.index, @as(i64, handle.debugRefCount()) - 1 });
+        handle.trace("Decr ref count of index {} (now {})", .{ handle.index, @as(i64, handle.refCount()) - 1 });
 
         if (options.trace_mem) last_touched = handle;
         if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
@@ -1445,12 +1439,9 @@ const ObjectAndMetadata = struct {
         order: u5,
         /// Whether this object is shared across threads.
         cross_thread: bool,
-        /// Used to indicate that an object cannot be modified, even when not shared
-        /// (currently used to prevent dictionary keys from being modified, as that
-        /// would mess up the index).
-        mutable: bool,
         /// Whether this object is currently being used (used to track double frees).
         in_use: bool,
+        _padding: u1 = 0,
     };
 
     object: Object,
@@ -1811,7 +1802,6 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
             .order = 31,
             .cross_thread = false,
             .in_use = false,
-            .mutable = false,
         });
     }
 
@@ -1847,7 +1837,6 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     self.objects.items(.metadata)[index] = .{
         .order = order,
         .cross_thread = false,
-        .mutable = true,
         .in_use = true,
     };
 
@@ -1856,7 +1845,6 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         .{
             .order = order,
             .cross_thread = false,
-            .mutable = true,
             .in_use = true,
         },
     );
@@ -1883,7 +1871,6 @@ fn freeObjectBackingInner(handle: Handle) void {
     @memset(obj_heap.objects.items(.metadata)[handle.index..][0..alloc_size], .{
         .order = 31,
         .cross_thread = false,
-        .mutable = false,
         .in_use = false,
     });
 
@@ -2870,7 +2857,7 @@ test "object duplication" {
 
     // Try borrowing.
     new_obj.incrRefCount();
-    try expectEqual(2, new_obj.debugRefCount());
+    try expectEqual(2, new_obj.refCount());
 
     new_obj.decrRefCount();
     try expectEqual(1, heap.objects.get(new_obj.index).ref_count);
@@ -2990,7 +2977,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
                     handle.tag(),
                     i,
                     handle.getMetadata().order,
-                    handle.debugRefCount(),
+                    handle.refCount(),
                     val,
                 });
             } else |_| {
@@ -2998,7 +2985,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
                     handle.tag(),
                     i,
                     handle.getMetadata().order,
-                    handle.debugRefCount(),
+                    handle.refCount(),
                 });
             }
         }
@@ -3014,14 +3001,14 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
                     std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
                         handle.tag(),
                         i,
-                        handle.debugRefCount(),
+                        handle.refCount(),
                         val,
                     });
                 } else |_| {
                     std.debug.print("Trace for {}, index {}, ref count {}, <oom>\n", .{
                         handle.tag(),
                         i,
-                        handle.debugRefCount(),
+                        handle.refCount(),
                     });
                 }
 
@@ -3070,7 +3057,7 @@ fn renderDotNodeLabel(handle: Handle, index: u32, max_str_len: u32) !void {
 
     std.debug.print("idx: {} | ", .{index});
     std.debug.print("{s} | ", .{@tagName(handle.tag())});
-    std.debug.print("rc: {} | ", .{handle.debugRefCount()});
+    std.debug.print("rc: {} | ", .{handle.refCount()});
     std.debug.print("\\\"", .{});
     try escapeDotString(truncated_str);
     if (str.len > max_str_len) std.debug.print("...", .{});
@@ -3096,7 +3083,7 @@ fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
 
     // Subgraph header.
     std.debug.print("  subgraph cluster_{} {{\n", .{index});
-    std.debug.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.debugRefCount(), used_len, allocated_len });
+    std.debug.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.refCount(), used_len, allocated_len });
     try escapeDotString(truncated_str);
     if (str.len > max_str_len) std.debug.print("...", .{});
     std.debug.print("\";\n", .{});
@@ -3107,7 +3094,7 @@ fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
     // Collection head node.
     std.debug.print("    obj{} [label=\"{{", .{index});
     std.debug.print("HEAD | idx: {} | ", .{index});
-    std.debug.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.debugRefCount(), getTagColor(handle.tag()) });
+    std.debug.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.refCount(), getTagColor(handle.tag()) });
 
     // Collection items (all allocated slots, including unused ones).
     for (0..allocated_len) |offset| {

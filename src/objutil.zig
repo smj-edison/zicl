@@ -1090,11 +1090,12 @@ pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *
         try Heap.ensureMutableOrDup(provided_handle, new_handle);
         const handle = new_handle.orElse(provided_handle);
 
-        // Make sure to mark all the keys as mutable before switching to a list.
         var pair_index: u32 = 0;
         while (pair_index < len) : (pair_index += 2) {
-            const key = collectionItem(handle, pair_index, len);
-            key.getMetadata().mutable = true;
+            const key = collectionItemFollowRefs(handle, pair_index, len);
+            // Make sure the key never mutates by pinning it. This ensures that the hash map
+            // never gets out of sync with the keys' value.
+            key.incrRefCount();
         }
 
         // Because both lists and dicts store their values directly after,
@@ -1188,7 +1189,7 @@ pub fn followIfRef(handle: Handle) Handle {
     return handle;
 }
 
-fn collectionItem(handle: Handle, index: u32, len: u32) Handle {
+fn collectionItemNoFollow(handle: Handle, index: u32, len: u32) Handle {
     handle.assert(handle.tag() == .list or handle.tag() == .dict);
     handle.assert(index < len);
 
@@ -1242,20 +1243,18 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             // split this collection and create a new one.
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItemNoFollow(provided_handle, @intCast(current_len - freed_count + to_free));
-                if (to_free_handle.isShared()) break :new_collection_needed;
+                const to_free_handle = collectionItemFollowRefs(provided_handle, @intCast(current_len - freed_count + to_free), current_len);
+                if (!to_free_handle.canShimmer()) break :new_collection_needed;
             }
 
             // Be sure to free the abandoned items when we shrink.
             for (0..freed_count) |to_free| {
-                const to_free_handle = collectionItem(provided_handle, @intCast(current_len - freed_count + to_free), current_len);
+                const to_free_handle = collectionItemFollowRefs(provided_handle, @intCast(current_len - freed_count + to_free), current_len);
                 // If a dict, be sure to remove the keys from the table.
                 if (provided_handle.tag() == .dict and @mod(to_free, 2) == 0) {
                     if (provided_handle.getDictExtraData().table) |*table| {
                         _ = table.remove(to_free_handle);
                     }
-                    // Also mark keys as mutable again.
-                    to_free_handle.getMetadata().mutable = true;
                 }
 
                 to_free_handle.invalidateBoth();
@@ -1309,7 +1308,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
         // If the collection isn't shared, we can move the objects over to the new
         // collection without any duplication.
         for (new_items[0..current_len], 0..) |*new_item, i| {
-            const old_item = collectionItem(provided_handle, @intCast(i), current_len);
+            const old_item = collectionItemNoFollow(provided_handle, @intCast(i), current_len);
             // However, if an item within the list was shared, we can't move it, we instead have to reference
             // it. (Why not use `item_handle.reference()`? Because that would create one too many references
             // as the list already has one ref count for owning the item.)
@@ -1337,15 +1336,11 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             provided_handle.getHeap().splitAlloc(provided_handle.index, 0);
 
             for (0..current_len) |i| {
-                const item_handle: Handle = collectionItem(provided_handle, @intCast(i), current_len);
+                const item_handle: Handle = collectionItemNoFollow(provided_handle, @intCast(i), current_len);
 
                 // Only free the backing of non-shared objects, so we don't release the backing of a shared item.
                 // Why only a backing free? Because the non-shared objectes were moved to the new collection.
-                if (item_handle.isShared()) {
-                    // If this was a dict, and a key was marked as not mutable, we need to be sure to undo that.
-                    // This is fine to do on list items, since they're already mutable.
-                    item_handle.getMetadata().mutable = true;
-                } else {
+                if (!item_handle.isShared()) {
                     Heap.freeObjectBacking(item_handle);
                 }
             }
@@ -1391,7 +1386,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
 pub fn listItemNoFollow(handle: Handle, index: u32) Handle {
     assert(handle.tag() == .list);
 
-    return collectionItem(handle, index, handle.peek().body.list.len);
+    return collectionItemNoFollow(handle, index, handle.peek().body.list.len);
 }
 
 /// Assumes provided handle is a list.
@@ -1543,7 +1538,7 @@ pub fn dictGetTable(dict: Handle) !*DictTable {
     const dict_len = dict.peek().body.dict.len;
     var pair: u32 = 0;
     while (pair < dict_len) : (pair += 2) {
-        const key = collectionItem(dict, pair, dict_len);
+        const key = collectionItemNoFollow(dict, pair, dict_len);
         try new_table.put(Heap.global_gpa, key, pair + 1);
     }
 
@@ -1593,16 +1588,6 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     const metadata = handle_heap.getExtraData(metadata_index);
     metadata.* = .{ .dict = .{ .table = null, .parent_link = .none } };
 
-    // Make sure to mark all the keys as immutable, so they never change.
-    // If they could change, they'd make the table invalid, and there's
-    // no good way to check if a sub-object has changed and update the
-    // table without adding checks everywhere.
-    var pair: u32 = 0;
-    while (pair < len) : (pair += 2) {
-        const key = collectionItem(shimmerable, pair, len);
-        key.getMetadata().mutable = false;
-    }
-
     // Because both lists and dicts store their values directly after,
     // we can just swap out the head to convert to a dict.
     shimmerable.peek().head.tag = .dict;
@@ -1620,7 +1605,7 @@ pub fn dictItems(handle: Handle) []Heap.Object {
 
 pub fn dictItem(dict: Handle, index: u32) Handle {
     dict.assert(dict.tag() == .dict);
-    return collectionItem(dict, index, dict.peek().body.dict.len);
+    return collectionItemNoFollow(dict, index, dict.peek().body.dict.len);
 }
 
 pub fn dictItemFollowRefs(dict: Handle, index: u32) Handle {
@@ -1834,9 +1819,6 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
         if (key_handle.tag() == .marked) {
             removed += 1;
 
-            // Mark as mutable before invalidating (keys are marked immutable in shimmerToDict).
-            key_handle.getMetadata().mutable = true;
-
             // We have to invalidate the string here, and not earlier, because
             // the hash map `.get()` uses the string rep of the keys.
             key_handle.invalidateString();
@@ -1861,7 +1843,7 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
 
     // "zero" out the removed items.
     for ((original_len - removed * 2)..original_len) |to_zero| {
-        const item_handle = collectionItem(dict, @intCast(to_zero), original_len);
+        const item_handle = collectionItemNoFollow(dict, @intCast(to_zero), original_len);
         item_handle.peek().* = .{
             .head = .{
                 .str = Heap.Object.null_string,
@@ -1870,8 +1852,6 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
             .body = undefined,
         };
         item_handle.trace("Zero out removed", .{});
-        // Make sure to mark removed keys as mutable again.
-        item_handle.getMetadata().mutable = true;
     }
 
     dict.peek().body.dict.len -= removed * 2;
@@ -1981,7 +1961,6 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
 
                     // Set the new key and value.
                     new_key_handle.peek().* = key_obj;
-                    new_key_handle.getMetadata().mutable = false;
                     new_value_handle.peek().* = value;
 
                     break :blk .{ new_key_handle, new_value_handle };
@@ -2050,7 +2029,6 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                 const len = dict.peek().body.dict.len;
                 assert(state.new_key_index == len - 2);
 
-                dictItem(dict, len - 2).getMetadata().mutable = true;
                 dictItem(dict, len - 2).invalidateBoth();
                 dictItem(dict, len - 1).invalidateBoth();
                 dict.peek().body.dict.len -= 2;
@@ -2341,7 +2319,6 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
         // We checked that all our keys have strings earlier.
         const key_checking = dictItem(dict, item_index).getString() catch unreachable;
         if (std.mem.eql(u8, key_bytes, key_checking)) {
-            key_handle.getMetadata().mutable = true; // Make mutable before invalidating.
             key_handle.invalidateBoth();
             value_handle.invalidateBoth();
             pairs_removed += 1;
@@ -2359,8 +2336,6 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     for (start_of_removed..dict_len) |removed| {
         const item_handle = dictItem(dict, @intCast(removed));
         item_handle.peek().* = .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined };
-        // Mark abandoned keys as mutable again.
-        item_handle.getMetadata().mutable = true;
     }
 
     dict.peek().body.dict.len -= pairs_removed * 2;
