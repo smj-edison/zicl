@@ -1137,30 +1137,42 @@ const ClosureAndCacheKey = struct {
 };
 /// Caller is responsible for borrowing the returned closure
 /// if they intend to use it beyond temporarily.
-pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
-    if (handle.tag() == .closure) {
-        const closure = handle.getClosureExtraData().*;
-        return .{ .closure = closure, .cache_key = @as(u256, closure.cache_id) };
-    }
+pub fn getClosure(interp: *Interp, det: ?*objutil.ErrorDetails, handle: Handle, can_be_method: bool) !ClosureAndCacheKey {
+    _ = interp;
 
-    const cache_key = try handle.getHash();
-
-    if (Heap.local_heap.parsed_closures.get(cache_key)) |cached| {
-        return .{ .closure = cached.closure, .cache_key = cache_key };
-    } else {
-        // We need to parse the closure.
-        var det: objutil.ErrorDetails = undefined;
-        const closure: Heap.Closure = try interp.wrapError(&det, parseClosure(&det, try handle.getString()));
-        if (Heap.local_heap.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
-            var old = old_value;
-            old.closure.deinit();
+    const closure_and_key: ClosureAndCacheKey = blk: {
+        if (handle.tag() == .closure) {
+            const closure = handle.getClosureExtraData().*;
+            break :blk .{ .closure = closure, .cache_key = @as(u256, closure.cache_id) };
         }
-        const cached = Heap.local_heap.parsed_closures.get(cache_key).?;
-        return .{ .closure = cached.closure, .cache_key = cache_key };
+
+        const cache_key = try handle.getHash();
+
+        if (Heap.local_heap.parsed_closures.get(cache_key)) |cached| {
+            break :blk .{ .closure = cached.closure, .cache_key = cache_key };
+        } else {
+            // We need to parse the closure.
+            const closure: Heap.Closure = try parseClosure(det, try handle.getString());
+            if (Heap.local_heap.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
+                var old = old_value;
+                old.closure.deinit();
+            }
+            const cached = Heap.local_heap.parsed_closures.get(cache_key).?;
+            break :blk .{ .closure = cached.closure, .cache_key = cache_key };
+        }
+    };
+
+    if (!can_be_method and closure_and_key.closure.is_method) {
+        if (det) |details| details.* = .{
+            .message = try objutil.newString("method cannot be invoked as function"),
+        };
+        return error.CannotBeMethod;
     }
+
+    return closure_and_key;
 }
 
-pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle, called_as_method: bool) !void {
+pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -1254,17 +1266,16 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
 
     try interp.evalObjectInner(closure.body, cache_key);
 
-    // When called as a method, override the result with the current value of the self
-    // variable (the first parameter), so the caller can write it back to the outer scope.
-    // The call frame is still live here -- the defer { frame.deinit() } hasn't run yet.
-    if (called_as_method) {
+    // When called as a method, we write back `self` to `args[1]`, so that the
+    // caller can update the new method.
+    if (closure.is_method) {
         const self_var_name = objutil.listItem(closure.args, 0);
         if (interp.getVariableInner(null, call_frame_idx, self_var_name)) |updated_self| {
-            interp.setResult(updated_self);
+            args[1].swap(updated_self.borrow());
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.VariableNotFound => {
-                try interp.setResultString("\"self\" was unset in method body");
+                try interp.setResultFormatted("\"{f}\" was unset in method body", .{self_var_name});
                 return error.EvalError;
             },
             error.BadDict => unreachable,
@@ -1650,13 +1661,14 @@ fn getCommandInner(
     det: ?*objutil.ErrorDetails,
     call_frame: u32,
     name: Handle,
+    can_be_method: bool,
 ) !CommandOrClosure {
     if (interp.getVariableInner(null, call_frame, name)) |var_val| {
         if (var_val.tag() == .closure) {
-            return .{ .closure = try interp.getClosure(var_val) };
+            return .{ .closure = try interp.getClosure(det, var_val, can_be_method) };
         }
 
-        // TODO PERF figure out whether caching nativefn lookup would be beneficial.
+        // TODO PERF probably should cache nativefn lookup.
         const bytes = try var_val.getString();
         if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
             // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
@@ -1668,7 +1680,7 @@ fn getCommandInner(
             };
             return .{ .command = command };
         } else {
-            const closure = try interp.getClosure(var_val);
+            const closure = try interp.getClosure(det, var_val, can_be_method);
             return .{ .closure = closure };
         }
     } else |err| switch (err) {
@@ -1686,10 +1698,11 @@ pub fn getCommand(
     interp: *Interp,
     call_frame_idx: u32,
     handle: *Handle,
+    can_be_method: bool,
 ) !CommandOrClosure {
     try interp.ensureShimmerable(handle);
     var det: objutil.ErrorDetails = undefined;
-    return interp.getCommandInner(&det, call_frame_idx, handle.*) catch |err| switch (err) {
+    return interp.getCommandInner(&det, call_frame_idx, handle.*, can_be_method) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             interp.setResultOwning(det.message);
@@ -1703,7 +1716,7 @@ pub fn getCommand(
 }
 
 fn invokeUnknown(interp: *Interp, args: []Handle) !void {
-    const unknown_cmd = interp.getCommand(0, &interp.unknown_str) catch |err| switch (err) {
+    const unknown_cmd = interp.getCommand(0, &interp.unknown_str, false) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // No [unknown] command exists, so we'll default to the "no command found" error.
@@ -1728,11 +1741,11 @@ fn invokeUnknown(interp: *Interp, args: []Handle) !void {
     try new_args.append(Heap.global_gpa, interp.unknown_str);
     try new_args.appendSlice(Heap.global_gpa, args[1..]);
 
-    try interp.invokeCommand(unknown_cmd, new_args.items, false);
+    try interp.invokeCommand(unknown_cmd, new_args.items);
 }
 
 const CommandError = Error || error{InfiniteRecursion};
-fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Handle, called_as_method: bool) CommandError!void {
+fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Handle) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.InfiniteRecursion;
@@ -1758,7 +1771,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
                     break :blk interp.callNative(command, current_args);
                 },
                 .closure => |closure| {
-                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args, called_as_method);
+                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args);
                 },
             }
         };
@@ -2445,7 +2458,7 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
 
 /// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
 fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?CommandOrClosure, self: OptionalHandle } {
-    const command = interp.getCommand(interp.currentCallFrameIndex(), &args[0]) catch |err| switch (err) {
+    const command = interp.getCommand(interp.currentCallFrameIndex(), &args[0], true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EvalError => return error.EvalError,
         error.CommandNotFound => {
@@ -2466,8 +2479,8 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
         // check if it's .dict_sugar.
         const method_dict_path = args[0];
         if (method_dict_path.tag() != .dict_sugar) {
-            // Wasn't called with a dict path, so we treat it as a normal function call.
-            return .{ .command = command, .self = .none };
+            try interp.setResultFormatted("method \"{f}\" cannot be invoked as function", .{method_dict_path});
+            return error.EvalError;
         }
         const dict_sugar = method_dict_path.peek().body.dict_sugar;
 
@@ -2527,17 +2540,16 @@ fn invokeCommandMaybeMethod(
     interp: *Interp,
     args_raw: []Handle,
     args: *[]Handle,
-    arg_snapshot: *std.ArrayList(Handle),
+    args_snapshot_raw: []Handle,
+    args_snapshot: *[]Handle,
 ) CommandError!void {
-    const cmd_and_self = interp.getCommandAndSelfParam(args.*) catch |err| {
-        arg_snapshot.*.appendSliceAssumeCapacity(args.*);
-        interp.currentEvalFrame().args = arg_snapshot.items;
-        return err;
-    };
+    // Set this before so [unknown] works.
+    @memcpy(args_snapshot.*, args.*);
+    interp.currentEvalFrame().args = args_snapshot.*;
+
+    const cmd_and_self = try interp.getCommandAndSelfParam(args.*);
     const command = if (cmd_and_self.command) |val| val else {
         // [unknown] was invoked, so there is no command to be had.
-        arg_snapshot.*.appendSliceAssumeCapacity(args.*);
-        interp.currentEvalFrame().args = arg_snapshot.items;
         return;
     };
     const maybe_self = cmd_and_self.self;
@@ -2549,13 +2561,14 @@ fn invokeCommandMaybeMethod(
         // Set `self` to the empty handle, so if we fail to find `self`
         // the defer cleanup for args won't freak out.
         args_raw[1] = self;
-        args.* = args_raw; // Include all the allocated args now.
-    }
+        args.* = args_raw[0..]; // Include all the allocated args now.
 
-    // Be sure to set the args before invoking the command, since something
-    // like [info callframe] could view the callframe right away.
-    arg_snapshot.*.appendSliceAssumeCapacity(args.*);
-    interp.currentEvalFrame().args = arg_snapshot.items;
+        // Same modifications needed for `args_snapshot`, as it is laid out identically.
+        args_snapshot_raw[0] = args_raw[0];
+        args_snapshot_raw[1] = args_raw[1];
+        args_snapshot.* = args_snapshot_raw[0..];
+        interp.currentEvalFrame().args = args_snapshot.*;
+    }
 
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
     var log = std.ArrayList(u8).empty;
@@ -2567,14 +2580,15 @@ fn invokeCommandMaybeMethod(
     log.print(Heap.global_gpa, "\n", .{}) catch {};
     std.log.debug("{s}", .{log.items});
 
-    try interp.invokeCommand(command, args.*, maybe_self.toHandle() != null);
+    try interp.invokeCommand(command, args.*);
 
     if (maybe_self.toHandle()) |_| {
         // Be sure to write back `self`.
 
         const call_frame = interp.currentCallFrameIndex();
         const method_dict_path = args.*[0];
-        const new_self = interp.result;
+        // `self` is returned back through `args.*[1]`.
+        const new_self = args.*[1];
 
         // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
         var det: objutil.ErrorDetails = undefined;
@@ -2718,7 +2732,8 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
 
                     if (len > 1) {
                         // Expanded into multiple tokens, so we'll need to resize args.
-                        args = try args_alloc.realloc(args, args.len - 1 + len);
+                        args_raw = try args_alloc.realloc(args_raw, args_raw.len + (len - 1));
+                        args = args_raw[1..];
                     }
 
                     for (0..len) |list_idx| {
@@ -2735,9 +2750,11 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         }
         defer for (args) |arg| arg.decrRefCount();
 
-        var arg_snapshot: std.ArrayList(Handle) = try .initCapacity(args_alloc, args_raw.len);
-        defer arg_snapshot.deinit(args_alloc);
-        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args, &arg_snapshot);
+        var args_snapshot_raw = try args_alloc.alloc(Handle, args_raw.len);
+        defer args_alloc.free(args_snapshot_raw);
+        var args_snapshot = args_snapshot_raw[1..];
+
+        const command_result = interp.invokeCommandMaybeMethod(args_raw, &args, args_snapshot_raw, &args_snapshot);
 
         // TODO actually check for signals.
         if (false) {
@@ -3324,7 +3341,8 @@ pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []c
     if (result) |success| {
         try testing.expectEqualStrings(expected, try success.getString());
     } else |err| {
-        std.debug.print("Test failed with zig error {} and error message \"{f}\"", .{ err, interp.result });
+        std.debug.print("Test failed with zig error {}", .{err});
+        std.debug.print(" and error message \"{f}\"\n", .{interp.result});
         return err;
     }
 }

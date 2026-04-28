@@ -106,18 +106,24 @@ test "method as fn" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    try interp.testExpectScriptResult("hello dave",
-        \\ method greet {self prepend} { return "$prepend $self::name" }
-        \\ greet {name dave} hello
+    try interp.testExpectScriptError(error.EvalError,
+        \\method "greet" cannot be invoked as function
+    ,
+        \\ method greet {self} { puts "hello" }
+        \\ greet
     );
 }
 
-test "method anonymous via apply" {
+test "method anonymous via applymethod" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    try interp.testExpectScriptResult("8",
-        \\ apply [method {self x} { + $self::current $x }] {current 5} 3
+    try interp.testExpectScriptResult("{counter 8} 8",
+        \\ set method [method {self x} {
+        \\   incr self::counter $x
+        \\   return $self::counter
+        \\ }]
+        \\ applymethod $method {counter 5} 3
     );
 }
 
@@ -146,14 +152,13 @@ test "method updates self" {
     );
 }
 
-test "method string form is parseable by apply" {
+test "method parseable by applymethod" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    // Same as the fn string form test, but for methods. Verifies that
-    // parseClosure recognises the "method " prefix and sets is_method correctly.
-    try interp.testExpectScriptResult("6",
-        \\ apply {method impl {{self x} {+ $x 1}} scope {+ {nativefn +}}} {} 5
+    try interp.testExpectScriptResult("{x 5} 10",
+        \\ set method {method impl {{self y} {+ $self::x $y}} scope {+ {nativefn +}}}
+        \\ applymethod $method {x 5} 5
     );
 }
 
@@ -161,89 +166,41 @@ test "method lexical scope capture" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
+    try interp.testExpectScriptResult("55",
+        \\ set multiplier 5
+        \\ set scoreboard {base 5}
+        \\ method scoreboard::score {self scored} { + $self::base [* $scored $multiplier] }
+        \\ scoreboard::score 10
+    );
+}
+
+test "method in nested object" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
     try interp.testExpectScriptResult("15",
-        \\ set bonus 5
-        \\ method score {self base} { + $base $bonus }
-        \\ apply $score {} 10
+        \\ set inner {a 5}
+        \\ set outer [dict create inner $inner b 10]
+        \\ method outer::inner::frobnicate {self x} {
+        \\   return [+ $self::a $x]
+        \\ }
+        \\ outer::inner::frobnicate 10
     );
 }
 
-// --- dict sugar + method ---
-//
-// These tests cover methods stored as dict values and dispatched via the
-// $dict::key substitution. The `obj::method` command form (which also writes
-// the result back to `obj`) is not yet implemented; those cases are marked
-// with TODO comments below.
+test "method object copying" {
+    // This test makes sure that duplicated objects remain immutable.
 
-test "method stored in dict, called via apply" {
     var interp = try testStart(ta);
     defer testFinish(&interp);
 
-    try interp.testExpectScriptResult("woof",
-        \\ set Dog::bark [method {self} { return woof }]
-        \\ set doggo $Dog
-        \\ apply $doggo::bark $doggo
-    );
-}
-
-test "method retrieved via dict sugar reads self" {
-    var interp = try testStart(ta);
-    defer testFinish(&interp);
-
-    try interp.testExpectScriptResult("fido",
-        \\ set Dog::getName [method {self} { dict get $self name }]
-        \\ set doggo [dict merge $Dog {name fido}]
-        \\ apply $doggo::getName $doggo
-    );
-}
-
-test "method returns updated self via apply" {
-    var interp = try testStart(ta);
-    defer testFinish(&interp);
-
-    _ = try interp.testRunScript(
-        \\ set Dog::rename [method {self newName} {
-        \\   dict set self name $newName
-        \\ }]
-    );
-    std.debug.print("Variables: {f}\n", .{interp.currentCallFrame().variables});
-
-    // The method receives the dict, updates it, and returns the new state.
-    // The caller rebinds -- this is the manual form of what `doggo::rename rex`
-    // will do automatically once method dispatch is implemented.
-    try interp.testExpectScriptResult("rex",
-        \\ set Dog::rename [method {self newName} {
-        \\   dict set self name $newName
-        \\ }]
-        \\ set doggo [dict merge $Dog {name fido}]
-        \\ set doggo [apply $doggo::rename $doggo rex]
-        \\ dict get $doggo name
-    );
-}
-
-test "independent copies are unaffected by method dispatch" {
-    var interp = try testStart(ta);
-    defer testFinish(&interp);
-
-    // Value semantics: updating doggo via apply does not affect doggoClone,
-    // which was assigned before the call.
     try interp.testExpectScriptResult("fido",
         \\ set Dog::rename [method {self newName} {
         \\   dict set self name $newName
         \\ }]
         \\ set doggo [dict merge $Dog {name fido}]
         \\ set doggoClone $doggo
-        \\ set doggo [apply $doggo::rename $doggo rex]
+        \\ doggo::rename rex
         \\ dict get $doggoClone name
     );
 }
-
-// TODO: once `obj::method` command dispatch is implemented, the above tests
-// should also work as:
-//
-//   doggo::rename rex
-//   dict get $doggo name  ;# rex
-//
-//   set doggoClone $doggo
-//   doggo::rename rex
-//   dict get $doggoClone name  ;# fido -- clone unaffected

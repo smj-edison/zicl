@@ -12,7 +12,7 @@ const ioutil = @import("ioutil.zig");
 fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
-        var result: i64 = 0;
+        var result: i64 = if (operator == .add) 0 else 1;
 
         for (1..args.len) |i| {
             const operand = blk: {
@@ -313,6 +313,13 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
 
     switch (subcommand) {
+        .create => {
+            const pairs = args[2..];
+            if (@mod(pairs.len, 2) != 0) {
+                return error.WrongUsage;
+            }
+            interp.setResultOwning(try objutil.newDict(args[2..]));
+        },
         .get => {
             const dict = &args[2];
             interp.setResult(try interp.getDictValueRecursivelyOrError(dict, args[3..]));
@@ -789,15 +796,37 @@ pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
 /// Unlike Tcl's [apply], the lambda must be a Zicl closure object or its
 /// serialized string form, a raw {argList body} list is not supported.
 pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const closure_and_key = try interp.getClosure(args[1]);
+    var det: objutil.ErrorDetails = undefined;
+    const closure_and_key = try interp.wrapError(&det, interp.getClosure(&det, args[1], false));
+
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
     try Interp.narrowToEvalError(interp.callClosure(
         closure_and_key.closure,
         closure_and_key.cache_key,
         args[1..],
-        false,
     ));
+}
+
+pub fn applymethodCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    var det: objutil.ErrorDetails = undefined;
+    const closure_and_key = try interp.wrapError(&det, interp.getClosure(&det, args[1], true));
+
+    if (!closure_and_key.closure.is_method) {
+        try interp.setResultString("[applymethod] called with a function");
+        return error.EvalError;
+    }
+
+    try Interp.narrowToEvalError(interp.callClosure(
+        closure_and_key.closure,
+        closure_and_key.cache_key,
+        args[1..],
+    ));
+
+    const new_self = args[2];
+    const method_result = interp.result;
+
+    interp.setResultOwning(try objutil.newList(&.{ new_self, method_result }));
 }
 
 pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -1412,7 +1441,8 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "-", subCmd, "?number ...?", 1, null, null);
     try registerCommand(interp, "/", divCmd, "?number ...?", 1, null, null);
     try registerCommand(interp, "append", appendCmd, "varName ?value ...?", 1, null, null);
-    try registerCommand(interp, "apply", applyCmd, "lambda ?arg ...?", 1, null, null);
+    try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null, null);
+    try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null, null);
     try registerCommand(interp, "break", breakCmd, "?level?", 0, 1, null);
     try registerCommand(interp, "catch", catchCmd, "script ?resultVar? ?optsVar?", 1, 3, null);
     try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null, null);
