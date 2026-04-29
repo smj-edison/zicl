@@ -275,7 +275,7 @@ fn ensureValidVariableType(
 
     // We don't know whether this is a normal variable or dict sugar yet.
     const var_name = try name.getString();
-    if (std.mem.indexOf(u8, var_name, "::") != null) return error.DictSugar;
+    if (validateDictSugar(var_name)) return error.DictSugar;
 
     // Make sure the variable exists.
     try interp.reshimmerToVariable(det, var_call_frame, name);
@@ -300,11 +300,23 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
     };
 }
 
+fn validateDictSugar(var_name: [:0]const u8) bool {
+    const double_colons = std.mem.indexOf(u8, var_name, "::");
+    const start_at = if (double_colons) |val| val else return false;
+
+    // Can't have dict sugar start with colons.
+    if (start_at == 0) return false;
+    // Also can't end with colons.
+    if (std.mem.lastIndexOf(u8, var_name, "::").? == var_name.len - 2) return false;
+
+    return true;
+}
+
 const DictSugar = struct { name: Handle, path: Handle };
 fn parseDictSugar(var_name: [:0]const u8) error{OutOfMemory}!?DictSugar {
-    const double_colons = std.mem.indexOf(u8, var_name, "::");
-    const start_at = if (double_colons) |val| val else return null;
+    if (!validateDictSugar(var_name)) return null;
 
+    const start_at = std.mem.indexOf(u8, var_name, "::").?;
     const dict_name = try objutil.newString(var_name[0..start_at]);
     errdefer dict_name.decrRefCount();
 
