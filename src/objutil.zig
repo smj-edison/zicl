@@ -8,6 +8,7 @@ const stringutil = @import("stringutil.zig");
 const expr_parse = @import("expr_parse.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
+const regexp = @import("regexp.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
@@ -559,7 +560,7 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
     if (options.use_utf8) {
         // Go through once to calculate the length
         var new_len: usize = 0;
-        var iter = stringutil.Iterator.init(bytes);
+        var iter = stringutil.CodepointIterator.init(bytes);
         var is_first_char = true;
         while (iter.next()) |cp| {
             const converted = blk: {
@@ -591,7 +592,7 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
         };
 
         // Now go through and write all the bytes.
-        iter = stringutil.Iterator.init(bytes);
+        iter = stringutil.CodepointIterator.init(bytes);
         var written: usize = 0;
         is_first_char = true;
         while (iter.next()) |cp| {
@@ -989,8 +990,8 @@ pub fn stringIs(
         .xdigit => stringutil.checkAllAscii(bytes, stringutil.isHexDigit),
         .control => stringutil.checkAllAscii(bytes, std.ascii.isControl),
         .print => stringutil.checkAllAscii(bytes, std.ascii.isPrint),
-        .graph => stringutil.checkAllAscii(bytes, stringutil.isGraph),
-        .punct => stringutil.checkAllAscii(bytes, stringutil.isPunct),
+        .graph => stringutil.checkAllAscii(bytes, std.ascii.isGraphical),
+        .punct => stringutil.checkAllAscii(bytes, std.ascii.isPunctuation),
     };
 }
 
@@ -2637,7 +2638,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var i: usize = 0;
     while (i < tokens.items.len) {
         // Skip any leading separators.
-        while (tokens.items[i].tag == .word_separator) i += 1;
+        while (tokens.items[i].tag == .word_separator or tokens.items[i].tag == .command_separator) i += 1;
 
         // Look ahead to see when the next separator is.
         var arg_token_count: usize = 0;
@@ -2646,7 +2647,9 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             switch (tokens.items[i + arg_token_count].tag) {
                 .argument_expansion => found_expansion = true,
                 .command_separator, .word_separator, .end_of_file => break,
-                else => {},
+                else => {
+                    // Keep scanning for the next separator.
+                },
             }
         }
 

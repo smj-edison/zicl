@@ -7,6 +7,7 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
 const uucode = @import("uucode");
+const Utf8Iterator = uucode.utf8.Iterator;
 
 const use_utf8 = @import("options").use_utf8;
 
@@ -18,19 +19,12 @@ const StringFlags = packed struct(u32) {
 
 const Codepoint = if (use_utf8) u21 else u8;
 
+/// Helper function that runs `check` on each byte any only returns true
+/// if it was true for each character.
 pub fn checkAllAscii(bytes: []const u8, check: fn (u8) bool) bool {
     for (bytes) |char| {
         if (!check(char)) return false;
     } else return true;
-}
-
-pub fn isGraph(c: u8) bool {
-    return std.ascii.isPrint(c) and c != 0x20;
-}
-
-pub fn isPunct(c: u8) bool {
-    _ = std.mem.indexOfScalar(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c) orelse return false;
-    return true;
 }
 
 fn toTitlecaseUtf8(cp: u21) u21 {
@@ -48,21 +42,6 @@ fn toLowercaseUtf8(cp: u21) u21 {
 pub const toTitle = if (use_utf8) toTitlecaseUtf8 else std.ascii.toUpper;
 pub const toUpper = if (use_utf8) toUppercaseUtf8 else std.ascii.toUpper;
 pub const toLower = if (use_utf8) toLowercaseUtf8 else std.ascii.toLower;
-
-/// Conditional uppercase
-fn condUpper(cp: Codepoint, enabled: bool) Codepoint {
-    if (enabled) {
-        return toUpper(cp);
-    } else {
-        return cp;
-    }
-}
-
-test "Conditional uppercase" {
-    try expectEqual('A', condUpper('a', true));
-    try expectEqual('a', condUpper('a', false));
-    try expectEqual('/', condUpper('/', true));
-}
 
 const AsciiIterator = struct {
     bytes: []const u8,
@@ -91,35 +70,33 @@ const AsciiIterator = struct {
     }
 };
 
-/// Iterate over codepoints
-pub const Iterator = if (use_utf8) uucode.utf8.Iterator else AsciiIterator;
+/// Iterate over codepoints.
+pub const CodepointIterator = if (use_utf8) Utf8Iterator else AsciiIterator;
 
-/// lexographical comparision of codepoints
+/// Lexographical comparision of codepoints.
 pub fn compare(a: []const u8, b: []const u8, case_insensitive: bool) std.math.Order {
-    var a_iter = Iterator.init(a);
-    var b_iter = Iterator.init(b);
+    var a_iter = CodepointIterator.init(a);
+    var b_iter = CodepointIterator.init(b);
 
     while (true) {
-        const a_cp = condUpper(a_iter.next(), case_insensitive);
-        const b_cp = condUpper(b_iter.next(), case_insensitive);
+        const a_cp = a_iter.next() orelse return .lt;
+        const b_cp = b_iter.next() orelse return .gt;
 
-        if (a_cp != null and b_cp != null) {
-            const order = std.math.order(u21, a_cp.?, b_cp.?);
-            if (order != .eq) return order;
-        } else {
-            if (a_cp == null and b_cp != null) return .lt;
-            if (a_cp == null and b_cp == null) return .eq;
-            if (a_cp != null and b_cp == null) return .gt;
-        }
+        return std.math.order(
+            Codepoint,
+            if (case_insensitive) toUpper(a_cp) else a_cp,
+            if (case_insensitive) toUpper(b_cp) else b_cp,
+        );
     }
 
     return .eq;
 }
 
+/// Convert a codepoint index to a byte index.
 pub fn cpIndexUtf8(str: []const u8, index: usize) ?usize {
     if (index >= str.len) return null;
 
-    var iter = Iterator.init(str);
+    var iter = CodepointIterator.init(str);
 
     var cp_index: usize = 0;
     while (cp_index < index) {
@@ -139,8 +116,8 @@ pub fn cpIndexAscii(str: []const u8, index: usize) ?usize {
 pub const cpIndex = if (use_utf8) cpIndexUtf8 else cpIndexAscii;
 
 test "codepoint index" {
-    try expectEqual(cpIndex("hello", 3), 3);
-    if (use_utf8) try expectEqual(cpIndex("⇧hello", 3), 5);
+    try expectEqual(cpIndexAscii("hello", 3), 3);
+    try expectEqual(cpIndexUtf8("⇧hello", 3), 5);
 }
 
 fn codepointLengthAscii(str: []const u8) usize {
@@ -150,7 +127,7 @@ fn codepointLengthAscii(str: []const u8) usize {
 fn codepointLengthUtf8(str: []const u8) usize {
     var len: usize = 0;
 
-    var iter = Iterator.init(str);
+    var iter = CodepointIterator.init(str);
     while (iter.next()) |_| {
         len += 1;
     }
@@ -158,16 +135,13 @@ fn codepointLengthUtf8(str: []const u8) usize {
     return len;
 }
 
-/// Get the length of the string in codepoints
-pub const codepointLength = if (use_utf8) codepointLengthUtf8 else codepointLengthUtf8;
+/// Get the length of the string in codepoints.
+pub const codepointLength = if (use_utf8) codepointLengthUtf8 else codepointLengthAscii;
 
 pub fn strlenUtf8(str: []const u8) usize {
-    var iter = Iterator.init(str);
+    var iter = CodepointIterator.init(str);
     var count = 0;
-
-    while (iter.next()) {
-        count += 1;
-    }
+    while (iter.next()) count += 1;
 
     return count;
 }
@@ -179,9 +153,9 @@ pub fn strlenAscii(str: []const u8) usize {
 /// get the string length in codepoints
 const strlen = if (use_utf8) strlenUtf8 else strlenAscii;
 
-/// Finds the location of a codepoint
+/// Finds the location of a codepoint.
 pub fn findCodepoint(str: []const u8, cp: u21) ?usize {
-    var iter = Iterator.init(str);
+    var iter = CodepointIterator.init(str);
 
     var idx: usize = 0;
     while (iter.next()) |cp_to_check| {
@@ -198,11 +172,11 @@ pub fn findCodepoint(str: []const u8, cp: u21) ?usize {
 /// Returns the new left-most index in bytes, after trimming. Returns 0
 /// if there was nothing to trim.
 pub fn trimLeft(str: []const u8, trim_chars: []u8) usize {
-    var iter = Iterator.init(str);
+    var iter = CodepointIterator.init(str);
 
     outer: while (iter.next()) |cp_to_check| {
         // Check this codepoint against all the trim_chars codepoints
-        var trim_char_iter = Iterator.init(trim_chars);
+        var trim_char_iter = CodepointIterator.init(trim_chars);
         while (trim_char_iter.next()) |check_against| {
             if (cp_to_check == check_against) {
                 continue :outer;
@@ -213,7 +187,8 @@ pub fn trimLeft(str: []const u8, trim_chars: []u8) usize {
     return iter.i;
 }
 
-fn reverseNext(iter: *Iterator) ?Codepoint {
+/// Step backwards by one codepoint.
+fn reverseNext(iter: *CodepointIterator) ?Codepoint {
     if (use_utf8) {
         while (iter.i > 0) {
             iter.i -= 1;
@@ -251,13 +226,13 @@ fn reverseNext(iter: *Iterator) ?Codepoint {
 /// Returns the new length in bytes, after trimming. `trim_chars` can be
 /// utf8-encoded codepoints.
 pub fn trimRight(str: []const u8, trim_chars: []const u8) usize {
-    var iter = Iterator.init(str);
+    var iter = CodepointIterator.init(str);
     iter.i = str.len;
 
     var len = iter.i;
     outer: while (reverseNext(iter)) |cp_to_check| : (len = iter.i) {
         // Check this codepoint against all the trim_chars codepoints
-        var trim_char_iter = Iterator.init(trim_chars);
+        var trim_char_iter = CodepointIterator.init(trim_chars);
         while (trim_char_iter.next()) |check_against| {
             if (cp_to_check == check_against) {
                 continue :outer;
@@ -287,22 +262,22 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
     var inverted = false;
     var found_match = false;
 
-    var pattern_iter = Iterator.init(pattern);
+    var pattern_iter = CodepointIterator.init(pattern);
 
-    const to_check = condUpper(cp, flags.case_insensitive);
+    const to_check = if (flags.case_insensitive) toUpper(cp) else cp;
 
     if (flags.charset_scan) {
         if (pattern_iter.peek() == '^') {
             inverted = true;
-            _ = pattern_iter.next(); // advance iterator
+            _ = pattern_iter.next(); // Advance iterator.
         }
 
-        // Special case. If the first char is ']', it is part of the set
+        // Special case: If the first char is ']', it is part of the set.
         if (pattern_iter.peek() == ']') {
             if (cp == ']') {
                 found_match = true;
             }
-            _ = pattern_iter.next(); // advance iterator
+            _ = pattern_iter.next(); // Advance iterator.
         }
     }
 
@@ -314,20 +289,20 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
 
         var check_against: ?Codepoint = null;
 
-        // Exact match
+        // Exact match.
         if (pattern_cp == '\\') {
-            if (pattern_iter.next()) |unwrapped| {
-                check_against = condUpper(unwrapped, flags.case_insensitive);
+            if (pattern_iter.next()) |val| {
+                check_against = if (flags.case_insensitive) toUpper(val) else val;
             }
         } else {
             // Is this a range? e.g. [a-z]
             if (pattern_iter.peek() == '-') {
-                const start_cp = condUpper(pattern_cp, flags.case_insensitive);
+                const start_cp = if (flags.case_insensitive) toUpper(pattern_cp) else pattern_cp;
                 _ = pattern_iter.next(); // skip -
-                const end_cp = condUpper(
-                    pattern_iter.next() orelse continue,
-                    flags.case_insensitive,
-                );
+                const end_cp = blk: {
+                    const raw_cp = pattern_iter.next() orelse continue;
+                    break :blk if (flags.case_insensitive) toUpper(raw_cp) else raw_cp;
+                };
 
                 // Handle reversed range too
                 if ((to_check >= start_cp and to_check <= end_cp) or
@@ -338,7 +313,7 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
                 continue;
             }
 
-            check_against = condUpper(pattern_cp, flags.case_insensitive);
+            check_against = if (flags.case_insensitive) toUpper(pattern_cp) else pattern_cp;
         }
 
         if (check_against != null and check_against == to_check) {
@@ -366,8 +341,8 @@ test "charsetMatch" {
 
 /// Glob-style pattern matching.
 pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) bool {
-    var pattern_iter = Iterator.init(pattern);
-    var string_iter = Iterator.init(str);
+    var pattern_iter = CodepointIterator.init(pattern);
+    var string_iter = CodepointIterator.init(str);
 
     while (pattern_iter.next()) |pattern_cp| {
         switch (pattern_cp) {
@@ -413,18 +388,18 @@ pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) b
             else => {
                 var check_against: Codepoint = undefined;
                 if (pattern_cp == '\\') {
-                    check_against = condUpper(
-                        pattern_iter.next() orelse '\\',
-                        case_insensitive,
-                    );
+                    check_against = blk: {
+                        const raw_cp = pattern_iter.next() orelse break :blk '\\';
+                        break :blk if (case_insensitive) toUpper(raw_cp) else raw_cp;
+                    };
                 } else {
-                    check_against = condUpper(pattern_cp, case_insensitive);
+                    check_against = if (case_insensitive) toUpper(pattern_cp) else pattern_cp;
                 }
 
-                const to_check = condUpper(
-                    string_iter.next() orelse return false,
-                    case_insensitive,
-                );
+                const to_check = blk: {
+                    const raw_cp = string_iter.next() orelse return false;
+                    break :blk if (case_insensitive) toUpper(raw_cp) else raw_cp;
+                };
                 if (check_against != to_check) return false;
             },
         }
@@ -451,7 +426,7 @@ pub fn findFirstOccurrence(searching_for: []const u8, searching_in: []const u8, 
         return null;
     }
 
-    var searching_in_iter = Iterator.init(searching_in);
+    var searching_in_iter = CodepointIterator.init(searching_in);
     searching_in_iter.i = cpIndex(searching_in, cp_index) orelse return null;
 
     while (true) : (_ = searching_in_iter.next()) {
@@ -460,8 +435,7 @@ pub fn findFirstOccurrence(searching_for: []const u8, searching_in: []const u8, 
             return null;
         }
 
-        const searching_in_slice =
-            searching_in[searching_in_iter.i .. searching_in_iter.i + searching_for.len];
+        const searching_in_slice = searching_in[searching_in_iter.i..(searching_in_iter.i + searching_for.len)];
         if (std.mem.eql(u8, searching_for, searching_in_slice)) {
             return searching_in_iter.i;
         }
@@ -690,11 +664,11 @@ fn testEscape(alloc: *std.mem.Allocator, expected: []const u8, to_escape: []cons
 
 pub const QuotingType = enum(u8) { bare, brace, escape };
 pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
-    // Empty string needs to be represented in braces
-    if (str.len == 0) return QuotingType.brace;
+    // Empty string needs to be represented in braces.
+    if (str.len == 0) return .brace;
 
     // Whether it's possible to represent the string without
-    // braces or escaping
+    // braces or escaping.
     var bare_string_possible = true;
     var brace_level: i64 = 0;
     var bracket_level: i64 = 0;
@@ -720,10 +694,10 @@ pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
             }
         }
 
-        if (return_bare) return QuotingType.bare;
+        if (return_bare) return .bare;
     }
 
-    // Check for any characters that we can't represent
+    // Check for any characters that we can't represent.
     var i: usize = 0;
     while (i < str.len) : (i += 1) {
         switch (str[i]) {
@@ -733,8 +707,8 @@ pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
             '}' => {
                 brace_level -= 1;
                 if (brace_level < 0) {
-                    // Unbalanced braces, so the only possible way is escaping
-                    return QuotingType.escape;
+                    // Unbalanced braces, so the only possible way is escaping.
+                    return .escape;
                 }
             },
             '[' => {
@@ -750,7 +724,7 @@ pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
                         // newlines cannot be accurately represented in braces,
                         // as they'll be replaced with a single space. Hence,
                         // we better go with escaping.
-                        return QuotingType.escape;
+                        return .escape;
                     } else {
                         // skip the escaped character
                         i += 1;
@@ -762,8 +736,8 @@ pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
     }
 
     if (bracket_level < 0) {
-        // Unbalanced brackets
-        return QuotingType.escape;
+        // Unbalanced brackets.
+        return .escape;
     }
 
     if (brace_level == 0) {
@@ -772,7 +746,7 @@ pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
         if (!bare_string_possible) {
             // The string started with characters that are impossible to
             // represent as a bare string, so braces it is.
-            return QuotingType.brace;
+            return .brace;
         }
 
         // Last attempt at a bare string.
@@ -781,17 +755,17 @@ pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
                 ' ', '$', '"', '[', ']', ';', '\\', '\r', '\n', '\t', 12, 11 => {
                     // All of these characters can't be in a bare string, so braces
                     // it is.
-                    return QuotingType.brace;
+                    return .brace;
                 },
                 else => {},
             }
         }
 
-        return QuotingType.bare;
+        return .bare;
     }
 
     // Braces weren't balanced, so we better use an escaped string
-    return QuotingType.escape;
+    return .escape;
 }
 
 pub fn quoteSize(quoting_type: QuotingType, str_len: usize) usize {
@@ -802,7 +776,7 @@ pub fn quoteSize(quoting_type: QuotingType, str_len: usize) usize {
     }
 }
 
-/// Returns the amount written to dest
+/// Returns the amount written to dest.
 pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escape_first_pound: bool) usize {
     switch (quoting_type) {
         .bare => {

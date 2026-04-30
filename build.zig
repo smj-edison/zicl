@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
 
     root.addImport("uucode", uucode_dep.module("uucode"));
     root.addImport("options", options_mod);
+    root.addCSourceFile(.{ .file = b.path("src/regexp.c") });
 
     // executable
     const exe = b.addExecutable(.{
@@ -69,6 +70,7 @@ pub fn build(b: *std.Build) void {
     });
     lz_mod.addImport("uucode", uucode_dep.module("uucode"));
     lz_mod.addImport("options", options_mod);
+    lz_mod.addCSourceFile(.{ .file = b.path("src/regexp.c") });
 
     const lz = b.addLibrary(.{
         .name = "zicl",

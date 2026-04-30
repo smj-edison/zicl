@@ -4,6 +4,10 @@ const Heap = @import("Heap.zig");
 const Interp = @import("Interp.zig");
 const commands = @import("commands.zig");
 
+comptime {
+    _ = @import("regexp.zig");
+}
+
 pub fn main(init: std.process.Init) !void {
     defer Heap.deinitAll();
     try Heap.initGlobals(init.gpa, init.io);
