@@ -10,8 +10,10 @@ anything that might already exist.
 ### Strings
 - `shimmerToString(provided_handle, new_handle)` -- Shimmer any object to `.string` tag; `new_handle` set if object moved.
 - `getCodepointLength(provided_handle, new_handle)` -- Return the codepoint length of a string handle.
-- `newString(heap, bytes)` -- Allocate a new string object copying `bytes`.
-- `newStringFmt(heap, fmt, args)` -- Allocate a new string object from a format string.
+- `newStringInner(heap, bytes)` -- Allocate a new string object copying `bytes` (internal, takes explicit heap).
+- `newString(bytes)` -- Allocate a new string object copying `bytes` (uses local heap).
+- `newStringFmtInner(heap, fmt, args)` -- Allocate a formatted string (internal, takes explicit heap).
+- `newStringFmt(fmt, args)` -- Allocate a new string object from a format string (uses local heap).
 - `newStringToFill(heap, len)` -- Allocate a string of `len` bytes for the caller to fill in.
 - `newStringWithCodepointLen(heap, bytes, cp_length)` -- Allocate a string with a pre-computed codepoint length.
 - `setStringFromEscaped(handle, escaped)` -- Parse escape sequences and store the unescaped bytes as the string rep.
@@ -42,6 +44,7 @@ anything that might already exist.
 ### Booleans
 - `shimmerToBoolean(det, provided_handle, new_handle)` -- Shimmer to `.bool`; `new_handle` set if object moved.
 - `getBoolean(det, provided_handle, new_handle)` -- Shimmer + return the `bool` value.
+- `newBoolean(value)` -- Allocate a new boolean object.
 
 ### Indices
 - `shimmerToIndex(det, provided_handle, new_handle)` -- Shimmer to `.index` (list index) representation.
@@ -54,6 +57,7 @@ anything that might already exist.
 - `shimmerToList(det, provided_handle, new_handle)` -- Shimmer to `.list`; `new_handle` set if object moved.
 - `listLengthRaw(list)` -- Return item count without shimmering (asserts already a list).
 - `listLength(det, provided_list, new_list)` -- Shimmer + return the item count.
+- `listItemNoFollow(handle, index)` -- Get item handle by index without following refs (asserts already a list).
 - `listItem(handle, index)` -- Get item handle by index (non-owning; asserts already a list).
 - `listItemFollowRefs(handle, index)` -- Same as `listItem` but dereferences `.reference` objects.
 - `listItems(handle)` -- Slice over all item objects in a list.
@@ -189,6 +193,9 @@ anything that might already exist.
 - `heap.getLocalObject(index)` -- Return `*Object` for a local heap index.
 - `heap.objectSlice(start, end)` -- Slice of objects by index range.
 - `heap.getLocalMetadata(index)` -- Return `*Metadata` for a local heap index.
+- `heap.createExtraData()` -- Allocate an `ExtraData` slot (thread-safe via mutex).
+- `heap.getExtraData(index)` -- Return `*ExtraDataValue` for an `ExtraData` index.
+- `heap.destroyExtraData(index)` -- Free an `ExtraData` slot, handling cleanup of contained data.
 - `heap.stringEquals(handle, value)` -- Compare a handle's string rep to a byte slice.
 - `heap.getStringMut(handle)` -- Return a mutable slice of the string rep.
 - `heap.getHeapString(start, end)` -- Get a string by byte range in the string heap.
@@ -200,11 +207,6 @@ anything that might already exist.
 - `heap.setStringOwning(handle, bytes)` -- Set a sentinel-terminated string; takes ownership.
 - `heap.exchangeString(index, expected, to_set_to)` -- Atomic CAS on the string field.
 - `heap.splitAlloc(index, new_order)` -- Split a buddy block to a smaller order.
-- `heap.createExtraData()` -- Allocate an `ExtraData` slot.
-- `heap.getExtraData(index)` -- Return `*ExtraDataValue` for an `ExtraData` index.
-- `heap.destroyExtraData(index)` -- Free an `ExtraData` slot.
-- `heap.getInternedString(string)` -- Return the handle for a compile-time-interned string.
-- `heap.internedStringRef(string)` -- Return an interned string as a raw `.reference` `Object` (no extra allocation; useful when building object arrays).
 
 ### Lifecycle
 - `Heap.init(heap)` -- Initialize a heap (called by `initLocalHeap`).
@@ -226,6 +228,9 @@ anything that might already exist.
 ### Misc
 - `Heap.nextCacheId()` -- Generate a monotonically increasing cache ID.
 - `Heap.emptyObject()` -- Return a zero-initialized `Object` value (not a handle).
+- `heap.emptyHandle()` -- Return the empty/zero-length string handle (method form).
+- `heap.getInternedString(string)` -- Return the handle for a compile-time-interned string (method form).
+- `heap.internedStringRef(string)` -- Return an interned string as a raw `.reference` `Object` (no extra allocation).
 - `Heap.ListIndex.asAbsoluteIndex(list_len)` -- Resolve a possibly-negative list index to an absolute offset.
 
 ### Testing helpers
@@ -403,5 +408,12 @@ anything that might already exist.
 - `signalMaskToList(mask)` -- Build a list of signal name strings (e.g. `"SIGINT"`) for each bit set in `mask`.
 
 ### Misc
+- `narrowError(err)` -- Convert any error to `EvalError` (maps unknown errors to `EvalError`).
 - `narrowToEvalError(result)` -- Comptime: narrow any error-union or error-set to `EvalError`; useful in command implementations that call internal functions with wider error sets.
 - `nextRandomFloat(interp)` -- Advance the interpreter's PRNG and return the next `f64` in [0, 1).
+- `callFrameIdx(interp)` -- Return the current call frame index.
+- `callFrame(interp)` -- Return a pointer to the current call frame.
+- `currentEvalFrameIndex(interp)` -- Return the current evaluation frame index.
+- `currentEvalFrame(interp)` -- Return a pointer to the current evaluation frame.
+- `setResultBoolean(interp, value)` -- Allocate a boolean object and set it as the result.
+- `makeErrorMessage(interp)` -- Format the current error message with stack trace attached.

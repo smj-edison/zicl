@@ -1921,6 +1921,8 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
                     // (else we'd smash up a value someone else is using). Instead, we'll use a new dict
                     // which, due to duplication, must have non-shared elements.
                     new_dict.swapRef(try Heap.duplicate(dict.getHeap(), dict));
+                    dict = new_dict.orElse(provided_dict);
+                    value_handle = dictItem(dict, existing_value_index);
                 }
 
                 value_handle.assert(value_handle.getHeap() == Heap.local_heap);
@@ -2082,6 +2084,10 @@ pub fn dictPutRecursively(
     // Find/create the child dict.
     const child_dict = blk: {
         if ((try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0])).toHandle()) |existing_dict| {
+            // Make sure the parent dict is mutable before the recursive call. If we wait until
+            // after the child is modified, the parent may contain a stale .reference to an
+            // invalidated child, and duplicating the parent would then panic.
+            try Heap.ensureMutableOrDup(new_dict.orElse(provided_dict), new_dict);
             break :blk existing_dict;
         } else {
             // Create a new child dictionary.
@@ -2594,7 +2600,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         }
     }
 
-    // +1 for the first ".script_command".
+    // Worst case: every token becomes a parsed token, plus one .start_of_command.
     const new_token_capacity: u32 = @intCast(tokens.items.len + 1);
 
     // Initialize the Heap-stored list that will contain the corrisponding value for each token.
@@ -2604,32 +2610,6 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.global_gpa, new_token_capacity);
     errdefer new_token_tags.deinit(Heap.global_gpa);
 
-    // Use the first real token's relative line as the starting command line. After
-    // leading separators are trimmed (see is_trimming_start above), tokens[0] is the
-    // first actual word, so its line is the correct relative offset. Fall back to
-    // source_info.line_no (= 1) for empty scripts.
-    const first_command_line: u32 = if (tokens.items.len > 0 and tokens.items[0].tag != .end_of_file)
-        tokens.items[0].loc.line_no
-    else
-        source_info.line_no;
-
-    // Be sure to append the first .script_command token.
-    try new_token_tags.append(Heap.global_gpa, .start_of_command);
-    var first_append_result: OptionalHandle = .none;
-    _ = try listAppendObject(det, new_token_values, &first_append_result, .{
-        .head = .{
-            .str = Heap.Object.null_string,
-            .tag = .parsed_script_command,
-        },
-        .body = .{
-            .parsed_script_command = .{
-                .line = first_command_line,
-                .arg_count = 0, // Set later.
-            },
-        },
-    });
-    new_token_values.swapIfNew(first_append_result);
-
     // The current script line's token index.
     var script_command_idx: usize = 0;
     // The number of arguments for this command.
@@ -2638,6 +2618,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     while (i < tokens.items.len) {
         // Skip any leading separators.
         while (tokens.items[i].tag == .word_separator) i += 1;
+        if (i >= tokens.items.len) break;
 
         // Look ahead to see when the next separator is.
         var arg_token_count: usize = 0;
@@ -2654,16 +2635,25 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         // word_token_count counts all tokens except those (well, and it doesn't count .word_separator,
         // but that's ruled out at the beginning when we skipped leading separators).
         if (arg_token_count == 0) {
-            listItems(new_token_values)[script_command_idx].body.parsed_script_command.arg_count = command_arg_count;
-
             if (tokens.items[i].tag == .end_of_file) {
+                if (command_arg_count > 0) {
+                    listItems(new_token_values)[script_command_idx].body.parsed_script_command.arg_count = command_arg_count;
+                }
                 break; // Don't append a .script_command for EOF
             }
 
             i += 1; // Skip command separator.
 
-            // Start a new command.
-            command_arg_count = 0;
+            if (command_arg_count > 0) {
+                listItems(new_token_values)[script_command_idx].body.parsed_script_command.arg_count = command_arg_count;
+                command_arg_count = 0;
+            }
+
+            continue;
+        }
+
+        // First word of a new command.
+        if (command_arg_count == 0) {
             try new_token_tags.append(Heap.global_gpa, .start_of_command);
             var append_result: OptionalHandle = .none;
             const index = try listAppendObject(det, new_token_values, &append_result, .{
@@ -2671,12 +2661,15 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                     .str = Heap.Object.null_string,
                     .tag = .parsed_script_command,
                 },
-                .body = .{ .parsed_script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
+                .body = .{
+                    .parsed_script_command = .{
+                        .line = tokens.items[i].loc.line_no,
+                        .arg_count = 0,
+                    },
+                },
             });
             new_token_values.swapIfNew(append_result);
             script_command_idx = index;
-
-            continue;
         }
 
         // Append the start of the word (only if necessary).
@@ -2757,6 +2750,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
         // Be sure to advance our index to the next word.
         i += arg_token_count;
+    }
+
+    if (command_arg_count > 0) {
+        listItems(new_token_values)[script_command_idx].body.parsed_script_command.arg_count = command_arg_count;
     }
 
     const parsed_script: Heap.ParsedScript = .{

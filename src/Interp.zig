@@ -1684,13 +1684,24 @@ fn getCommandInner(
         const bytes = try var_val.getString();
         if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
             // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
-            const command = interp.global_commands.getPtr(bytes[9..]) orelse {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt("invalid native command name \"{s}\"", .{bytes[9..]}),
-                };
-                return error.CommandNotFound;
+            const cmd_name = bytes[9..];
+            if (interp.global_commands.getPtr(cmd_name)) |command| {
+                return .{ .command = command };
+            }
+
+            // Command not registered locally, so check the shared lazy-init registry.
+            if (Heap.nativefn_registry.get(cmd_name)) |init_fn| {
+                init_fn(@ptrCast(interp));
+                // Retry after initialization.
+                if (interp.global_commands.getPtr(cmd_name)) |command| {
+                    return .{ .command = command };
+                }
+            }
+
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt("invalid native command name \"{s}\"", .{cmd_name}),
             };
-            return .{ .command = command };
+            return error.CommandNotFound;
         } else {
             const closure = try interp.getClosure(det, var_val, can_be_method);
             return .{ .closure = closure };

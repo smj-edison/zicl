@@ -23,4 +23,14 @@ test "parsing" {
         \\ set x [+ {*}$items]
         \\ set x
     );
+
+    try interp.testExpectScriptResult("hello world",
+        \\ set x "hello world"
+        \\ # multiple
+        \\
+        \\ # separated
+        \\
+        \\ # comments
+        \\ set x
+    );
 }

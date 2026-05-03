@@ -65,6 +65,36 @@ pub var heaps: [cfg.max_heaps]Heap = undefined;
 pub threadlocal var local_heap: *Heap = undefined;
 pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
 
+/// Signature for a lazy native command initializer. The interpreter pointer
+/// is opaque here to avoid a circular dependency on Interp.zig.
+pub const NativeInitFn = *const fn (interp: *anyopaque) callconv(.c) void;
+
+pub const NativeFnRegistry = struct {
+    mutex: std.Io.Mutex = .init,
+    entries: std.StringHashMapUnmanaged(NativeInitFn) = .empty,
+
+    pub fn register(self: *NativeFnRegistry, gpa: Allocator, name: []const u8, init_fn: NativeInitFn) !void {
+        self.mutex.lockUncancelable(global_io);
+        defer self.mutex.unlock(global_io);
+        if (self.entries.contains(name)) {
+            return error.DuplicateNativeFn;
+        }
+        try self.entries.put(gpa, name, init_fn);
+    }
+
+    pub fn get(self: *NativeFnRegistry, name: []const u8) ?NativeInitFn {
+        self.mutex.lockUncancelable(global_io);
+        defer self.mutex.unlock(global_io);
+        return self.entries.get(name);
+    }
+
+    pub fn deinit(self: *NativeFnRegistry, gpa: Allocator) void {
+        self.entries.deinit(gpa);
+    }
+};
+
+pub var nativefn_registry: NativeFnRegistry = .{};
+
 const Heap = @This();
 
 const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
@@ -2099,6 +2129,7 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
 /// If called with a multi-item object, will return `error.MultiItemObject`.
 pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
+    if (options.trace_mem) last_touched = handle;
     switch (handle.tag()) {
         .none, .index, .integer, .float, .string, .bool, .parsed_script_command, .marked => {
             return .{
@@ -2744,6 +2775,8 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
     errdefer custom_types.deinit(global_gpa);
 
+    nativefn_registry = .{};
+
     state.initialized = true;
 }
 
@@ -2819,6 +2852,7 @@ pub fn deinitAll() void {
     state.mutex.lockUncancelable(global_io);
     if (state.initialized) {
         custom_types.deinit(global_gpa);
+        nativefn_registry.deinit(global_gpa);
         state.initialized = false;
     }
     state.mutex.unlock(global_io);

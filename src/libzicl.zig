@@ -219,6 +219,14 @@ export fn Zicl_InterpDestroy(interp: *Interp) callconv(.c) void {
     Heap.global_gpa.destroy(interp);
 }
 
+export fn Zicl_RegisterNativeFn(name: [*:0]const u8, init_fn: Heap.NativeInitFn) callconv(.c) ReturnCode {
+    Heap.nativefn_registry.register(Heap.global_gpa, std.mem.span(name), init_fn) catch |err| switch (err) {
+        error.OutOfMemory => return .oom,
+        error.DuplicateNativeFn => return .@"error",
+    };
+    return .ok;
+}
+
 export fn Zicl_CreateCommand(
     interp: *Interp,
     name: [*:0]const u8,

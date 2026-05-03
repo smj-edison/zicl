@@ -552,6 +552,15 @@ pub fn putsCmd(interp: *Interp, args: []Handle) !void {
     };
 }
 
+/// [pid]
+pub fn pidCmd(interp: *Interp, args: []Handle) !void {
+    if (args.len != 1) {
+        try interp.setResultString("wrong # args: should be \"pid\"");
+        return error.EvalError;
+    }
+    try interp.setResultInteger(@intCast(std.os.linux.getpid()));
+}
+
 /// [if]
 pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     var remaining_args = args[1..];
@@ -1363,7 +1372,10 @@ pub fn returnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     // `evalObjectInner` decrements `left_to_go` each time PropagateResult bubbles up
     // one eval level. Starting at `level` means it lands exactly `level` frames up.
-    interp.return_propagate.left_to_go = level;
+    interp.return_propagate = .{
+        .left_to_go = level,
+        .return_at_end = null,
+    };
 
     return code.toError();
 }
@@ -1457,6 +1469,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
     try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, 2, null);
+    try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);

@@ -82,11 +82,22 @@ zig build -Dtoken-debugging=true
 
 -   Dual frame system: call frames (scope) and eval frames (execution state)
 -   Variable resolution with caching via epochs (invalidated on scope changes)
--   Command dispatch supporting both native and Tcl procedures
+-   Command dispatch supporting native commands, closures, and Tcl procedures
+    -   Native commands are looked up in `interp.global_commands`
+    -   Closures are looked up as variables in the call frame chain (lexical scoping)
+    -   Lazy native command initialization via `Heap.nativefn_registry` (see below)
 -   Expression evaluation system
 -   Loop control (break/continue with level support)
 -   Procedure support with optional/required parameters, default values, and `args` parameter
 -   Tail call optimization preparation
+
+**NativeFn Registry (src/Heap.zig)**: A global, mutex-protected hash map for lazy C command initialization.
+
+-   `Heap.nativefn_registry` maps command name → `NativeInitFn` (`*const fn (interp: *anyopaque) callconv(.c) void`)
+-   When `getCommandInner` sees a variable containing `"nativefn <name>"` but the command is not in `interp.global_commands`, it checks the registry
+-   If found, the init function is called, which should use `Zicl_CreateCommand` to register the actual commands in that interpreter
+-   This replaces the old Jimtcl-style `<C:id>` string pattern matching in `unknown`
+-   Registration panics on duplicate names to prevent definition drift
 
 ### Object Representation
 
@@ -97,6 +108,8 @@ Objects use a packed 128-bit structure with three main parts:
 3. **Body** (64 bits): Type-specific data
 
 Objects automatically "shimmer" between types, maintaining cached representations when beneficial. For example, a string "1 2 3" can be shimmered to a list while keeping the string representation.
+
+**Native command string representation**: When a native command is converted to a string, it produces `"nativefn <name>"`. This is the Tcl equivalent of JavaScript's `function log() { [native code] }`. `getCommandInner` recognizes this prefix and resolves it to the corresponding `global_commands` entry. If the command is not registered locally, the `nativefn_registry` is consulted for lazy initialization.
 
 ### Memory Management Principles
 
@@ -222,6 +235,7 @@ const result = try someFn(heap, &det, arg);
 -   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
 -   `src/stringutil.zig`: String utilities with optional UTF-8 support (~875 lines)
 -   `src/memutil.zig`: Buddy allocator, memory primitives, and LRU cache (~900 lines)
+-   `.claude/helpers.md`: Index of public helper functions in the utility files
 -   `src/commands.zig`: Built-in command implementations (~520 lines)
 -   `src/tripwire.zig`: Vendored failure-injection library for testing error paths (~290 lines)
 -   `src/repl.zig`: REPL (stub, not yet implemented)
@@ -312,6 +326,10 @@ Currently implemented:
 -   Variable management and scoping with epoch-based caching
 -   Command registration and dispatch system
 -   Closures with lexical scope capture
+    -   `[fn]` captures its defining lexical scope automatically
+    -   This eliminates the need for Jimtcl-style `^$name` prefixing and manual `captureEnvStack` plumbing
+    -   Most `proc` definitions that use `upvar`/`uplevel` are workarounds for lack of lexical scoping and should migrate to `fn`
+    -   Legitimate dynamic scope uses (e.g., `uplevel expr`, reading caller's `this`, `uplevel subst`) will need dedicated zicl commands
 -   Core built-in commands (12 implemented):
     -   Math: [+], [*], [incr], [expr]
     -   Control flow: [if], [for], [break], [continue]
