@@ -16,7 +16,6 @@ const Tokenizer = @import("Tokenizer.zig");
 const expr_parse = @import("expr_parse.zig");
 const objutil = @import("objutil.zig");
 
-// These numbers are final, and can be depended on to be their current values.
 pub const special_string_count = 2;
 pub const null_string = 0;
 pub const empty_string = 1;
@@ -40,7 +39,7 @@ pub const HeapSettings = struct {
 };
 const cfg: HeapSettings = .{};
 
-threadlocal var debugging_buffer: [1024 * 1024]u8 = undefined;
+threadlocal var debugging_buffer: [16 * 1024 * 1024]u8 = undefined;
 threadlocal var debugging_gpa: if (builtin.mode == .Debug) memutil.RingBufferAllocator else void = undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 threadlocal var debug_gpa: Allocator = undefined;
@@ -158,6 +157,10 @@ pub const InternedString = enum {
     impl,
     scope,
     name,
+    type,
+    file,
+    line,
+    level,
     @"division by zero",
     // Error handling.
     NONE,
@@ -2529,6 +2532,7 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     var total_length: usize = 0;
     for (0..len) |i| {
         const element_string = try self.getHandle(@intCast(index + i)).getString();
+
         quoting_types[i] = stringutil.calculateNeededQuotingType(element_string);
         if (i == 0 and quoting_types[i] == .bare and
             element_string.len > 0 and element_string[0] == '#')

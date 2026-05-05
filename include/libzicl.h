@@ -47,6 +47,7 @@ Zicl_Handle Zicl_ListGetItem(Zicl_Handle list, uint32_t index);
 
 /* Dict functions */
 Zicl_Handle Zicl_NewDict(Zicl_Handle *handles, int n_handles);
+int Zicl_DictPut(Zicl_Interp *interp, Zicl_Handle *dict, Zicl_Handle key, Zicl_Handle value);
 
 /* Source functions */
 const char *Zicl_SourceGetFilename(Zicl_Handle source);
@@ -60,6 +61,7 @@ int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
 Zicl_Handle Zicl_GetResult(Zicl_Interp *interp);
 void Zicl_SetResult(Zicl_Interp *interp, Zicl_Handle handle);
 void Zicl_SetResultOwning(Zicl_Interp *interp, Zicl_Handle handle);
+int Zicl_SetVariable(Zicl_Interp *interp, Zicl_Handle *name, Zicl_Handle handle);
 int Zicl_SetResultString(Zicl_Interp *interp, const char *str, int len);
 int Zicl_SetResultBool(Zicl_Interp *interp, int value);
 int Zicl_SetResultInt(Zicl_Interp *interp, long value);

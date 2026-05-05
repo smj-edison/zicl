@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lz_mod,
         .use_llvm = use_llvm,
     });
+    lz.bundle_compiler_rt = true;
     lz_mod.link_libc = true;
     lz.installHeader(b.path("include/libzicl.h"), "libzicl.h");
     b.installArtifact(lz);

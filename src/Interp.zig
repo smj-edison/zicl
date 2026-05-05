@@ -547,22 +547,22 @@ pub fn setVariableLinkInner(
                 error.OutOfMemory => return error.OutOfMemory,
             }
         }
-
-        const target_name_duped = try objutil.newString(target_name_bytes);
-
-        interp.setVariableInner(null, call_frame_idx, name, .{
-            .head = .{ .str = Heap.Object.null_string, .tag = .upvar_link },
-            .body = .{ .upvar_link = .{
-                .call_frame = target_call_frame_idx,
-                .linked_name = target_name_duped.index,
-            } },
-        }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // We already checked that the name isn't dict sugar, so it's definitely
-            // impossible for it to be a bad dict.
-            error.BadDict => unreachable,
-        };
     }
+
+    const target_name_duped = try objutil.newString(target_name_bytes);
+
+    interp.setVariableInner(null, call_frame_idx, name, .{
+        .head = .{ .str = Heap.Object.null_string, .tag = .upvar_link },
+        .body = .{ .upvar_link = .{
+            .call_frame = target_call_frame_idx,
+            .linked_name = target_name_duped.index,
+        } },
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // We already checked that the name isn't dict sugar, so it's definitely
+        // impossible for it to be a bad dict.
+        error.BadDict => unreachable,
+    };
 }
 
 pub fn unsetVariableInner(
@@ -1494,7 +1494,7 @@ fn nextCallEpoch(interp: *Interp) u32 {
 }
 
 /// Evaluation frame.
-const EvalFrame = struct {
+pub const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
     /// Arguments of the command currently being dispatched in this eval frame.
@@ -2594,14 +2594,6 @@ fn invokeCommandMaybeMethod(
     }
 
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
-    var log = std.ArrayList(u8).empty;
-    defer log.deinit(Heap.global_gpa);
-    log.print(Heap.global_gpa, "Calling command: ", .{}) catch {};
-    for (args.*) |arg| {
-        log.print(Heap.global_gpa, "{{{f}}} ", .{arg}) catch {};
-    }
-    log.print(Heap.global_gpa, "\n", .{}) catch {};
-    std.log.debug("{s}", .{log.items});
 
     try interp.invokeCommand(command, args.*);
 
@@ -3185,12 +3177,21 @@ pub fn putDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, ke
     errdefer new_dict.swapWithNone();
 
     var det: objutil.ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict));
+    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict, new_dict));
 
     const put_result = try objutil.dictPut(new_dict.orElse(dict), key, value);
     new_dict.swapRefIfNew(put_result.new_dict);
 
     return put_result.new_value;
+}
+
+/// Like `putDictValue`, but updates the dict handle in place when the dict
+/// has to be moved (e.g. because it was shared or inline).
+pub fn putDictValueInPlace(interp: *Interp, dict: *Handle, key: Handle, value: Handle) Interp.Error!Handle {
+    var new_dict: OptionalHandle = .none;
+    const result = try interp.putDictValue(dict.*, &new_dict, key, value);
+    dict.swapIfNew(new_dict);
+    return result;
 }
 
 pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle, value: Handle) Interp.Error!Handle {

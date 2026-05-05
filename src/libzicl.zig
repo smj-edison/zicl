@@ -135,6 +135,11 @@ export fn Zicl_NewDict(handles: ?[*]Handle, n_handles: c_int) callconv(.c) Optio
     }
 }
 
+export fn Zicl_DictPut(interp: *Interp, dict: *Handle, key: Handle, value: Handle) callconv(.c) ReturnCode {
+    _ = interp.putDictValueInPlace(dict, key, value) catch |err| return ReturnCode.fromError(err);
+    return .ok;
+}
+
 // Number functions.
 export fn Zicl_GetLong(interp: *Interp, handle: *Handle, out: *c_long) callconv(.c) ReturnCode {
     out.* = interp.getInteger(handle) catch |err| return ReturnCode.fromError(err);
@@ -186,15 +191,15 @@ export fn Zicl_SourceSetInfo(handle: Handle, filename: [*:0]const u8, line_no: c
 
 // Global init functions.
 var global_threaded: std.Io.Threaded = undefined;
-export fn Zicl_InitGlobals() callconv(.c) c_int {
+export fn Zicl_InitGlobals() ReturnCode {
     global_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
-    Heap.initGlobals(std.heap.c_allocator, global_threaded.io()) catch return -1;
-    return 0;
+    Heap.initGlobals(std.heap.c_allocator, global_threaded.io()) catch return ReturnCode.@"error";
+    return .ok;
 }
 
-export fn Zicl_InitLocalHeap() callconv(.c) c_int {
-    Heap.initLocalHeap() catch return -1;
-    return 0;
+export fn Zicl_InitLocalHeap() ReturnCode {
+    Heap.initLocalHeap() catch return ReturnCode.@"error";
+    return .ok;
 }
 
 export fn Zicl_DeinitAll() callconv(.c) void {
@@ -264,6 +269,11 @@ export fn Zicl_SetResult(interp: *Interp, handle: Handle) callconv(.c) void {
 
 export fn Zicl_SetResultOwning(interp: *Interp, handle: Handle) callconv(.c) void {
     interp.setResultOwning(handle);
+}
+
+export fn Zicl_SetVariable(interp: *Interp, name: *Handle, handle: Handle) callconv(.c) ReturnCode {
+    interp.setVariableTo(name, handle) catch |err| return ReturnCode.fromError(err);
+    return .ok;
 }
 
 export fn Zicl_SetResultString(interp: *Interp, str: [*:0]const u8, len: c_int) ReturnCode {

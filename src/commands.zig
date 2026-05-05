@@ -801,6 +801,98 @@ pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
     }
 }
 
+/// [upvar] - link a local variable to a variable in an upper scope.
+/// Syntax: upvar ?level? otherVar myVar ?otherVar myVar ...?
+pub fn upvarCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    var upvar_names_start: usize = 1;
+    var levels_up: u32 = 1;
+
+    if (args.len > 3 and @mod(args.len, 2) == 0) {
+        if (interp.getInteger(&args[1])) |level| {
+            if (level >= 0) {
+                levels_up = @intCast(level);
+                upvar_names_start = 2;
+            } else {
+                try interp.setResultString("bad level");
+                return error.EvalError;
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try interp.setResultString("bad level");
+                return error.EvalError;
+            },
+        }
+    }
+
+    if (args.len - upvar_names_start < 2) return error.WrongUsage;
+
+    const current_frame = interp.callFrameIdx();
+    if (current_frame < levels_up) {
+        try interp.setResultString("bad level");
+        return error.EvalError;
+    }
+    const target_frame = current_frame - levels_up;
+
+    var j = upvar_names_start;
+    while (j + 1 < args.len) : (j += 2) {
+        try interp.ensureShimmerable(&args[j]);
+        try interp.ensureShimmerable(&args[j + 1]);
+
+        var det: objutil.ErrorDetails = undefined;
+        try interp.wrapError(&det, interp.setVariableLinkInner(&det, current_frame, args[j + 1], target_frame, args[j]));
+    }
+}
+
+/// [uplevel] - evaluate a script in an upper scope.
+/// Syntax: uplevel ?level? script ?arg ...?
+pub fn uplevelCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    if (args.len < 2) return error.WrongUsage;
+
+    var script_start: usize = 1;
+    var levels_up: u32 = 1;
+
+    const first_str = try args[1].getString();
+    if (first_str.len > 0 and (first_str[0] >= '0' and first_str[0] <= '9')) {
+        if (interp.getInteger(&args[1])) |level| {
+            if (level >= 0) {
+                levels_up = @intCast(level);
+                script_start = 2;
+            } else {
+                try interp.setResultString("bad level");
+                return error.EvalError;
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try interp.setResultString("bad level");
+                return error.EvalError;
+            },
+        }
+    }
+
+    if (args.len - script_start < 1) return error.WrongUsage;
+
+    const current_frame = interp.callFrameIdx();
+    if (current_frame < levels_up) {
+        try interp.setResultString("bad level");
+        return error.EvalError;
+    }
+    const target_frame = current_frame - levels_up;
+
+    const script, const is_new_script = blk: {
+        if (args.len - script_start == 1) {
+            break :blk .{ args[script_start], false };
+        }
+        const list = try objutil.newList(args[script_start..]);
+        break :blk .{ list, true };
+    };
+    defer if (is_new_script) script.decrRefCount();
+
+    const cache_key = @as(u256, interp.call_frames.items[target_frame].signature.cache_id) ^ try script.getHash();
+    return interp.evalObjectInner(target_frame, script, cache_key);
+}
+
 /// [apply] - invoke a closure value directly without binding it to a name.
 /// Unlike Tcl's [apply], the lambda must be a Zicl closure object or its
 /// serialized string form, a raw {argList body} list is not supported.
@@ -840,21 +932,15 @@ pub fn applymethodCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
 pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
     if (interp.callFrameIdx() == 0) {
-        interp.setResultString("tailcall can only be called from a proc or lambda");
+        try interp.setResultString("tailcall can only be called from a proc or lambda");
         return error.EvalError;
     } else if (args.len >= 2) {
         // Make sure that if the command doesn't exist, we throw the error here, so
         // it doesn't mysteriously show up at a untracable spot up the call stack.
-        var det: objutil.ErrorDetails = undefined;
-        var new_handle: OptionalHandle = .none;
-        _ = interp.getCommand(&det, interp.callFrameIdx() - 1, args[1], &new_handle) catch |err| switch (err) {
+        _ = interp.getCommand(interp.callFrameIdx() - 1, &args[1], false) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                interp.setResultOwning(det.message);
-                return error.EvalError;
-            },
+            else => return error.EvalError,
         };
-        args[1].swapIfNew(new_handle);
 
         var tailcall_args = std.ArrayList(Handle).empty;
         // `args[1..]` includes the name of the command to run.
@@ -865,7 +951,7 @@ pub fn tallcallCommand(interp: *Interp, args: []Handle) Interp.Error!void {
         };
         return error.Tailcall;
     } else {
-        interp.setResultString("no function provided");
+        try interp.setResultString("no function provided");
         return error.EvalError;
     }
 }
@@ -1380,7 +1466,280 @@ pub fn returnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     return code.toError();
 }
 
+pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const Subcommands = enum {
+        exists,
+        dirname,
+        tail,
+        rootname,
+        join,
+        mkdir,
+        size,
+        readable,
+        isdirectory,
+        mtime,
+        readlink,
+        tempfile,
+    };
+    const Parser = objutil.SubcommandParser(Subcommands, &.{
+        .{ .variant = .exists, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .dirname, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .tail, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .rootname, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .join, .usage = "name ?name ...?", .min_args = 1, .max_args = null },
+        .{ .variant = .mkdir, .usage = "dir", .min_args = 1, .max_args = 1 },
+        .{ .variant = .size, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .readable, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .isdirectory, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .mtime, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .readlink, .usage = "name", .min_args = 1, .max_args = 1 },
+        .{ .variant = .tempfile, .usage = "?name?", .min_args = 0, .max_args = 1 },
+    });
+
+    var det: objutil.ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    switch (subcommand) {
+        .exists => {
+            const path = try args[2].getString();
+            const exists = blk: {
+                std.Io.Dir.accessAbsolute(Heap.global_io, path, .{}) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => {
+                        try interp.setResultFormatted("could not access file: {s}", .{@errorName(err)});
+                        return error.EvalError;
+                    },
+                };
+                break :blk true;
+            };
+            try interp.setResultInteger(if (exists) 1 else 0);
+        },
+        .dirname => {
+            const path = try args[2].getString();
+            const dir = std.Io.Dir.path.dirname(path) orelse ".";
+            interp.setResultOwning(try objutil.newString(dir));
+        },
+        .tail => {
+            const path = try args[2].getString();
+            const base = std.Io.Dir.path.basename(path);
+            interp.setResultOwning(try objutil.newString(base));
+        },
+        .rootname => {
+            const path = try args[2].getString();
+            const ext = std.Io.Dir.path.extension(path);
+            const root = if (ext.len > 0) path[0 .. path.len - ext.len] else path;
+            interp.setResultOwning(try objutil.newString(root));
+        },
+        .join => {
+            var path_parts: std.ArrayList([]const u8) = .empty;
+            defer path_parts.deinit(Heap.global_gpa);
+            for (args[2..]) |arg| {
+                try path_parts.append(Heap.global_gpa, try arg.getString());
+            }
+            const joined = try std.Io.Dir.path.join(Heap.global_gpa, path_parts.items);
+            defer Heap.global_gpa.free(joined);
+            interp.setResultOwning(try objutil.newString(joined));
+        },
+        .mkdir => {
+            const path = try args[2].getString();
+            std.Io.Dir.cwd().createDir(Heap.global_io, path, .default_dir) catch |err| {
+                try interp.setResultFormatted("could not create directory: {s}", .{@errorName(err)});
+                return error.EvalError;
+            };
+            interp.setEmptyResult();
+        },
+        .size => {
+            const path = try args[2].getString();
+            const stat = std.Io.Dir.cwd().statFile(Heap.global_io, path, .{}) catch |err| {
+                try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
+                return error.EvalError;
+            };
+            try interp.setResultInteger(@intCast(stat.size));
+        },
+        .readable => {
+            const path = try args[2].getString();
+            const readable = blk: {
+                std.Io.Dir.accessAbsolute(Heap.global_io, path, .{ .read = true }) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => {
+                        try interp.setResultFormatted("could not access file: {s}", .{@errorName(err)});
+                        return error.EvalError;
+                    },
+                };
+                break :blk true;
+            };
+            try interp.setResultInteger(if (readable) 1 else 0);
+        },
+        .isdirectory => {
+            const path = try args[2].getString();
+            const is_dir = blk: {
+                const stat = std.Io.Dir.cwd().statFile(Heap.global_io, path, .{}) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => {
+                        try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
+                        return error.EvalError;
+                    },
+                };
+                break :blk stat.kind == .directory;
+            };
+            try interp.setResultInteger(if (is_dir) 1 else 0);
+        },
+        .mtime => {
+            const path = try args[2].getString();
+            const stat = std.Io.Dir.cwd().statFile(Heap.global_io, path, .{}) catch |err| {
+                try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
+                return error.EvalError;
+            };
+            // Convert to millseconds first so we should fit within the f64's mantissa pretty well.
+            const mtime_ms: f64 = @floatFromInt(stat.mtime.toMilliseconds());
+            try interp.setResultFloat(mtime_ms / 1000.0);
+        },
+        .readlink => {
+            const path = try args[2].getString();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const len = std.Io.Dir.cwd().readLink(Heap.global_io, path, &buf) catch |err| {
+                try interp.setResultFormatted("could not read link: {s}", .{@errorName(err)});
+                return error.EvalError;
+            };
+            interp.setResultOwning(try objutil.newString(buf[0..len]));
+        },
+        .tempfile => std.debug.panic("tempfile not fully implemented", .{}),
+    }
+}
+
 /// [errorinfo optsDict]
+pub fn infoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const Subcommands = enum {
+        exists,
+        source,
+        frame,
+        hostname,
+    };
+    const Parser = objutil.SubcommandParser(Subcommands, &.{
+        .{ .variant = .exists, .usage = "varName", .min_args = 1, .max_args = 1 },
+        .{ .variant = .source, .usage = "script ?fileName lineNo?", .min_args = 1, .max_args = 3 },
+        .{ .variant = .frame, .usage = "?level?", .min_args = 0, .max_args = 1 },
+        .{ .variant = .hostname, .usage = "", .min_args = 0, .max_args = 0 },
+    });
+
+    var det: objutil.ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    switch (subcommand) {
+        .exists => {
+            const val = try interp.getVariable(&args[2]);
+            try interp.setResultInteger(if (val.toHandle() != null) 1 else 0);
+        },
+        .source => {
+            const script = args[2];
+            if (args.len == 3) {
+                if (objutil.getSourceInfo(script)) |info| {
+                    const file_name = info.file_name.orEmpty();
+                    const line_no = try objutil.newInteger(Heap.local_heap, info.line_no);
+                    defer line_no.decrRefCount();
+                    const list = try objutil.newList(&.{ file_name, line_no });
+                    interp.setResultOwning(list);
+                } else {
+                    const line_no = try objutil.newInteger(Heap.local_heap, 1);
+                    defer line_no.decrRefCount();
+                    const list = try objutil.newList(&.{ Heap.local_heap.emptyHandle(), line_no });
+                    interp.setResultOwning(list);
+                }
+            } else {
+                const file_name = try objutil.newString(try args[3].getString());
+                defer file_name.decrRefCount();
+                const line_no = try interp.getInteger(&args[4]);
+                try objutil.setSourceInfo(script, .{ .file_name = file_name.toOptional(), .line_no = @intCast(line_no) });
+            }
+        },
+        .frame => {
+            const current = interp.callFrameIdx();
+
+            if (args.len == 2) {
+                try interp.setResultInteger(@intCast(current + 1));
+                return;
+            }
+
+            const level = try interp.getInteger(&args[2]);
+            const signed_current: i64 = @intCast(current);
+            const signed_level: i64 = @intCast(level);
+            const target: u32 = blk: {
+                if (level < 0) {
+                    const t = signed_current + signed_level;
+                    if (t < 0) {
+                        try interp.setResultString("bad level");
+                        return error.EvalError;
+                    }
+                    break :blk @intCast(t);
+                } else {
+                    if (signed_level >= signed_current + 1) {
+                        try interp.setResultString("bad level");
+                        return error.EvalError;
+                    }
+                    break :blk @intCast(level);
+                }
+            };
+
+            // Find the topmost eval frame for the target call frame.
+            var target_eval_frame: ?*Interp.EvalFrame = null;
+            var i = interp.eval_frames.items.len;
+            while (i > 0) {
+                i -= 1;
+                const eval_frame = &interp.eval_frames.items[i];
+                if (eval_frame.call_frame == target) {
+                    target_eval_frame = eval_frame;
+                    break;
+                }
+            }
+
+            if (target_eval_frame == null) {
+                try interp.setResultString("bad level");
+                return error.EvalError;
+            }
+
+            const eval_frame = target_eval_frame.?;
+            const body = eval_frame.currently_evaluating;
+            const source_info = objutil.getSourceInfo(body);
+            const file_name, const base_line = if (source_info) |info|
+                .{ info.file_name.orEmpty(), info.line_no }
+            else
+                .{ Heap.local_heap.emptyHandle(), 1 };
+            const abs_line = base_line + (eval_frame.current_line -| 1);
+
+            const call_frame = &interp.call_frames.items[eval_frame.call_frame];
+            const type_val = if (call_frame.signature.name.toHandle() != null) "fn" else "source";
+            const type_handle = try objutil.newString(type_val);
+            defer type_handle.decrRefCount();
+            const file_name_str = if (file_name.tag() == .string) try file_name.getString() else "";
+            const file_handle = try objutil.newString(file_name_str);
+            defer file_handle.decrRefCount();
+            const line_handle = try objutil.newInteger(Heap.local_heap, @intCast(abs_line));
+            defer line_handle.decrRefCount();
+
+            var dict = try objutil.newDictWithCapacity(Heap.local_heap, 6);
+            defer dict.decrRefCount();
+
+            _ = try interp.putDictValueInPlace(&dict, Heap.local_heap.getInternedString(.type), type_handle);
+            _ = try interp.putDictValueInPlace(&dict, Heap.local_heap.getInternedString(.file), file_handle);
+            _ = try interp.putDictValueInPlace(&dict, Heap.local_heap.getInternedString(.line), line_handle);
+
+            const rel_level = try objutil.newInteger(Heap.local_heap, @intCast(current - target));
+            defer rel_level.decrRefCount();
+            _ = try interp.putDictValueInPlace(&dict, Heap.local_heap.getInternedString(.level), rel_level);
+
+            interp.setResult(dict.borrow());
+        },
+        .hostname => {
+            var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            const name = std.posix.gethostname(&buf) catch |err| {
+                try interp.setResultFormatted("could not get hostname: {s}", .{@errorName(err)});
+                return error.EvalError;
+            };
+            interp.setResultOwning(try objutil.newString(name));
+        },
+    }
+}
+
 ///
 /// Lazily generates the human-readable error info string from an opts dict.
 pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -1463,19 +1822,24 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2, null);
     try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
+    try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3, null);
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
     try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
+    try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, 2, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
+    try registerCommand(interp, "tailcall", tallcallCommand, "command ?arg ...?", 1, null, null);
     try registerCommand(interp, "try", tryCmd, "script ?handler ...? ?finally body?", 1, null, null);
     try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null, null);
+    try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null, null);
+    try registerCommand(interp, "upvar", upvarCmd, "?level? otherVar myVar ?otherVar myVar ...?", 2, null, null);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
