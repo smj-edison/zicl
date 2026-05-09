@@ -370,7 +370,10 @@ pub const Parse = struct {
                 const loc = p.tokenLoc(p.nextToken());
                 const handle = try p.heap.createObject();
                 errdefer handle.decrRefCount();
-                try objutil.setStringFromEscaped(handle, p.source[loc.start..loc.end]);
+                objutil.setStringFromEscaped(handle, p.source[loc.start..loc.end]) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.OtherThreadSet => unreachable,
+                };
 
                 return try p.addNode(.{
                     .tag = .string,

@@ -676,22 +676,21 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
         total_len += (try arg.getString()).len;
     }
 
-    const result_str = try objutil.newStringToFill(Heap.local_heap, total_len);
-    defer result_str.decrRefCount();
+    var new_bytes = try Heap.global_gpa.alloc(u8, total_len);
+    defer Heap.global_gpa.free(new_bytes);
 
     if (total_len > 0) {
-        const buf = Heap.getStringMut(result_str) catch unreachable;
         var pos: usize = 0;
-        @memcpy(buf[pos..(pos + var_value.len)], var_value);
+        @memcpy(new_bytes[pos..(pos + var_value.len)], var_value);
         pos += var_value.len;
         for (args[2..]) |arg| {
             const s = try arg.getString();
-            @memcpy(buf[pos..(pos + s.len)], s);
+            @memcpy(new_bytes[pos..(pos + s.len)], s);
             pos += s.len;
         }
     }
 
-    try interp.setVariableTo(var_name, result_str);
+    try interp.setVariableTo(var_name, try objutil.newString(new_bytes));
     interp.setResult((try interp.getVariable(var_name)).toHandle().?);
 }
 

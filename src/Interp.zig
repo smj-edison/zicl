@@ -1646,20 +1646,16 @@ fn interpolateTokens(
 
     if (new_str_len == 0) return Heap.local_heap.emptyHandle();
 
-    const new_str = try objutil.newStringToFill(Heap.local_heap, new_str_len);
-    errdefer new_str.decrRefCount();
-    if (Heap.getStringMut(new_str)) |new_str_mut| {
-        var written: usize = 0;
-        for (new_values.items) |new_value| {
-            const value_str = try new_value.getString();
-            @memcpy(new_str_mut[written..][0..value_str.len], value_str);
-            written += value_str.len;
-        }
-    } else |err| switch (err) {
-        error.NotMutable => unreachable,
+    var new_bytes = try Heap.global_gpa.alloc(u8, new_str_len);
+    defer Heap.global_gpa.free(new_bytes);
+    var written: usize = 0;
+    for (new_values.items) |new_value| {
+        const value_str = try new_value.getString();
+        @memcpy(new_bytes[written..][0..value_str.len], value_str);
+        written += value_str.len;
     }
 
-    return new_str;
+    return try objutil.newString(new_bytes);
 }
 
 const CommandOrClosure = union(enum) {

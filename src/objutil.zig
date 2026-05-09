@@ -93,7 +93,10 @@ pub fn newStringInner(heap: *Heap, bytes: []const u8) !Handle {
     var handle = try heap.createObject();
     errdefer handle.decrRefCount();
 
-    try Heap.setString(handle, bytes);
+    Heap.setString(handle, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OtherThreadSet => unreachable, // Brand new string, so impossible.
+    };
     var new_handle: OptionalHandle = .none;
     try shimmerToString(handle, &new_handle);
     assert(new_handle == .none);
@@ -106,49 +109,14 @@ pub fn newString(bytes: []const u8) !Handle {
 }
 
 pub fn newStringFmtInner(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
-    const new_count = std.fmt.count(fmt, args);
-    const str = try newStringToFill(heap, new_count);
-    // Don't try setting the string of an empty object.
-    if (str == heap.emptyHandle()) return str;
+    const str = try std.fmt.allocPrint(Heap.global_gpa, fmt, args);
+    defer Heap.global_gpa.free(str);
 
-    const written = std.fmt.bufPrint(Heap.getStringMut(str) catch unreachable, fmt, args) catch return error.OutOfMemory;
-    assert(written.len == new_count);
-
-    return str;
+    return try newStringInner(heap, str);
 }
 
 pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
     return newStringFmtInner(Heap.local_heap, fmt, args);
-}
-
-pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
-    if (len == 0) return heap.emptyHandle();
-
-    const handle = try heap.createObject();
-    errdefer handle.decrRefCount();
-
-    if (len < Heap.LongString.split_point) {
-        const new_str = try heap.createString(@intCast(len));
-        const new_str_end = new_str + @as(u32, @intCast(len));
-        @memset(heap.getHeapString(new_str, new_str_end), 0);
-
-        // New object, so we can set directly.
-        handle.peek().head.str = .{
-            .u = .{
-                .str = .{ .index = new_str, .len = @intCast(len) },
-            },
-            .is_ptr = false,
-        };
-    } else {
-        // Create new string.
-        const new_str = try Heap.global_gpa.allocSentinel(u8, len, 0);
-        errdefer Heap.global_gpa.free(new_str);
-        @memset(new_str, 0);
-        const did_take = try heap.setLongString(handle.index, .{ .normal = new_str });
-        assert(did_take);
-    }
-
-    return handle;
 }
 
 /// Copies provided string.
@@ -158,7 +126,7 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
 
     handle.peek().head.tag = .string;
 
-    switch (Heap.getStringDetails(handle)) {
+    switch (handle.getStringDetails()) {
         .long => |long_str| {
             long_str.setUtf8Length(cp_length);
             handle.peek().body = undefined;
@@ -184,24 +152,11 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
 pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
     // Unescaped will be equal or shorter than escaped version.
     const unescaped = try Heap.global_gpa.allocSentinel(u8, escaped.len, 0);
-    errdefer Heap.global_gpa.free(unescaped);
+    defer Heap.global_gpa.free(unescaped);
     const written = stringutil.removeEscaping(escaped, unescaped);
-    unescaped[written] = 0; // null terminator
+    unescaped[written] = 0; // Null terminator.
 
-    const did_set = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
-    if (did_set) {
-        Heap.global_gpa.free(unescaped);
-    } else {
-        // Too large for normal string, so we'll try setting as a long string.
-        const did_take = try handle.getHeap().setLongString(
-            handle.index,
-            .{ .different_capacity = .{
-                .string = unescaped[0..written :0],
-                .original_capacity = unescaped.len,
-            } },
-        );
-        if (!did_take) Heap.global_gpa.free(unescaped);
-    }
+    try Heap.setString(handle, unescaped);
 }
 
 pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !bool {
@@ -492,7 +447,7 @@ pub fn stringReplace(
     const byte_start = stringutil.cpIndex(bytes, range.start);
     const byte_end = stringutil.cpIndex(bytes, range.end);
 
-    const replaced: Handle = blk: {
+    const replaced: []u8 = blk: {
         // Is there anything to insert?
         if (to_insert) |val| {
             const to_insert_bytes = try val.getString();
@@ -503,52 +458,31 @@ pub fn stringReplace(
             // Tcl ranges are inclusive, so `- 1` is needed.
             const after_range_len = bytes.len - byte_end - 1;
 
-            const new_str = newStringToFill(up_to_range_len + to_insert_len + after_range_len);
-            const new_bytes = Heap.getStringMut(new_str) catch |err| {
-                switch (err) {
-                    error.NotMutable => {
-                        // Empty strings aren't mutable, so we'll just return the empty string.
-                        assert(new_str.peek().str == Heap.Object.empty_string);
-                        break :blk new_str;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                }
-            };
-
+            var new_bytes = try Heap.global_gpa.alloc(u8, up_to_range_len + to_insert_len + after_range_len);
             @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
             @memcpy(new_bytes[up_to_range_len..][0..to_insert_len], to_insert_bytes);
             @memcpy(new_bytes[(up_to_range_len + to_insert_len)..], bytes[(byte_end + 1)..]);
 
-            break :blk new_str;
+            break :blk new_bytes;
         } else {
             // Figure out how long the new string needs to be.
             const up_to_range_len = byte_start;
             // Tcl ranges are inclusive, so `- 1` is needed.
             const after_range_len = bytes.len - byte_end - 1;
 
-            const new_str = try newStringToFill(up_to_range_len + after_range_len);
-            const new_bytes = Heap.getStringMut(new_str) catch |err| {
-                switch (err) {
-                    error.NotMutable => {
-                        // Empty strings aren't mutable, so we'll just return the empty string.
-                        assert(new_str.peek().str == Heap.Object.empty_string);
-                        break :blk new_str;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                }
-            };
-
+            var new_bytes = try Heap.global_gpa.alloc(u8, up_to_range_len + after_range_len);
             @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
             @memcpy(new_bytes[up_to_range_len..], bytes[(byte_end + 1)..]);
 
-            break :blk new_str;
+            break :blk new_bytes;
         }
     };
+    defer Heap.global_gpa.free(replaced);
 
     return .{
         .new_start = new_start,
         .new_end = new_end,
-        .replaced = replaced,
+        .replaced = try newString(replaced),
     };
 }
 
@@ -557,7 +491,7 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
     const bytes = try str.getString();
 
     if (options.use_utf8) {
-        // Go through once to calculate the length
+        // Go through once to calculate the length.
         var new_len: usize = 0;
         var iter = stringutil.Iterator.init(bytes);
         var is_first_char = true;
@@ -580,15 +514,8 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
             is_first_char = false;
         }
 
-        const new_str = try newStringToFill(new_len);
-        errdefer new_str.decrRefCount();
-        const new_bytes = try Heap.getStringMut(new_str) catch |err| switch (err) {
-            error.NotMutable => {
-                // Empty strings aren't mutable, so we'll just return the empty string.
-                assert(new_str.peek().str == Heap.Object.empty_string);
-                return new_str;
-            },
-        };
+        var new_bytes = try Heap.global_gpa.alloc(u8, new_len);
+        defer Heap.global_gpa.free(new_bytes);
 
         // Now go through and write all the bytes.
         iter = stringutil.Iterator.init(bytes);
@@ -612,16 +539,11 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
 
             is_first_char = false;
         }
+
+        return try newString(new_bytes);
     } else {
-        const new_len = bytes.len;
-        const new_str = try newStringToFill(new_len);
-        const new_bytes = try Heap.getStringMut(new_str) catch |err| switch (err) {
-            // Empty strings aren't mutable, so we'll just return the empty string.
-            error.NotMutable => {
-                assert(new_str.peek().str == Heap.Object.empty_string);
-                return new_str;
-            },
-        };
+        const new_bytes = try Heap.global_gpa.alloc(bytes.len);
+        defer Heap.global_gpa.free(new_bytes);
 
         for (bytes, new_bytes) |old_char, *new_char| {
             if (mode == .upper) {
@@ -631,7 +553,7 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
             }
         }
 
-        return new_str;
+        return try newString(new_bytes);
     }
 }
 

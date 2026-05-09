@@ -61,13 +61,15 @@ pub var state: GlobalHeapState = .{};
 pub var global_gpa: std.mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
-pub threadlocal var local_heap: *Heap = undefined;
 pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
+pub var nativefn_registry: NativeFnRegistry = .{};
+pub var registered_hashes: HashRegistry = .{};
 
 /// Signature for a lazy native command initializer. The interpreter pointer
 /// is opaque here to avoid a circular dependency on Interp.zig.
 pub const NativeInitFn = *const fn (interp: *anyopaque) callconv(.c) void;
-
+/// Registry for lazily loaded functions. Will call `init_fn` when the function doesn't
+/// exist as a nativefn.
 pub const NativeFnRegistry = struct {
     mutex: std.Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(NativeInitFn) = .empty,
@@ -92,9 +94,165 @@ pub const NativeFnRegistry = struct {
     }
 };
 
-pub var nativefn_registry: NativeFnRegistry = .{};
+/// The hash registry is the lifeblood of how Zicl deals with hashes. I think it's first
+/// useful to understand the requirements that brought the hash registry about, to
+/// contextualize the design decisions made:
+///
+/// 1. If someone has a hash of something in the Zicl heap, it must resolve to that
+///    thing in the heap.
+/// 2. If that hash no longer exists anywhere in the Zicl heap, that object needs to be
+///    able to be freed, so that objects aren't leaked when nothing refers to them.
+/// 3. Registering and unregistering a hash needs to be fast, since hashes will
+///    be made and destroyed constantly.
+///
+/// (1) rules out an LRU cache, since an object could be evicted even though it still
+/// had a live hash reference. (2) rules out an infinitely growing cache. (3) rules out
+/// duplicating the value to have it be exclusively owned by the registry.
+///
+/// The above requirements have brought me to the following design:
+/// a. We assume a closed world. If a hash reference does not exist in this global heap,
+///    then we don't hang onto the object just because some other computer could contain
+///    a hash to the object. This way we have reclaimation.
+/// b. Every time an object is registered, we set a flag on the object called
+///    `hash_registered`. This way we can register a hash idempotently, and quickly
+///    determine whether the object needs to be unregistered before locking the RwLock.
+/// c. Multiple objects may resolve to the same hash, so we choose the first one registered
+///    to be called the "representative". The representative will have an identical value
+///    to every other object by virtue of hashing, so we only need to hold onto the
+///    representative. What gets tricky though is that we need the representative to stay
+///    alive, even when everyone else has released the representative, since a second object
+///    could resolve to the representative's hash and then cause a UAF. Hence, the registry
+///    borrows the representative until every instance of the hash reference has disappeared.
+///    You might wonder then, won't that mean that there's a circular reference between the
+///    hash registry and the representative? The representative only unregisters when it's
+///    freed, but the hash registry owns the representative. The way around this is that
+///    an object will unregister itself in `decrRefCount` when the new ref count is less than
+///    _or equal_ to 1. That way the representative can unregister itself when nobody else
+///    besides the registry owns it.
+/// d. This registry is in the global heap, not in the threadlocal heap. I couldn't figure
+///    out a good way to have object references moving between threads and have a threadlocal
+///    heap. In particular, the `hash_registered` field makes no sense with multiple heaps,
+///    because it would have to check what heaps it's been registered with.
+/// e. We use an RwLock, not a Mutex, since in many cases a caller just wants to look up a
+///    hash, not register it. And in some cases, if a hash already has a representative, we
+///    can just bump the instances count.
+pub const HashRegistry = struct {
+    pub const Entry = struct {
+        /// Registry owns a reference to the representative.
+        representative: Handle,
+        instances: std.atomic.Value(usize),
+    };
+
+    rw_lock: std.Io.RwLock = .init,
+    entries: std.HashMapUnmanaged(u256, Entry, struct {
+        pub fn hash(self: @This(), full_hash: u256) u64 {
+            _ = self;
+            return @truncate(full_hash);
+        }
+        pub fn eql(self: @This(), a: u256, b: u256) bool {
+            _ = self;
+            return a == b;
+        }
+    }, 80) = .empty,
+
+    pub fn get(registry: *HashRegistry, hash: u256) ?Handle {
+        registry.rw_lock.lockSharedUncancelable(global_io);
+        defer registry.rw_lock.unlockShared(global_io);
+
+        if (registry.entries.getPtr(hash)) |entry| {
+            assert(entry.instances.load(.monotonic) > 0);
+            return entry.representative;
+        } else return null;
+    }
+
+    pub fn register(registry: *HashRegistry, key: u256, value: Handle) !void {
+        const metadata = value.getMetadata();
+
+        registry.rw_lock.lockSharedUncancelable(global_io);
+
+        if (registry.entries.getPtr(key)) |entry| {
+            if (@cmpxchgStrong(bool, &metadata.hash_registered, false, true, .release, .acquire)) |_| {
+                // Someone else registered this already, so no need to do anything.
+            } else {
+                // We were the ones to successfully set `value` as registered.
+                entry.instances.fetchAdd(1, .monotonic);
+            }
+
+            registry.rw_lock.unlockShared(global_io);
+            return;
+        }
+
+        // Entry doesn't exist, so we'll create it.
+        registry.rw_lock.unlockShared(global_io);
+        registry.rw_lock.lockUncancelable(global_io);
+        defer registry.rw_lock.unlock(global_io);
+
+        const new_entry = try registry.entries.getOrPut(global_gpa, key);
+        if (new_entry.found_existing) {
+            if (@cmpxchgStrong(bool, &metadata.hash_registered, false, true, .release, .acquire)) |_| {
+                // Someone registered it inbetween upgrading the shared lock to an exclusive lock.
+            } else {
+                // We successfully marked it as registered, so we can increment the instances count.
+                new_entry.value_ptr.instances.fetchAdd(1, .monotonic);
+            }
+            return;
+        }
+
+        new_entry.key_ptr.* = key;
+        new_entry.value_ptr.* = .{
+            .representative = value.borrow(),
+            .instances = .init(1),
+        };
+
+        // We have an exclusive lock on rw_lock, so nobody else could have registered this value.
+        value.assert(metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire) == null);
+    }
+
+    pub fn unregister(registry: *HashRegistry, key: u256, value: Handle) void {
+        const metadata = value.getMetadata();
+
+        registry.rw_lock.lockSharedUncancelable(global_io);
+
+        if (registry.entries.getPtr(key)) |entry| {
+            if (metadata.cmpxchgStrongHashRegistered(true, false, .release, .acquire)) |_| {
+                // Someone else unregistered this already, so no need to do anything.
+                registry.rw_lock.unlockShared(global_io);
+            } else {
+                // We were the ones to successfully set `value` as not registered.
+                const instance_count = entry.instances.fetchSub(1, .monotonic);
+                if (instance_count == 0) {
+                    // This was the last instance of this hash, so we can now clean it up.
+
+                    registry.rw_lock.unlockShared(global_io);
+                    registry.rw_lock.lockUncancelable(global_io);
+                    defer registry.rw_lock.unlock(global_io);
+
+                    // The entry should still exist here, as we were the ones who set instances
+                    // to 0. It could have moved locations though, when upgrading to an exclusive
+                    // lock.
+                    const entry_second_check = registry.entries.getPtr(key).?;
+                    // Note that we don't need to worry about this `decrRefCount` calling `unregister`
+                    // recursively, since the only way recursion could happen is if
+                    // 1. There were circular references (in which case a global invariant has been
+                    //    violated and we're screwed anyways)
+                    // 2. `representative == value`, but we've just set `value.hash_registered`
+                    //    as false, so it won't call `unregister`.
+                    entry_second_check.representative.decrRefCount();
+
+                    assert(registry.entries.remove(key));
+                }
+            }
+
+            return;
+        } else {
+            // Was already unregistered by the time we checked, so nothing to do.
+            registry.rw_lock.unlockShared(global_io);
+        }
+    }
+};
 
 const Heap = @This();
+pub threadlocal var local_heap: *Heap = undefined;
 
 const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
 const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
@@ -322,23 +480,28 @@ pub const ParsedExpression = struct {
 
 pub const Object = packed struct(u128) {
     pub const null_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = 0, .len = 0 } },
+        .u = .{ .str = .{ .index = 0, .len = 0, .hash_count = 0 } },
         .is_ptr = false,
     };
     pub const empty_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = 1, .len = 0 } },
+        .u = .{ .str = .{ .index = 1, .len = 0, .hash_count = 0 } },
         .is_ptr = false,
     };
 
     pub const StrOrPtr = packed struct(u59) {
+        pub const NormalLength = u16;
+
         u: packed union {
+            /// Normal strings store both the bytes and the hash references inline in the
+            /// same allocation. Check `heapStringLayout` for details.
             str: packed struct {
                 index: u32,
-                len: u26,
+                len: NormalLength,
+                /// Number of Handle references stored inline after the null byte (and
+                /// potentially padding).
+                hash_count: u10,
             },
             /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
-            /// TODO when/if aligned pointers in packed structs become a thing, switch
-            /// over to that system.
             ptr: u58,
         },
         is_ptr: bool,
@@ -349,7 +512,7 @@ pub const Object = packed struct(u128) {
                     long_str.decrRefCount(global_gpa);
                 },
                 .normal => {
-                    heap.freeString(str.u.str.index, str.u.str.len);
+                    heap.freeHeapString(str.u.str.index, str.u.str.len, str.u.str.hash_count);
                 },
                 .null, .empty => {},
             }
@@ -357,7 +520,7 @@ pub const Object = packed struct(u128) {
 
         pub fn format(self: StrOrPtr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             if (self.is_ptr) {
-                try writer.print(".{{ .ptr = {*} }}", .{LongString.fromInt(self.u.ptr)});
+                try writer.print(".{{ .ptr = {*} }}", .{SpecialString.fromInt(self.u.ptr)});
             } else {
                 try writer.print("{}", .{self.u.str});
             }
@@ -832,6 +995,10 @@ pub const OptionalHandle = enum(HandleBacking) {
         return ref;
     }
 
+    pub fn incrOptional(ref: OptionalHandle) void {
+        if (ref.toHandle()) |val| val.incrRefCount();
+    }
+
     pub fn decrOptional(ref: OptionalHandle) void {
         if (ref.toHandle()) |val| val.decrRefCount();
     }
@@ -910,10 +1077,21 @@ pub const Handle = packed struct(HandleBacking) {
         const obj_heap = handle.getHeap();
         const metadata = obj_heap.getLocalMetadata(handle.index);
 
+        // Cross thread objects can't be mutated, even if the ref count is 1, because
+        // objects can be indirectly accessed by traversing lists. Imagine thread 1
+        // is traversing a list, while thread 2 is modifying the list elements.
+        // Thread 2 sees that the list element only has ref count one (since it's only
+        // owned by the list), so it figures it's safe to modify. Wrong! It's not safe
+        // to modify, because thread 1 is also reading the list. This is why crossthread
+        // objects are never safe to modify, or even shimmer.
         const cross_thread = metadata.cross_thread;
+        // If the hash is registered, it means it is considered frozen. We can't very
+        // well mutate something that has a fixed value.
+        const hash_registered = @atomicLoad(ObjectAndMetadata.Metadata, metadata, .acquire).hash_registered;
         const multiple_refs = obj_heap.getLocalRefCount(handle.index) > 1;
 
         if (cross_thread) return false;
+        if (hash_registered) return false;
         if (multiple_refs) return false;
         if (metadata.order > 1) {
             const head = allocHead(handle);
@@ -1059,7 +1237,20 @@ pub const Handle = packed struct(HandleBacking) {
         handle.trace("Decr ref count of index {} (now {})", .{ handle.index, @as(i64, handle.refCount()) - 1 });
 
         if (options.trace_mem) last_touched = handle;
-        if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
+        const new_ref_count = decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread);
+
+        // You may be wondering, why the heck `<= 1`, and not `== 0`? Because hash representatives
+        // are owned by the hash registry, so there's a circular reference. But, hash representatives
+        // can be safely freed if nobody else references them, so this is the needed logic to deal
+        // with the circular reference created by the hash registry.
+        if (new_ref_count <= 1 and @atomicLoad(ObjectAndMetadata.Metadata, metadata, .acquire).hash_registered == true) {
+            // It's impossible for this to not have a string, since if the hash
+            // was registered, we know that it has a string.
+            const hash = handle.getHash() catch unreachable;
+            registered_hashes.unregister(hash, handle);
+        }
+
+        if (new_ref_count == 0) {
             freeObject(handle);
         }
     }
@@ -1084,7 +1275,7 @@ pub const Handle = packed struct(HandleBacking) {
         switch (handle.getStringDetails()) {
             .null => return null,
             .empty => return "",
-            .normal => |str| return str,
+            .normal => |str| return str.bytes,
             .long => |long_str| return long_str.getString(),
         }
     }
@@ -1130,7 +1321,7 @@ pub const Handle = packed struct(HandleBacking) {
                 return long_str.getString();
             },
             .normal => |str| {
-                return str;
+                return str.bytes;
             },
             .empty => {
                 return empty_string_value;
@@ -1272,10 +1463,21 @@ pub const Handle = packed struct(HandleBacking) {
             },
         };
 
-        // Ensure new_str is freed if setStringOwning fails (e.g., OOM during LongString allocation).
+        // Ensure new_str is freed if setStringOwning fails (e.g. OOM during LongString allocation).
         {
             errdefer global_gpa.free(new_str);
-            const took_ownership = try setStringOwning(handle, new_str);
+            // TODO PERF no need to scan for hashes in the string every time,
+            // as we can pass them upwards from the child objects.
+            var resolved_hashes = try scanAndResolveHashRefs(global_gpa, new_str);
+            defer resolved_hashes.deinit(global_gpa);
+            const took_ownership = setStringOwning(handle, new_str, resolved_hashes.items) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.OtherThreadSet => blk: {
+                    // Since string generation should always produce the same results, it's fine
+                    // if a different thread beat us to generating this.
+                    break :blk false;
+                },
+            };
             if (!took_ownership) global_gpa.free(new_str);
         }
 
@@ -1313,7 +1515,7 @@ pub const Handle = packed struct(HandleBacking) {
             }
         }
 
-        // We don't save the hash when it's not a long string, since
+        // We don't save the hash when it's not a special string, since
         // it should be pretty cheap to compute it again.
         return memutil.hashBytes(try handle.getString());
     }
@@ -1397,7 +1599,7 @@ fn invalidateStringInner(handle: Handle) void {
         .null, .empty => {
             // Don't print anything, else the traces get completely spammed.
         },
-        .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
+        .normal => |str| handle.trace("Invalidate string (was {s})", .{str.bytes}),
         .long => |long_str| handle.trace("Invalidate string (was {s})", .{long_str.getString()}),
     }
     if (handle.tag() == .source) {
@@ -1480,7 +1682,27 @@ const ObjectAndMetadata = struct {
         cross_thread: bool,
         /// Whether this object is currently being used (used to track double frees).
         in_use: bool,
-        _padding: u1 = 0,
+        /// Whether the hash of this value is being tracked in the central registry.
+        hash_registered: bool,
+
+        pub fn cmpxchgStrongHashRegistered(
+            metadata: *Metadata,
+            expected_hash_value: bool,
+            new_hash_value: bool,
+            comptime success_order: std.builtin.AtomicOrder,
+            comptime fail_order: std.builtin.AtomicOrder,
+        ) ?bool {
+            var current = @atomicLoad(Metadata, metadata, fail_order);
+            while (current.hash_registered == expected_hash_value) {
+                var new_value = current;
+                new_value.hash_registered = new_hash_value;
+                const result = @cmpxchgWeak(Metadata, metadata, current, new_value, success_order, fail_order);
+                if (result) |val| {
+                    current = val; // Failed load was done with `fail_order`.
+                } else return null; // Success!
+            }
+            return current.hash_registered;
+        }
     };
 
     object: Object,
@@ -1503,15 +1725,15 @@ fn heapBackingAlloc() Allocator {
 fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
     const interned = try heap.createObject();
     errdefer freeObjectBackingInner(interned);
-    const cast_len: u26 = @intCast(str.len);
-    const str_index = try heap.createString(cast_len);
-    errdefer heap.freeString(str_index, cast_len);
+    const cast_len: Object.StrOrPtr.NormalLength = @intCast(str.len);
+    const str_index = try heap.createHeapString(cast_len, &.{});
+    errdefer heap.freeHeapString(str_index, cast_len, 0);
     assert(interned.index == (expected_index + special_object_count));
 
     @memcpy(heap.getHeapString(str_index, str_index + cast_len), str);
     assert(heap.exchangeString(interned.index, Object.null_string, .{
         .is_ptr = false,
-        .u = .{ .str = .{ .index = str_index, .len = cast_len } },
+        .u = .{ .str = .{ .index = str_index, .len = cast_len, .hash_count = 0 } },
     }));
 
     return interned;
@@ -1841,6 +2063,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
             .order = 31,
             .cross_thread = false,
             .in_use = false,
+            .hash_registered = false,
         });
     }
 
@@ -1877,6 +2100,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         .order = order,
         .cross_thread = false,
         .in_use = true,
+        .hash_registered = false,
     };
 
     if (aligned_count > 1) @memset(
@@ -1885,6 +2109,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
             .order = order,
             .cross_thread = false,
             .in_use = true,
+            .hash_registered = false,
         },
     );
 
@@ -1911,6 +2136,7 @@ fn freeObjectBackingInner(handle: Handle) void {
         .order = 31,
         .cross_thread = false,
         .in_use = false,
+        .hash_registered = false,
     });
 
     if (obj_heap == local_heap) {
@@ -1963,39 +2189,77 @@ pub fn getHeapString(self: *Heap, start: u32, end: u32) [:0]u8 {
     return self.strings.items[start..end :0];
 }
 
-/// Get a null-terminated string from heap string storage starting at index.
-pub fn getHeapStringZ(self: *Heap, index: u32) [:0]u8 {
-    const ptr: [*:0]u8 = @ptrCast(&self.strings.items[index]);
-    return std.mem.span(ptr);
+/// Returns the total length of the string, including the null byte and the hash handles.
+/// This will always align the `Handle`s to their alignment, assuming that the first index
+/// of the string is aligned by `Handle`s alignment as well.
+fn heapStringLayout(len: u32, hash_count: u10) struct { total_len: u32, handle_start: u32 } {
+    const length_with_null = len + 1;
+    if (hash_count > 0) {
+        // The handles need to be aligned, so we may need some padding.
+        const handle_start: u32 = @intCast(mem.alignForward(usize, length_with_null, @alignOf(Handle)));
+        return .{
+            .total_len = handle_start + hash_count * @sizeOf(Handle),
+            .handle_start = handle_start,
+        };
+    } else {
+        // No alignment needed.
+        return .{
+            .total_len = length_with_null,
+            .handle_start = math.maxInt(u32), // No handle start, so use something that will blow up.
+        };
+    }
 }
 
-/// Allocates 1 + length, in order to make space for the null byte.
-pub fn createString(self: *Heap, len: u32) !u32 {
-    const length_with_null = len + 1;
-    const order = memutil.getOrder(length_with_null);
+/// Additionally allocates space for the null byte and for the hash handles. Aligns
+/// `Handle`s according to their alignment.
+pub fn createHeapString(heap: *Heap, len: u32, hash_handles: []const OptionalHandle) !u32 {
+    const layout = heapStringLayout(len, @intCast(hash_handles.len));
+    const order = memutil.getOrder(layout.total_len);
 
     const new_string = blk: {
-        if (self == local_heap) {
-            break :blk try self.string_tracking.allocFromOwningThread(order);
+        if (heap == local_heap) {
+            break :blk try heap.string_tracking.allocFromOwningThread(order);
         } else {
-            break :blk try self.string_tracking.allocFromAnyThread(order);
+            break :blk try heap.string_tracking.allocFromAnyThread(order);
         }
     };
-    errdefer self.string_tracking.freeFromAnyThread(new_string, order);
+    errdefer heap.string_tracking.freeFromAnyThread(new_string, order);
+    // Make sure the returned allocation is aligned to Handle, so that our earlier
+    // aligning relative to the string start is valid. Should always be valid with
+    // the buddy allocator, but this should catch any regressions.
+    assert(@mod(new_string, @alignOf(Handle)) == 0);
+
     if (!options.threading) {
-        try self.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + length_with_null);
-        self.strings.items.len = @max(self.strings.items.len, new_string + length_with_null);
+        try heap.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + layout.total_len);
+        heap.strings.items.len = @max(heap.strings.items.len, new_string + layout.total_len);
     }
 
-    self.strings.items[new_string + len] = 0; // Set null byte.
+    heap.strings.items[new_string + len] = 0; // Set null byte.
+
+    // Copy handles in and borrows them.
+    for (hash_handles, 0..) |handle, i| {
+        mem.writeInt(
+            HandleBacking,
+            heap.strings.items[(layout.handle_start + @sizeOf(Handle) * i)..][0..@sizeOf(Handle)],
+            @bitCast(@intFromEnum(handle)),
+            .native,
+        );
+        _ = handle.borrowOptional();
+    }
+
     return new_string;
 }
 
-pub fn freeString(self: *Heap, index: u32, len: u32) void {
+pub fn freeHeapString(self: *Heap, index: u32, len: u32, hash_count: u10) void {
     assert(index >= special_string_count);
 
-    const length_with_null = len + 1;
-    const order = memutil.getOrder(length_with_null);
+    const layout = heapStringLayout(len, hash_count);
+    const order = memutil.getOrder(layout.total_len);
+
+    // Release handles.
+    const handles: [*]const Handle = @ptrCast(@alignCast(&self.strings.items[index + layout.handle_start]));
+    for (handles[0..hash_count]) |handle| handle.decrRefCount();
+
     if (self == local_heap) {
         self.string_tracking.freeFromOwningThread(index, order);
     } else {
@@ -2033,7 +2297,7 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
             else => break :blk,
         };
 
-        // If both strings are long strings, we can just
+        // If both strings are special strings, we can just
         // compare their hashes instead of the whole string.
         return a_long_str.getHash() == b_long_str.getHash();
     }
@@ -2066,17 +2330,17 @@ pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
         .long => |long_str| {
             long_str.incrRefCount();
             return .{
-                .u = .{ .ptr = LongString.toInt(long_str) },
+                .u = .{ .ptr = SpecialString.toInt(long_str) },
                 .is_ptr = true,
             };
         },
-        .normal => |bytes| {
-            const new_string = try dest_heap.createString(@intCast(bytes.len));
-            const len: u26 = @intCast(bytes.len);
-            @memcpy(dest_heap.getHeapString(new_string, new_string + len), bytes);
+        .normal => |normal_str| {
+            const new_string = try dest_heap.createHeapString(@intCast(normal_str.bytes.len), normal_str.hash_handles);
+            const len: Object.StrOrPtr.NormalLength = @intCast(normal_str.bytes.len);
+            @memcpy(dest_heap.getHeapString(new_string, new_string + len), normal_str.bytes);
 
             return .{
-                .u = .{ .str = .{ .index = new_string, .len = len } },
+                .u = .{ .str = .{ .index = new_string, .len = len, .hash_count = @intCast(normal_str.hash_handles.len) } },
                 .is_ptr = false,
             };
         },
@@ -2371,19 +2635,85 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
     }
 }
 
+const hash_prepend = "blake3^";
+const hash_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789~.";
+const hash_encoder = std.base64.Base64Encoder.init(hash_chars.*, null);
+const hash_decoder = std.base64.Base64Decoder.init(hash_chars.*, null);
+const hash_len = hash_decoder.calcSizeUpperBound(256) catch unreachable;
+const hash_and_prepend_len = hash_prepend.len + hash_len;
+fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u256) {
+    var found_hashes: std.ArrayList(u256) = .empty;
+    errdefer found_hashes.deinit(arena);
+
+    var current_index: usize = 0;
+    while (true) {
+        if (std.mem.findPos(u8, bytes, current_index, hash_prepend)) |next| {
+            if (bytes.len - current_index >= hash_and_prepend_len) {
+                defer current_index = next + hash_and_prepend_len;
+
+                var output: [32]u8 = undefined;
+                hash_decoder.decode(&output, bytes[(next + 6)..][0..hash_len]) catch |err| switch (err) {
+                    error.InvalidCharacter => continue,
+                    error.InvalidPadding, error.NoSpaceLeft => unreachable,
+                };
+
+                try found_hashes.append(arena, @bitCast(output));
+            } else break;
+        }
+    }
+
+    return found_hashes;
+}
+
+fn scanAndResolveHashRefs(arena: Allocator, bytes: []const u8) error{OutOfMemory}!std.ArrayList(OptionalHandle) {
+    var found_hashes = try scanStringForHashRefs(arena, bytes);
+    defer found_hashes.deinit(arena);
+
+    // Look up all the found hashes.
+    var resolved_hashes: std.ArrayList(OptionalHandle) = try .initCapacity(arena, found_hashes.items.len);
+    {
+        registered_hashes.rw_lock.lockSharedUncancelable(global_io);
+        defer registered_hashes.rw_lock.unlockShared(global_io);
+
+        for (found_hashes.items) |found_hash| {
+            if (registered_hashes.entries.get(found_hash)) |resolved| {
+                resolved_hashes.appendAssumeCapacity(resolved.representative.toOptional());
+            } else {
+                resolved_hashes.appendAssumeCapacity(.none);
+            }
+        }
+    }
+
+    return resolved_hashes;
+}
+
+pub fn setString(handle: Handle, bytes: []const u8) error{ OutOfMemory, OtherThreadSet }!void {
+    const resolved = try scanAndResolveHashRefs(global_gpa, bytes);
+    try setStringKnownHashHandles(handle, bytes, resolved.items);
+}
+
 /// Copies provided string.
-pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
+pub fn setStringKnownHashHandles(
+    handle: Handle,
+    bytes: []const u8,
+    hash_handles: []const OptionalHandle,
+) error{ OutOfMemory, OtherThreadSet }!void {
     const heap = handle.getHeap();
 
     // Try setting as a normal string first.
-    const did_set = try heap.setNormalString(handle.index, bytes);
-    if (!did_set) {
-        // Setting it as a long string will most likely take ownership,
-        // so we need to copy.
-        const new_str = try global_gpa.dupeZ(u8, bytes);
-        errdefer global_gpa.free(new_str);
-        const took_ownership = try heap.setLongString(handle.index, .{ .normal = new_str });
-        if (!took_ownership) global_gpa.free(new_str);
+    if (heap.setNormalString(handle.index, bytes, hash_handles)) {
+        // Success!
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OtherThreadSet => return error.OtherThreadSet,
+        error.TooBig => {
+            // Setting it as a special string will most likely take ownership,
+            // so we need to copy.
+            const new_str = try global_gpa.dupeSentinel(u8, bytes, 0);
+            errdefer global_gpa.free(new_str);
+            errdefer for (hash_handles) |val| val.decrOptional();
+            try heap.setSpecialString(handle.index, .{ .normal = new_str }, hash_handles);
+        },
     }
 }
 
@@ -2413,33 +2743,24 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
     const success = blk: {
         const obj: *Object = self.getLocalObject(index);
         if (options.threading and self.objects.get(index).metadata.cross_thread) {
-            // Atomically swap only the first half of the object
-            if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
-            if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
-            if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
-
-            const str_mask: u64 = (1 << 59) - 1;
-
-            const object_head: *u64 = @ptrCast(obj);
-            var current_head = @atomicLoad(u64, object_head, .acquire);
-
+            const object_head: *align(8) Object.Head = @ptrCast(&obj.head);
+            var current_head = @atomicLoad(Object.Head, object_head, .acquire);
             while (true) {
                 // Is the string pointer what we expected?
-                if (current_head & str_mask != @as(u59, @bitCast(expected))) {
+                if (current_head.str != expected) {
                     // If not, somebody else must've won this, so let the caller know.
                     break :blk false;
                 }
 
-                const to_set_to_bits: u59 = @bitCast(to_set_to);
                 // Preserve type tag from current_head.
-                var new_head = current_head & ~str_mask;
-                new_head |= to_set_to_bits;
+                var new_head = current_head;
+                new_head.str = to_set_to;
 
-                const res: ?u64 = @cmpxchgWeak(u64, object_head, current_head, new_head, .release, .acquire);
-
+                const res: ?Object.Head =
+                    @cmpxchgWeak(Object.Head, object_head, current_head, new_head, .release, .acquire);
                 if (res) |winning_head| {
                     current_head = winning_head;
-                    continue;
+                    continue; // Try again.
                 } else {
                     // Successfully swapped.
                     break :blk true;
@@ -2451,75 +2772,101 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
         }
     };
 
-    const handle = self.getHandle(index);
-    handle.trace("Set string to \"{f}\"", .{handle});
+    if (success) {
+        const handle = self.getHandle(index);
+        handle.trace("Set string to \"{f}\"", .{handle});
+    }
 
     return success;
 }
 
 /// Returns whether the heap took ownership. It may copy the bytes into
 /// the heap, so it can succeed while also not taking ownership.
-pub fn setStringOwning(handle: Handle, bytes: [:0]u8) error{OutOfMemory}!bool {
+pub fn setStringOwning(handle: Handle, bytes: [:0]u8, hash_handles: []const OptionalHandle) error{ OutOfMemory, OtherThreadSet }!bool {
     const heap = handle.getHeap();
 
-    if (try heap.setNormalString(handle.index, bytes)) {
-        // Successfully set as normal string.
-        return false;
-    } else {
-        return try heap.setLongString(handle.index, .{ .normal = bytes });
-    }
+    heap.setNormalString(handle.index, bytes, hash_handles) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OtherThreadSet => return error.OtherThreadSet,
+        error.TooBig => {
+            try heap.setSpecialString(handle.index, .{ .normal = bytes }, hash_handles);
+            return true;
+        },
+    };
+
+    // Successfully set as normal string.
+    return false;
 }
 
 /// Low-level function. You probably want `Heap.setString()`.
 /// Attempts to copy the provided string into the object heap.
 /// Returns false if the string is too big.
-pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
+pub fn setNormalString(
+    self: *Heap,
+    obj_index: u32,
+    bytes: []const u8,
+    hash_handles: []const OptionalHandle,
+) error{ OutOfMemory, TooBig, OtherThreadSet }!void {
     if (bytes.len == 0) {
         // No need to check the result of the exchange, as there's nothing to clean up
-        assert(self.exchangeString(index, Object.null_string, Object.empty_string));
-        return true;
-    } else if (bytes.len < LongString.split_point) {
-        const string = try self.createString(@intCast(bytes.len));
-        const len: u26 = @intCast(bytes.len);
-        @memcpy(
-            self.getHeapString(string, string + len),
-            bytes,
-        );
+        assert(self.exchangeString(obj_index, Object.null_string, Object.empty_string));
+        return;
+    }
 
-        const string_header: Object.StrOrPtr = .{
-            .u = .{
-                .str = .{ .index = string, .len = len },
-            },
-            .is_ptr = false,
-        };
+    if (bytes.len >= SpecialString.split_point) return error.TooBig;
 
-        const did_win = self.exchangeString(index, Object.null_string, string_header);
-        if (!did_win) {
-            self.freeString(string, len);
-        }
+    const string = try self.createHeapString(@intCast(bytes.len), hash_handles);
+    const len: Object.StrOrPtr.NormalLength = @intCast(bytes.len);
+    @memcpy(
+        self.getHeapString(string, string + len),
+        bytes,
+    );
 
-        return true;
-    } else {
-        return false;
+    const string_header: Object.StrOrPtr = .{
+        .u = .{
+            .str = .{ .index = string, .len = len, .hash_count = @intCast(hash_handles.len) },
+        },
+        .is_ptr = false,
+    };
+
+    const did_win = self.exchangeString(obj_index, Object.null_string, string_header);
+    if (!did_win) {
+        self.freeHeapString(string, len, @intCast(hash_handles.len));
+        return error.OtherThreadSet;
     }
 }
 
 /// Low-level function. You probably want `Heap.setString()`.
-/// Returns whether the object heap took ownership of the string.
 /// The only case where this would fail is OOM or if someone else
 /// exchanged the string right before us.
-pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allocator.Error!bool {
-    const long_string = &(try global_gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
-    errdefer global_gpa.free(long_string);
-    long_string.* = .{ .string_type = string_type };
+pub fn setSpecialString(
+    self: *Heap,
+    obj_index: u32,
+    string: SpecialString.Type,
+    hash_handles: []const OptionalHandle,
+) error{ OutOfMemory, OtherThreadSet }!void {
+    const special_string_backing = try global_gpa.alignedAlloc(SpecialString, SpecialString.align_type, 1);
+    const special_string = &special_string_backing[0];
+    errdefer global_gpa.free(special_string_backing);
+    var owned_hash_handles = std.ArrayList(OptionalHandle).empty;
+    errdefer owned_hash_handles.deinit(global_gpa);
+    try owned_hash_handles.appendSlice(global_gpa, hash_handles);
+    special_string.* = .{
+        .string_type = string,
+        .hash_handles = owned_hash_handles,
+    };
+
+    for (hash_handles) |handle| handle.incrOptional();
+    errdefer for (hash_handles) |handle| handle.decrOptional();
 
     const string_header = Object.StrOrPtr{
-        .u = .{ .ptr = LongString.toInt(long_string) },
+        .u = .{ .ptr = SpecialString.toInt(special_string) },
         .is_ptr = true,
     };
 
-    const res = self.exchangeString(index, Object.null_string, string_header);
-    return res;
+    if (!self.exchangeString(obj_index, Object.null_string, string_header)) {
+        return error.OtherThreadSet;
+    }
 }
 
 fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
@@ -2599,16 +2946,16 @@ fn generateDictString(handle: Handle) ![:0]u8 {
 const StringDetails = union(enum) {
     null: void,
     empty: void,
-    normal: [:0]u8,
-    long: *align(LongString.align_amt) LongString,
+    normal: struct { bytes: [:0]u8, hash_handles: []const OptionalHandle },
+    long: *align(SpecialString.align_amt) SpecialString,
 };
 
 fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
-    // Normal string or long string?
+    // Normal string or special string?
     if (str_or_ptr.is_ptr) {
         // Convert to LongString ptr (guaranteed to be non-null).
         return .{
-            .long = LongString.fromInt(str_or_ptr.u.ptr),
+            .long = SpecialString.fromInt(str_or_ptr.u.ptr),
         };
     } else {
         const str = str_or_ptr.u.str;
@@ -2617,21 +2964,31 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
         } else if (str.index == empty_string) {
             return .empty;
         } else {
+            const layout = heapStringLayout(str.len, str.hash_count);
+            const handles: [*]const OptionalHandle = @ptrCast(@alignCast(&heap.strings.items[str.index + layout.handle_start]));
             return .{
-                .normal = heap.getHeapString(str.index, str.index + str.len),
+                .normal = .{
+                    .bytes = heap.getHeapString(str.index, str.index + str.len),
+                    .hash_handles = handles[0..str.hash_count],
+                },
             };
         }
     }
 }
 
-pub const LongString = struct {
-    /// At what point should we switch to using a long string?
+/// Special strings are strings that have special properties, such as being large,
+/// having a different allocation backing then what's visible, or (in the future)
+/// being memory mapped. This means that they have some more specialized handling,
+/// so this is the structure that encapsulates that behavior.
+pub const SpecialString = struct {
+    /// At what point should we switch to using a special string?
     /// Whenever the string length >= `split_point`.
-    pub const split_point = 100_000;
+    pub const split_point = math.maxInt(Object.StrOrPtr.NormalLength);
+    /// This needs to be aligned to 128, due to how pointers are stored in StrOrPtr.
     pub const align_amt = 128;
     pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
 
-    /// Long strings are special in that they can have
+    /// Special strings are special in that they can have
     /// extended properties (mmaping is in the plans,
     /// for example). Since it has special properties,
     /// we have to track them so it can be freed correctly.
@@ -2647,11 +3004,14 @@ pub const LongString = struct {
             original_capacity: u64,
         },
     };
+    /// This is contains the handles to the hashes referenced in the string.
+    /// They are in order as appearing in the string, although they are
+    /// deduplicated.
+    hash_handles: std.ArrayList(OptionalHandle),
 
     string_type: Type,
-    /// Length has not been determined if == `maxInt(u64)`. Be sure to use
-    /// atomics!
-    utf8_length: u64 = std.math.maxInt(u64),
+    /// Length has not been determined if == `maxInt(u64)`.
+    utf8_length: u64 = math.maxInt(u64),
     hash: struct {
         value: ?u256 = null,
         // TODO PERF this probably can be done with acquire/release, the mutex is a bit overkill.
@@ -2659,15 +3019,15 @@ pub const LongString = struct {
     } = .{},
     ref_count: usize = 1,
 
-    pub fn fromInt(int: u58) *align(align_amt) LongString {
+    pub fn fromInt(int: u58) *align(align_amt) SpecialString {
         return @ptrFromInt(int << 6);
     }
 
-    pub fn toInt(ptr: *align(align_amt) LongString) u58 {
+    pub fn toInt(ptr: *align(align_amt) SpecialString) u58 {
         return @intCast(@intFromPtr(ptr) >> 6);
     }
 
-    pub fn getHash(self: *align(align_amt) LongString) u256 {
+    pub fn getHash(self: *align(align_amt) SpecialString) u256 {
         self.hash.mutex.lockUncancelable(global_io);
         defer self.hash.mutex.unlock(global_io);
 
@@ -2680,19 +3040,19 @@ pub const LongString = struct {
         }
     }
 
-    pub fn getUtf8Length(self: *align(align_amt) LongString) ?u64 {
+    pub fn getUtf8Length(self: *align(align_amt) SpecialString) ?u64 {
         const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
         if (value == std.math.maxInt(u64)) return null else return value;
     }
 
     /// Value is `u64`, not `?u64`, since utf8 length should not ever
     /// change (excluding `LongString` temp strings).
-    pub fn setUtf8Length(self: *align(align_amt) LongString, value: u64) void {
+    pub fn setUtf8Length(self: *align(align_amt) SpecialString, value: u64) void {
         assert(value != std.math.maxInt(u64));
         @atomicStore(u64, &self.utf8_length, value, .monotonic);
     }
 
-    pub fn getString(self: *align(align_amt) LongString) [:0]const u8 {
+    pub fn getString(self: *align(align_amt) SpecialString) [:0]const u8 {
         switch (self.string_type) {
             .normal => |string| return string,
             .temp => |temp| return temp,
@@ -2700,17 +3060,17 @@ pub const LongString = struct {
         }
     }
 
-    pub fn incrRefCount(self: *align(align_amt) LongString) void {
+    pub fn incrRefCount(self: *align(align_amt) SpecialString) void {
         incrRefCountOf(usize, &self.ref_count, options.threading);
     }
 
-    pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
-        if (decrRefCountOf(usize, &self.ref_count, options.threading)) {
+    pub fn decrRefCount(self: *align(align_amt) SpecialString, gpa: Allocator) void {
+        if (decrRefCountOf(usize, &self.ref_count, options.threading) == 0) {
             self.freeInner(gpa);
         }
     }
 
-    pub fn freeInner(self: *align(align_amt) LongString, gpa: Allocator) void {
+    pub fn freeInner(self: *align(align_amt) SpecialString, gpa: Allocator) void {
         switch (self.string_type) {
             .normal => |string| gpa.free(string),
             .different_capacity => |info| {
@@ -2720,6 +3080,8 @@ pub const LongString = struct {
                 // We don't want to free the string, as it's managed by someone else.
             },
         }
+        for (self.hash_handles.items) |handle| handle.decrOptional();
+        self.hash_handles.deinit(gpa);
 
         gpa.destroy(self);
     }
@@ -2934,8 +3296,8 @@ pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) void {
     }
 }
 
-/// Returns true if count has reached zero. Multithreaded safe.
-pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
+/// Returns value after decrementing. Multithreaded safe.
+pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) T {
     var after_sub: T = undefined;
     if (is_atomic) {
         const before_sub = @atomicRmw(T, ref, .Sub, 1, .release);
@@ -2949,7 +3311,7 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
         after_sub = ref.*;
     }
 
-    return after_sub == 0;
+    return after_sub;
 }
 
 pub fn testStart(gpa: Allocator, io: std.Io) !*Heap {
