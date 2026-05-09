@@ -151,12 +151,11 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
 
 pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
     // Unescaped will be equal or shorter than escaped version.
-    const unescaped = try Heap.global_gpa.allocSentinel(u8, escaped.len, 0);
+    const unescaped = try Heap.global_gpa.alloc(u8, escaped.len);
     defer Heap.global_gpa.free(unescaped);
     const written = stringutil.removeEscaping(escaped, unescaped);
-    unescaped[written] = 0; // Null terminator.
 
-    try Heap.setString(handle, unescaped);
+    try Heap.setString(handle, unescaped[0..written]);
 }
 
 pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !bool {

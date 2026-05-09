@@ -2227,7 +2227,7 @@ pub fn createHeapString(heap: *Heap, len: u32, hash_handles: []const OptionalHan
     // Make sure the returned allocation is aligned to Handle, so that our earlier
     // aligning relative to the string start is valid. Should always be valid with
     // the buddy allocator, but this should catch any regressions.
-    assert(@mod(new_string, @alignOf(Handle)) == 0);
+    if (hash_handles.len > 0) assert(@mod(new_string, @alignOf(Handle)) == 0);
 
     if (!options.threading) {
         try heap.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + layout.total_len);
@@ -2240,7 +2240,7 @@ pub fn createHeapString(heap: *Heap, len: u32, hash_handles: []const OptionalHan
     for (hash_handles, 0..) |handle, i| {
         mem.writeInt(
             HandleBacking,
-            heap.strings.items[(layout.handle_start + @sizeOf(Handle) * i)..][0..@sizeOf(Handle)],
+            heap.strings.items[(new_string + layout.handle_start + @sizeOf(Handle) * i)..][0..@sizeOf(Handle)],
             @bitCast(@intFromEnum(handle)),
             .native,
         );
@@ -2257,8 +2257,10 @@ pub fn freeHeapString(self: *Heap, index: u32, len: u32, hash_count: u10) void {
     const order = memutil.getOrder(layout.total_len);
 
     // Release handles.
-    const handles: [*]const Handle = @ptrCast(@alignCast(&self.strings.items[index + layout.handle_start]));
-    for (handles[0..hash_count]) |handle| handle.decrRefCount();
+    if (hash_count > 0) {
+        const handles: [*]const Handle = @ptrCast(@alignCast(&self.strings.items[index + layout.handle_start]));
+        for (handles[0..hash_count]) |handle| handle.decrRefCount();
+    }
 
     if (self == local_heap) {
         self.string_tracking.freeFromOwningThread(index, order);
@@ -2659,7 +2661,7 @@ fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u25
 
                 try found_hashes.append(arena, @bitCast(output));
             } else break;
-        }
+        } else break;
     }
 
     return found_hashes;
@@ -2965,11 +2967,15 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
             return .empty;
         } else {
             const layout = heapStringLayout(str.len, str.hash_count);
-            const handles: [*]const OptionalHandle = @ptrCast(@alignCast(&heap.strings.items[str.index + layout.handle_start]));
+            const hash_handles: []const OptionalHandle = if (str.hash_count > 0) blk: {
+                const raw: [*]const OptionalHandle = @ptrCast(@alignCast(&heap.strings.items[str.index + layout.handle_start]));
+                break :blk raw[0..str.hash_count];
+            } else &.{};
+
             return .{
                 .normal = .{
                     .bytes = heap.getHeapString(str.index, str.index + str.len),
-                    .hash_handles = handles[0..str.hash_count],
+                    .hash_handles = hash_handles,
                 },
             };
         }

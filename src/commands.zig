@@ -690,7 +690,9 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
         }
     }
 
-    try interp.setVariableTo(var_name, try objutil.newString(new_bytes));
+    const result = try objutil.newString(new_bytes);
+    defer result.decrRefCount();
+    try interp.setVariableTo(var_name, result);
     interp.setResult((try interp.getVariable(var_name)).toHandle().?);
 }
 

@@ -69,6 +69,7 @@ fn panicAndPrintTraces(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 test {
+    _ = @import("Heap.zig");
     _ = @import("memutil.zig");
     _ = @import("stringutil.zig");
     _ = @import("objutil.zig");
