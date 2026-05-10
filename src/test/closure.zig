@@ -97,7 +97,7 @@ test "fn parsing" {
     // A manually-constructed fn string exercises parseClosure directly, since
     // there is no .closure tag to shortcut through.
     try interp.testExpectScriptResult("30",
-        \\ set foo {fn impl {{a b} {+ $a $b}} scope {+ {nativefn +}}}
+        \\ set foo "fn impl {{a b} {+ \$a \$b}} scope [hash { + {nativefn +}}]"
         \\ foo 10 20
     );
 }
@@ -157,7 +157,7 @@ test "method parseable by applymethod" {
     defer testFinish(&interp);
 
     try interp.testExpectScriptResult("{x 5} 10",
-        \\ set method {method impl {{self y} {+ $self::x $y}} scope {+ {nativefn +}}}
+        \\ set method "method impl {{self y} {+ \$self::x \$y}} scope [hash {+ {nativefn +}}]"
         \\ applymethod $method {x 5} 5
     );
 }

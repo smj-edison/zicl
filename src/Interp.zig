@@ -152,7 +152,7 @@ fn resolveVariable(
     var_name: Handle,
 ) error{ OutOfMemory, LinkLookupFailed }!?Heap.VariableValue {
     const var_dict = interp.call_frames.items[var_call_frame].variables;
-    var maybe_scope = &interp.call_frames.items[var_call_frame].signature.scope;
+    var maybe_scope_hash_ref = &interp.call_frames.items[var_call_frame].signature.scope_hash_ref;
 
     // Check the variables dictionary. Don't follow refs here so the
     // cached index points at the dict slot, not the ref target.
@@ -164,10 +164,27 @@ fn resolveVariable(
     }
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
-    if (maybe_scope.toHandleRef()) |scope| {
+    if (maybe_scope_hash_ref.toHandleRef()) |scope_hash_ref| {
+        assert(scope_hash_ref.tag() == .hash_reference);
+        var new_scope_dict: OptionalHandle = .none;
+        defer new_scope_dict.decrOptional();
+        objutil.shimmerToDict(det, scope_hash_ref.peek().body.hash_reference, &new_scope_dict) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.LinkLookupFailed,
+        };
+        const scope_dict = new_scope_dict.orElse(scope_hash_ref.peek().body.hash_reference);
+        if (new_scope_dict.toHandle()) |new_dict| {
+            const new_hash_ref = try objutil.createHashReference(new_dict);
+            scope_hash_ref.swap(new_hash_ref);
+        }
+
         var new_scope: OptionalHandle = .none;
-        const in_linked_scope = try objutil.dictLookupFollowLinks(det, scope.*, &new_scope, var_name);
-        scope.swapIfNew(new_scope);
+        defer new_scope.decrOptional();
+        const in_linked_scope = try objutil.dictLookupFollowLinks(det, scope_dict, &new_scope, var_name);
+        if (new_scope.toHandle()) |new_dict| {
+            const new_hash_ref = try objutil.createHashReference(new_dict);
+            scope_hash_ref.swap(new_hash_ref);
+        }
         if (in_linked_scope.toHandle()) |val| {
             return .{ .lexical_variable = .{
                 .target = val,
@@ -1022,20 +1039,12 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     };
     args.swapIfNew(new_args);
 
-    // Make sure scope is a dict.
+    // Scope must always be a hash reference.
     var new_scope: OptionalHandle = .none;
     defer new_scope.decrOptional();
-    const scope_as_dict: OptionalHandle = blk: {
+    const scope_hash_ref: OptionalHandle = blk: {
         if (maybe_scope.toHandle()) |scope| {
-            objutil.shimmerToDict(null, scope, &new_scope) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt("function scope is not a valid dict: \"{f}\"", .{args}),
-                    };
-                    return error.OutOfMemory;
-                },
-                else => return error.BadClosure,
-            };
+            try objutil.shimmerToHashReference(det, scope, &new_scope);
             break :blk new_scope.orElse(scope).toOptional();
         } else break :blk .none;
     };
@@ -1047,7 +1056,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
         .args = args.borrow(),
         .body = body.borrow(),
         .name = maybe_name.borrowOptional(),
-        .scope = scope_as_dict.borrowOptional(),
+        .scope_hash_ref = scope_hash_ref.borrowOptional(),
         .required_arity = parsed_args.required_arity,
         .optional_arity = parsed_args.optional_arity,
         .optional_values = parsed_args.optional_values,
@@ -1464,9 +1473,8 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
         const value = objutil.dictItem(frame.variables, i * 2 + 1);
         if (value.tag() == .upvar_link) break;
     } else {
-        // No upvars found, so we can just borrow the variables.
-        const scope = frame.variables.borrow();
-        return scope;
+        // No upvars found, so we can just reference the variables dict.
+        return try objutil.createHashReference(frame.variables);
     }
 
     // Found upvars if we made it to this point, so we need
@@ -1504,7 +1512,11 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
         }
     }
 
-    return new_dict;
+    // Create a hash reference so the scope can be shared across threads
+    // and is consistent with the ^parent link representation.
+    const hash_ref = try objutil.createHashReference(new_dict);
+    new_dict.decrRefCount();
+    return hash_ref;
 }
 
 /// Returns a dict capturing the current call frame's variables.
@@ -1548,9 +1560,14 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
     const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
 
-    if (borrowed_signature.scope.toHandle()) |scope| {
+    if (borrowed_signature.scope_hash_ref.toHandle()) |scope_hash_ref| {
+        assert(scope_hash_ref.tag() == .hash_reference);
         // Safe since vars_handle is freshly allocated.
-        const put_result = try objutil.dictPutInner(vars_handle, Heap.local_heap.getInternedString(.@"^parent"), scope.hashReference());
+        const put_result = try objutil.dictPutInner(
+            vars_handle,
+            Heap.local_heap.getInternedString(.@"^parent"),
+            scope_hash_ref.peek().body.hash_reference.hashReference(),
+        );
         vars_handle.swapIfNew(put_result.new_dict);
     }
 
@@ -2956,7 +2973,7 @@ pub fn init() !Interp {
         .args = Heap.local_heap.emptyHandle(),
         .body = Heap.local_heap.emptyHandle(),
         .name = .none,
-        .scope = .none,
+        .scope_hash_ref = .none,
         .required_arity = 0,
         .optional_arity = 0,
         .optional_values = .none,

@@ -294,6 +294,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         @"for",
         replace,
         update,
+        link,
     };
     const Parser = objutil.SubcommandParser(Subcommands, &.{
         .{ .variant = .create, .usage = "?key value ...?", .stride = 2 },
@@ -315,6 +316,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         .{ .variant = .@"for", .usage = "vars dictionary script", .min_args = 3, .max_args = 3 },
         .{ .variant = .replace, .usage = "dictionary ?key value ...?", .min_args = 1 },
         .{ .variant = .update, .usage = "varName ?arg ...? script", .min_args = 2 },
+        .{ .variant = .link, .usage = "linkTo dict", .min_args = 2, .max_args = 2 },
     });
 
     var det: objutil.ErrorDetails = undefined;
@@ -436,6 +438,15 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             }
 
             interp.setResultOwning(result);
+        },
+        .link => {
+            const link_to = args[2];
+            const dict = &args[3];
+
+            const hash_ref = try objutil.createHashReference(link_to);
+            defer hash_ref.decrRefCount();
+            _ = try interp.putDictValueInPlace(dict, Heap.local_heap.getInternedString(.@"^parent"), hash_ref);
+            interp.setResult(dict.*);
         },
         else => @panic("unimplemented"),
     }
@@ -1001,7 +1012,7 @@ fn closureHelper(interp: *Interp, args: []Handle, mode: enum { function, method 
         .args = arglist.*,
         .body = body,
         .name = if (fn_name) |val| val.toOptional() else .none,
-        .scope = scope.toOptional(),
+        .scope_hash_ref = scope.toOptional(),
         .required_arity = parsed_args.required_arity,
         .optional_arity = parsed_args.optional_arity,
         .optional_values = parsed_args.optional_values,

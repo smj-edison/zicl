@@ -866,8 +866,8 @@ pub const Closure = struct {
     body: Handle,
     /// We do our best to track the closure's name.
     name: OptionalHandle,
-    /// Handle to the closure's scope (linked dictionary).
-    scope: OptionalHandle,
+    /// Handle to the closure's scope as a hash reference.
+    scope_hash_ref: OptionalHandle,
     /// Required number of arguments.
     required_arity: u32,
     /// Optional number of arguments.
@@ -887,7 +887,7 @@ pub const Closure = struct {
             .args = closure.args.borrow(),
             .body = closure.body.borrow(),
             .name = closure.name.borrowOptional(),
-            .scope = closure.scope.borrowOptional(),
+            .scope_hash_ref = closure.scope_hash_ref.borrowOptional(),
             .required_arity = closure.required_arity,
             .optional_arity = closure.optional_arity,
             .optional_values = closure.optional_values.borrowOptional(),
@@ -901,7 +901,7 @@ pub const Closure = struct {
         closure.args.decrRefCount();
         closure.body.decrRefCount();
         closure.name.decrOptional();
-        closure.scope.decrOptional();
+        closure.scope_hash_ref.decrOptional();
         closure.optional_values.decrOptional();
     }
 };
@@ -1415,7 +1415,7 @@ pub const Handle = packed struct(HandleBacking) {
                 objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.impl));
                 objutil.listAppendAssumeCapacity(outer, impl_val.dupOrRef());
 
-                if (closure.scope.toHandle()) |scope_handle| {
+                if (closure.scope_hash_ref.toHandle()) |scope_handle| {
                     objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.scope));
                     objutil.listAppendAssumeCapacity(outer, scope_handle.dupOrRef());
                 }
@@ -1583,7 +1583,7 @@ pub const Handle = packed struct(HandleBacking) {
                 try closure.body.makeCrossthread();
                 try closure.name.makeCrossthread();
                 try closure.optional_values.makeCrossthread();
-                try closure.scope.makeCrossthread();
+                try closure.scope_hash_ref.makeCrossthread();
             },
             .custom_type => @panic("unimplemented"),
             .cached_local_var,

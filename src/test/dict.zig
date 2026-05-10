@@ -48,6 +48,18 @@ test "dict parent links" {
     );
 }
 
+test "dict link command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    try interp.testExpectScriptResult("value",
+        \\ set a {key value}
+        \\ set b {key2 value2}
+        \\ set c [dict link $a $b]
+        \\ dict get $c key
+    );
+}
+
 test "dict sugar" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
