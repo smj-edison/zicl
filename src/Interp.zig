@@ -145,9 +145,14 @@ pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) w
 }
 
 /// Resolves to the variable's value, if any. Does not account for dict sugar.
-fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: Handle) !?Heap.VariableValue {
+fn resolveVariable(
+    interp: *Interp,
+    det: ?*objutil.ErrorDetails,
+    var_call_frame: u32,
+    var_name: Handle,
+) error{ OutOfMemory, LinkLookupFailed }!?Heap.VariableValue {
     const var_dict = interp.call_frames.items[var_call_frame].variables;
-    const scope = interp.call_frames.items[var_call_frame].signature.scope;
+    var maybe_scope = &interp.call_frames.items[var_call_frame].signature.scope;
 
     // Check the variables dictionary. Don't follow refs here so the
     // cached index points at the dict slot, not the ref target.
@@ -159,8 +164,10 @@ fn resolveVariable(interp: *Interp, var_call_frame: u32, var_name: Handle) !?Hea
     }
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
-    if (scope.toHandle()) |dict| {
-        const in_linked_scope = try objutil.dictLookupFollowLinks(dict, var_name);
+    if (maybe_scope.toHandleRef()) |scope| {
+        var new_scope: OptionalHandle = .none;
+        const in_linked_scope = try objutil.dictLookupFollowLinks(det, scope.*, &new_scope, var_name);
+        scope.swapIfNew(new_scope);
         if (in_linked_scope.toHandle()) |val| {
             return .{ .lexical_variable = .{
                 .target = val,
@@ -179,13 +186,13 @@ fn reshimmerToVariable(
     det: ?*objutil.ErrorDetails,
     var_call_frame: u32,
     name: Handle,
-) error{ OutOfMemory, VariableNotFound }!void {
+) error{ OutOfMemory, VariableNotFound, LinkLookupFailed }!void {
     name.assert(name.canShimmer());
 
     const var_name = try name.getString();
     const call_frame = &interp.call_frames.items[var_call_frame];
 
-    if (try interp.resolveVariable(var_call_frame, name)) |var_value| {
+    if (try interp.resolveVariable(det, var_call_frame, name)) |var_value| {
         switch (var_value) {
             .local_variable => |local_var| {
                 try name.prepareToShimmer();
@@ -226,7 +233,7 @@ fn ensureValidVariableType(
     det: ?*objutil.ErrorDetails,
     var_call_frame: u32,
     name: Handle,
-) error{ OutOfMemory, VariableNotFound, DictSugar }!void {
+) error{ OutOfMemory, VariableNotFound, DictSugar, LinkLookupFailed }!void {
     assert(name.canShimmer());
 
     const call_frame = interp.call_frames.items[var_call_frame];
@@ -372,7 +379,7 @@ pub fn setVariableInner(
     call_frame_idx: u32,
     name: Handle,
     value: Heap.Object,
-) error{ OutOfMemory, BadDict }!void {
+) error{ OutOfMemory, LinkLookupFailed }!void {
     // TODO PERF a lot of functions look the variable back up after setting it. We should probably
     // return the variable's new handle after setting it. After doing so, be sure to audit all
     // the call sites.
@@ -428,6 +435,7 @@ pub fn setVariableInner(
             value_taken = true;
             try createVariable(interp, call_frame_idx, name, value);
         },
+        error.LinkLookupFailed => return error.LinkLookupFailed,
         error.DictSugar => {
             try shimmerToDictSugarAssumeValid(name);
             const dict_sugar = name.peek().body.dict_sugar;
@@ -439,6 +447,7 @@ pub fn setVariableInner(
                     break :blk dict.borrow();
                 } else |get_err| switch (get_err) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    error.LinkLookupFailed => return error.LinkLookupFailed,
                     error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
                     error.VariableNotFound => {
                         // If it's not found, then we'll just create it.
@@ -464,7 +473,7 @@ pub fn setVariableInner(
     }
 }
 
-pub fn setVariableLinkInner(
+pub fn setVariableUpvarInner(
     interp: *Interp,
     det: ?*objutil.ErrorDetails,
     call_frame_idx: u32,
@@ -487,6 +496,12 @@ pub fn setVariableLinkInner(
         return error.VariableAlreadyExists;
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.LinkLookupFailed => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newString("failed to do a hash lookup"),
+            };
+            return error.LinkLookupFailed;
+        },
         error.VariableNotFound => {
             // Fall through.
         },
@@ -535,6 +550,12 @@ pub fn setVariableLinkInner(
                     break;
                 }
             } else |err| switch (err) {
+                error.LinkLookupFailed => {
+                    if (det) |details| details.* = .{
+                        .message = try objutil.newString("failed to do a hash lookup"),
+                    };
+                    return error.LinkLookupFailed;
+                },
                 error.VariableNotFound => {
                     // If the target var doesn't exist, then of course the var name != nothing,
                     // so it's not equal to itself.
@@ -561,7 +582,12 @@ pub fn setVariableLinkInner(
         error.OutOfMemory => return error.OutOfMemory,
         // We already checked that the name isn't dict sugar, so it's definitely
         // impossible for it to be a bad dict.
-        error.BadDict => unreachable,
+        error.LinkLookupFailed => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newString("failed to do a hash lookup"),
+            };
+            return error.LinkLookupFailed;
+        },
     };
 }
 
@@ -574,6 +600,7 @@ pub fn unsetVariableInner(
     interp.ensureValidVariableType(det, call_frame_idx, name) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => return error.VariableNotFound,
+        error.LinkLookupFailed => return error.LinkLookupFailed,
         error.DictSugar => {
             try shimmerToDictSugarAssumeValid(name);
 
@@ -635,7 +662,7 @@ pub fn unsetVariableInner(
             }
 
             const call_frame = &interp.call_frames.items[call_frame_idx];
-            const remove_result = try objutil.dictRemove(call_frame.variables, name);
+            const remove_result = try objutil.dictRemove(det, call_frame.variables, name);
             if (!remove_result.did_remove) {
                 assert(remove_result.new_dict == .none);
                 if (det) |details| details.* = .{
@@ -650,7 +677,7 @@ pub fn unsetVariableInner(
         },
         .cached_lexical_var => {
             const call_frame = &interp.call_frames.items[call_frame_idx];
-            const remove_result = try objutil.dictRemove(call_frame.variables, name);
+            const remove_result = try objutil.dictRemove(det, call_frame.variables, name);
             if (!remove_result.did_remove) {
                 assert(remove_result.new_dict == .none);
                 if (det) |details| details.* = .{
@@ -673,10 +700,11 @@ pub fn getVariableInner(
     det: ?*objutil.ErrorDetails,
     call_frame_idx: u32,
     name: Handle,
-) error{ OutOfMemory, VariableNotFound, BadDict }!Handle {
+) error{ OutOfMemory, VariableNotFound, LinkLookupFailed, BadDict }!Handle {
     interp.ensureValidVariableType(det, call_frame_idx, name) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => return error.VariableNotFound,
+        error.LinkLookupFailed => return error.LinkLookupFailed,
         error.DictSugar => {
             try shimmerToDictSugarAssumeValid(name);
 
@@ -757,18 +785,18 @@ fn testVariables(ta: std.mem.Allocator) !void {
     defer str_foo.decrRefCount();
 
     // Make sure it doesn't resolve to anything.
-    try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
+    try testing.expectEqual(null, interp.resolveVariable(null, 0, str_foo));
 
     const str_value = try objutil.newStringInner(heap, "value");
     defer str_value.decrRefCount();
     try interp.setVariableTo(&str_foo, str_value);
 
-    const cached_lookup_value = (try interp.resolveVariable(0, str_foo)).?.local_variable.target;
+    const cached_lookup_value = (try interp.resolveVariable(null, 0, str_foo)).?.local_variable.target;
     try testing.expectEqualStrings("value", try cached_lookup_value.getString());
     // Also try resolving the value from a new string.
     var str2_foo = try objutil.newStringInner(heap, "foo");
     defer str2_foo.decrRefCount();
-    const lookup_value = (try interp.resolveVariable(0, str2_foo)).?.local_variable.target;
+    const lookup_value = (try interp.resolveVariable(null, 0, str2_foo)).?.local_variable.target;
     try testing.expectEqualStrings("value", try lookup_value.getString());
 
     // Next, we test dict sugar.
@@ -800,14 +828,14 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
     var str_foo = try objutil.newStringInner(heap, "foo");
     defer str_foo.decrRefCount();
 
-    try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
+    try testing.expectEqual(null, interp.resolveVariable(null, 0, str_foo));
     const str_value = try objutil.newStringInner(heap, "value");
     defer str_value.decrRefCount();
     try interp.setVariableTo(&str_foo, str_value);
 
     var str_bar = try objutil.newStringInner(heap, "bar");
     defer str_bar.decrRefCount();
-    try interp.setVariableLinkInner(null, 0, str_bar, 0, str_foo);
+    try interp.setVariableUpvarInner(null, 0, str_bar, 0, str_foo);
 
     // Make sure we can get the value of `foo` through `bar`.
     var lookup_value = try interp.getVariableInner(null, 0, str_bar);
@@ -940,9 +968,13 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     };
     closure_value.swapIfNew(dict_new);
 
-    const maybe_name = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.name));
-    const maybe_impl = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.impl));
-    const maybe_scope = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.scope));
+    var new_closure_value: OptionalHandle = .none;
+    const maybe_name = try objutil.dictLookupFollowLinks(det, closure_value, &new_closure_value, Heap.local_heap.getInternedString(.name));
+    closure_value.swapAndClear(&new_closure_value);
+    const maybe_impl = try objutil.dictLookupFollowLinks(det, closure_value, &new_closure_value, Heap.local_heap.getInternedString(.impl));
+    closure_value.swapAndClear(&new_closure_value);
+    const maybe_scope = try objutil.dictLookupFollowLinks(det, closure_value, &new_closure_value, Heap.local_heap.getInternedString(.scope));
+    closure_value.swapAndClear(&new_closure_value);
 
     var args, const body = blk: {
         if (maybe_impl.toHandle()) |impl| {
@@ -1158,7 +1190,7 @@ pub fn getClosure(interp: *Interp, det: ?*objutil.ErrorDetails, handle: Handle, 
             break :blk .{ .closure = closure, .cache_key = @as(u256, closure.cache_id) };
         }
 
-        const cache_key = try handle.getHash();
+        const cache_key = try handle.getHashNoRegister();
 
         if (Heap.local_heap.parsed_closures.get(cache_key)) |cached| {
             break :blk .{ .closure = cached.closure, .cache_key = cache_key };
@@ -1226,51 +1258,48 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
             // Assign remaining arguments to `args`.
             const list = try objutil.newList(args[called_idx..]);
             defer list.decrRefCount();
-            interp.setVariableInner(null, call_frame_idx, var_name, list.reference()) catch |err| switch (err) {
+            var det: objutil.ErrorDetails = undefined;
+            interp.setVariableInner(&det, call_frame_idx, var_name, list.reference()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                // It's impossible to hit bad dict when initializing a brand new call frame.
-                error.BadDict => unreachable,
+                error.LinkLookupFailed => {
+                    interp.setResultOwning(det.message);
+                    return error.EvalError;
+                },
             };
         } else if (signature_idx >= closure.required_arity) {
             // This is an optional argument.
 
             // Are there any remaining unassigned arguments?
             if (called_idx < args.len) {
-                interp.setVariableInner(
-                    null,
-                    call_frame_idx,
-                    var_name,
-                    args[called_idx].dupOrRef(),
-                ) catch |err| switch (err) {
+                var det: objutil.ErrorDetails = undefined;
+                interp.setVariableInner(&det, call_frame_idx, var_name, args[called_idx].dupOrRef()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    // It's impossible to hit bad dict when initializing a brand new call frame.
-                    error.BadDict => unreachable,
+                    error.LinkLookupFailed => {
+                        interp.setResultOwning(det.message);
+                        return error.EvalError;
+                    },
                 };
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
                 const default_value = objutil.listItem(closure.optional_values.toHandle().?, signature_idx - closure.required_arity);
-                interp.setVariableInner(
-                    null,
-                    call_frame_idx,
-                    var_name,
-                    default_value.dupOrRef(),
-                ) catch |err| switch (err) {
+                var det: objutil.ErrorDetails = undefined;
+                interp.setVariableInner(&det, call_frame_idx, var_name, default_value.dupOrRef()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    // It's impossible to hit bad dict when initializing a brand new call frame.
-                    error.BadDict => unreachable,
+                    error.LinkLookupFailed => {
+                        interp.setResultOwning(det.message);
+                        return error.EvalError;
+                    },
                 };
             }
         } else {
-            interp.setVariableInner(
-                null,
-                call_frame_idx,
-                var_name,
-                args[called_idx].dupOrRef(),
-            ) catch |err| switch (err) {
+            var det: objutil.ErrorDetails = undefined;
+            interp.setVariableInner(&det, call_frame_idx, var_name, args[called_idx].dupOrRef()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                // It's impossible to hit bad dict when initializing a brand new call frame.
-                error.BadDict => unreachable,
+                error.LinkLookupFailed => {
+                    interp.setResultOwning(det.message);
+                    return error.EvalError;
+                },
             };
             called_idx += 1;
         }
@@ -1286,11 +1315,10 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
             args[1].swap(updated_self.borrow());
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.VariableNotFound => {
-                try interp.setResultFormatted("\"{f}\" was unset in method body", .{self_var_name});
+            error.VariableNotFound, error.LinkLookupFailed, error.BadDict => {
+                try interp.setResultFormatted("\"{f}\" was missing in method body", .{self_var_name});
                 return error.EvalError;
             },
-            error.BadDict => unreachable,
         }
     }
 }
@@ -1445,8 +1473,6 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
     // to duplicate everything, and follow any upvars.
     const new_dict = try objutil.newDictWithCapacity(Heap.local_heap, pairs * 2);
     errdefer new_dict.decrRefCount();
-    try objutil.dictSetLinkIfPresent(new_dict, frame.variables.getDictExtraData().parent_link);
-
     for (0..pairs) |i_usize| {
         const i: u32 = @intCast(i_usize);
         const key = objutil.dictItem(frame.variables, i * 2);
@@ -1454,24 +1480,24 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
 
         if (value.tag() == .upvar_link) {
             const upvar_link = value.peek().body.upvar_link;
-            if (interp.getVariableInner(null, upvar_link.call_frame, Heap.local_heap.getHandle(upvar_link.linked_name))) |upvar_val| {
+            if (interp.getVariableInner(det, upvar_link.call_frame, Heap.local_heap.getHandle(upvar_link.linked_name))) |upvar_val| {
                 assert((try objutil.dictPut(new_dict, key, upvar_val)).new_dict == .none);
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => {
-                    if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmtInner(
-                            Heap.local_heap,
-                            "failed to capture the variable \"{f}\", as it was an upvar that pointed at nothing",
-                            .{key},
-                        ),
-                    };
+                error.VariableNotFound, error.BadDict => {
+                    if (det) |details| {
+                        details.message.decrRefCount();
+                        details.* = .{
+                            .message = try objutil.newStringFmtInner(
+                                Heap.local_heap,
+                                "failed to capture the variable \"{f}\", as it was an upvar that pointed at nothing",
+                                .{key},
+                            ),
+                        };
+                    }
                     return error.UninitializedUpvar;
                 },
-                error.VariableNotFound => {
-                    // Don't put anything in the dictionary if the upvar
-                    // doesn't point at anything.
-                },
+                error.LinkLookupFailed => return error.LinkLookupFailed,
             }
         } else {
             assert((try objutil.dictPut(new_dict, key, value)).new_dict == .none);
@@ -1517,14 +1543,15 @@ pub fn currentEvalFrame(interp: *Interp) *EvalFrame {
 }
 
 fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
-    const vars_handle = try objutil.newDictWithCapacity(Heap.local_heap, 0);
+    var vars_handle = try objutil.newDictWithCapacity(Heap.local_heap, 0);
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
     errdefer borrowed_signature.deinit();
 
-    if (signature.scope.toHandle()) |scope| {
+    if (borrowed_signature.scope.toHandle()) |scope| {
         // Safe since vars_handle is freshly allocated.
-        try objutil.dictSetLink(vars_handle, scope);
+        const put_result = try objutil.dictPutInner(vars_handle, Heap.local_heap.getInternedString(.@"^parent"), scope.hashReference());
+        vars_handle.swapIfNew(put_result.new_dict);
     }
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
@@ -1575,7 +1602,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
             @panic("Expression sugar unimplemented");
         },
         .command_subst => {
-            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHash();
+            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
             try interp.evalObjectInner(interp.callFrameIdx(), value, nested_cache_key);
             return interp.result.borrow();
         },
@@ -1671,7 +1698,7 @@ fn getCommandInner(
     name: Handle,
     can_be_method: bool,
 ) !CommandOrClosure {
-    if (interp.getVariableInner(null, call_frame, name)) |var_val| {
+    if (interp.getVariableInner(det, call_frame, name)) |var_val| {
         if (var_val.tag() == .closure) {
             return .{ .closure = try interp.getClosure(det, var_val, can_be_method) };
         }
@@ -1704,10 +1731,14 @@ fn getCommandInner(
         }
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.LinkLookupFailed => return error.LinkLookupFailed,
         error.VariableNotFound, error.BadDict => {
-            if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt("invalid command name \"{f}\"", .{name}),
-            };
+            if (det) |details| {
+                details.message.decrRefCount();
+                details.* = .{
+                    .message = try objutil.newStringFmt("invalid command name \"{f}\"", .{name}),
+                };
+            }
             return error.CommandNotFound;
         },
     }
@@ -2158,7 +2189,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .integer => return .{ .int = node_data.integer },
         .float => return .{ .float = node_data.float },
         .command_subst => {
-            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node_data.object.getHash();
+            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node_data.object.getHashNoRegister();
             const result = interp.evalObjectInner(interp.callFrameIdx(), node_data.object, nested_cache_key);
 
             if (result) {
@@ -2374,7 +2405,7 @@ pub fn evalExpression(interp: *Interp, handle: Handle, new_handle: *OptionalHand
     // hash, so identical expressions at different call sites get their
     // own cached variable lookups.
     var det: objutil.ErrorDetails = undefined;
-    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try handle.getHash();
+    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try handle.getHashNoRegister();
     const expr = try interp.wrapError(&det, objutil.getExpression(&det, handle, cache_key));
 
     return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
@@ -2525,15 +2556,8 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Handle) !struct { command: ?C
             objutil.dictLookupRecursively(&det, dict_resolved, &maybe_new_dict, all_but_last),
         );
         if (maybe_new_dict.toHandle()) |new_dict| {
-            interp.setVariableInner(
-                null,
-                interp.callFrameIdx(),
-                dict_name,
-                new_dict.referenceOwning(),
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => unreachable,
-            };
+            det = undefined;
+            try interp.wrapError(&det, interp.setVariableInner(&det, interp.callFrameIdx(), dict_name, new_dict.referenceOwning()));
         }
 
         if (maybe_self.toHandle()) |self| {
@@ -2605,7 +2629,7 @@ fn invokeCommandMaybeMethod(
         var det: objutil.ErrorDetails = undefined;
         interp.ensureValidVariableType(&det, call_frame, args.*[0]) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.VariableNotFound => {
+            error.LinkLookupFailed, error.VariableNotFound => {
                 interp.setResultOwning(det.message);
                 return error.EvalError;
             },
@@ -2618,16 +2642,22 @@ fn invokeCommandMaybeMethod(
         const dict_sugar = method_dict_path.peek().body.dict_sugar;
 
         const dict_name = method_dict_path.getHeap().getHandle(dict_sugar.dict_name_index);
-        const dict_resolved = interp.getVariableInner(null, call_frame, dict_name) catch |err| switch (err) {
+        const dict_resolved = interp.getVariableInner(&det, call_frame, dict_name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => unreachable,
+            error.LinkLookupFailed, error.VariableNotFound, error.BadDict => {
+                interp.setResultOwning(det.message);
+                return error.EvalError;
+            },
         };
         const dict_path = method_dict_path.getHeap().getHandle(dict_sugar.path_index);
 
         if (objutil.listLengthRaw(dict_path) == 1) {
-            interp.setVariableInner(null, call_frame, dict_name, new_self.reference()) catch |err| switch (err) {
+            interp.setVariableInner(&det, call_frame, dict_name, new_self.reference()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => unreachable,
+                error.LinkLookupFailed => {
+                    interp.setResultOwning(det.message);
+                    return error.EvalError;
+                },
             };
         } else {
             var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
@@ -2644,9 +2674,12 @@ fn invokeCommandMaybeMethod(
             ));
 
             if (maybe_new_dict.toHandle()) |new_dict| {
-                interp.setVariableInner(null, call_frame, dict_name, new_dict.reference()) catch |err| switch (err) {
+                interp.setVariableInner(&det, call_frame, dict_name, new_dict.reference()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => unreachable,
+                    error.LinkLookupFailed => {
+                        interp.setResultOwning(det.message);
+                        return error.EvalError;
+                    },
                 };
             }
         }
@@ -2863,7 +2896,7 @@ pub const ReturnCodeEnum = objutil.TclEnum(Interp.ReturnCode, "return code", tru
 pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
-    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHash();
+    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHashNoRegister();
     return evalObjectInner(interp, interp.callFrameIdx(), script, cache_key);
 }
 
@@ -2970,7 +3003,7 @@ pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMem
 pub fn wrapShimmerFn(
     interp: *Interp,
     handle: *Handle,
-    to_call: fn (?*objutil.ErrorDetails, Handle, *OptionalHandle) objutil.Error!void,
+    to_call: fn (?*objutil.ErrorDetails, Handle, *OptionalHandle) anyerror!void,
 ) !void {
     var det: objutil.ErrorDetails = undefined;
     var new_handle: OptionalHandle = .none;
@@ -3005,6 +3038,11 @@ pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
 pub fn getBoolean(interp: *Interp, handle: *Handle) !bool {
     try interp.wrapShimmerFn(handle, objutil.shimmerToBoolean);
     return handle.peek().body.bool.data;
+}
+
+pub fn resolveHash(interp: *Interp, handle: *Handle) !Handle {
+    try interp.wrapShimmerFn(handle, objutil.shimmerToHashReference);
+    return handle.peek().body.hash_reference;
 }
 
 /// Shimmers a handle to a dict, updating it in place if a duplicate was
@@ -3089,13 +3127,13 @@ pub fn getVariable(interp: *Interp, provided_name: *Handle) !OptionalHandle {
     const value = interp.getVariableInner(null, interp.callFrameIdx(), provided_name.*) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => return .none,
-        error.BadDict => {
+        error.BadDict, error.LinkLookupFailed => {
             // We normally don't capture the error message, but in this case we want the error,
             // so we'll just rerun it, this time with `det`.
             var det: objutil.ErrorDetails = undefined;
             _ = interp.getVariableInner(&det, interp.callFrameIdx(), provided_name.*) catch |inner_err| switch (inner_err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => {},
+                error.BadDict, error.LinkLookupFailed => {},
                 else => unreachable,
             };
             interp.setResultOwning(det.message);

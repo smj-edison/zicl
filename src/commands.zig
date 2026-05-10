@@ -264,6 +264,14 @@ pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     return error.Continue;
 }
 
+pub fn hashCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    interp.setResultOwning(try objutil.createHashReference(args[1]));
+}
+
+pub fn hashlookupCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    interp.setResult(try interp.resolveHash(&args[1]));
+}
+
 /// [dict]
 pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const Subcommands = enum {
@@ -411,26 +419,23 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 return;
             }
 
-            // the name "merge" is a little misleading, since under the hood
-            // it's actually implemented as linked dictionaries. This is to
-            // allow prototype construction by the usual prototype chain
-            // approach. The rightmost argument takes the highest priority, the
-            // next rightmost argument has second priority, all the way down to
-            // the first argument, which is the end of the chain.
-            var current_top: Handle = try Heap.local_heap.duplicate(dicts[1]);
-            errdefer current_top.decrRefCount();
-            try objutil.dictSetLink(current_top, dicts[0]);
+            var result = try objutil.newDictWithCapacity(Heap.local_heap, 0);
+            errdefer result.decrRefCount();
 
-            for (dicts[2..]) |dict| {
-                const child = try Heap.local_heap.duplicate(dict);
-                errdefer child.decrRefCount();
-                const prev = current_top;
-                try objutil.dictSetLink(child, prev);
-                prev.decrRefCount(); // dictSetLink borrowed prev, so we need to release our ref.
-                current_top = child;
+            for (dicts) |dict| {
+                const pair_count = dict.peek().body.dict.len / 2;
+                var pair_i: u32 = 0;
+                while (pair_i < pair_count) : (pair_i += 1) {
+                    const k = objutil.dictItemFollowRefs(dict, pair_i * 2);
+                    const v = objutil.dictItemFollowRefs(dict, pair_i * 2 + 1);
+                    const put_result = try objutil.dictPut(result, k, v);
+                    if (put_result.new_dict.toHandle()) |new| {
+                        result.swap(new);
+                    }
+                }
             }
 
-            interp.setResultOwning(current_top);
+            interp.setResultOwning(result);
         },
         else => @panic("unimplemented"),
     }
@@ -759,6 +764,11 @@ pub fn concatCmd(interp: *Interp, args: []Handle) !void {
     try interp.setResultString(buf.items);
 }
 
+pub fn launderCmd(interp: *Interp, args: []Handle) !void {
+    const str = try args[1].getString();
+    try interp.setResultString(str);
+}
+
 /// [set]
 pub fn setCmd(interp: *Interp, args: []Handle) !void {
     const var_name = &args[1];
@@ -795,7 +805,11 @@ pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
     } else {
         while (i < args.len) : (i += 1) {
             interp.unsetVariableSilent(&args[i]) catch |err| switch (err) {
-                error.VariableNotFound, error.BadDict => {},
+                error.VariableNotFound,
+                error.HashLookupFailed,
+                error.LinkLookupFailed,
+                error.NotHashReference,
+                => {},
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
@@ -841,7 +855,7 @@ pub fn upvarCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         try interp.ensureShimmerable(&args[j + 1]);
 
         var det: objutil.ErrorDetails = undefined;
-        try interp.wrapError(&det, interp.setVariableLinkInner(&det, current_frame, args[j + 1], target_frame, args[j]));
+        try interp.wrapError(&det, interp.setVariableUpvarInner(&det, current_frame, args[j + 1], target_frame, args[j]));
     }
 }
 
@@ -1825,12 +1839,15 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3, null);
+    try registerCommand(interp, "hash", hashCmd, "string", 1, 1, null);
+    try registerCommand(interp, "hashlookup", hashlookupCmd, "hash", 1, 1, null);
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
     try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, 2, null);
+    try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);

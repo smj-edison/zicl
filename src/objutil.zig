@@ -51,6 +51,48 @@ pub fn shimmerToString(provided_handle: Handle, new_handle: *OptionalHandle) !vo
     };
 }
 
+pub fn createHashReference(referent: Handle) !Handle {
+    const handle = try Heap.local_heap.createObject();
+    handle.peek().head.tag = .hash_reference;
+    handle.peek().body.hash_reference = referent.borrow();
+    return handle;
+}
+
+pub const hash_lookup_failed_fmt_string = "Could not find value for hash reference {f}";
+pub fn shimmerToHashReference(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
+    if (provided_handle.tag() == .hash_reference) return;
+    errdefer new_handle.swapWithNone();
+
+    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
+    const handle = new_handle.orElse(provided_handle);
+
+    const str = try handle.getString();
+    const hash = Heap.parseHashReference(str) orelse {
+        if (det) |details| details.* = .{
+            .message = try newStringFmtInner(
+                Heap.local_heap,
+                "Expected a hash reference like \"blake3^...\" in \"{f}\".",
+                .{handle},
+            ),
+        };
+        return error.NotHashReference;
+    };
+    const target = Heap.registered_hashes.get(hash) orelse {
+        if (det) |details| details.* = .{
+            .message = try newStringFmtInner(
+                Heap.local_heap,
+                hash_lookup_failed_fmt_string,
+                .{handle},
+            ),
+        };
+        return error.HashLookupFailed;
+    };
+
+    try handle.prepareToShimmer();
+    handle.peek().head.tag = .hash_reference;
+    handle.peek().body = .{ .hash_reference = target.borrow() };
+}
+
 pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) !usize {
     errdefer new_handle.swapWithNone();
 
@@ -1206,18 +1248,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
     // We've exhausted all other options, so we'll need to make a new collection.
     const new_handle = switch (provided_handle.tag()) {
         .list => try newListWithCapacity(new_len),
-        .dict => blk: {
-            const new_dict = try newDictWithCapacity(Heap.local_heap, new_len);
-            errdefer new_dict.decrRefCount();
-            if (provided_handle.getDictExtraData().parent_link.toHandle()) |parent_link| {
-                try dictSetLink(new_dict, parent_link);
-                // `dictSetLink` generates a table for the dict to make sure there's
-                // no duplicates, but we haven't added any items to `new_dict` yet,
-                // so we need to invalidate the table so it's generated correctly later.
-                dictInvalidateTable(new_dict);
-            }
-            break :blk new_dict;
-        },
+        .dict => try newDictWithCapacity(Heap.local_heap, new_len),
         else => unreachable,
     };
     errdefer new_handle.decrRefCount();
@@ -1507,7 +1538,7 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     errdefer handle_heap.destroyExtraData(metadata_index);
 
     const metadata = handle_heap.getExtraData(metadata_index);
-    metadata.* = .{ .dict = .{ .table = null, .parent_link = .none } };
+    metadata.* = .{ .dict = .{ .table = null } };
 
     // Because both lists and dicts store their values directly after,
     // we can just swap out the head to convert to a dict.
@@ -1564,7 +1595,6 @@ pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
 
     heap.getExtraData(dict_metadata).* = .{ .dict = .{
         .table = null,
-        .parent_link = .none,
     } };
 
     const dict_head = heap.getLocalObject(dict_index);
@@ -1626,22 +1656,64 @@ pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!Option
     } else return .none;
 }
 
-pub fn dictLookupFollowLinks(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
+pub fn dictLookupFollowLinks(
+    det: ?*ErrorDetails,
+    dict: Handle,
+    new_dict: *OptionalHandle,
+    key: Handle,
+) error{ OutOfMemory, LinkLookupFailed }!OptionalHandle {
     dict.assert(dict.tag() == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
     _ = try key.getString();
 
-    const table = try dictGetTable(dict);
+    var current_dict = dict;
+
+    const table = try dictGetTable(current_dict);
     if (table.get(key)) |value_offset| {
-        return dictItemFollowRefs(dict, value_offset).toOptional();
+        return dictItemFollowRefs(current_dict, value_offset).toOptional();
     } else {
-        if (dict.getDictExtraData().parent_link.toHandle()) |parent_link| {
-            // Check the parent link.
-            return dictLookupFollowLinks(parent_link, key);
-        } else {
-            // Nothing found, even after checking parent links.
-            return .none;
+        const parent_key = Heap.local_heap.getInternedString(.@"^parent");
+        if ((try dictLookupFollowRefs(current_dict, parent_key)).toHandle()) |parent_link| {
+            var maybe_new_parent_link: OptionalHandle = .none;
+            defer maybe_new_parent_link.decrOptional();
+            shimmerToHashReference(det, parent_link, &maybe_new_parent_link) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.HashLookupFailed => return error.LinkLookupFailed,
+                error.NotHashReference => {
+                    if (det) |details| {
+                        details.message.decrRefCount();
+                        details.* = undefined;
+                    }
+                },
+            };
+
+            if (maybe_new_parent_link.toHandle()) |new_parent_link| {
+                const put_result = try dictPutInner(current_dict, parent_key, new_parent_link.reference());
+                new_dict.swapRefIfNew(put_result.new_dict);
+                current_dict = new_dict.orElse(current_dict);
+            }
+
+            const hash_reference = maybe_new_parent_link.orElse(parent_link);
+            const parent = hash_reference.peek().body.hash_reference;
+            var new_parent: OptionalHandle = .none;
+            defer new_parent.decrOptional();
+            shimmerToDict(det, parent, &new_parent) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.LinkLookupFailed,
+            };
+
+            const looked_up = try dictLookupFollowLinks(det, new_parent.orElse(parent), &new_parent, key);
+
+            if (new_parent.toHandle()) |new| {
+                const put_result = try dictPutInner(dict, parent_key, new.hashReference());
+                new_dict.swapRefIfNew(put_result.new_dict);
+                current_dict = new_dict.orElse(current_dict);
+            }
+
+            return looked_up;
         }
+        // Nothing found, even after checking parent links.
+        return .none;
     }
 }
 
@@ -1652,22 +1724,6 @@ fn dictHasDuplicatesRaw(dict: Handle) !bool {
     const len = dict.peek().body.dict.len;
     assert(table.size * 2 <= len);
     return table.size * 2 != len;
-}
-
-/// Note: this generates the dict's table when checking for duplicates.
-pub fn dictSetLink(dict: Handle, link: Handle) error{OutOfMemory}!void {
-    dict.assert(dict.canMutate());
-    dict.assert(!(try dictHasDuplicatesRaw(dict))); // Can't link a dictionary with duplicates.
-
-    const extra_data = dict.getDictExtraData();
-    extra_data.parent_link.swapWithNone();
-    extra_data.parent_link = link.borrow().toOptional();
-
-    dict.invalidateString(); // String needs to be regenerated since it's linked.
-}
-
-pub fn dictSetLinkIfPresent(dict: Handle, link: OptionalHandle) error{OutOfMemory}!void {
-    if (link.toHandle()) |handle| try dictSetLink(dict, handle);
 }
 
 /// Removes duplicate entries. Assumes handle is a dict. If the caller needs to track
@@ -2052,7 +2108,7 @@ pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: [
     assert(keys.len > 0);
 
     if (keys.len == 1) {
-        const remove_result = try dictRemove(new_dict.orElse(provided_dict), keys[0]);
+        const remove_result = try dictRemove(det, new_dict.orElse(provided_dict), keys[0]);
         new_dict.swapRefIfNew(remove_result.new_dict);
         return .{ .new_dict = new_dict, .did_remove = remove_result.did_remove };
     }
@@ -2083,15 +2139,17 @@ pub fn dictLookupRecursively(
     new_dict: *OptionalHandle,
     keys: []const Handle,
 ) !OptionalHandle {
-    new_dict.swapWithNone();
+    assert(new_dict.* == .none);
+
+    errdefer new_dict.swapWithNone();
     try shimmerToDict(det, provided_dict, new_dict);
 
     if (keys.len == 0) return new_dict.orElse(provided_dict).toOptional();
     if (keys.len == 1) {
-        return try dictLookupFollowLinks(new_dict.orElse(provided_dict), keys[0]);
+        return try dictLookupFollowLinks(det, new_dict.orElse(provided_dict), new_dict, keys[0]);
     }
 
-    if ((try dictLookupFollowLinks(new_dict.orElse(provided_dict), keys[0])).toHandle()) |child_dict| {
+    if ((try dictLookupFollowLinks(det, new_dict.orElse(provided_dict), new_dict, keys[0])).toHandle()) |child_dict| {
         var new_child: OptionalHandle = .none;
         const child_result = try dictLookupRecursively(det, child_dict, &new_child, keys[1..]);
         if (new_child.toHandle()) |new| {
@@ -2111,12 +2169,16 @@ pub fn dictPut(dict: Handle, key: Handle, value: Handle) !DictAndValueResult {
     return dictPutInner(dict, key, value.dupOrRef());
 }
 
-pub fn dictFlatten(provided_dict: Handle) !OptionalHandle {
-    const extra_data = provided_dict.getDictExtraData();
+pub fn dictFlatten(det: ?*ErrorDetails, provided_dict: Handle) !OptionalHandle {
+    if ((try dictLookupFollowRefs(provided_dict, Heap.local_heap.getInternedString(.@"^parent"))).toHandle()) |parent_link| {
+        var new_parent_link: OptionalHandle = .none;
+        defer new_parent_link.decrOptional();
+        try shimmerToHashReference(det, parent_link, &new_parent_link);
 
-    if (extra_data.parent_link.toHandle()) |parent_link| {
-        var new_dict = try dictFlatten(parent_link);
-        var to_add_to = if (new_dict.toHandle()) |handle| handle else try Heap.local_heap.duplicate(parent_link);
+        const parent = new_parent_link.orElse(parent_link).peek().body.hash_reference;
+
+        var new_dict = try dictFlatten(det, parent);
+        var to_add_to = if (new_dict.toHandle()) |handle| handle else try Heap.local_heap.duplicate(parent);
         errdefer to_add_to.decrRefCount();
 
         var pair_i: u32 = 0;
@@ -2126,9 +2188,7 @@ pub fn dictFlatten(provided_dict: Handle) !OptionalHandle {
                 dictItemFollowRefs(provided_dict, pair_i * 2),
                 dictItemFollowRefs(provided_dict, pair_i * 2 + 1),
             );
-            if (put_result.new_dict.toHandle()) |new| {
-                to_add_to.swap(new);
-            }
+            to_add_to.swapIfNew(put_result.new_dict);
         }
 
         return to_add_to.toOptional();
@@ -2160,9 +2220,10 @@ fn testDictFlatten(ta: std.mem.Allocator) !void {
     const dict2 = try newDictInner(heap, &.{ key_foo, value2, key_baz, value3 });
     defer dict2.decrRefCount();
 
-    try dictSetLink(dict2, dict1);
+    const parent_key = heap.getInternedString(.@"^parent");
+    _ = try dictPutInner(dict2, parent_key, dict1.hashReference());
 
-    const result = try dictFlatten(dict2);
+    const result = try dictFlatten(null, dict2);
     defer result.decrOptional();
 }
 test "dict flatten" {
@@ -2172,7 +2233,7 @@ test "dict flatten" {
 const DictAndRemovedResult = struct { new_dict: OptionalHandle, did_remove: bool };
 /// Returns true if the value was removed, or false if the value doesn't exist.
 /// Always merges parent links.
-pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
+pub fn dictRemove(det: ?*ErrorDetails, provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     assert(provided_dict.tag() == .dict);
 
     const key_bytes = try key.getString();
@@ -2180,24 +2241,47 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     var new_dict: OptionalHandle = .none;
     errdefer new_dict.swapWithNone();
     try Heap.ensureMutableOrDup(provided_dict, &new_dict);
-    var dict = new_dict.orElse(provided_dict);
+    var current_dict = new_dict.orElse(provided_dict);
 
-    if (dict.getDictExtraData().parent_link != .none) {
-        // If there's a parent link, we need to flatten the dict before swapping.
-        if ((try dictFlatten(dict)).toHandle()) |new| {
-            new_dict.swapRef(new);
-            dict = new;
+    const parent_key = Heap.local_heap.getInternedString(.@"^parent");
+    if ((try dictLookupFollowRefs(current_dict, parent_key)).toHandle()) |parent_link| {
+        // If the parent chain contains the key we're removing, we must flatten first,
+        // otherwise removing locally would leave the parent value still visible.
+        var maybe_new_parent_link: OptionalHandle = .none;
+        defer maybe_new_parent_link.decrOptional();
+        try shimmerToHashReference(det, parent_link, &maybe_new_parent_link);
+        if (maybe_new_parent_link.toHandle()) |new_parent_link| {
+            const put_result = try dictPutInner(current_dict, parent_key, new_parent_link.reference());
+            new_dict.swapRefIfNew(put_result.new_dict);
+            current_dict = new_dict.orElse(current_dict);
+        }
+
+        const parent = maybe_new_parent_link.orElse(parent_link).peek().body.hash_reference;
+        var maybe_new_parent: OptionalHandle = .none;
+        const key_in_parent = (try dictLookupFollowLinks(det, parent, &maybe_new_parent, key)) != .none;
+        if (maybe_new_parent.toHandle()) |new_parent| {
+            const put_result = try dictPutInner(current_dict, parent_key, new_parent.hashReference());
+            new_dict.swapRefIfNew(put_result.new_dict);
+            current_dict = new_dict.orElse(current_dict);
+        }
+
+        if (key_in_parent) {
+            // Key was found in the parent, so we do need to flatten.
+            if ((try dictFlatten(det, current_dict)).toHandle()) |new| {
+                new_dict.swapRef(new);
+                current_dict = new;
+            }
         }
     }
 
-    assert(dict.heap == Heap.local_heap.heapId());
-    const dict_len = dictItemLength(dict);
+    assert(current_dict.heap == Heap.local_heap.heapId());
+    const dict_len = dictItemLength(current_dict);
 
     // Locate the first key (note, we can't use `metadata.table.get`, because Tcl removes all
     // key(s), while `metadata.table.get` only returns the last key).
     var first_key_index: u32 = 0;
     while (first_key_index < dict_len) : (first_key_index += 2) {
-        const key_checking = try dictItem(dict, first_key_index).getString();
+        const key_checking = try dictItem(current_dict, first_key_index).getString();
         if (std.mem.eql(u8, key_bytes, key_checking)) {
             break; // Found our key.
         }
@@ -2210,7 +2294,7 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     // following the key and value.
     var shared_values_found = false;
     for (first_key_index..dict_len) |item_index| {
-        const item_handle = dictItem(dict, @intCast(item_index));
+        const item_handle = dictItem(current_dict, @intCast(item_index));
         if (item_handle.isShared()) shared_values_found = true;
     }
 
@@ -2218,9 +2302,9 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
         // Looks like this dictionary item is shared, so we can't replace the value in place
         // (else we'd smash up an item someone else is using). Instead, we'll start this whole
         // process over with a new dictionary.
-        const duplicated = try Heap.local_heap.duplicate(dict);
+        const duplicated = try Heap.local_heap.duplicate(current_dict);
         new_dict.swapRef(duplicated);
-        dict = duplicated;
+        current_dict = duplicated;
     }
 
     // Make sure all the keys have string reps. If we OOM halfway through removal
@@ -2228,31 +2312,31 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     // string rep to start with. If not, we'll safely propagate the OOM.
     var item_index: u32 = 0;
     while (item_index < dict_len) : (item_index += 2) {
-        _ = try dictItem(dict, item_index).getString();
+        _ = try dictItem(current_dict, item_index).getString();
     }
 
     // This is the start of mutation. From here on there's no going back.
-    dictInvalidateTable(dict);
+    dictInvalidateTable(current_dict);
 
     // Remove all matching keys and their values, moving the following pair
     // backwards to fill the gap(s).
     item_index = first_key_index;
     var pairs_removed: u32 = 0;
     while (item_index < dict_len) : (item_index += 2) {
-        const key_handle = dictItem(dict, item_index);
-        const value_handle = dictItem(dict, item_index + 1);
+        const key_handle = dictItem(current_dict, item_index);
+        const value_handle = dictItem(current_dict, item_index + 1);
         assert(!key_handle.isShared());
         assert(!value_handle.isShared());
         // We checked that all our keys have strings earlier.
-        const key_checking = dictItem(dict, item_index).getString() catch unreachable;
+        const key_checking = dictItem(current_dict, item_index).getString() catch unreachable;
         if (std.mem.eql(u8, key_bytes, key_checking)) {
             key_handle.invalidateBoth();
             value_handle.invalidateBoth();
             pairs_removed += 1;
         } else if (pairs_removed > 0) {
             // Move this pair backwards.
-            const new_key_handle = dictItem(dict, item_index - pairs_removed * 2);
-            const new_value_handle = dictItem(dict, item_index - pairs_removed * 2 + 1);
+            const new_key_handle = dictItem(current_dict, item_index - pairs_removed * 2);
+            const new_value_handle = dictItem(current_dict, item_index - pairs_removed * 2 + 1);
             new_key_handle.peek().* = key_handle.peek().*;
             new_value_handle.peek().* = value_handle.peek().*;
         }
@@ -2261,13 +2345,13 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     // Be sure to "zero" out all the moved items that weren't replaced with something else.
     const start_of_removed = dict_len - pairs_removed * 2;
     for (start_of_removed..dict_len) |removed| {
-        const item_handle = dictItem(dict, @intCast(removed));
+        const item_handle = dictItem(current_dict, @intCast(removed));
         item_handle.peek().* = .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined };
     }
 
-    dict.peek().body.dict.len -= pairs_removed * 2;
+    current_dict.peek().body.dict.len -= pairs_removed * 2;
 
-    dict.invalidateString();
+    current_dict.invalidateString();
 
     return .{ .new_dict = new_dict, .did_remove = true };
 }
@@ -2334,7 +2418,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Dict remove testing.
     var dict_for_remove = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2, key_foo, value3 });
     defer dict_for_remove.decrRefCount();
-    const remove_result = try dictRemove(dict_for_remove, key_foo);
+    const remove_result = try dictRemove(null, dict_for_remove, key_foo);
     dict_for_remove.swapIfNew(remove_result.new_dict);
     try testing.expectEqual(true, remove_result.did_remove);
     try testing.expectEqualStrings("bar 2", try dict_for_remove.getString());

@@ -171,11 +171,11 @@ pub const HashRegistry = struct {
         registry.rw_lock.lockSharedUncancelable(global_io);
 
         if (registry.entries.getPtr(key)) |entry| {
-            if (@cmpxchgStrong(bool, &metadata.hash_registered, false, true, .release, .acquire)) |_| {
+            if (metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire)) |_| {
                 // Someone else registered this already, so no need to do anything.
             } else {
                 // We were the ones to successfully set `value` as registered.
-                entry.instances.fetchAdd(1, .monotonic);
+                _ = entry.instances.fetchAdd(1, .monotonic);
             }
 
             registry.rw_lock.unlockShared(global_io);
@@ -189,11 +189,11 @@ pub const HashRegistry = struct {
 
         const new_entry = try registry.entries.getOrPut(global_gpa, key);
         if (new_entry.found_existing) {
-            if (@cmpxchgStrong(bool, &metadata.hash_registered, false, true, .release, .acquire)) |_| {
+            if (metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire)) |_| {
                 // Someone registered it inbetween upgrading the shared lock to an exclusive lock.
             } else {
                 // We successfully marked it as registered, so we can increment the instances count.
-                new_entry.value_ptr.instances.fetchAdd(1, .monotonic);
+                _ = new_entry.value_ptr.instances.fetchAdd(1, .monotonic);
             }
             return;
         }
@@ -219,7 +219,7 @@ pub const HashRegistry = struct {
                 registry.rw_lock.unlockShared(global_io);
             } else {
                 // We were the ones to successfully set `value` as not registered.
-                const instance_count = entry.instances.fetchSub(1, .monotonic);
+                const instance_count = entry.instances.fetchSub(1, .monotonic) - 1;
                 if (instance_count == 0) {
                     // This was the last instance of this hash, so we can now clean it up.
 
@@ -240,6 +240,8 @@ pub const HashRegistry = struct {
                     entry_second_check.representative.decrRefCount();
 
                     assert(registry.entries.remove(key));
+                } else {
+                    registry.rw_lock.unlockShared(global_io);
                 }
             }
 
@@ -314,6 +316,7 @@ pub const InternedString = enum {
     method,
     impl,
     scope,
+    @"^parent",
     name,
     type,
     file,
@@ -585,6 +588,9 @@ pub const Object = packed struct(u128) {
                 heap.getHandle(dict_sugar.dict_name_index).decrRefCount();
                 heap.getHandle(dict_sugar.path_index).decrRefCount();
             },
+            .hash_reference => {
+                obj.body.hash_reference.decrRefCount();
+            },
             .none,
             .index,
             .integer,
@@ -628,6 +634,7 @@ pub const Object = packed struct(u128) {
             .upvar_link => try writer.print(" = {}", .{self.body.upvar_link}),
             .closure => try writer.print(" = {}", .{self.body.closure}),
             .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
+            .hash_reference => try writer.print(" = {any}", .{self.body.hash_reference}),
         }
         try writer.writeAll(" } }");
     }
@@ -654,6 +661,7 @@ pub const Tag = enum(u5) {
     upvar_link,
     closure,
     custom_type,
+    hash_reference,
 };
 
 pub const Body = packed union(u64) {
@@ -742,6 +750,7 @@ pub const Body = packed union(u64) {
         type_id: u32,
         extra_data: ExtraData,
     },
+    hash_reference: Handle,
 };
 
 comptime {
@@ -780,10 +789,6 @@ pub const ExtraDataValue = union(enum) {
         /// Caller needs to ensure that any string this is called with
         /// is valid, as hash map methods don't return errors.
         table: ?Table,
-
-        /// Used during variable lookup to walk the parent scopes. References
-        /// the dict if present.
-        parent_link: OptionalHandle,
     };
 
     /// This does not store the key/value pairs directly, instead it
@@ -1194,6 +1199,18 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.referenceOwning();
     }
 
+    pub fn hashReference(handle: Handle) Object {
+        return .{
+            .head = .{
+                .str = Object.null_string,
+                .tag = .hash_reference,
+            },
+            .body = .{
+                .hash_reference = handle.borrow(),
+            },
+        };
+    }
+
     pub fn dupOrRef(handle: Handle) Object {
         return local_heap.dupOrReference(handle);
     }
@@ -1452,6 +1469,13 @@ pub const Handle = packed struct(HandleBacking) {
                     break :blk try std.fmt.allocPrintSentinel(global_gpa, "<upvar_link>", .{}, 0);
                 } else @panic("Tried to generate a string for .upvar_link");
             },
+            .hash_reference => {
+                const target_hash = try obj.body.hash_reference.getHash();
+                var encoded: [hash_and_prepend_len]u8 = undefined;
+                @memcpy(encoded[0..hash_prepend.len], hash_prepend);
+                _ = hash_encoder.encode(encoded[hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
+                break :blk try global_gpa.dupeZ(u8, &encoded);
+            },
             .string,
             .source,
             .dict_sugar,
@@ -1486,6 +1510,14 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn getHash(handle: Handle) !u256 {
+        const hash = try handle.getHashNoRegister();
+        if (!@atomicLoad(ObjectAndMetadata.Metadata, handle.getMetadata(), .acquire).hash_registered) {
+            try registered_hashes.register(hash, handle);
+        }
+        return hash;
+    }
+
+    pub fn getHashNoRegister(handle: Handle) !u256 {
         switch (handle.getStringDetails()) {
             .empty => {
                 return comptime blk: {
@@ -1708,7 +1740,7 @@ const ObjectAndMetadata = struct {
     object: Object,
     ref_count: u32,
     metadata: Metadata,
-    trace: std.debug.ConfigurableTrace(16, 16, options.trace_mem),
+    trace: std.debug.ConfigurableTrace(30, 16, options.trace_mem),
 };
 
 /// Used for the big backing objects, such as Heap.objects or Heap.strings.
@@ -2258,8 +2290,8 @@ pub fn freeHeapString(self: *Heap, index: u32, len: u32, hash_count: u10) void {
 
     // Release handles.
     if (hash_count > 0) {
-        const handles: [*]const Handle = @ptrCast(@alignCast(&self.strings.items[index + layout.handle_start]));
-        for (handles[0..hash_count]) |handle| handle.decrRefCount();
+        const handles: [*]const OptionalHandle = @ptrCast(@alignCast(&self.strings.items[index + layout.handle_start]));
+        for (handles[0..hash_count]) |handle| handle.decrOptional();
     }
 
     if (self == local_heap) {
@@ -2494,6 +2526,15 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .list, .dict => {
             return error.MultiItemObject;
         },
+        .hash_reference => {
+            return .{
+                .head = .{
+                    .str = try dest_heap.duplicateObjString(handle),
+                    .tag = .hash_reference,
+                },
+                .body = .{ .hash_reference = src.body.hash_reference.borrow() },
+            };
+        },
         .upvar_link => @panic("Cannot duplicate an upvar"),
         .invalid => @panic("Tried to duplicate an invalid object."),
     }
@@ -2551,7 +2592,6 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
         .dict => {
             const old_len = src.body.dict.len;
             const old_start = src_handle.index + 1;
-            const old_metadata = src_handle.getDictExtraData();
 
             const new_dict_idx = try dest_heap.createObjects(1 + old_len);
             errdefer dest_heap.getHandle(new_dict_idx).decrRefCount();
@@ -2578,7 +2618,6 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
                 };
                 dest_heap.getExtraData(new_extra_data).* = .{ .dict = .{
                     .table = null,
-                    .parent_link = old_metadata.parent_link.borrowOptional(),
                 } };
             }
 
@@ -2641,7 +2680,7 @@ const hash_prepend = "blake3^";
 const hash_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789~.";
 const hash_encoder = std.base64.Base64Encoder.init(hash_chars.*, null);
 const hash_decoder = std.base64.Base64Decoder.init(hash_chars.*, null);
-const hash_len = hash_decoder.calcSizeUpperBound(256) catch unreachable;
+const hash_len = hash_encoder.calcSize(32);
 const hash_and_prepend_len = hash_prepend.len + hash_len;
 fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u256) {
     var found_hashes: std.ArrayList(u256) = .empty;
@@ -2650,13 +2689,15 @@ fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u25
     var current_index: usize = 0;
     while (true) {
         if (std.mem.findPos(u8, bytes, current_index, hash_prepend)) |next| {
-            if (bytes.len - current_index >= hash_and_prepend_len) {
+            if (bytes.len - next >= hash_and_prepend_len) {
                 defer current_index = next + hash_and_prepend_len;
 
                 var output: [32]u8 = undefined;
-                hash_decoder.decode(&output, bytes[(next + 6)..][0..hash_len]) catch |err| switch (err) {
-                    error.InvalidCharacter => continue,
-                    error.InvalidPadding, error.NoSpaceLeft => unreachable,
+                hash_decoder.decode(&output, bytes[(next + hash_prepend.len)..][0..hash_len]) catch |err| switch (err) {
+                    error.InvalidCharacter,
+                    error.InvalidPadding,
+                    error.NoSpaceLeft,
+                    => continue,
                 };
 
                 try found_hashes.append(arena, @bitCast(output));
@@ -2665,6 +2706,18 @@ fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u25
     }
 
     return found_hashes;
+}
+
+/// Parse a string that is exactly a single hash reference.
+/// The string must start with `blake3^` at position 0, followed by a valid
+/// base64-encoded 32-byte hash.
+pub fn parseHashReference(bytes: []const u8) ?u256 {
+    if (!std.mem.startsWith(u8, bytes, hash_prepend)) return null;
+    if (bytes.len != hash_and_prepend_len) return null;
+
+    var output: [32]u8 = undefined;
+    hash_decoder.decode(&output, bytes[hash_prepend.len..]) catch return null;
+    return @bitCast(output);
 }
 
 fn scanAndResolveHashRefs(arena: Allocator, bytes: []const u8) error{OutOfMemory}!std.ArrayList(OptionalHandle) {
@@ -2690,7 +2743,8 @@ fn scanAndResolveHashRefs(arena: Allocator, bytes: []const u8) error{OutOfMemory
 }
 
 pub fn setString(handle: Handle, bytes: []const u8) error{ OutOfMemory, OtherThreadSet }!void {
-    const resolved = try scanAndResolveHashRefs(global_gpa, bytes);
+    var resolved = try scanAndResolveHashRefs(global_gpa, bytes);
+    defer resolved.deinit(global_gpa);
     try setStringKnownHashHandles(handle, bytes, resolved.items);
 }
 
@@ -2926,23 +2980,7 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
 }
 
 fn generateDictString(handle: Handle) ![:0]u8 {
-    const extra_data = handle.getDictExtraData();
-    const table = try objutil.dictGetTable(handle);
-
-    // If we've lost our string rep, we sure as heck should not have duplicate
-    // keys. Any other way of handling this would be self-contradictory.
-    handle.assert(table.size * 2 == handle.peek().body.dict.len);
-    if (extra_data.parent_link == .none) {
-        // Easy case: no parent link.
-        return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
-    }
-
-    // Delegate to `dictFlatten`, which produces the correctly ordered merged dict,
-    // then stringify the result as a plain (no parent link) dict.
-    const flat = (try objutil.dictFlatten(handle)).toHandle() orelse unreachable;
-    defer flat.decrRefCount();
-
-    return try getListString(flat.getHeap(), flat.index + 1, flat.peek().body.dict.len);
+    return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
 }
 
 const StringDetails = union(enum) {
@@ -3011,8 +3049,7 @@ pub const SpecialString = struct {
         },
     };
     /// This is contains the handles to the hashes referenced in the string.
-    /// They are in order as appearing in the string, although they are
-    /// deduplicated.
+    /// They are in order as appearing in the string, and are not deduplicated.
     hash_handles: std.ArrayList(OptionalHandle),
 
     string_type: Type,
@@ -3115,7 +3152,6 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
             lexical_var.ref.decrRefCount();
         },
         .dict => |*dict| {
-            dict.parent_link.decrOptional();
             if (dict.table) |*table| table.deinit(global_gpa);
         },
         .source => |*source| {
@@ -3147,6 +3183,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
     errdefer custom_types.deinit(global_gpa);
 
+    registered_hashes = .{};
     nativefn_registry = .{};
 
     state.initialized = true;
@@ -3225,6 +3262,7 @@ pub fn deinitAll() void {
     if (state.initialized) {
         custom_types.deinit(global_gpa);
         nativefn_registry.deinit(global_gpa);
+        registered_hashes.entries.deinit(global_gpa);
         state.initialized = false;
     }
     state.mutex.unlock(global_io);
@@ -3281,6 +3319,84 @@ test "get string" {
     ref.body.integer = 10;
 
     try expectEqualSlices(u8, "10", try obj.getString());
+}
+
+test "scanStringForHashRefs finds no tokens in plain text" {
+    const ta = std.testing.allocator;
+    var found = try scanStringForHashRefs(ta, "hello world");
+    defer found.deinit(ta);
+    try std.testing.expectEqual(0, found.items.len);
+}
+
+test "scanStringForHashRefs finds a single token" {
+    const ta = std.testing.allocator;
+    var hash_bytes: [32]u8 = undefined;
+    @memset(&hash_bytes, 0xAB);
+    var encoded: [hash_len]u8 = undefined;
+    _ = hash_encoder.encode(&encoded, &hash_bytes);
+
+    const input = try std.fmt.allocPrint(ta, "prefix blake3^{s} suffix", .{encoded});
+    defer ta.free(input);
+
+    var found = try scanStringForHashRefs(ta, input);
+    defer found.deinit(ta);
+    try std.testing.expectEqual(1, found.items.len);
+    try std.testing.expectEqual(@as(u256, @bitCast(hash_bytes)), found.items[0]);
+}
+
+test "scanStringForHashRefs finds multiple tokens" {
+    const ta = std.testing.allocator;
+    var hash_a: [32]u8 = undefined;
+    @memset(&hash_a, 0x01);
+    var hash_b: [32]u8 = undefined;
+    @memset(&hash_b, 0x02);
+    var enc_a: [hash_len]u8 = undefined;
+    var enc_b: [hash_len]u8 = undefined;
+    _ = hash_encoder.encode(&enc_a, &hash_a);
+    _ = hash_encoder.encode(&enc_b, &hash_b);
+
+    const input = try std.fmt.allocPrint(ta, "blake3^{s} and blake3^{s}", .{ enc_a, enc_b });
+    defer ta.free(input);
+
+    var found = try scanStringForHashRefs(ta, input);
+    defer found.deinit(ta);
+    try std.testing.expectEqual(2, found.items.len);
+    try std.testing.expectEqual(@as(u256, @bitCast(hash_a)), found.items[0]);
+    try std.testing.expectEqual(@as(u256, @bitCast(hash_b)), found.items[1]);
+}
+
+test "scanStringForHashRefs skips bad chars" {
+    const ta = std.testing.allocator;
+    // Invalid base64 character '@' in the hash position.
+    const input = "blake3^" ++ "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@";
+    var found = try scanStringForHashRefs(ta, input);
+    defer found.deinit(ta);
+    try std.testing.expectEqual(0, found.items.len);
+}
+
+test "scanStringForHashRefs ignores short ending" {
+    const ta = std.testing.allocator;
+    const input = "blake3^short";
+    var found = try scanStringForHashRefs(ta, input);
+    defer found.deinit(ta);
+    try std.testing.expectEqual(0, found.items.len);
+}
+
+test "scanStringForHashRefs duplicates identical tokens" {
+    const ta = std.testing.allocator;
+    var hash_bytes: [32]u8 = undefined;
+    @memset(&hash_bytes, 0xCD);
+    var encoded: [hash_len]u8 = undefined;
+    _ = hash_encoder.encode(&encoded, &hash_bytes);
+
+    const input = try std.fmt.allocPrint(ta, "blake3^{s} blake3^{s}", .{ encoded, encoded });
+    defer ta.free(input);
+
+    var found = try scanStringForHashRefs(ta, input);
+    defer found.deinit(ta);
+    try std.testing.expectEqual(2, found.items.len);
+    try std.testing.expectEqual(@as(u256, @bitCast(hash_bytes)), found.items[0]);
+    try std.testing.expectEqual(@as(u256, @bitCast(hash_bytes)), found.items[1]);
 }
 
 /// Atomically adds, if multithreading is enabled. Returns value before adding.
@@ -3610,7 +3726,11 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
     std.debug.print("}}\n", .{});
 }
 
+var already_panicking: std.atomic.Value(bool) = .init(false);
 fn printLastTouchedTrace(terminal: std.Io.Terminal) !void {
+    if (already_panicking.load(.seq_cst)) return;
+    already_panicking.store(true, .seq_cst);
+
     const w = terminal.writer;
     if (!options.trace_mem) {
         try terminal.setColor(.yellow);
@@ -3620,9 +3740,6 @@ fn printLastTouchedTrace(terminal: std.Io.Terminal) !void {
 
     try terminal.setColor(.reset);
     if (last_touched) |val| {
-        val.getHeap().trace_mutex.lockUncancelable(global_io);
-        defer val.getHeap().trace_mutex.unlock(global_io);
-
         try w.writeAll("== Last touched details ==\n\n");
 
         const trace = val.getHeap().objects.get(val.index).trace;
