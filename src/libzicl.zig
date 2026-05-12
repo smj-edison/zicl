@@ -297,7 +297,10 @@ export fn Zicl_SetEmptyResult(interp: *Interp) callconv(.c) void {
 }
 
 export fn Zicl_MakeErrorMessage(interp: *Interp) callconv(.c) ReturnCode {
-    const msg = interp.makeErrorMessage() catch |err| return ReturnCode.fromError(narrowError(err));
+    const msg = Interp.makeErrorMessage(
+        interp.result,
+        interp.stack_trace.orEmpty(),
+    ) catch |err| return ReturnCode.fromError(narrowError(err));
     interp.setResultOwning(msg);
     return .ok;
 }

@@ -971,7 +971,7 @@ pub const OptionalHandle = enum(HandleBacking) {
         ref.* = @enumFromInt(@as(HandleBacking, @bitCast(new_handle)));
     }
 
-    pub fn swapRefIfNew(ref: *OptionalHandle, new_handle: OptionalHandle) void {
+    pub fn swapIfNew(ref: *OptionalHandle, new_handle: OptionalHandle) void {
         if (new_handle != .none) {
             if (ref.toHandle()) |val| val.decrRefCount();
             ref.* = new_handle;
@@ -2204,9 +2204,10 @@ pub fn ensureMutableOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
 }
 
 /// If the object can't shimmer, this will return a duplicate.
-pub fn ensureShimmerableOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
-    if (!handle.canShimmer()) {
-        new_handle.swapRef(try Heap.duplicate(local_heap, handle));
+pub fn ensureShimmerableOrDup(original: Handle, new: *OptionalHandle) !void {
+    const current = new.orElse(original);
+    if (!current.canShimmer()) {
+        new.swapRef(try Heap.duplicate(local_heap, current));
     }
 }
 

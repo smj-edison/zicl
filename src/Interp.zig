@@ -313,14 +313,15 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
     call_frame.call_epoch = interp.nextCallEpoch();
 
     // Add variable.
-    const put_result = try objutil.dictPutInner(call_frame.variables, name, value);
-    call_frame.variables.swapIfNew(put_result.new_dict);
+    var new_variables: OptionalHandle = .none;
+    const put_result = try objutil.dictPutObject(call_frame.variables, &new_variables, name, value);
+    call_frame.variables.swapIfNew(new_variables);
 
     try name.prepareToShimmer();
     name.peek().head.tag = .cached_local_var;
     name.peek().body.cached_local_var = .{
         .call_epoch = call_frame.call_epoch,
-        .cached_index = put_result.new_value.index,
+        .cached_index = put_result.index,
     };
 }
 
@@ -427,16 +428,17 @@ pub fn setVariableInner(
                 const var_call_frame = &interp.call_frames.items[call_frame_idx];
 
                 value_taken = true;
-                const put_result = try objutil.dictPutInner(var_call_frame.variables, name, value);
-                if (put_result.new_dict.toHandle()) |new_dict| {
+                var new_variables: OptionalHandle = .none;
+                const put_result = try objutil.dictPutObject(var_call_frame.variables, &new_variables, name, value);
+                if (new_variables.toHandle()) |val| {
                     // Did the dict change locations? If so, all cached lookups are now invalid.
-                    var_call_frame.variables.swap(new_dict);
+                    var_call_frame.variables.swap(val);
                     var_call_frame.call_epoch = interp.nextCallEpoch();
                 }
 
                 cached_var.* = .{
                     .call_epoch = var_call_frame.call_epoch,
-                    .cached_index = put_result.new_value.index,
+                    .cached_index = put_result.index,
                 };
             },
             .cached_lexical_var => {
@@ -630,7 +632,8 @@ pub fn unsetVariableInner(
                 var keys = try objutil.listToHandles(Heap.global_gpa, dict_path);
                 defer keys.deinit(Heap.global_gpa);
 
-                const remove_result = objutil.dictRemoveRecursively(det, dict, keys.items) catch |rerr| switch (rerr) {
+                var new_dict: OptionalHandle = .none;
+                const did_remove = objutil.dictRemoveRecursively(det, dict, &new_dict, keys.items) catch |rerr| switch (rerr) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
                         if (det) |details| details.* = .{
@@ -642,8 +645,7 @@ pub fn unsetVariableInner(
                         return error.VariableNotFound;
                     },
                 };
-                if (!remove_result.did_remove) {
-                    assert(remove_result.new_dict == .none);
+                if (!did_remove) {
                     if (det) |details| details.* = .{
                         .message = try objutil.newStringFmt(
                             "can't unset \"{s}\": no such element in dictionary",
@@ -651,8 +653,8 @@ pub fn unsetVariableInner(
                         ),
                     };
                     return error.VariableNotFound;
-                } else if (remove_result.new_dict.toHandle()) |new_dict| {
-                    try interp.setVariableInner(det, call_frame_idx, dict_name, new_dict.referenceOwning());
+                } else if (new_dict.toHandle()) |val| {
+                    try interp.setVariableInner(det, call_frame_idx, dict_name, val.referenceOwning());
                 }
             } else |get_err| switch (get_err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -679,30 +681,30 @@ pub fn unsetVariableInner(
             }
 
             const call_frame = &interp.call_frames.items[call_frame_idx];
-            const remove_result = try objutil.dictRemove(det, call_frame.variables, name);
-            if (!remove_result.did_remove) {
-                assert(remove_result.new_dict == .none);
+            var new_variables: OptionalHandle = .none;
+            const did_remove = try objutil.dictRemove(det, call_frame.variables, &new_variables, name);
+            if (!did_remove) {
                 if (det) |details| details.* = .{
                     .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
                 };
                 return error.VariableNotFound;
-            } else if (remove_result.new_dict.toHandle()) |new_dict| {
-                call_frame.variables.swap(new_dict);
+            } else if (new_variables.toHandle()) |val| {
+                call_frame.variables.swap(val);
             }
 
             call_frame.call_epoch = interp.nextCallEpoch();
         },
         .cached_lexical_var => {
             const call_frame = &interp.call_frames.items[call_frame_idx];
-            const remove_result = try objutil.dictRemove(det, call_frame.variables, name);
-            if (!remove_result.did_remove) {
-                assert(remove_result.new_dict == .none);
+            var new_variables: OptionalHandle = .none;
+            const did_remove = try objutil.dictRemove(det, call_frame.variables, &new_variables, name);
+            if (!did_remove) {
                 if (det) |details| details.* = .{
                     .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
                 };
                 return error.VariableNotFound;
-            } else if (remove_result.new_dict.toHandle()) |new_dict| {
-                call_frame.variables.swap(new_dict);
+            } else if (new_variables.toHandle()) |new| {
+                call_frame.variables.swap(new);
             }
 
             call_frame.call_epoch = interp.nextCallEpoch();
@@ -927,6 +929,31 @@ pub const NativeCommand = struct {
         }
     }
 };
+
+fn getClosureUsage(closure: Heap.Closure, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(gpa);
+    defer aw.deinit();
+
+    aw.writer.writeAll(command_name) catch return error.OutOfMemory;
+
+    const signature_len = objutil.listLengthRaw(closure.args);
+    const optional_start = if (closure.has_args_parameter) closure.required_arity - 1 else closure.required_arity;
+
+    for (0..signature_len) |i| {
+        const var_name_handle = objutil.listItem(closure.args, @intCast(i));
+        const var_name = try var_name_handle.getString();
+
+        if (i == signature_len - 1 and closure.has_args_parameter) {
+            aw.writer.writeAll(" ?arg ...?") catch return error.OutOfMemory;
+        } else if (i >= optional_start) {
+            aw.writer.print(" ?{s}?", .{var_name}) catch return error.OutOfMemory;
+        } else {
+            aw.writer.print(" {s}", .{var_name}) catch return error.OutOfMemory;
+        }
+    }
+
+    return try aw.toOwnedSlice();
+}
 
 fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u8) !void {
     if (det) |details| details.* = .{
@@ -1233,9 +1260,16 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     const has_args: bool = closure.has_args_parameter;
     const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
     if (too_few_arguments or too_many_arguments) {
+        std.log.debug("Too few arguments? {} Too many arguments? {}\n", .{ too_few_arguments, too_many_arguments });
+
         // Wrong argument count, error accordingly.
+        var sf = std.heap.stackFallback(64, Heap.global_gpa);
+        const scratch = sf.get();
+        const command_name = try args[0].getString();
+        const command_usage = try getClosureUsage(closure, scratch, command_name);
+        defer scratch.free(command_usage);
         var det: objutil.ErrorDetails = undefined;
-        return interp.wrapError(&det, wrongArgumentCountError(&det, "FIXME"));
+        return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
     }
 
     // Check for infinite recursion.
@@ -1409,22 +1443,65 @@ pub fn setEmptyResult(interp: *Interp) void {
     interp.freeLastResult();
 }
 
-pub fn makeErrorMessage(interp: *Interp) !Handle {
-    const st = interp.stack_trace.toHandle() orelse return error.NoStackTrace;
-    const err_msg = try interp.result.getString();
+/// Caller must ensure `stack_trace` is already a list.
+pub fn makeErrorMessage(error_mesage: Handle, stack_trace: Handle) !Handle {
+    const list_len = objutil.listLengthRaw(stack_trace);
+    if (list_len == 0 or @mod(list_len, 4) != 0) return error.WrongSize;
 
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(Heap.global_gpa);
-    try buf.appendSlice(Heap.global_gpa, err_msg);
 
-    // Stack trace is a flat list: {name file line args} repeated per frame.
-    const n_items = objutil.listLengthRaw(st);
-    var i: u32 = 0;
-    while (i < n_items) : (i += 4) {
-        const file = objutil.listItem(st, i + 1);
-        const line = objutil.listItem(st, i + 2);
-        buf.print(Heap.global_gpa, "\n    at {f}:{f}", .{ file, line }) catch return error.OutOfMemory;
+    const first_file = objutil.listItem(stack_trace, 1);
+    const first_line = objutil.listItem(stack_trace, 2);
+
+    try buf.print(Heap.global_gpa, "{f}:{f}: Error: {f}\n", .{ first_file, first_line, error_mesage });
+    try buf.print(Heap.global_gpa, "Traceback (most recent call last):\n", .{});
+
+    if (list_len <= 4) {
+        // Stack trace only had one entry, so there's no point in printing the traceback.
+        return try objutil.newString(buf.items);
     }
+
+    // Stack trace is a flat list of {command file line args} repeated per frame.
+    const stack_trace_len = objutil.listLengthRaw(stack_trace);
+    var i: u32 = stack_trace_len;
+    while (i > 0) {
+        i -= 4;
+        const fn_name = try objutil.listItem(stack_trace, i + 0).getString();
+        const file = try objutil.listItem(stack_trace, i + 1).getString();
+        const line = try objutil.listItem(stack_trace, i + 2).getString();
+        const args = try objutil.listItem(stack_trace, i + 3).getString();
+
+        if (file.len > 0) {
+            try buf.print(Heap.global_gpa, "  File \"{s}\", line {s}", .{ file, line });
+        }
+
+        if (fn_name.len > 0) {
+            if (file.len > 0) {
+                try buf.print(Heap.global_gpa, ", in {s}", .{fn_name});
+            } else {
+                try buf.print(Heap.global_gpa, "  In {s}", .{fn_name});
+            }
+        }
+
+        if (file.len > 0 or fn_name.len > 0) {
+            try buf.append(Heap.global_gpa, '\n');
+        }
+
+        if (args.len > 0) {
+            if (std.mem.indexOfScalar(u8, args, '\n')) |args_newline| {
+                const shortened = args[0..args_newline];
+                try buf.print(Heap.global_gpa, "    {s}...\n", .{shortened});
+            } else {
+                try buf.print(Heap.global_gpa, "    {s}\n", .{args});
+            }
+        }
+    }
+
+    // Remove trailing \n
+    if (buf.getLastOrNull()) |last| if (last == '\n') {
+        _ = buf.pop();
+    };
 
     return try objutil.newString(buf.items);
 }
@@ -1479,8 +1556,8 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
 
     // Found upvars if we made it to this point, so we need
     // to duplicate everything, and follow any upvars.
-    const new_dict = try objutil.newDictWithCapacity(Heap.local_heap, pairs * 2);
-    errdefer new_dict.decrRefCount();
+    const upvar_free_dict = try objutil.newDictWithCapacity(Heap.local_heap, pairs * 2);
+    errdefer upvar_free_dict.decrRefCount();
     for (0..pairs) |i_usize| {
         const i: u32 = @intCast(i_usize);
         const key = objutil.dictItem(frame.variables, i * 2);
@@ -1489,7 +1566,9 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
         if (value.tag() == .upvar_link) {
             const upvar_link = value.peek().body.upvar_link;
             if (interp.getVariableInner(det, upvar_link.call_frame, Heap.local_heap.getHandle(upvar_link.linked_name))) |upvar_val| {
-                assert((try objutil.dictPut(new_dict, key, upvar_val)).new_dict == .none);
+                var new_dict: OptionalHandle = .none;
+                _ = try objutil.dictPut(upvar_free_dict, &new_dict, key, upvar_val);
+                assert(new_dict == .none);
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.VariableNotFound, error.BadDict => {
@@ -1508,14 +1587,16 @@ pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx
                 error.LinkLookupFailed => return error.LinkLookupFailed,
             }
         } else {
-            assert((try objutil.dictPut(new_dict, key, value)).new_dict == .none);
+            var new_dict: OptionalHandle = .none;
+            _ = try objutil.dictPut(upvar_free_dict, &new_dict, key, value);
+            assert(new_dict == .none);
         }
     }
 
     // Create a hash reference so the scope can be shared across threads
     // and is consistent with the ^parent link representation.
-    const hash_ref = try objutil.createHashReference(new_dict);
-    new_dict.decrRefCount();
+    const hash_ref = try objutil.createHashReference(upvar_free_dict);
+    upvar_free_dict.decrRefCount();
     return hash_ref;
 }
 
@@ -1562,13 +1643,15 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
 
     if (borrowed_signature.scope_hash_ref.toHandle()) |scope_hash_ref| {
         assert(scope_hash_ref.tag() == .hash_reference);
+        var new_vars_handle: OptionalHandle = .none;
         // Safe since vars_handle is freshly allocated.
-        const put_result = try objutil.dictPutInner(
+        _ = try objutil.dictPutObject(
             vars_handle,
+            &new_vars_handle,
             Heap.local_heap.getInternedString(.@"^parent"),
             scope_hash_ref.peek().body.hash_reference.hashReference(),
         );
-        vars_handle.swapIfNew(put_result.new_dict);
+        vars_handle.swapIfNew(new_vars_handle);
     }
 
     const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
@@ -1591,7 +1674,7 @@ fn pushEvalFrame(interp: *Interp, call_frame: u32, script: Handle) !u32 {
     try interp.eval_frames.append(Heap.global_gpa, .{
         .call_frame = call_frame,
         .args = &.{},
-        .current_line = 1,
+        .current_line = 0,
         .currently_evaluating = script,
     });
     return interp.currentEvalFrameIndex();
@@ -2415,8 +2498,10 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
     }
 }
 
-pub fn evalExpression(interp: *Interp, handle: Handle, new_handle: *OptionalHandle) !ExprResult {
-    errdefer new_handle.swapWithNone();
+pub fn evalExpression(interp: *Interp, original: Handle, new: *OptionalHandle) !ExprResult {
+    errdefer new.swapWithNone();
+
+    const handle = new.orElse(original);
 
     // Combine the call frame's cache ID with the expression's content
     // hash, so identical expressions at different call sites get their
@@ -2495,13 +2580,18 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
         const body = if (is_top) script else call_frame.signature.body;
         const source_info = objutil.getSourceInfo(body);
 
-        const file_name, const base_line = if (source_info) |info|
-            .{ info.file_name.orEmpty(), info.line_no }
-        else
-            .{ Heap.local_heap.emptyHandle(), 1 };
+        const file_name = if (source_info) |info| info.file_name.orEmpty() else Heap.local_heap.emptyHandle();
+        const base_line = if (source_info) |info| info.line_no else null;
 
-        const abs_line = base_line + (eval_frame.current_line - 1);
-        const line_handle = try objutil.newInteger(Heap.local_heap, @intCast(abs_line));
+        std.log.debug("Base line: {?}, eval frame line: {}, call frame #: {}", .{
+            base_line,
+            eval_frame.current_line,
+            eval_frame.call_frame,
+        });
+
+        const base = if (base_line) |val| val else 1;
+        const absolute_line = base + eval_frame.current_line;
+        const line_handle = try objutil.newInteger(Heap.local_heap, @intCast(absolute_line));
         defer line_handle.decrRefCount();
 
         // For the top frame, use the command args stored in the eval frame
@@ -3178,26 +3268,27 @@ pub fn unsetVariableSilent(interp: *Interp, name: *Handle) !void {
     try interp.unsetVariableInner(null, interp.callFrameIdx(), name.*);
 }
 
-pub fn getDictValue(interp: *Interp, dict: Handle, key: Handle) Interp.Error!struct {
-    new_dict: ?Handle,
-    value: ?Handle,
-} {
+pub fn getDictValue(interp: *Interp, dict: Handle, new_dict: OptionalHandle, key: Handle) Interp.Error!?Handle {
     var det: objutil.ErrorDetails = undefined;
-    const new_dict = try interp.wrapError(&det, objutil.shimmerToDict(&det, dict));
-    return .{ .new_dict = new_dict, .value = objutil.dictLookupFollowRefs(new_dict orelse dict, key) };
+    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict));
+    return try interp.wrapError(det, objutil.dictLookupFollowLinks(det, new_dict.orElse(dict), new_dict, key));
 }
 
-pub fn getDictValueOrError(interp: *Interp, dict: Handle, key: Handle) Interp.Error!struct {
-    new_dict: ?Handle,
-    value: Handle,
-} {
-    const result = try interp.getDictValue(dict, key);
+pub fn getDictValueOrError(interp: *Interp, dict: Handle, new_dict: OptionalHandle, key: Handle) Interp.Error!?Handle {
+    const result = interp.getDictValue(dict, new_dict, key);
     if (result.value) |val| {
-        return .{ .new_dict = result.new_dict, .value = val };
+        return val;
     } else {
         try interp.setResultFormatted("could not find value for key \"{f}\"", .{key});
         return error.EvalError;
     }
+}
+
+pub fn getDictValueInPlace(interp: *Interp, dict: *Handle, key: Handle) !?Handle {
+    var maybe_new_dict: OptionalHandle = .none;
+    const result = try interp.getDictValue(dict.*, &maybe_new_dict, key);
+    dict.swapIfNew(maybe_new_dict);
+    return result;
 }
 
 pub fn getDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle) Interp.Error!OptionalHandle {
@@ -3224,16 +3315,12 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, dict: *Handle, keys: []co
     return error.EvalError;
 }
 
-pub fn putDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, key: Handle, value: Handle) Interp.Error!Handle {
-    errdefer new_dict.swapWithNone();
+pub fn putDictValue(interp: *Interp, original: Handle, new: *OptionalHandle, key: Handle, value: Handle) Interp.Error!Handle {
+    errdefer new.swapWithNone();
 
     var det: objutil.ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict, new_dict));
-
-    const put_result = try objutil.dictPut(new_dict.orElse(dict), key, value);
-    new_dict.swapRefIfNew(put_result.new_dict);
-
-    return put_result.new_value;
+    try interp.wrapError(&det, objutil.shimmerToDict(&det, original, new));
+    return try objutil.dictPut(original, new, key, value);
 }
 
 /// Like `putDictValue`, but updates the dict handle in place when the dict
@@ -3260,15 +3347,12 @@ pub fn putDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Han
 }
 
 /// Returns whether the value was removed.
-pub fn removeDictValue(interp: *Interp, dict: Handle, new_dict: *OptionalHandle, key: Handle) !bool {
-    errdefer new_dict.swapWithNone();
+pub fn removeDictValue(interp: *Interp, original: Handle, new: *OptionalHandle, key: Handle) !bool {
+    errdefer new.swapWithNone();
 
     var det: objutil.ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict, new_dict));
-
-    const remove_result = try objutil.dictRemove(new_dict orelse dict, key);
-    Handle.swapRefIfNew(&new_dict, remove_result.new_dict);
-    return .{ .new_dict = new_dict, .did_remove = remove_result.did_remove };
+    try interp.wrapError(&det, objutil.shimmerToDict(&det, original, new));
+    return try interp.wrapError(&det, objutil.dictRemove(&det, original, new, key));
 }
 
 pub fn removeDictValueRecursively(interp: *Interp, dict: *Handle, keys: []const Handle) Interp.Error!bool {

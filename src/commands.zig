@@ -394,13 +394,13 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 }
             };
 
-            const result = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, dict, args[3..args.len]));
+            var new_dict: OptionalHandle = .none;
+            _ = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, dict, &new_dict, args[3..args.len]));
 
-            if (result.new_dict.toHandle()) |new| {
+            if (new_dict.toHandle()) |new| {
                 defer new.decrRefCount();
-                try interp.setVariableTo(var_name, new);
-                // TODO probably can do this faster than looking back up every time.
-                interp.setResult((try interp.getVariable(var_name)).toHandle().?);
+                try interp.setVariableToObject(var_name, new.reference());
+                interp.setResult(new);
             } else {
                 interp.setResult(dict);
             }
@@ -430,10 +430,9 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 while (pair_i < pair_count) : (pair_i += 1) {
                     const k = objutil.dictItemFollowRefs(dict, pair_i * 2);
                     const v = objutil.dictItemFollowRefs(dict, pair_i * 2 + 1);
-                    const put_result = try objutil.dictPut(result, k, v);
-                    if (put_result.new_dict.toHandle()) |new| {
-                        result.swap(new);
-                    }
+                    var new: OptionalHandle = .none;
+                    _ = try objutil.dictPut(result, &new, k, v);
+                    result.swapIfNew(new);
                 }
             }
 
@@ -710,6 +709,10 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
     defer result.decrRefCount();
     try interp.setVariableTo(var_name, result);
     interp.setResult((try interp.getVariable(var_name)).toHandle().?);
+}
+
+pub fn llengthCmd(interp: *Interp, args: []Handle) !void {
+    try interp.setResultInteger(try interp.getListLength(&args[1]));
 }
 
 pub fn lappendCmd(interp: *Interp, args: []Handle) !void {
@@ -993,6 +996,12 @@ fn closureHelper(interp: *Interp, args: []Handle, mode: enum { function, method 
             break :blk .{ null, &args[1], args[2] };
         }
     };
+
+    if (objutil.getSourceInfo(body)) |info| {
+        std.log.debug("Body info: filename {f} line {}\n", .{ info.file_name, info.line_no });
+    } else {
+        std.log.debug("Nothing", .{});
+    }
 
     // Shimmer to list via the interp helper, which handles the case where
     // the handle can't be shimmered in place.
@@ -1766,52 +1775,21 @@ pub fn infoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     }
 }
 
-///
-/// Lazily generates the human-readable error info string from an opts dict.
 pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const opts = &args[1];
-
-    const heap = Heap.local_heap;
-    var det: objutil.ErrorDetails = undefined;
-
-    // Pull out -errorstack from the dict (may not be present).
-    const stack_val = try interp.getDictValueRecursively(opts, &.{heap.getInternedString(.@"-errorstack")});
-
-    if (stack_val.toHandle() == null) {
-        interp.setEmptyResult();
-        return;
-    }
-
-    const stack = stack_val.toHandle().?;
-    defer stack.decrRefCount();
+    const message = args[1];
+    var interp_options = interp.stack_trace.orEmpty().borrow();
+    defer interp_options.decrRefCount();
+    const stack_trace = if (args.len == 3) &args[2] else if (args.len == 2) &interp_options else unreachable;
 
     // The stack is a flat list: {name file line args ...} repeated.
-    var stack_list = stack.borrow();
-    defer stack_list.decrRefCount();
+    var stack_list = stack_trace.borrow();
     try interp.shimmerToList(&stack_list);
-    const len = objutil.listLengthRaw(stack_list);
 
-    // Each frame is 4 items: name, file, line, args.
-    if (len == 0 or @mod(len, 4) != 0) {
-        interp.setEmptyResult();
-        return;
-    }
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(Heap.global_gpa);
-
-    _ = &det;
-    var frame: usize = 0;
-    while (frame < len / 4) : (frame += 1) {
-        const base = frame * 4;
-        const name_str = try objutil.listItem(stack_list, @intCast(base)).getString();
-        const file_str = try objutil.listItem(stack_list, @intCast(base + 1)).getString();
-        const line_str = try objutil.listItem(stack_list, @intCast(base + 2)).getString();
-        if (frame > 0) try buf.appendSlice(Heap.global_gpa, "\n");
-        try buf.print(Heap.global_gpa, "    at {s} ({s}:{s})", .{ name_str, file_str, line_str });
-    }
-
-    interp.setResultOwning(try objutil.newStringInner(heap, buf.items));
+    const error_message = Interp.makeErrorMessage(message, stack_list) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.WrongSize => return,
+    };
+    interp.setResultOwning(error_message);
 }
 
 fn registerCommand(
@@ -1859,6 +1837,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, 2, null);
     try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
+    try registerCommand(interp, "llength", llengthCmd, "list", 1, 1, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
