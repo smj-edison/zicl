@@ -2532,10 +2532,7 @@ var next_script_id = 1;
 /// Not threadsafe (though this will use `handle` correctly if it's from another thread).
 pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
     // Get source info, or use defaults.
-    const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else .{
-        .file_name = .none,
-        .line_no = 1,
-    };
+    const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else .{ .file_name = .none, .line_no = 1 };
 
     // Parse all the tokens of the script, handling any errors that come up.
 
@@ -2744,7 +2741,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             if (str_handle) |token_str| {
                 try setSourceInfo(token_str, .{
                     .file_name = source_info.file_name,
-                    .line_no = token.loc.line_no,
+                    .line_no = token.loc.line_no + source_info.line_no,
                 });
             }
         }

@@ -997,12 +997,6 @@ fn closureHelper(interp: *Interp, args: []Handle, mode: enum { function, method 
         }
     };
 
-    if (objutil.getSourceInfo(body)) |info| {
-        std.log.debug("Body info: filename {f} line {}\n", .{ info.file_name, info.line_no });
-    } else {
-        std.log.debug("Nothing", .{});
-    }
-
     // Shimmer to list via the interp helper, which handles the case where
     // the handle can't be shimmered in place.
     try interp.shimmerToList(arglist);

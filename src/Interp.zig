@@ -1455,7 +1455,7 @@ pub fn makeErrorMessage(error_mesage: Handle, stack_trace: Handle) !Handle {
     const first_line = objutil.listItem(stack_trace, 2);
 
     try buf.print(Heap.global_gpa, "{f}:{f}: Error: {f}\n", .{ first_file, first_line, error_mesage });
-    try buf.print(Heap.global_gpa, "Traceback (most recent call last):\n", .{});
+    try buf.print(Heap.global_gpa, "Traceback:\n", .{});
 
     if (list_len <= 4) {
         // Stack trace only had one entry, so there's no point in printing the traceback.
@@ -1464,9 +1464,8 @@ pub fn makeErrorMessage(error_mesage: Handle, stack_trace: Handle) !Handle {
 
     // Stack trace is a flat list of {command file line args} repeated per frame.
     const stack_trace_len = objutil.listLengthRaw(stack_trace);
-    var i: u32 = stack_trace_len;
-    while (i > 0) {
-        i -= 4;
+    var i: u32 = 0;
+    while (i < stack_trace_len) : (i += 4) {
         const fn_name = try objutil.listItem(stack_trace, i + 0).getString();
         const file = try objutil.listItem(stack_trace, i + 1).getString();
         const line = try objutil.listItem(stack_trace, i + 2).getString();
@@ -2547,21 +2546,21 @@ test "eval expression" {
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
 }
 
-pub fn setErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!void {
+pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
     if (interp.stack_trace != .none) return;
-    interp.stack_trace.swapRef(try buildErrorStack(interp, script));
+    interp.stack_trace.swapRef(try buildErrorStack(interp));
 }
 
 /// Builds the stack trace as a flat list of {name file line args} repeated once per call
 /// frame. The top (innermost) frame is emitted first.
-fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
+fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Handle {
     var trace = try objutil.newListWithCapacity(@intCast(interp.call_frames.items.len * 4));
     errdefer trace.decrRefCount();
 
     var last_call_frame_idx: ?u32 = null;
-    var is_top = true;
 
-    // Eval frames are walked from top to bottom; each one is followed to its call frame.
+    // Eval frames are walked from top to bottom. Each one is followed to its
+    // corresponding call frame.
     var i = interp.eval_frames.items.len;
     while (i > 0) {
         i -= 1;
@@ -2574,34 +2573,16 @@ fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
         const call_frame = &interp.call_frames.items[eval_frame.call_frame];
         const closure_name = call_frame.signature.name.orEmpty();
 
-        // Source info: the top frame uses the active script handle so command
-        // substitution positions are reflected correctly; earlier frames use
-        // their closure body.
-        const body = if (is_top) script else call_frame.signature.body;
-        const source_info = objutil.getSourceInfo(body);
-
+        const source_info = objutil.getSourceInfo(eval_frame.currently_evaluating);
         const file_name = if (source_info) |info| info.file_name.orEmpty() else Heap.local_heap.emptyHandle();
         const base_line = if (source_info) |info| info.line_no else null;
-
-        std.log.debug("Base line: {?}, eval frame line: {}, call frame #: {}", .{
-            base_line,
-            eval_frame.current_line,
-            eval_frame.call_frame,
-        });
 
         const base = if (base_line) |val| val else 1;
         const absolute_line = base + eval_frame.current_line;
         const line_handle = try objutil.newInteger(Heap.local_heap, @intCast(absolute_line));
         defer line_handle.decrRefCount();
 
-        // For the top frame, use the command args stored in the eval frame
-        // (set just before invokeCommand while the slice is still live). For
-        // lower frames use the invocation args stored in the call frame (set
-        // when the frame was pushed, also still live on the Zig stack at this
-        // point).
-        const raw_args: []const Handle = if (is_top) eval_frame.args else call_frame.args;
-        is_top = false;
-        const args_list = try objutil.newList(raw_args);
+        const args_list = try objutil.newList(eval_frame.args);
         defer args_list.decrRefCount();
 
         objutil.listAppendAssumeCapacity(trace, closure_name.dupOrRef());
@@ -2937,9 +2918,9 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
                         try interp.setResultString("FIXME: prolly should explain how to use the command");
                     }
 
-                    // `eval_frame.args` and `call_frame.args` are still live here; capture the stack
+                    // `eval_frame.args` and `call_frame.args` are still live here. Capture the stack
                     // trace before the loop-body defers unwind them.
-                    try interp.setErrorStack(script);
+                    try interp.setErrorStack();
 
                     return narrowToEvalError(narrowed_err);
                 },

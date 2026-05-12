@@ -61,7 +61,7 @@ test "stack trace in nested closure" {
         \\ bad
     ;
     try interp.testExpectScriptError(error.EvalError, "division by zero", script);
-    try testing.expectEqualStrings("bad {} 2 {/ 1 0} {} {} 4 {}", try traceString(&interp));
+    try testing.expectEqualStrings("bad {} 2 {/ 1 0} {} {} 4 bad", try traceString(&interp));
 }
 
 test "stack trace in command substitution" {
@@ -102,7 +102,7 @@ test "stack trace line number correct dedup" {
     const count_before_foo = Heap.local_heap.parsed_scripts.mapping.count();
     try interp.testExpectScriptError(error.EvalError, "division by zero", script_foo);
     try testing.expectEqual(count_before_foo + 2, Heap.local_heap.parsed_scripts.mapping.count());
-    try testing.expectEqualStrings("foo {} 2 {/ 1 0} {} {} 7 {}", try traceString(&interp));
+    try testing.expectEqualStrings("foo {} 2 {/ 1 0} {} {} 7 foo", try traceString(&interp));
 
     const script_bar =
         \\ fn foo {} {
@@ -118,7 +118,7 @@ test "stack trace line number correct dedup" {
     // bar has a distinct cache_id from foo, so it gets its own parsed_scripts entry even
     // though the body text is identical — the ParsedScript is NOT shared.
     try testing.expectEqual(count_before_bar + 2, Heap.local_heap.parsed_scripts.mapping.count());
-    try testing.expectEqualStrings("bar {} 5 {/ 1 0} {} {} 7 {}", try traceString(&interp));
+    try testing.expectEqualStrings("bar {} 5 {/ 1 0} {} {} 7 bar", try traceString(&interp));
 }
 
 test "unknown" {
