@@ -835,7 +835,7 @@ pub const ListIndex = packed struct(u34) {
         if (self.is_relative) {
             return self.u.end_offset + (list_len -| 1);
         } else {
-            return self.u.index;
+            return self.u.index.data;
         }
     }
 };
@@ -1062,6 +1062,8 @@ pub const Handle = packed struct(HandleBacking) {
         // have a string rep yet.
         if (handle.tag() != .none) _ = try handle.getString();
         handle.invalidateBody();
+
+        handle.trace("Prepared to shimmer", .{});
     }
 
     pub fn canShimmer(handle: Handle) bool {
@@ -1327,10 +1329,24 @@ pub const Handle = packed struct(HandleBacking) {
         return &handle.getHeap().getExtraData(handle.peek().body.closure.extra_data).closure;
     }
 
+    threadlocal var recursion_depth: usize = 0;
     const empty_string_value = "";
     /// This returns a temporary string. Whenever the object is mutated, it
     /// may become invalid. Guaranteed to be valid, barring OOM.
     pub fn getString(handle: Handle) error{OutOfMemory}![:0]const u8 {
+        recursion_depth += 1;
+        defer recursion_depth -= 1;
+
+        if (recursion_depth > 50) {
+            last_touched = handle;
+            std.debug.panic("Infinite recursion in getString, handle: {any}, type: {}, ref: {any}, body ptr: {*}", .{
+                handle,
+                handle.tag(),
+                handle.peek().body.reference,
+                &handle.peek().body,
+            });
+        }
+
         const obj = handle.peek();
 
         switch (handle.getStringDetails()) {
@@ -2099,7 +2115,10 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
         });
     }
 
-    self.getHandle(index).trace("Alloc at index {} of order {} with ref count 1", .{ index, order });
+    self.getHandle(index).trace(
+        "Alloc at index {} of order {} with ref count 1 in heap {}",
+        .{ index, order, self.heapId() },
+    );
     if (aligned_count > 1) {
         for ((index + 1)..end) |collection_item| {
             self.getHandle(@intCast(collection_item)).trace(

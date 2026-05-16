@@ -83,3 +83,63 @@ test "concat command" {
     try interp.testExpectScriptResult("1 2 3 4", "concat {1 2} {3 4}");
     try interp.testExpectScriptResult("1 2 3", "concat {1 2 3} {}");
 }
+
+test "string map basic" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // Single-character replacement.
+    try interp.testExpectScriptResult("bbbb", "string map {a b} abba");
+
+    // Single-character replacement on single-char string.
+    try interp.testExpectScriptResult("b", "string map {a b} a");
+
+    // Multiple replacements with overlapping prefixes.
+    // Longer keys are tried first, so "abc" matches before "ab" or "a".
+    try interp.testExpectScriptResult("A321*A*321*", "string map {abc 321 ab * a A} aabcabaababcab");
+}
+
+test "string map -nocase" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // Case-insensitive single-character replacement.
+    try interp.testExpectScriptResult("bbbb", "string map -nocase {a b} Abba");
+
+    // Case-insensitive with overlapping prefixes.
+    try interp.testExpectScriptResult("A321*A*321*", "string map -nocase {aBc 321 Ab * a A} aabcabaababcab");
+
+    // One-pair case: longer key wins regardless of case.
+    try interp.testExpectScriptResult("a32aBaAb32Ab", "string map -nocase {abc 32} aAbCaBaAbAbcAb");
+
+    // One-pair case with shorter key.
+    try interp.testExpectScriptResult("a4321C4321a43214321c4321", "string map -nocase {ab 4321} aAbCaBaAbAbcAb");
+}
+
+test "string map error cases" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // Odd number of elements in the mapping list is an error.
+    try interp.testExpectScriptError(error.EvalError, "list must contain an even number of elements",
+        "string map {a b c} abba");
+}
+
+test "string map empty keys" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // Empty key is skipped; the string is returned unchanged.
+    try interp.testExpectScriptResult("foo", "string map -nocase {{} abc} foo");
+
+    // Empty key followed by a real key still replaces the real key.
+    try interp.testExpectScriptResult("baroo", "string map -nocase {{} abc f bar {} def} foo");
+}
+
+test "string map case sensitive" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // Case-sensitive: "Ab" only matches "Ab", not "ab" or "aB".
+    try interp.testExpectScriptResult("a4321CaBa43214321c4321", "string map {Ab 4321} aAbCaBaAbAbcAb");
+}

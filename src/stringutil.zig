@@ -95,22 +95,17 @@ const AsciiIterator = struct {
 pub const Iterator = if (use_utf8) uucode.utf8.Iterator else AsciiIterator;
 
 /// lexographical comparision of codepoints
-pub fn compare(a: []const u8, b: []const u8, case_insensitive: bool) std.math.Order {
+pub fn compare(a: []const u8, b: []const u8, up_to_cp: ?usize, case_insensitive: bool) std.math.Order {
     var a_iter = Iterator.init(a);
     var b_iter = Iterator.init(b);
 
-    while (true) {
-        const a_cp = condUpper(a_iter.next(), case_insensitive);
-        const b_cp = condUpper(b_iter.next(), case_insensitive);
+    var i: usize = 0;
+    while (up_to_cp == null or i < up_to_cp.?) : (i += 1) {
+        const a_cp = condUpper(a_iter.next() orelse return .lt, case_insensitive);
+        const b_cp = condUpper(b_iter.next() orelse return .gt, case_insensitive);
 
-        if (a_cp != null and b_cp != null) {
-            const order = std.math.order(u21, a_cp.?, b_cp.?);
-            if (order != .eq) return order;
-        } else {
-            if (a_cp == null and b_cp != null) return .lt;
-            if (a_cp == null and b_cp == null) return .eq;
-            if (a_cp != null and b_cp == null) return .gt;
-        }
+        const order = std.math.order(a_cp, b_cp);
+        if (order != .eq) return order;
     }
 
     return .eq;

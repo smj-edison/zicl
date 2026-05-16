@@ -148,8 +148,11 @@ const binary_oper_table = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, 
     .equal_equal = .{ .prec = 70, .tag = Node.Tag.equal, .assoc = .none },
     .bang_equal = .{ .prec = 70, .tag = Node.Tag.not_equal, .assoc = .none },
 
-    .keyword_in = .{ .prec = 55, .tag = Node.Tag.string_equal, .assoc = .none },
-    .keyword_ni = .{ .prec = 55, .tag = Node.Tag.string_not_equal, .assoc = .none },
+    .keyword_eq = .{ .prec = 60, .tag = Node.Tag.string_equal, .assoc = .none },
+    .keyword_ne = .{ .prec = 60, .tag = Node.Tag.string_not_equal, .assoc = .none },
+
+    .keyword_in = .{ .prec = 55, .tag = Node.Tag.string_in, .assoc = .none },
+    .keyword_ni = .{ .prec = 55, .tag = Node.Tag.string_not_in, .assoc = .none },
 
     .ampersand = .{ .prec = 50, .tag = Node.Tag.bit_and },
     .caret = .{ .prec = 49, .tag = Node.Tag.bit_xor },

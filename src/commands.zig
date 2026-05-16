@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const assert = std.debug.assert;
 
+const strutil = @import("stringutil.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
@@ -447,7 +448,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             _ = try interp.putDictValueInPlace(dict, Heap.local_heap.getInternedString(.@"^parent"), hash_ref);
             interp.setResult(dict.*);
         },
-        else => @panic("unimplemented"),
+        else => std.debug.panic("unimplemented: {}", .{subcommand}),
     }
 }
 
@@ -711,6 +712,263 @@ pub fn appendCmd(interp: *Interp, args: []Handle) !void {
     interp.setResult((try interp.getVariable(var_name)).toHandle().?);
 }
 
+pub fn stringCmd(interp: *Interp, args: []Handle) !void {
+    const Subcommands = enum {
+        bytelength,
+        byterange,
+        cat,
+        compare,
+        equal,
+        first,
+        index,
+        is,
+        last,
+        length,
+        map,
+        match,
+        range,
+        repeat,
+        replace,
+        reverse,
+        tolower,
+        totitle,
+        toupper,
+        trim,
+        trimleft,
+        trimright,
+    };
+    const Parser = objutil.SubcommandParser(Subcommands, &.{
+        .{ .variant = .bytelength, .usage = "string", .min_args = 1, .max_args = 1 },
+        .{ .variant = .byterange, .usage = "string first last", .min_args = 3, .max_args = 3 },
+        .{ .variant = .cat, .usage = "?string ...?", .min_args = 0, .max_args = null },
+        .{ .variant = .compare, .usage = "?-nocase? ?-length int? string1 string2", .min_args = 2, .max_args = 5 },
+        .{ .variant = .equal, .usage = "?-nocase? ?-length int? string1 string2", .min_args = 2, .max_args = 5 },
+        .{ .variant = .first, .usage = "subString string ?index?", .min_args = 2, .max_args = 3 },
+        .{ .variant = .index, .usage = "string index", .min_args = 2, .max_args = 2 },
+        .{ .variant = .is, .usage = "class ?-strict? str", .min_args = 2, .max_args = 3 },
+        .{ .variant = .last, .usage = "subString string ?index?", .min_args = 2, .max_args = 3 },
+        .{ .variant = .length, .usage = "string", .min_args = 1, .max_args = 1 },
+        .{ .variant = .map, .usage = "?-nocase? mapList string", .min_args = 2, .max_args = 3 },
+        .{ .variant = .match, .usage = "?-nocase? pattern string", .min_args = 2, .max_args = 3 },
+        .{ .variant = .range, .usage = "string first last", .min_args = 3, .max_args = 3 },
+        .{ .variant = .repeat, .usage = "string count", .min_args = 2, .max_args = 2 },
+        .{ .variant = .replace, .usage = "string first last ?string?", .min_args = 3, .max_args = 4 },
+        .{ .variant = .reverse, .usage = "string", .min_args = 1, .max_args = 1 },
+        .{ .variant = .tolower, .usage = "string", .min_args = 1, .max_args = 1 },
+        .{ .variant = .totitle, .usage = "string", .min_args = 1, .max_args = 1 },
+        .{ .variant = .toupper, .usage = "string", .min_args = 1, .max_args = 1 },
+        .{ .variant = .trim, .usage = "string ?trimchars?", .min_args = 1, .max_args = 2 },
+        .{ .variant = .trimleft, .usage = "string ?trimchars?", .min_args = 1, .max_args = 2 },
+        .{ .variant = .trimright, .usage = "string ?trimchars?", .min_args = 1, .max_args = 2 },
+    });
+
+    var det: objutil.ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    const sub_args = args[2..];
+    const was_wrong_usage = wrong_usage: {
+        switch (subcommand) {
+            .bytelength => {
+                const bytes = try sub_args[0].getString();
+                try interp.setResultInteger(@intCast(bytes.len));
+            },
+            .byterange => {
+                const bytes = try sub_args[0].getString();
+                const range = try interp.wrapError(&det, objutil.getRangeInPlace(
+                    &det,
+                    @intCast(bytes.len),
+                    &sub_args[1],
+                    &sub_args[2],
+                ));
+                try interp.setResultString(bytes[range.start..range.end]);
+            },
+            .cat => {
+                var new_str: std.ArrayList(u8) = .empty;
+                defer new_str.deinit(Heap.global_gpa);
+                for (sub_args[0..]) |handle| {
+                    const str = try handle.getString();
+                    try new_str.appendSlice(Heap.global_gpa, str);
+                }
+
+                try interp.setResultString(new_str.items);
+            },
+            .compare, .equal => {
+                var opt_case_insensitive = false;
+                var opt_length: ?usize = null;
+
+                // The last two arguments are the strings to compare. Everything
+                // before is a flag.
+                var i: usize = 0;
+                while (i < sub_args.len - 2) : (i += 1) {
+                    if (try sub_args[i].equalsString("-nocase")) {
+                        opt_case_insensitive = true;
+                    } else if (try sub_args[i].equalsString("-length")) {
+                        if (i + 1 >= sub_args.len - 2) break :wrong_usage true; // There needs to be a value after `-length`.
+                        opt_length = std.math.lossyCast(usize, try interp.getInteger(&sub_args[i + 1]));
+                        i += 1;
+                    } else break :wrong_usage true;
+                }
+
+                const bytes_a = try sub_args[i].getString();
+                const bytes_b = try sub_args[i + 1].getString();
+
+                // Fast case: [string equal], case sensitive, no max length.
+                if (subcommand == .equal and !opt_case_insensitive and opt_length == null) {
+                    try interp.setResultBoolean(std.mem.eql(u8, bytes_a, bytes_b));
+                } else {
+                    const order = strutil.compare(bytes_a, bytes_b, opt_length, opt_case_insensitive);
+                    if (subcommand == .equal) {
+                        try interp.setResultBoolean(order == .eq);
+                    } else switch (order) {
+                        .lt => try interp.setResultInteger(-1),
+                        .eq => try interp.setResultInteger(0),
+                        .gt => try interp.setResultInteger(1),
+                    }
+                }
+            },
+            .length => {
+                try interp.setResultInteger(@intCast(try interp.getCodepointLength(&args[1])));
+            },
+            .map => {
+                var opt_case_insensitive = false;
+                if (sub_args.len == 3) {
+                    if (!try sub_args[0].equalsString("-nocase")) break :wrong_usage true;
+                    opt_case_insensitive = true;
+                }
+
+                const map_list = &sub_args[sub_args.len - 2];
+                const str_handle = &sub_args[sub_args.len - 1];
+                try interp.shimmerToList(map_list);
+
+                const map_len = objutil.listLengthRaw(map_list.*);
+                if (@mod(map_len, 2) != 0) {
+                    try interp.setResultString("list must contain an even number of elements");
+                    return error.EvalError;
+                }
+
+                const pair_count = map_len / 2;
+                const Pair = struct {
+                    key: []const u8,
+                    value: []const u8,
+                    key_cp_len: usize,
+                };
+
+                // Precompute keys and values so that getCodepointLength is only called
+                // once per key. Without this, a non-string key would be shimmered (and
+                // possibly duplicated) on every scan position.
+                var pairs = try std.ArrayList(Pair).initCapacity(Heap.global_gpa, pair_count);
+                defer pairs.deinit(Heap.global_gpa);
+
+                for (0..pair_count) |i| {
+                    const key_obj = objutil.listItem(map_list.*, @intCast(i * 2));
+                    const val_obj = objutil.listItem(map_list.*, @intCast(i * 2 + 1));
+                    const key_str = try key_obj.getString();
+                    var new_handle: OptionalHandle = .none;
+                    defer new_handle.decrOptional();
+                    const key_cp_len = try objutil.getCodepointLength(key_obj, &new_handle);
+                    pairs.appendAssumeCapacity(.{
+                        .key = key_str,
+                        .value = try val_obj.getString(),
+                        .key_cp_len = key_cp_len,
+                    });
+                }
+
+                const str = try str_handle.getString();
+
+                var result: std.ArrayList(u8) = .empty;
+                defer result.deinit(Heap.global_gpa);
+
+                var str_iter = strutil.Iterator.init(str);
+
+                // no_match_start tracks the first byte of a contiguous run of characters
+                // that did not match any key. When a match is found, everything from
+                // this byte index up to the current position is copied verbatim into
+                // the result. It is null when we are not in the middle of an unmatched
+                // run (e.g. right after a replacement, or at the start of the string).
+                var no_match_start: ?usize = null;
+
+                while (str_iter.peek()) |_| : (_ = str_iter.next()) {
+                    var matched = false;
+                    for (pairs.items) |pair| {
+                        if (pair.key.len == 0) continue;
+                        const remaining = str[str_iter.i..];
+                        if (remaining.len < pair.key.len) continue;
+
+                        // Limit the comparison to the key's codepoint count so that a
+                        // longer remaining string still matches when the prefix is
+                        // identical. Without the limit, compare would return .gt.
+                        const order = strutil.compare(remaining, pair.key, pair.key_cp_len, opt_case_insensitive);
+                        if (order != .eq) continue;
+
+                        // A key matched. First, flush any preceding unmatched characters.
+                        if (no_match_start) |start| {
+                            try result.appendSlice(Heap.global_gpa, str[start..str_iter.i]);
+                            no_match_start = null;
+                        }
+                        try result.appendSlice(Heap.global_gpa, pair.value);
+
+                        // The outer loop already peeked at 1 codepoint but did not consume it.
+                        // We need to advance past the rest of the matched key so the next
+                        // iteration resumes at the first character after the replacement.
+                        for (1..pair.key_cp_len) |_| {
+                            _ = str_iter.next() orelse break;
+                        }
+                        matched = true;
+                        break;
+                    }
+
+                    if (!matched) {
+                        // This codepoint is not the start of any key. If we are not
+                        // already tracking an unmatched run, mark the start here.
+                        if (no_match_start == null) no_match_start = str_iter.i;
+                    }
+                }
+
+                // If the string ended while we were still in an unmatched run, copy the
+                // trailing characters into the result.
+                if (no_match_start) |start| {
+                    try result.appendSlice(Heap.global_gpa, str[start..str_iter.i]);
+                }
+
+                try interp.setResultString(result.items);
+            },
+            .index => {
+                var new_str: OptionalHandle = .none;
+                const codepoint_len = try objutil.getCodepointLength(sub_args[0], &new_str);
+                sub_args[0].swapIfNew(new_str);
+                const bytes = try sub_args[0].getString();
+                const index = try interp.getIndex(&sub_args[1]);
+
+                const abs_index = index.asAbsoluteIndex(@intCast(codepoint_len));
+                if (abs_index < 0 or abs_index >= codepoint_len) {
+                    interp.setEmptyResult();
+                    return;
+                } else if (bytes.len == codepoint_len) {
+                    // ASCII optimization.
+                    try interp.setResultString(&.{bytes[@intCast(abs_index)]});
+                } else {
+                    const byte_index = strutil.cpIndex(bytes, @intCast(abs_index)).?;
+                    const len = std.unicode.utf8ByteSequenceLength(bytes[byte_index]) catch {
+                        interp.setEmptyResult();
+                        return;
+                    };
+                    try interp.setResultString(bytes[byte_index..][0..len]);
+                }
+            },
+            else => std.debug.panic("unimplemented: {}", .{subcommand}),
+        }
+        break :wrong_usage false;
+    };
+
+    if (was_wrong_usage) {
+        try interp.setResultFormatted(
+            "wrong # args: should be \"{f} {f} {s}\"",
+            .{ args[0], args[1], Parser.EnumToSubcommand.get(subcommand).usage },
+        );
+        return error.EvalError;
+    }
+}
+
 pub fn llengthCmd(interp: *Interp, args: []Handle) !void {
     try interp.setResultInteger(try interp.getListLength(&args[1]));
 }
@@ -731,6 +989,43 @@ pub fn lappendCmd(interp: *Interp, args: []Handle) !void {
 
     try interp.setVariableTo(&args[1], list);
     interp.setResult(list);
+}
+
+pub fn lassignCmd(interp: *Interp, args: []Handle) !void {
+    // args[0] = "lassign", args[1] = list, args[2..] = varNames
+    try interp.shimmerToList(&args[1]);
+    const list = args[1];
+    const list_len = objutil.listLengthRaw(list);
+    const var_count = args.len - 2;
+
+    // Assign each list element to the corresponding variable.
+    for (0..var_count) |i| {
+        const var_name = &args[2 + i];
+        if (i < list_len) {
+            try interp.setVariableTo(var_name, objutil.listItem(list, @intCast(i)));
+        } else {
+            try interp.setVariableTo(var_name, Heap.local_heap.emptyHandle());
+        }
+    }
+
+    // Collect any remaining list elements as the result.
+    const remaining_start = var_count;
+    if (remaining_start < list_len) {
+        const remaining_count = list_len - remaining_start;
+        var remaining = try objutil.newListWithCapacity(@intCast(remaining_count));
+        errdefer remaining.decrRefCount();
+        for (remaining_start..list_len) |i| {
+            objutil.listAppendAssumeCapacity(remaining, objutil.listItem(list, @intCast(i)).dupOrRef());
+        }
+        interp.setResultOwning(remaining);
+    } else {
+        interp.setEmptyResult();
+    }
+}
+
+/// [list]
+pub fn listCmd(interp: *Interp, args: []Handle) !void {
+    interp.setResultOwning(try objutil.newList(args[1..]));
 }
 
 pub fn concatCmd(interp: *Interp, args: []Handle) !void {
@@ -797,6 +1092,13 @@ pub fn setCmd(interp: *Interp, args: []Handle) !void {
     }
 }
 
+/// [switch]
+// pub fn switchCmd(interp: *Interp, args: []Handle) !void {
+//     const MatchType = enum { exact, glob, regex, command };
+//     var match_type: MatchType = .exact;
+// }
+
+/// [unset]
 pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
     var should_complain = true;
 
@@ -1829,13 +2131,16 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
-    try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, 2, null);
+    try registerCommand(interp, "lappend", lappendCmd, "varName ?value value ...?", 1, null, null);
+    try registerCommand(interp, "lassign", lassignCmd, "list ?varName ...?", 1, null, null);
     try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
+    try registerCommand(interp, "list", listCmd, "?arg ...?", 0, null, null);
     try registerCommand(interp, "llength", llengthCmd, "list", 1, 1, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
+    try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
     try registerCommand(interp, "tailcall", tallcallCommand, "command ?arg ...?", 1, null, null);
     try registerCommand(interp, "try", tryCmd, "script ?handler ...? ?finally body?", 1, null, null);

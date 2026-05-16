@@ -1273,13 +1273,12 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     }
 
     // Check for infinite recursion.
-    if (interp.callFrame().level >= interp.max_call_depth) {
+    if (interp.callFrameIdx() >= interp.max_call_depth) {
         try interp.setResultString("Too many nested calls. Infinite recursion?");
         return error.InfiniteRecursion;
     }
 
-    const parent_idx = interp.callFrameIdx();
-    const call_frame_idx = try interp.pushCallFrame(parent_idx, args, closure);
+    const call_frame_idx = try interp.pushCallFrame(args, closure);
     defer {
         var frame = interp.call_frames.pop().?;
         frame.deinit();
@@ -1507,10 +1506,6 @@ pub fn makeErrorMessage(error_mesage: Handle, stack_trace: Handle) !Handle {
 
 /// Call frame.
 const CallFrame = struct {
-    /// Parent index.
-    parent: ?u32,
-    /// Level of the call frame. 0 = global.
-    level: u32,
     /// Dictionary containing the frame's variables.
     variables: Handle,
     /// Arguments of this procedure call. Lifetime managed by creator.
@@ -1634,7 +1629,7 @@ pub fn currentEvalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.currentEvalFrameIndex()];
 }
 
-fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.Closure) !u32 {
+fn pushCallFrame(interp: *Interp, args: []Handle, signature: Heap.Closure) !u32 {
     var vars_handle = try objutil.newDictWithCapacity(Heap.local_heap, 0);
     errdefer vars_handle.decrRefCount();
     const borrowed_signature = signature.borrow();
@@ -1653,13 +1648,10 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
         vars_handle.swapIfNew(new_vars_handle);
     }
 
-    const level = if (parent) |val| interp.call_frames.items[val].level + 1 else 0;
     const new_call_frame_idx = interp.call_frames.items.len;
     try interp.call_frames.append(Heap.global_gpa, .{
-        .parent = parent,
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
-        .level = level,
         .signature = borrowed_signature,
         // TODO PERF recycle variable hash table if possible.
         .variables = vars_handle,
@@ -1693,7 +1685,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
             var det: objutil.ErrorDetails = undefined;
             const var_target: Handle = try interp.wrapError(
                 &det,
-                interp.getVariableInner(&det, interp.callFrame().level, value),
+                interp.getVariableInner(&det, interp.callFrameIdx(), value),
             );
             return var_target.borrow();
         },
@@ -1960,31 +1952,8 @@ fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
             try interp.setResultFormatted("expected boolean but got \"{}\"", .{float});
             return error.BadBoolean;
         },
-        .owned_handle => |string| {
-            string.incrRefCount();
-            var new_handle: OptionalHandle = .none;
-            const bool_result = objutil.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string.*});
-                    return error.BadBoolean;
-                },
-            };
-            string.swapIfNew(new_handle);
-            return bool_result;
-        },
-        .stack_handle => |*string| {
-            var new_handle: OptionalHandle = .none;
-            const bool_result = objutil.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
-                    return error.BadBoolean;
-                },
-            };
-            string.swapIfNew(new_handle);
-            return bool_result;
-        },
+        .owned_handle => |string| return try interp.getBoolean(string),
+        .stack_handle => |*string| return try interp.getBoolean(string),
     }
 }
 
@@ -2554,7 +2523,7 @@ pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
 /// Builds the stack trace as a flat list of {name file line args} repeated once per call
 /// frame. The top (innermost) frame is emitted first.
 fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Handle {
-    var trace = try objutil.newListWithCapacity(@intCast(interp.call_frames.items.len * 4));
+    var trace = try objutil.newListWithCapacity(@intCast(interp.eval_frames.items.len * 4));
     errdefer trace.decrRefCount();
 
     var last_call_frame_idx: ?u32 = null;
@@ -3040,7 +3009,7 @@ pub fn init() !Interp {
         .prng = .init(0),
     };
 
-    _ = try new_interp.pushCallFrame(null, &.{}, .{
+    _ = try new_interp.pushCallFrame(&.{}, .{
         .args = Heap.local_heap.emptyHandle(),
         .body = Heap.local_heap.emptyHandle(),
         .name = .none,
@@ -3128,6 +3097,11 @@ pub fn getBoolean(interp: *Interp, handle: *Handle) !bool {
     return handle.peek().body.bool.data;
 }
 
+pub fn getIndex(interp: *Interp, handle: *Handle) !Heap.ListIndex {
+    try interp.wrapShimmerFn(handle, objutil.shimmerToIndex);
+    return handle.peek().body.index.data;
+}
+
 pub fn resolveHash(interp: *Interp, handle: *Handle) !Handle {
     try interp.wrapShimmerFn(handle, objutil.shimmerToHashReference);
     return handle.peek().body.hash_reference;
@@ -3164,6 +3138,14 @@ pub fn listAppend(interp: *Interp, list: *Handle, item: Handle) !Handle {
     const result = try interp.wrapError(&det, objutil.listAppend(&det, new_list.orElse(list.*), &new_list, item));
     list.swapIfNew(new_list);
 
+    return result;
+}
+
+pub fn getCodepointLength(interp: *Interp, handle: *Handle) !usize {
+    _ = interp;
+    var new: OptionalHandle = .none;
+    const result = try objutil.getCodepointLength(handle.*, &new);
+    handle.swapIfNew(new);
     return result;
 }
 

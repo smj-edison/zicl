@@ -101,7 +101,7 @@ pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
     switch (handle.getStringDetails()) {
         .long => |long_str| {
             const current_len = long_str.getUtf8Length();
-            if (current_len != std.math.maxInt(u64)) return current_len;
+            if (current_len) |val| return val;
 
             // String length hasn't been computed yet, so compute now.
             const utf8_length = stringutil.codepointLength(long_str.getString());
@@ -115,13 +115,13 @@ pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
                 const bytes = try handle.getString();
                 const utf8_length = stringutil.codepointLength(bytes);
                 handle.peek().body.string = .{
-                    .utf8_length = utf8_length, // Cache utf8 length.
+                    .utf8_length = @intCast(utf8_length), // Cache utf8 length.
                     .length_determined = true,
                 };
                 return utf8_length;
             }
         },
-        .empty => 0,
+        .empty => return 0,
         .null => unreachable,
     }
 }
@@ -203,11 +203,11 @@ pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !boo
     return stringutil.globMatch(pattern_str, to_check_str, case_insensitive);
 }
 
-pub fn compare(a: Handle, b: Handle, case_insensitive: bool) !std.math.Order {
+pub fn compare(a: Handle, b: Handle, up_to_cp: ?usize, case_insensitive: bool) !std.math.Order {
     const a_str = try a.getString();
     const b_str = try b.getString();
 
-    return stringutil.compare(a_str, b_str, case_insensitive);
+    return stringutil.compare(a_str, b_str, up_to_cp, case_insensitive);
 }
 
 // Integer related functions
@@ -329,7 +329,7 @@ pub fn floatGet(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !i6
 ///////////////////////////////
 //  Index related functions  //
 
-/// `start` is inclusive, `end` is exclusive. (Note, this is different from tcl's
+/// `start` is inclusive, `end` is exclusive. (Note, this is different from Tcl's
 /// convention, where both are inclusive. `fromIndexes` accounts for this when
 /// running the conversion).
 pub const Range = struct {
@@ -337,7 +337,7 @@ pub const Range = struct {
     end: usize,
 
     /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
-    pub fn fromIndexes(list_len: usize, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
+    pub fn fromIndexes(list_len: u32, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
         var start = start_index.asAbsoluteIndex(list_len);
         var end = end_index.asAbsoluteIndex(list_len);
 
@@ -358,10 +358,17 @@ pub const Range = struct {
 };
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
-fn badIndexError(det: ?*ErrorDetails, handle: Handle) !void {
-    if (det) |details| details.* = .{
-        .message = try newStringFmtInner("bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
-    };
+fn badIndexError(det: ?*ErrorDetails, handle: Handle) error{ OutOfMemory, BadIndex } {
+    if (det) |details| {
+        const err_msg = newStringFmt(
+            "bad index \"{f}\": must be intexpr or end?[+-]intexpr?",
+            .{handle},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            inline else => unreachable,
+        };
+        details.* = .{ .message = err_msg };
+    }
 
     return error.BadIndex;
 }
@@ -385,19 +392,21 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandl
                 const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, handle);
                 break :blk .{
                     .u = .{ .end_offset = index_offset },
-                    .is_end = true,
+                    .is_relative = true,
                 };
             }
 
             break :blk Heap.ListIndex.end;
         } else {
-            break :blk std.fmt.parseInt(u32, bytes, 10) catch return badIndexError(det, handle);
+            break :blk .{ .u = .{ .index = .{
+                .data = std.fmt.parseInt(u32, bytes, 10) catch return badIndexError(det, handle),
+            } }, .is_relative = false };
         }
     };
 
-    handle.prepareToShimmer();
+    try handle.prepareToShimmer();
     handle.peek().head.tag = .index;
-    handle.peek().index = index;
+    handle.peek().body = .{ .index = .{ .data = index } };
 }
 
 pub fn getIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !Heap.ListIndex {
@@ -410,7 +419,7 @@ pub fn getIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !He
         if (integer < 0) return badIndexError(det, handle);
         if (integer > std.math.maxInt(u32)) return badIndexError(det, handle);
 
-        return .{ .u = .{ .index = @intCast(integer) }, .is_end = false };
+        return .{ .u = .{ .index = .{ .data = @intCast(integer) } }, .is_relative = false };
     } else if (handle.tag() == .float) {
         const float = handle.peek().body.float;
 
@@ -418,11 +427,33 @@ pub fn getIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !He
         if (float < 0) return badIndexError(det, handle);
         if (float > std.math.maxInt(u32)) return badIndexError(det, handle);
 
-        return .{ .u = .{ .index = @intFromFloat(float) }, .is_end = false };
+        return .{ .u = .{ .index = .{ .data = @intFromFloat(float) } }, .is_relative = false };
     }
 
     try shimmerToIndex(det, original, new);
-    return new.orElse(original).peek().body.index;
+    return new.orElse(original).peek().body.index.data;
+}
+
+pub fn getRange(
+    det: ?*ErrorDetails,
+    list_len: u32,
+    orig_start: Handle,
+    new_start: *OptionalHandle,
+    orig_end: Handle,
+    new_end: *OptionalHandle,
+) !Range {
+    const start = try getIndex(det, orig_start, new_start);
+    const end = try getIndex(det, orig_end, new_end);
+    return Range.fromIndexes(list_len, start, end);
+}
+
+pub fn getRangeInPlace(det: ?*ErrorDetails, list_len: u32, start: *Handle, end: *Handle) !Range {
+    var new_start: OptionalHandle = .none;
+    var new_end: OptionalHandle = .none;
+    const range = try getRange(det, list_len, start.*, &new_start, end.*, &new_end);
+    start.swapIfNew(new_start);
+    end.swapIfNew(new_end);
+    return range;
 }
 
 /// Creates a substring of the passed in string. Used in `[string range]`.
@@ -775,7 +806,7 @@ pub fn SubcommandParser(
         // Create a mapping from subcommand name -> Enum.
         pub const NameToEnum = (EnumMapping(Enum, false){}).map;
         // As well as a mapping from Enum -> subcommand.
-        const EnumToSubcommand = blk: {
+        pub const EnumToSubcommand = blk: {
             const variants = std.enums.values(Enum);
 
             var converted_mapping: std.enums.EnumFieldStruct(Enum, Subcommand, null) = undefined;
@@ -1178,7 +1209,8 @@ pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
 
 /// The reason this returns a new object instead of having a `new_handle` parameter is
 /// that we need to prevent a situation where `provided_handle` and the theoretical
-/// `new_handle` alias, as that would lead to UAF.
+/// `new_handle` alias, as that would lead to UAF. TODO: I've redesigned how out
+/// parameters work, so this should be switched to the new system.
 fn setCollectionLengthInner(original: Handle, new_len: u32) !OptionalHandle {
     const current_len = blk: {
         switch (original.tag()) {
@@ -1315,8 +1347,8 @@ fn setCollectionLengthInner(original: Handle, new_len: u32) !OptionalHandle {
         }
     } else {
         // If the collection is shared, we need to duplicate all the items.
-        for (0.., new_items) |i, *new_item| {
-            new_item.* = collectionItemFollowRefs(original, @intCast(i), current_len).dupOrRef();
+        for (0..current_len, new_items[0..current_len]) |i, *new_item| {
+            new_item.* = collectionItemFollowRefs(original, @intCast(i), new_len).dupOrRef();
         }
 
         switch (new_handle.tag()) {
@@ -1410,7 +1442,8 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
     list.assert(list.canMutate());
 
     const current_len = list.peek().body.list.len;
-    list.assert(current_len < memutil.getOrderSize(list.getMetadata().order) - 1); // -1 for list head.
+    // -2 for list head and new item.
+    list.assert(current_len <= memutil.getOrderSize(list.getMetadata().order) - 2);
     list.peek().body.list.len += 1;
 
     listItemNoFollow(list, current_len).peek().* = object;
