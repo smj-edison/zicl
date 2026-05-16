@@ -50,6 +50,8 @@ anything that might already exist.
 - `shimmerToIndex(det, provided_handle, new_handle)` -- Shimmer to `.index` (list index) representation.
 - `getIndex(det, handle, new_handle)` -- Shimmer + return the `Heap.ListIndex` value.
 - `Range.fromIndexes(list_len, start_index, end_index)` -- Resolve two `ListIndex` values to an absolute byte range.
+- `getRange(det, list_len, orig_start, new_start, orig_end, new_end)` -- Compute a `Range` from start/end handles for a list of the given length.
+- `getRangeInPlace(det, list_len, start, end)` -- Compute a `Range` from start/end handles in place, updating handles if they shimmer.
 
 ### Lists
 - `newListWithCapacity(capacity)` -- Allocate a list with pre-reserved slots.
@@ -93,6 +95,8 @@ anything that might already exist.
 - `dictSetLink(dict, link)` -- Set a parent-scope upvar link on a mutable dict (for variable scoping chains).
 - `dictSetLinkIfPresent(dict, link)` -- Call `dictSetLink` only if `link` is non-null.
 - `dictFlatten(provided_dict)` -- Recursively merge a linked-dict chain into a single flat dict; returns `.none` if nothing changed.
+- `newDictInner(heap, handles)` -- Like `newDict` but takes an explicit heap.
+- `dictPutObject(original, new, key, value)` -- Insert/update a key-value pair in a dict, taking ownership of the value object.
 
 ### References & misc
 - `integerObject(value)` -- Build a raw `Heap.Object` for an integer without allocating (no Handle, no heap needed).
@@ -100,6 +104,8 @@ anything that might already exist.
 - `getSourceInfo(handle)` -- Return `SourceInfo` if the handle has `.source` tag, else null.
 - `setSourceInfo(handle, source_info)` -- Attach source location metadata to an object.
 - `convertTokenizerError(heap, err)` -- Convert a `Tokenizer.Error` into a heap-allocated `ErrorDetails`.
+- `createHashReference(referent)` -- Create a new `.hash_reference` object pointing to the given referent.
+- `shimmerToHashReference(det, original, new)` -- Shimmer a handle to a hash reference, resolving the hash string to a registered object.
 
 ### Enums
 - `enumNames(T)` -- Comptime: return enum variant names joined by `", "`.
@@ -207,6 +213,14 @@ anything that might already exist.
 - `heap.setStringOwning(handle, bytes)` -- Set a sentinel-terminated string; takes ownership.
 - `heap.exchangeString(index, expected, to_set_to)` -- Atomic CAS on the string field.
 - `heap.splitAlloc(index, new_order)` -- Split a buddy block to a smaller order.
+- `heap.heapId()` -- Return the heap's ID.
+- `heap.createHeapString(len, hash_handles)` -- Allocate space in the heap's string storage for a string plus null byte and optional hash handles.
+- `heap.freeHeapString(index, len, hash_count)` -- Free a string previously allocated in the heap's string storage.
+- `Heap.parseHashReference(bytes)` -- Parse a string that is exactly a single `blake3^` hash reference.
+- `Heap.setStringKnownHashHandles(handle, bytes, hash_handles)` -- Set a handle's string when hash handles are already known.
+- `Heap.setStringOwning(handle, bytes, hash_handles)` -- Set a string, taking ownership of the bytes if they are too big for a normal string; returns whether ownership was taken.
+- `heap.setNormalString(obj_index, bytes, hash_handles)` -- Low-level function that copies a string into the object heap.
+- `heap.setSpecialString(obj_index, string, hash_handles)` -- Low-level function that sets an object's string to a special string representation.
 
 ### Lifecycle
 - `Heap.init(heap)` -- Initialize a heap (called by `initLocalHeap`).
@@ -232,6 +246,7 @@ anything that might already exist.
 - `heap.getInternedString(string)` -- Return the handle for a compile-time-interned string (method form).
 - `heap.internedStringRef(string)` -- Return an interned string as a raw `.reference` `Object` (no extra allocation).
 - `Heap.ListIndex.asAbsoluteIndex(list_len)` -- Resolve a possibly-negative list index to an absolute offset.
+- `Heap.dumpLastTouchedTrace(fd)` -- Export a trace of the last touched object to a file descriptor or stderr.
 
 ### Testing helpers
 - `Heap.testStart(gpa)` -- Create a test heap (use with `defer Heap.testFinish()`).
@@ -290,6 +305,18 @@ anything that might already exist.
 ### Testing
 - `expectErrorOrOom(expected_error, actual_error_union)` -- Assert an error matches `expected_error` (passes through OOM).
 
+### RingBufferAllocator
+- `init(buffer)` -- Initialize a ring buffer allocator with the provided buffer.
+- `allocator(self)` -- Return a standard `Allocator` backed by this ring buffer.
+- `alloc(ctx, n, alignment, ra)` -- Allocate from the ring buffer, wrapping around on overflow.
+- `resize(ctx, buf, alignment, new_size, return_address)` -- Always returns false (resize unsupported).
+- `remap(ctx, memory, alignment, new_len, return_address)` -- Always returns null (remap unsupported).
+- `free(ctx, buf, alignment, return_address)` -- No-op free.
+
+### Hash context
+- `hash(self, s)` -- Hash a string slice using Wyhash.
+- `eql(self, a, b)` -- Compare two string slices for byte equality.
+
 ---
 
 ## src/stringutil.zig
@@ -333,6 +360,7 @@ anything that might already exist.
 - `evalExpression(interp, handle, new_handle)` -- Parse and evaluate an expression; returns `ExprResult`.
 - `evalExpressionInPlace(interp, handle)` -- Evaluate an expression, shimmering `handle` in-place; returns `ExprResult`.
 - `getBoolFromExpression(interp, handle)` -- Evaluate an expression and return its boolean value; updates `handle` if shimmered.
+- `evalFile(interp, filename)` -- Read a file and evaluate its contents as a script, attaching source info for error reporting.
 
 ### Setting the result
 - `setResult(interp, handle)` -- Set `interp.result`, borrowing the handle (caller still owns original).
@@ -356,6 +384,10 @@ anything that might already exist.
 - `getVariableOrError(interp, name)` -- Look up a variable; returns `EvalError` if unset.
 - `unsetVariable(interp, name)` -- Unset a variable, reporting an error via the interpreter if it does not exist.
 - `unsetVariableSilent(interp, name)` -- Unset a variable, silently succeeding if it does not exist.
+- `setVariableInner(interp, det, call_frame_idx, name, value)` -- Set a variable in the given call frame; takes ownership of `value`.
+- `setVariableUpvarInner(interp, det, call_frame_idx, name, target_call_frame_idx, target_name)` -- Create an upvar link, checking for circular references.
+- `unsetVariableInner(interp, det, call_frame_idx, name)` -- Unset a variable in the given call frame.
+- `getVariableInner(interp, det, call_frame_idx, name)` -- Resolve a variable's value; must be called with a heap-native name.
 
 ### Dict helpers (interp-aware wrappers)
 - `getDictValue(interp, dict, key)` -- Look up `key` in `dict`; returns struct with value and shimmer handle.
@@ -366,6 +398,8 @@ anything that might already exist.
 - `putDictValueRecursively(interp, dict, keys, value)` -- Recursive insert/update along a key path.
 - `removeDictValue(interp, dict, new_dict, key)` -- Remove `key`; returns true if the key existed.
 - `removeDictValueRecursively(interp, dict, keys)` -- Recursive remove along a key path.
+- `getDictValueInPlace(interp, dict, key)` -- Look up a dict key in-place, updating the dict handle if shimmering produces a new one.
+- `putDictValueInPlace(interp, dict, key, value)` -- Insert/update a key-value pair in-place, updating the dict handle when it has to be moved.
 
 ### Shimmer wrappers (interp error context)
 - `wrapError(interp, det, result)` -- Translate an `ErrorDetails`-tagged error into an interp-level `EvalError`.
@@ -379,6 +413,10 @@ anything that might already exist.
 - `listAppend(interp, list, item)` -- Append `item` to `*list`, duplicating if needed.
 - `ensureShimmerable(interp, handle)` -- Duplicate `*handle` if it cannot be shimmered.
 - `integerOverflowError(interp, value)` -- Report an integer overflow error on the interpreter.
+- `getBoolean(interp, handle)` -- Shimmer `*handle` to boolean and return the `bool` value.
+- `getIndex(interp, handle)` -- Shimmer `*handle` to index and return the `Heap.ListIndex` value.
+- `resolveHash(interp, handle)` -- Shimmer `*handle` to hash reference and return the resolved handle.
+- `getCodepointLength(interp, handle)` -- Shimmer `*handle` to string and return its UTF-8 codepoint length.
 
 ### Closures
 - `parseClosure(det, bytes)` -- Parse a closure definition from raw bytes; returns `Heap.Closure`.
@@ -398,6 +436,7 @@ anything that might already exist.
 ### Testing helpers
 - `testExpectScriptResult(interp, expected, script)` -- Assert `script` evaluates to `expected` string.
 - `testExpectScriptError(interp, expected_error, expected_str, script)` -- Assert `script` yields a specific error and message.
+- `testRunScript(interp, script)` -- Convenience helper: evaluate a script string and return the interpreter result handle.
 
 ### Error handling
 - `setErrorStack(interp, script)` -- Capture the current call stack into `interp.stack_trace` (no-op if already set).

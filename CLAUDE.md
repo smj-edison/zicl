@@ -59,7 +59,7 @@ zig build -Dtoken-debugging=true
 
 -   Multi-heap architecture for potential threading
 -   Reference counting for objects
--   Two string storage modes: normal (in-heap) and long (external allocation with a 100KB threshold)
+-   Two string storage modes: normal (in-heap) and long (external allocation with a 65535-byte threshold)
 -   Cross-thread object sharing with atomic operations
 -   Object "shimmering" - dynamic type conversion that preserves cached representations
 
@@ -68,7 +68,7 @@ zig build -Dtoken-debugging=true
 -   Objects can dynamically convert between types (string → list → dict, etc.)
 -   Maintains string representation alongside typed representation when beneficial
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
--   Dictionary operations: `dictPut`, `dictPutRecursively`, `dictRemove`, `dictRemoveRecursively`, `dictLookupRecursively`, `dictLookupFollowRefs`, `dictReindex`
+-   Dictionary operations: `dictPut`, `dictPutRecursively`, `dictRemove`, `dictRemoveRecursively`, `dictLookupRecursively`, `dictLookupFollowLinks`
 -   Supports recursive key lookups for nested dictionaries
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
@@ -83,14 +83,16 @@ zig build -Dtoken-debugging=true
 
 -   Dual frame system: call frames (scope) and eval frames (execution state)
 -   Variable resolution with caching via epochs (invalidated on scope changes)
--   Command dispatch supporting native commands, closures, and Tcl procedures
+-   Command dispatch supporting native commands, closures, and `[fn]` closures
     -   Native commands are looked up in `interp.global_commands`
     -   Closures are looked up as variables in the call frame chain (lexical scoping)
     -   Lazy native command initialization via `Heap.nativefn_registry` (see below)
 -   Expression evaluation system
 -   Loop control (break/continue with level support)
--   Procedure support with optional/required parameters, default values, and `args` parameter
--   Tail call optimization preparation
+-   Exception handling: `[catch]`, `[try]`, `[return]` with `-code`/`-level`/`-errorstack` propagation
+-   Scope manipulation: `[upvar]`, `[uplevel]`
+-   Closure support (`[fn]`, `[method]`) with optional/required parameters, default values, and `args` parameter
+-   Tail call optimization via `[tailcall]`
 
 **NativeFn Registry (src/Heap.zig)**: A global, mutex-protected hash map for lazy C command initialization.
 
@@ -98,7 +100,14 @@ zig build -Dtoken-debugging=true
 -   When `getCommandInner` sees a variable containing `"nativefn <name>"` but the command is not in `interp.global_commands`, it checks the registry
 -   If found, the init function is called, which should use `Zicl_CreateCommand` to register the actual commands in that interpreter
 -   This replaces the old Jimtcl-style `<C:id>` string pattern matching in `unknown`
--   Registration panics on duplicate names to prevent definition drift
+-   Registration returns `error.DuplicateNativeFn` on duplicate names to prevent definition drift
+
+**Hash Registry (src/Heap.zig)**: A global, `RwLock`-protected content-addressable store for cross-heap object sharing.
+
+-   `Heap.hash_registry` maps `u256` Blake3 hashes to `Handle`
+-   Objects can be stored by hash via `.hash_reference` tags, allowing any heap to resolve the same object by content hash
+-   Enables lexical scope capture across threads: closure scopes are captured as dicts, hashed, and stored in the registry
+-   Foreign threads can free objects from a blocked heap by looking up and releasing hash references directly
 
 ### Object Representation
 
@@ -118,7 +127,7 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
 2. **OptionalHandle**: A special enum type that can be `.none` or contain a `Handle`. Used as an output parameter in shimmer functions to indicate whether duplication occurred.
 
-3. **Reference Counting**: Handles can be ref-counted (sharable) or non-ref-counted (e.g., list items).
+3. **Reference Counting**: All heap objects are ref-counted (including list items). Only interned strings and special objects bypass ref counting.
 
 4. **Ownership Patterns**:
 
@@ -135,8 +144,8 @@ Scripts go through several stages:
 2. **Preprocessing** (parseScript in objutil.zig): Tokens → optimized script structure
     - Precomputes word boundaries and argument counts
     - Stores tokens as `.start_of_command` + arguments
-    - Example: `set x 5` becomes [start_of_command(2), "set", "x", "5"]
-3. **Caching** (LRU cache): Parsed scripts, expressions, and closures cached per-heap by unique ID
+    - Example: `set x 5` becomes [start_of_command(3), "set", "x", "5"]
+3. **Caching** (LRU cache): Parsed scripts, expressions, and closures cached per-heap by `u256` content hash
 4. **Evaluation** (evalObject): Walks token list, substitutes variables/commands, invokes commands
 
 ### Testing Patterns
@@ -145,7 +154,7 @@ Tests use `testing.checkAllAllocationFailures()` to ensure proper error handling
 
 ```zig
 fn testFoo(ta: std.mem.Allocator) !void {
-    const heap = try Heap.createHeap(ta);
+    const heap = try Heap.testStart(ta, std.io.getStdOut());
     defer Heap.testFinish();
     // ... test code ...
 }
@@ -167,15 +176,16 @@ The project has 14 comprehensive test suites covering:
 
 Helper functions available:
 
--   `testRunScript(heap, script)` - Execute script and return result
--   `testExpectScriptResult(heap, script, expected)` - Assert result matches expected value
+-   `testRunScript(interp, script)` -- Evaluate script and return result handle
+-   `testExpectScriptResult(interp, expected, script)` -- Assert result string matches expected
+-   `testExpectScriptError(interp, expected_error, expected_str, script)` -- Assert script fails with specific error and message
 
 ### Important Code Patterns
 
 **Creating Objects**:
 
 ```zig
-const str = try object.newString(heap, "hello");
+const str = try object.newString("hello");
 defer str.decrRefCount();
 ```
 
@@ -189,35 +199,53 @@ const item = object.listItem(list, 0); // Non-owning handle
 
 **Type Shimmering** (output parameter API):
 
+The out parameter `new` is an accumulating scratch space that tracks the current handle through a chain of operations. It starts as `.none`, gets populated if the object is duplicated or replaced, and subsequent operations in the same scope read `new.orElse(original)` to see the latest handle.
+
 ```zig
 // Shimmer functions take Handle by value and *OptionalHandle output parameter.
 var det: object.ErrorDetails = undefined;
-var new_handle: OptionalHandle = .none;
-try object.shimmerToList(&det, handle, &new_handle);
-handle.swapIfNew(new_handle);  // Update if shimmer created a duplicate
+var new: OptionalHandle = .none;
+try object.shimmerToList(&det, handle, &new);
+handle.swapIfNew(new);  // Update if shimmer created a duplicate
 // handle is now a list type
 
 // Pattern inside shimmer functions:
-pub fn shimmerToInteger(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
-    if (provided_handle.tag() == .integer) return;
-    errdefer new_handle.swapWithNone();
+pub fn shimmerToInteger(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
+    var handle = new.orElse(original);
+    if (handle.tag() == .integer) return;
+    errdefer new.swapWithNone();
 
-    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-    const handle = new_handle.orElse(provided_handle);
+    try Heap.ensureShimmerableOrDup(original, new);
+    handle = new.orElse(original);
 
     // ... shimmer logic ...
+}
+```
+
+**In-place Shimmering** (for wrapped types like enums):
+
+```zig
+// When a shimmer function is called on a *Handle, use a local working variable.
+pub fn getInPlace(det: ?*ErrorDetails, handle: *Handle) !T {
+    var working: OptionalHandle = .none;
+    errdefer working.swapWithNone();
+    const result = try get(det, handle.*, &working);
+    handle.swapIfNew(working);
+    return result;
 }
 ```
 
 **Get Functions** (shimmer + extract value):
 
 ```zig
-// Get functions that shimmer and return a value.
-var new_handle: OptionalHandle = .null;
-const value = try object.integerGet(&det, my_handle, &new_handle);
-my_handle.swapIfNew(new_handle);
+// Get functions shimmer and return a value, leaving the handle updated.
+var new: OptionalHandle = .none;
+const value = try object.integerGet(&det, my_handle, &new);
+my_handle.swapIfNew(new);
 // my_handle is now an integer type, value contains the i64
 ```
+
+**Shimmerability guards**: Before mutating or shimmering an object, always check (or ensure) that it is safe to do so. `handle.canShimmer()` returns false for shared or cross-thread objects. `handle.canMutate()` returns false when ref count is greater than 1. Use `Heap.ensureShimmerableOrDup()` or `Heap.ensureMutableOrDup()` to duplicate the object automatically when needed. Always call `handle.prepareToShimmer()` before changing an object's tag or body.
 
 **Error Handling with Details**:
 
@@ -229,15 +257,15 @@ const result = try someFn(heap, &det, arg);
 
 ## Key Files
 
--   `src/Heap.zig`: Memory allocator and object storage (~3000 lines)
+-   `src/Heap.zig`: Memory allocator and object storage (~3800 lines)
 -   `src/objutil.zig`: Object type system and operations (~2700 lines)
--   `src/Interp.zig`: Interpreter and command execution (~2400 lines)
+-   `src/Interp.zig`: Interpreter and command execution (~3500 lines)
 -   `src/Tokenizer.zig`: Tcl tokenizer (~1200 lines)
 -   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
 -   `src/stringutil.zig`: String utilities with optional UTF-8 support (~875 lines)
 -   `src/memutil.zig`: Buddy allocator, memory primitives, and LRU cache (~900 lines)
--   `.claude/helpers.md`: Index of public helper functions in the utility files
--   `src/commands.zig`: Built-in command implementations (~520 lines)
+-   `src/commands.zig`: Built-in command implementations (~2200 lines)
+-   `src/libzicl.zig`: C FFI library entry point (~320 lines)
 -   `src/tripwire.zig`: Vendored failure-injection library for testing error paths (~290 lines)
 -   `src/repl.zig`: REPL (stub, not yet implemented)
 -   `.claude/helpers.md`: Index of public helper functions in the utility files
@@ -250,14 +278,17 @@ Build options (in build.zig):
 -   `use_llvm`: Force LLVM backend (default: false)
 -   `test_filter`: Filter for specific tests
 -   `token_debugging`: Print tokens during parsing (default: false)
+-   `threading`: Enable thread-safe operations (default: true)
+-   `trace_mem`: Enable memory operation tracing (default: true in Debug, false in Release)
 
 Heap settings (in Heap.zig cfg):
 
--   `threading`: Enable thread-safe operations (default: true)
--   `use_vmem`: Use virtual memory mapping (default: true)
--   `object_heap_order`: Max 2^24 objects (default: 24)
+-   `object_heap_order`: Max 2^16 objects (default: 16)
 -   `string_heap_order`: Max 2^28 bytes for strings (default: 28)
 -   `max_heaps`: Maximum concurrent heaps (default: 128)
+-   `max_custom_types`: Maximum registered custom types (default: 65536)
+-   `max_scripts`: Maximum cached parsed scripts per heap (default: 65536)
+-   `cache_size`: LRU cache size for parsed scripts, expressions, and closures (default: 512)
 
 ## Development Principles
 
@@ -297,30 +328,36 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 
 Recent fixes and improvements:
 
--   **Closures via `[fn]`**: Implemented first-class closures with lexical scope capture. `[fn]` replaces both `[proc]` and `[apply]`. Closures capture their defining scope and support required args, optional args with defaults, and varargs.
+-   **String commands**: Implemented `[string]` with 20 subcommands (length, index, range, match, map, cat, compare, equal, trim, tolower, toupper, totitle, repeat, replace, reverse, first, last).
+-   **List commands**: Implemented `[list]`, `[llength]`, `[lappend]`, `[lassign]`, and `[concat]`.
+-   **File I/O**: Implemented `[file]` with 12 subcommands (exists, dirname, tail, rootname, join, mkdir, size, readable, isdirectory, mtime, readlink, tempfile), plus `[source]`.
+-   **Hash references**: Implemented `.hash_reference` objects and a global `HashRegistry` for cross-heap, cross-thread object sharing by content hash.
+-   **Exception system**: Implemented `[catch]`, `[try]`, `[return]`, and `[errorinfo]` with proper `-code`/`-level`/`-errorstack` propagation.
+-   **Closures via `[fn]`**: Implemented first-class closures with lexical scope capture. `[fn]` replaces both `[proc]` and `[apply]`. Closures capture their defining scope and support required args, optional args with defaults, and varargs. `[method]` provides the same for methods.
 -   **LRU cache**: Parsed scripts, expressions, and closures are now cached per-heap using an LRU cache (in `memutil.zig`), replacing the old ScriptId system.
 -   **Handle Refactoring (complete)**: Refactored Handle management API from pointer-based mutation (`shimmerToX(&det, &handle)`) to an output parameter pattern that eliminates use-after-free issues.
-    -   New signature: `shimmerToX(det, provided_handle, new_handle: *OptionalHandle) !void`
-    -   Get functions (e.g., `integerGet`) take same parameters and return the value directly
-    -   Standard pattern: `errdefer new_handle.swapWithNone()` at function start
-    -   Caller pattern: `handle.swapIfNew(new_handle)` to update handle references
--   Dictionary operations: Added `dictRemove`, fixed duplicate handling
--   Command architecture: Standardized function naming conventions
--   Loop control: Fixed break/continue propagation with level support
--   Memory safety: Fixed double-free on initialization failure and interned string leaks
--   Dictionary commands: Fixed `[dict set]` bugs for nested operations
+    -   New signature: `shimmerToX(det, original, new: *OptionalHandle) !void`
+    -   The out parameter `new` is an accumulating scratch space; functions read `new.orElse(original)` to see the current handle, which may have been set by an earlier step in the same scope
+    -   Get functions (e.g., `integerGet`) take the same parameters and return the value directly
+    -   Standard pattern: `errdefer new.swapWithNone()` at function start; `var handle = new.orElse(original)` to resolve the current object
+    -   Caller pattern: `handle.swapIfNew(new)` to update handle references after the call
+    -   In-place helpers (e.g., `getInPlace`, `wrapShimmerFn`) use a local `working: OptionalHandle = .none` with `errdefer working.swapWithNone()`, then `handle.swapIfNew(working)` on success
+-   Dictionary operations: Added `dictRemove`, `dictRemoveRecursively`, fixed duplicate handling, added dict parent-link flattening.
+-   Command architecture: Standardized function naming conventions.
+-   Loop control: Fixed break/continue propagation with level support.
+-   Memory safety: Fixed double-free on initialization failure and interned string leaks.
 
 ## Development Status
 
 Currently implemented:
 
 -   Complete tokenizer with full Tcl syntax support
--   Object system with all major types (none, invalid, marked, index, integer, float, bool, string, source, list, dict, dict_sugar, parsed_script_command, reference, cached_local_var, cached_lexical_var, upvar_link, closure, custom_type)
+-   Object system with all major types (none, invalid, marked, index, integer, float, bool, string, source, list, dict, dict_sugar, parsed_script_command, reference, hash_reference, cached_local_var, cached_lexical_var, upvar_link, closure, custom_type)
 -   Memory management with reference counting and buddy allocation
 -   Script parsing and caching
 -   Expression evaluation with full AST
     -   Binary/unary operators, ternary conditional
-    -   Math functions: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh
+    -   Math functions: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, pow, hypot, fmod
     -   Utility functions: ceil, floor, exp, log, log10, sqrt, abs, round
     -   Type conversion: int(), wide(), double()
     -   Random: rand(), srand()
@@ -331,13 +368,16 @@ Currently implemented:
     -   This eliminates the need for Jimtcl-style `^$name` prefixing and manual `captureEnvStack` plumbing
     -   Most `proc` definitions that use `upvar`/`uplevel` are workarounds for lack of lexical scoping and should migrate to `fn`
     -   Legitimate dynamic scope uses (e.g., `uplevel expr`, reading caller's `this`, `uplevel subst`) will need dedicated zicl commands
--   Core built-in commands (12 implemented):
-    -   Math: [+], [*], [incr], [expr]
-    -   Control flow: [if], [for], [break], [continue]
-    -   Variables: [set]
-    -   Closures: [fn]
-    -   Data structures: [dict] (get, getdef, set, remove)
-    -   I/O: [puts]
+-   Core built-in commands (~40 implemented):
+    -   Math: [+], [-], [*], [/], [%], [**], [expr], [incr]
+    -   Control flow: [if], [for], [while], [break], [continue], [catch], [try], [return], [tailcall]
+    -   Variables: [set], [unset], [upvar], [uplevel], [append]
+    -   Closures: [fn], [method], [apply], [applymethod]
+    -   Data structures: [dict] (get, getdef, set, remove, exists, size, keys, values, merge, create), [list], [llength], [lappend], [lassign], [concat]
+    -   String: [string] (length, index, range, match, map, cat, compare, equal, trim, tolower, toupper, totitle, repeat, replace, reverse, first, last)
+    -   File I/O: [file] (exists, dirname, tail, rootname, join, mkdir, size, readable, isdirectory, mtime, readlink, tempfile), [source], [puts]
+    -   Introspection: [info], [errorinfo], [pid]
+    -   Misc: [hash], [hashlookup], [launder]
 
 Partially complete:
 
@@ -345,12 +385,10 @@ Partially complete:
 
 Not yet implemented:
 
--   String commands (string length, range, match, etc.)
--   List commands (lindex, lrange, lappend, llength, etc.)
--   While/foreach loops
--   File I/O (open, close, read, write)
+-   [lindex], [lrange], [lsort], [split], [join]
+-   [foreach] loop
+-   File I/O beyond [file] subcommands (open, close, read, write)
 -   Most Tcl standard library commands
--   Error stack traces
 
 ## Style guide
 -   Write Tcl as Tcl, not TCL.
