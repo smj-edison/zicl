@@ -1,7 +1,9 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = .musl },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     // options
@@ -21,11 +23,10 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "token_debugging", token_debugging);
     options.addOption(bool, "threading", threading);
     options.addOption(bool, "trace_mem", trace_mem);
-
     const options_mod = options.createModule();
 
     // deps
-    const uucode_dep = b.dependency("uucode", .{
+    const uucode = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
         .fields = @as([]const []const u8, &.{
@@ -33,6 +34,12 @@ pub fn build(b: *std.Build) void {
             "simple_lowercase_mapping",
             "simple_titlecase_mapping",
         }),
+    });
+
+    const pcre2 = b.dependency("pcre2", .{
+        .target = target,
+        .optimize = optimize,
+        .linkage = .static,
     });
 
     // steps
@@ -46,8 +53,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    root.addImport("uucode", uucode_dep.module("uucode"));
+    root.addImport("uucode", uucode.module("uucode"));
     root.addImport("options", options_mod);
+    root.linkLibrary(pcre2.artifact("pcre2-8"));
+    root.addIncludePath(pcre2.namedLazyPath("pcre2.h").dirname());
 
     // executable
     const exe = b.addExecutable(.{
@@ -67,8 +76,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    lz_mod.addImport("uucode", uucode_dep.module("uucode"));
+    lz_mod.addImport("uucode", uucode.module("uucode"));
     lz_mod.addImport("options", options_mod);
+    lz_mod.linkLibrary(pcre2.artifact("pcre2-8"));
+    lz_mod.addIncludePath(pcre2.namedLazyPath("pcre2.h").dirname());
 
     const lz = b.addLibrary(.{
         .name = "zicl",
