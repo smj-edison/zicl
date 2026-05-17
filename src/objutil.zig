@@ -1400,18 +1400,18 @@ pub fn listSetObject(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
     var handle = new.orElse(original);
     if (index > len) return error.OutOfBounds;
 
-    const mutatable_list: OptionalHandle = blk: {
-        if (!handle.canMutate() or listItemNoFollow(handle, index).isShared()) {
+    const mutable_list: OptionalHandle = blk: {
+        if (!handle.canMutate() or !listItemNoFollow(handle, index).canMutate()) {
             break :blk (try handle.duplicate()).toOptional();
         }
         break :blk .none;
     };
-    new.swapIfNew(mutatable_list);
+    new.swapIfNew(mutable_list);
     handle = new.orElse(original);
 
     // We know that this index is now safe to modify.
     const item = listItemNoFollow(handle, index);
-    assert(!item.isShared());
+    item.assert(item.canMutate());
 
     item.invalidateBoth(); // Clear the last value.
     item.peek().* = value;

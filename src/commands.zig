@@ -257,9 +257,7 @@ pub fn breakCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
 pub fn continueCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     if (args.len == 2) {
-        var level_arg = args[1].borrow();
-        defer level_arg.decrRefCount();
-        const level = try interp.getInteger(&level_arg);
+        const level = try interp.getInteger(&args[1]);
         if (level < 1) {
             try interp.setResultFormatted("continue level \"{}\" lower than 1", .{level});
         } else if (level > std.math.maxInt(u32)) {
@@ -462,7 +460,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 pub fn exprCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    const result = try (try interp.evalExpressionInPlace(&args[1])).toObject();
+    const result = try (try interp.evalExpression(args[1])).toObject();
     defer result.decrRefCount();
     interp.setResult(result);
 }
@@ -494,7 +492,7 @@ pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try interp.evalObject(args[1]);
 
     // Check condition.
-    while (try interp.getBoolFromExpression(&args[2])) {
+    while (try interp.getBoolFromExpression(args[2])) {
         // Evaluate body.
         switch (try propagateLoopControl(interp, interp.evalObject(args[4]))) {
             .@"break" => {
@@ -510,6 +508,92 @@ pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
         // Run increment.
         try interp.evalObject(args[3]);
+    }
+
+    interp.setEmptyResult();
+}
+
+/// [foreach] -- iterate over one or more lists, assigning variables.
+///
+/// Syntax: foreach varList list ?varList list ...? body
+pub fn foreachCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    const num_pairs = (args.len - 2) / 2;
+    const body = args[args.len - 1];
+
+    // Track per-pair iteration state.
+    var var_counts: std.ArrayList(u32) = .empty;
+    defer var_counts.deinit(Heap.global_gpa);
+    var value_counts: std.ArrayList(u32) = .empty;
+    defer value_counts.deinit(Heap.global_gpa);
+    var value_indices: std.ArrayList(u32) = .empty;
+    defer value_indices.deinit(Heap.global_gpa);
+
+    // Shimmer all varlists and value lists, validating varlists are non-empty.
+    for (0..num_pairs) |i| {
+        try interp.shimmerToList(&args[1 + i * 2]);
+        try interp.shimmerToList(&args[2 + i * 2]);
+
+        const vc = try interp.getListLength(&args[1 + i * 2]);
+        if (vc == 0) {
+            try interp.setResultString("foreach varlist is empty");
+            return error.EvalError;
+        }
+        try var_counts.append(Heap.global_gpa, vc);
+        try value_counts.append(Heap.global_gpa, try interp.getListLength(&args[2 + i * 2]));
+        try value_indices.append(Heap.global_gpa, 0);
+    }
+
+    while (true) {
+        // Continue only if any value list still has unconsumed elements.
+        for (0..num_pairs) |p| {
+            if (value_indices.items[p] < value_counts.items[p]) {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        // Assign variables for this iteration.
+        for (0..num_pairs) |p| {
+            var varlist = &args[1 + p * 2];
+            const valuelist = args[2 + p * 2];
+            const vcount = var_counts.items[p];
+
+            for (0..vcount) |v| {
+                var var_name = objutil.listItem(varlist.*, @intCast(v));
+
+                // Ensure the name can shimmer before passing to setVariableInner.
+                var name_new: OptionalHandle = .none;
+                try Heap.ensureShimmerableOrDup(var_name, &name_new);
+                if (name_new.toHandle()) |new| {
+                    // Write the duplicated handle back to the varlist slot as a
+                    // .reference so the list owns the ref.
+                    var new_list: OptionalHandle = .none;
+                    var det: objutil.ErrorDetails = undefined;
+                    try interp.wrapError(&det, objutil.listSetObject(&det, varlist.*, &new_list, @intCast(v), new.referenceOwning()));
+                    varlist.swapIfNew(new_list);
+                    name_new = .none;
+                    var_name = objutil.listItem(varlist.*, @intCast(v));
+                }
+
+                const value = if (value_indices.items[p] < value_counts.items[p]) blk: {
+                    const val = objutil.listItem(valuelist, value_indices.items[p]);
+                    value_indices.items[p] += 1;
+                    break :blk val;
+                } else Heap.local_heap.emptyHandle();
+
+                const value_obj = value.dupOrRef();
+                var set_det: objutil.ErrorDetails = undefined;
+                try interp.wrapError(&set_det, interp.setVariableInner(&set_det, interp.callFrameIdx(), var_name, value_obj));
+            }
+        }
+
+        // Evaluate body and handle break/continue.
+        switch (try propagateLoopControl(interp, interp.evalObject(body))) {
+            .@"break" => break,
+            .@"continue" => {},
+            .none => {},
+        }
     }
 
     interp.setEmptyResult();
@@ -538,6 +622,61 @@ test "loop commands" {
         \\   }
         \\ }
         \\ set j
+    );
+
+    // [foreach] basic iteration.
+    try interp.testExpectScriptResult("6",
+        \\ set sum 0
+        \\ foreach i {1 2 3} { set sum [expr {$sum + $i}] }
+        \\ set sum
+    );
+
+    // [foreach] with multiple list pairs.
+    try interp.testExpectScriptResult("1 2 x y|3 4 z |",
+        \\ set r ""
+        \\ foreach {a b} {1 2 3 4} {c d} {x y z} {
+        \\   append r "$a $b $c $d|"
+        \\ }
+        \\ set r
+    );
+
+    // [foreach] shorter valuelist than varlist (pad with empty strings).
+    try interp.testExpectScriptResult("1 2|3 |",
+        \\ set r ""
+        \\ foreach {a b} {1 2 3} { append r "$a $b|" }
+        \\ set r
+    );
+
+    // [foreach] empty valuelist (body never runs).
+    try interp.testExpectScriptResult("0",
+        \\ set sum 0
+        \\ foreach i {} { set sum [expr {$sum + $i}] }
+        \\ set sum
+    );
+
+    // [foreach] break inside foreach.
+    try interp.testExpectScriptResult("6",
+        \\ set sum 0
+        \\ foreach i {1 2 3 4 5} {
+        \\   if {$i > 3} { break }
+        \\   set sum [expr {$sum + $i}]
+        \\ }
+        \\ set sum
+    );
+
+    // [foreach] continue inside foreach.
+    try interp.testExpectScriptResult("9",
+        \\ set sum 0
+        \\ foreach i {1 2 3 4 5} {
+        \\   if {$i == 3} { continue }
+        \\   set sum [expr {$sum + $i}]
+        \\ }
+        \\ set sum
+    );
+
+    // [foreach] empty varlist error.
+    try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
+        \\ foreach {} {1 2} { puts hi }
     );
 }
 
@@ -594,8 +733,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         if (remaining_args.len < 2) return error.WrongUsage;
 
         // Check condition.
-        const cond = &remaining_args[0];
-        if (try interp.getBoolFromExpression(cond)) {
+        if (try interp.getBoolFromExpression(remaining_args[0])) {
             // Evaluate true branch.
             try interp.evalObject(remaining_args[1]);
             return;
@@ -2681,6 +2819,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "hashlookup", hashlookupCmd, "hash", 1, 1, null);
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
     try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
+    try registerCommand(interp, "foreach", foreachCmd, "varList list ?varList list ...? body", 3, null, 2);
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);

@@ -1588,6 +1588,7 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn makeCrossthread(handle: Handle) !void {
+        handle.assert(handle.canShimmer());
         switch (handle.tag()) {
             .none,
             .index,
@@ -1621,10 +1622,13 @@ pub const Handle = packed struct(HandleBacking) {
                 try closure.optional_values.makeCrossthread();
                 try closure.scope_hash_ref.makeCrossthread();
             },
+            .dict_sugar, .cached_lexical_var, .cached_local_var => {
+                try handle.prepareToShimmer();
+                handle.peek().head.tag = .none;
+                handle.peek().body = undefined;
+            },
             .custom_type => @panic("unimplemented"),
-            .cached_local_var,
             .upvar_link,
-            .dict_sugar,
             .parsed_script_command,
             .invalid,
             .marked,

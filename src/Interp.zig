@@ -1374,7 +1374,7 @@ fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
             if (arg_count > max_arity) break :wrong_arg_count;
         }
         if (command.multiple_of) |multiple_of| {
-            if (@mod(arg_count, multiple_of) != 0) break :wrong_arg_count;
+            if (@mod(arg_count - command.min_arity, multiple_of) != 0) break :wrong_arg_count;
         }
 
         switch (command.call_info) {
@@ -2466,33 +2466,26 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
     }
 }
 
-pub fn evalExpression(interp: *Interp, original: Handle, new: *OptionalHandle) !ExprResult {
-    errdefer new.swapWithNone();
-
-    const handle = new.orElse(original);
-
+pub fn evalExpression(interp: *Interp, handle: Handle) !ExprResult {
     // Combine the call frame's cache ID with the expression's content
     // hash, so identical expressions at different call sites get their
     // own cached variable lookups.
     var det: objutil.ErrorDetails = undefined;
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try handle.getHashNoRegister();
-    const expr = try interp.wrapError(&det, objutil.getExpression(&det, handle, cache_key));
+    const expr: Heap.ParsedExpression = try interp.wrapError(&det, objutil.getExpression(&det, handle, cache_key));
 
     return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.EvalError,
+        else => {
+            // Give the caller some context for what failed.
+            try interp.setResultFormatted("error occured when evaluating expression {f}: {f}", .{ handle, interp.result });
+            return error.EvalError;
+        },
     };
 }
 
-pub fn evalExpressionInPlace(interp: *Interp, handle: *Handle) !ExprResult {
-    var new_handle: OptionalHandle = .none;
-    const res = try evalExpression(interp, handle.*, &new_handle);
-    handle.swapIfNew(new_handle);
-    return res;
-}
-
-pub fn getBoolFromExpression(interp: *Interp, handle: *Handle) !bool {
-    var expr_result = try interp.evalExpressionInPlace(handle);
+pub fn getBoolFromExpression(interp: *Interp, handle: Handle) !bool {
+    var expr_result = try interp.evalExpression(handle);
     defer expr_result.release();
     const value = interp.exprResultAsBool(&expr_result) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
