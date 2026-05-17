@@ -33,7 +33,7 @@ pub fn create(
     const tool = b.addExecutable(.{
         .name = "combine_archives",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("build/combine_archives.zig"),
+            .root_source_file = b.path("src/build/combine_archives.zig"),
             .target = b.graph.host,
         }),
     });

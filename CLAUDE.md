@@ -13,6 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 -   **Interpreters can block indefinitely.** Blocking in C FFI (or otherwise) is considered normal operation. Nothing in the system may require an interpreter's owning thread to be active in order to make progress. In particular, foreign threads must be able to free objects belonging to a blocked heap without any cooperation from the owning thread.
 -   **Allocation is thread-local; deallocation is cross-thread safe.** The buddy allocator uses a mutex-protected main list for operations from any thread, and a lock-free pool as a fast path for the owning thread only. Cross-thread frees go directly through the mutex to the main list — no deferred queue is used, precisely because a deferred queue would require the owning thread to drain it.
 -   **Every object must be transparently treated as a string.** All design decisions revolve around this ­— at the end of the day everything in Zicl is a string. This means handle.tag() can't be relied on for the object to have a permanent type, since the tag is ephemeral. This also means that Zicl data structures can't depend on the current tag outside of optimization, since that would break the contract that all objects are transparently strings.
+-   **We don't use standard malloc/free.** When doing C FFI, make sure that we've registered our custom allocators, and called the functions accordingly.
 
 ## Build Commands
 

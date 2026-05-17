@@ -324,6 +324,7 @@ pub const InternedString = enum {
     file,
     line,
     level,
+    regexp,
     @"division by zero",
     // Error handling.
     NONE,

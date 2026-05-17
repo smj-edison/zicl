@@ -12,6 +12,13 @@ const ioutil = @import("ioutil.zig");
 const pcre2 = @import("pcre2");
 const regex = @import("regex.zig");
 
+fn commandMatch(interp: *Interp, command: Handle, pattern: Handle, string: Handle) !bool {
+    const script = try objutil.newList(&.{ command, pattern, string });
+    defer script.decrRefCount();
+    try interp.evalObject(script);
+    return try interp.getBoolean(&interp.result);
+}
+
 fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
     not_all_ints: {
@@ -1095,10 +1102,128 @@ pub fn setCmd(interp: *Interp, args: []Handle) !void {
 }
 
 /// [switch]
-// pub fn switchCmd(interp: *Interp, args: []Handle) !void {
-//     const MatchType = enum { exact, glob, regex, command };
-//     var match_type: MatchType = .exact;
-// }
+pub fn switchCmd(interp: *Interp, args: []Handle) !void {
+    const MatchType = enum { exact, glob, regex, command };
+    var match_type: MatchType = .exact;
+    var command_to_match: ?Handle = null;
+
+    var arg_index: usize = 1;
+    while (arg_index < args.len) : (arg_index += 1) {
+        // Make sure we have something after, since we look ahead for some
+        // of the flags.
+        if (args.len - arg_index < 2) return error.WrongUsage;
+
+        const bytes = try args[arg_index].getString();
+
+        if (bytes[0] != '-') break; // Not a flag.
+        if (try args[arg_index].equalsString("--")) {
+            arg_index += 1;
+            break;
+        }
+        if (try args[arg_index].equalsString("-exact")) {
+            match_type = .exact;
+        } else if (try args[arg_index].equalsString("-glob")) {
+            match_type = .glob;
+        } else if (try args[arg_index].equalsString("-regexp")) {
+            match_type = .regex;
+        } else if (try args[arg_index].equalsString("-command")) {
+            match_type = .command;
+            arg_index += 1;
+            command_to_match = args[arg_index];
+        } else {
+            try interp.setResultFormatted(
+                "bad option \"{f}\": must be -exact, -glob, -regexp, -command procname or --",
+                .{args[arg_index]},
+            );
+            return error.EvalError;
+        }
+    }
+
+    // Value we're switching on.
+    const to_match_on = args[arg_index];
+    arg_index += 1;
+    const to_match_on_bytes = try to_match_on.getString();
+
+    const switch_body, var to_free_after = blk: {
+        if (args.len - arg_index == 1) {
+            try interp.shimmerToList(&args[arg_index]);
+            const handles = try objutil.listToHandles(Heap.global_gpa, args[arg_index]);
+            break :blk .{ handles.items, handles };
+        } else {
+            if (@mod(args.len - arg_index, 2) != 0) return error.WrongUsage;
+            break :blk .{ args[arg_index..], null };
+        }
+    };
+    defer if (to_free_after) |*val| val.deinit(Heap.global_gpa);
+
+    var body_to_run: ?Handle = null;
+    // Go through each switch arm until we find one that matches.
+    var arm_idx: usize = 0;
+    while (arm_idx < switch_body.len) : (arm_idx += 2) {
+        const is_default = try switch_body[arm_idx].equalsString("default");
+        // If `default` isn't the last arm in the switch body, we treat it
+        // as a normal string to check against.
+        if (!is_default or arm_idx < switch_body.len - 2) {
+            switch (match_type) {
+                .exact => {
+                    if (try Heap.checkIfEqual(to_match_on, switch_body[arm_idx])) {
+                        body_to_run = switch_body[arm_idx + 1];
+                        break;
+                    }
+                },
+                .glob => {
+                    const matches = strutil.globMatch(try switch_body[arm_idx].getString(), to_match_on_bytes, false);
+                    if (matches) {
+                        body_to_run = switch_body[arm_idx + 1];
+                        break;
+                    }
+                },
+                .regex => {
+                    var new: OptionalHandle = .none;
+                    defer new.decrOptional();
+                    var det: objutil.ErrorDetails = undefined;
+                    const opts = pcre2.PCRE2_UTF | pcre2.PCRE2_UCP | pcre2.PCRE2_DOTALL;
+                    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, switch_body[arm_idx], &new, opts));
+                    const regexp_handle = new.orElse(switch_body[arm_idx]);
+
+                    const re = regexp_handle.getRegexpExtraData();
+
+                    const matches = try interp.wrapError(&det, regex.doesStringMatch(&det, re, to_match_on_bytes));
+                    if (matches) {
+                        body_to_run = switch_body[arm_idx + 1];
+                        break; // Match!
+                    } else continue;
+                },
+                .command => {
+                    const matches = try commandMatch(interp, command_to_match.?, switch_body[arm_idx], to_match_on);
+                    if (matches) {
+                        body_to_run = switch_body[arm_idx + 1];
+                        break; // Match!
+                    } else continue;
+                },
+            }
+        } else {
+            // Truly the default.
+            body_to_run = switch_body[arm_idx + 1];
+        }
+    }
+
+    interp.setEmptyResult();
+    if (body_to_run) |to_run| {
+        const to_run_fallthrough = if (try to_run.equalsString("-")) blk: {
+            // Fall through if the body is `-`.
+            var true_body_idx = arm_idx + 1;
+            while (true_body_idx < switch_body.len) : (true_body_idx += 2) {
+                if (!(try switch_body[true_body_idx].equalsString("-"))) break;
+            } else {
+                try interp.setResultFormatted("no body specified for pattern \"{f}\"", .{switch_body[arm_idx]});
+            }
+            break :blk switch_body[true_body_idx];
+        } else to_run;
+
+        try interp.evalObject(to_run_fallthrough);
+    }
+}
 
 /// [unset]
 pub fn unsetCmd(interp: *Interp, args: []Handle) !void {
@@ -2153,46 +2278,54 @@ pub fn regexpCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const subject = try remaining[1].getString();
     const match_vars = remaining[2..];
 
-    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, null) orelse return error.OutOfMemory;
+    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, regex.pcre2_ctx) orelse return error.OutOfMemory;
     defer pcre2.pcre2_match_data_free_8(match_data);
 
     var start_offset: usize = 0;
     var skip_match = false;
     if (opt_start != 0) {
         const cp_len = try interp.getCodepointLength(&remaining[1]);
-        var start_char_idx = opt_start;
-        if (start_char_idx < 0) {
-            start_char_idx += @as(i64, @intCast(cp_len)) + 1;
+        var start_cp_idx = opt_start;
+        if (start_cp_idx < 0) {
+            start_cp_idx += @as(i64, @intCast(cp_len)) + 1;
         }
-        if (start_char_idx <= 0) {
+        if (start_cp_idx <= 0) {
             start_offset = 0;
-        } else if (start_char_idx > cp_len) {
+        } else if (start_cp_idx > cp_len) {
             skip_match = true;
         } else {
-            start_offset = strutil.cpIndex(subject, @intCast(start_char_idx)) orelse subject.len;
+            start_offset = strutil.cpIndex(subject, @intCast(start_cp_idx)) orelse subject.len;
         }
     }
 
     var match_opts: u32 = 0;
     if (start_offset > 0) match_opts |= pcre2.PCRE2_NOTBOL;
 
-    var result_list: OptionalHandle = .none;
+    var result_list: ?Handle = null;
     if (opt_inline and opt_all) {
         const list = try objutil.newList(&.{});
-        result_list = list.toOptional();
+        result_list = list;
     }
-    errdefer result_list.decrOptional();
+    errdefer if (result_list) |val| val.decrRefCount();
 
     var match_count: usize = 0;
 
     if (!skip_match) while (true) {
         if (start_offset > subject.len) break;
-        const rc = pcre2.pcre2_match_8(re, subject.ptr, subject.len, start_offset, match_opts, match_data, null);
-        if (rc == pcre2.PCRE2_ERROR_NOMATCH) break;
-        if (rc == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
-        if (rc < 0) {
+        const return_code = pcre2.pcre2_match_8(
+            re,
+            subject.ptr,
+            subject.len,
+            start_offset,
+            match_opts,
+            match_data,
+            regex.pcre2_match_ctx,
+        );
+        if (return_code == pcre2.PCRE2_ERROR_NOMATCH) break;
+        if (return_code == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
+        if (return_code < 0) {
             var buf: [256]u8 = undefined;
-            const msg_len = pcre2.pcre2_get_error_message_8(rc, &buf, buf.len);
+            const msg_len = pcre2.pcre2_get_error_message_8(return_code, &buf, buf.len);
             const msg = buf[0..@intCast(msg_len)];
             try interp.setResultString(msg);
             return error.EvalError;
@@ -2200,22 +2333,22 @@ pub fn regexpCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
         match_count += 1;
 
-        const ovector = pcre2.pcre2_get_ovector_pointer_8(match_data);
-        const ovector_count = pcre2.pcre2_get_ovector_count_8(match_data);
+        const ovector_count = pcre2.pcre2_get_ovector_count_8(match_data) * 2;
+        const ovector = pcre2.pcre2_get_ovector_pointer_8(match_data)[0..ovector_count];
 
         if (opt_inline) {
             if (opt_all) {
-                const match_list = try regex.matchToList(subject, ovector, ovector_count, opt_indices);
+                const match_list = try regex.matchToList(subject, ovector, opt_indices);
                 defer match_list.decrRefCount();
                 const match_len = objutil.listLengthRaw(match_list);
-                var result_list_handle = result_list.toHandle().?;
+                var result_list_handle = result_list.?;
                 for (0..match_len) |j| {
                     const item = objutil.listItemNoFollow(match_list, @intCast(j));
                     _ = try interp.listAppend(&result_list_handle, item);
                 }
-                result_list = result_list_handle.toOptional();
+                result_list = result_list_handle;
             } else {
-                const list = try regex.matchToList(subject, ovector, ovector_count, opt_indices);
+                const list = try regex.matchToList(subject, ovector, opt_indices);
                 interp.setResultOwning(list);
                 return;
             }
@@ -2237,7 +2370,7 @@ pub fn regexpCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     if (opt_inline) {
         if (opt_all) {
-            interp.setResultOwning(result_list.toHandle().?);
+            interp.setResultOwning(result_list.?);
         } else {
             interp.setEmptyResult();
         }
@@ -2541,6 +2674,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
     try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
+    try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
     try registerCommand(interp, "tailcall", tallcallCommand, "command ?arg ...?", 1, null, null);
     try registerCommand(interp, "try", tryCmd, "script ?handler ...? ?finally body?", 1, null, null);
     try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null, null);
