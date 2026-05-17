@@ -1,14 +1,13 @@
 const std = @import("std");
+const CombineArchivesStep = @import("src/build/CombineArchivesStep.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{
-        .default_target = .{ .abi = .musl },
-    });
     const optimize = b.standardOptimizeOption(.{});
 
     // options
+    const static_link = b.option(bool, "static-link", "Whether to statically link libc") orelse true;
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
-    const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse false;
+    const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse !static_link;
     const trace_mem = b.option(bool, "trace-mem", "Trace object memory operations") orelse (optimize == .Debug);
     const test_filters = b.option(
         [][]const u8,
@@ -17,6 +16,10 @@ pub fn build(b: *std.Build) void {
     ) orelse &[0][]const u8{};
     const token_debugging = b.option(bool, "token-debugging", "Whether to print tokens when they're parsed") orelse false;
     const threading = b.option(bool, "threading", "Whether threading is enabled") orelse true;
+
+    const target = b.standardTargetOptions(.{
+        .default_target = if (static_link) .{ .abi = .musl } else .{},
+    });
 
     const options = b.addOptions();
     options.addOption(bool, "use_utf8", use_utf8);
@@ -87,6 +90,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/libzicl.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     lz_mod.addImport("uucode", uucode.module("uucode"));
     lz_mod.addImport("options", options_mod);
@@ -100,9 +104,18 @@ pub fn build(b: *std.Build) void {
         .use_llvm = use_llvm,
     });
     lz.bundle_compiler_rt = true;
-    lz_mod.link_libc = true;
     lz.installHeader(b.path("include/libzicl.h"), "libzicl.h");
-    b.installArtifact(lz);
+
+    // Combine pcre2 into libzicl.a so downstream consumers only need
+    // to link one library. Zig skips transitive static lib deps by design.
+    const lib_list = b.allocator.alloc(std.Build.LazyPath, 2) catch @panic("OOM");
+    lib_list[0] = pcre2.artifact("pcre2-8").getEmittedBin();
+    lib_list[1] = lz.getEmittedBin();
+    const combined = CombineArchivesStep.create(b, target, "zicl", lib_list);
+    combined.step.dependOn(&lz.step);
+
+    const install_lib = b.addInstallLibFile(combined.output, "libzicl.a");
+    b.getInstallStep().dependOn(&install_lib.step);
 
     // tests
     const tests = b.addTest(.{
