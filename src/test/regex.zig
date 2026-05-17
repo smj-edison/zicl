@@ -3,13 +3,13 @@ const std = @import("std");
 const commands = @import("../commands.zig");
 const testStart = commands.testStart;
 const testFinish = commands.testFinish;
-const stringutil = @import("../stringutil.zig");
+const strutil = @import("../strutil.zig");
 
 const ta = std.testing.allocator;
 
 test "codepointLength diagnostic" {
-    try std.testing.expectEqual(@as(usize, 8), stringutil.codepointLength("1abc2de3"));
-    try std.testing.expectEqual(@as(usize, 8), stringutil.codepointLength("abc2de3f"));
+    try std.testing.expectEqual(@as(usize, 8), strutil.codepointLength("1abc2de3"));
+    try std.testing.expectEqual(@as(usize, 8), strutil.codepointLength("abc2de3f"));
 }
 
 test "regexp basic match" {

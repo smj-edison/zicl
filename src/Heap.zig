@@ -11,7 +11,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 
 const options = @import("options");
 const ioutil = @import("ioutil.zig");
-const stringutil = @import("stringutil.zig");
+const strutil = @import("strutil.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const expr_parse = @import("expr_parse.zig");
@@ -2984,7 +2984,7 @@ pub fn setSpecialString(
 fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     var fallback = std.heap.stackFallback(64, global_gpa);
     var stack_alloc = fallback.get();
-    var quoting_types = try stack_alloc.alloc(stringutil.QuotingType, len);
+    var quoting_types = try stack_alloc.alloc(strutil.QuotingType, len);
     defer stack_alloc.free(quoting_types);
 
     // Step 1: calculate the list's string length.
@@ -2992,14 +2992,14 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     for (0..len) |i| {
         const element_string = try self.getHandle(@intCast(index + i)).getString();
 
-        quoting_types[i] = stringutil.calculateNeededQuotingType(element_string);
+        quoting_types[i] = strutil.calculateNeededQuotingType(element_string);
         if (i == 0 and quoting_types[i] == .bare and
             element_string.len > 0 and element_string[0] == '#')
         {
             // Make sure the first element has # escaped in braces
             quoting_types[i] = .brace;
         }
-        total_length += stringutil.quoteSize(quoting_types[i], element_string.len);
+        total_length += strutil.quoteSize(quoting_types[i], element_string.len);
         total_length += 1; // space between each element
     }
 
@@ -3010,7 +3010,7 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
 
     for (0..len) |i| {
         const element_string = try self.getHandle(@intCast(index + i)).getString();
-        written += stringutil.quoteString(
+        written += strutil.quoteString(
             quoting_types[i],
             element_string,
             unfinished_str[written..],

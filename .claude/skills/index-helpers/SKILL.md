@@ -7,7 +7,7 @@ Scan the following files for public helper functions (`pub fn`):
 - src/objutil.zig
 - src/Heap.zig
 - src/memutil.zig
-- src/stringutil.zig
+- src/strutil.zig
 - src/Interp.zig
 
 For each file, read it and collect every `pub fn` declaration along with its signature and a one-line description of what it does (inferred from the doc comment if present, otherwise from the implementation).

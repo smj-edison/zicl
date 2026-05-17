@@ -10,7 +10,7 @@ const testing = std.testing;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-const strutil = @import("stringutil.zig");
+const strutil = @import("strutil.zig");
 const ioutil = @import("ioutil.zig");
 const options = @import("options");
 

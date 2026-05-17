@@ -319,7 +319,7 @@ anything that might already exist.
 
 ---
 
-## src/stringutil.zig
+## src/strutil.zig
 
 - `checkAllAscii(bytes, check)` -- Return true if every byte passes the given predicate.
 - `isGraph(c)` -- True if `c` is a printable non-space ASCII character.

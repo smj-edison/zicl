@@ -5,7 +5,7 @@ const testing = std.testing;
 
 const options = @import("options");
 const ioutil = @import("ioutil.zig");
-const strutil = @import("stringutil.zig");
+const strutil = @import("strutil.zig");
 const expr_parse = @import("expr_parse.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");

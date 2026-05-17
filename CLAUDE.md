@@ -263,7 +263,7 @@ const result = try someFn(heap, &det, arg);
 -   `src/Interp.zig`: Interpreter and command execution (~3500 lines)
 -   `src/Tokenizer.zig`: Tcl tokenizer (~1200 lines)
 -   `src/expr_parse.zig`: Expression parser with full AST (~900 lines)
--   `src/stringutil.zig`: String utilities with optional UTF-8 support (~875 lines)
+-   `src/strutil.zig`: String utilities with optional UTF-8 support (~875 lines)
 -   `src/memutil.zig`: Buddy allocator, memory primitives, and LRU cache (~900 lines)
 -   `src/commands.zig`: Built-in command implementations (~2200 lines)
 -   `src/libzicl.zig`: C FFI library entry point (~320 lines)
