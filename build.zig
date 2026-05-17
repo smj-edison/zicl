@@ -103,8 +103,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lz_mod,
         .use_llvm = use_llvm,
     });
-    lz.bundle_compiler_rt = true;
-    lz.installHeader(b.path("include/libzicl.h"), "libzicl.h");
+    const install_header = b.addInstallFile(b.path("include/libzicl.h"), "include/libzicl.h");
+    b.getInstallStep().dependOn(&install_header.step);
 
     // Combine pcre2 into libzicl.a so downstream consumers only need
     // to link one library. Zig skips transitive static lib deps by design.
