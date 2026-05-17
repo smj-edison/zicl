@@ -1082,6 +1082,29 @@ pub fn concatCmd(interp: *Interp, args: []Handle) !void {
     try interp.setResultString(buf.items);
 }
 
+pub fn joinCmd(interp: *Interp, args: []Handle) !void {
+    // join list ?joinString?
+    const list_len = try interp.getListLength(&args[1]);
+    const join_string = if (args.len > 2) try args[2].getString() else " ";
+
+    if (list_len == 0) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(Heap.global_gpa);
+
+    for (0..list_len) |i| {
+        if (i > 0) try buf.appendSlice(Heap.global_gpa, join_string);
+        const item = objutil.listItem(args[1], @intCast(i));
+        const item_str = try item.getString();
+        try buf.appendSlice(Heap.global_gpa, item_str);
+    }
+
+    try interp.setResultString(buf.items);
+}
+
 pub fn launderCmd(interp: *Interp, args: []Handle) !void {
     const str = try args[1].getString();
     try interp.setResultString(str);
@@ -2665,6 +2688,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "lassign", lassignCmd, "list ?varName ...?", 1, null, null);
     try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
     try registerCommand(interp, "list", listCmd, "?arg ...?", 0, null, null);
+    try registerCommand(interp, "join", joinCmd, "list ?joinString?", 1, 2, null);
     try registerCommand(interp, "llength", llengthCmd, "list", 1, 1, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);

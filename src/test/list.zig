@@ -87,3 +87,29 @@ test "list command nesting" {
     // llength verifies the structure.
     try interp.testExpectScriptResult("2", "llength [list {a b} {c d}]");
 }
+
+test "join basic" {
+    var interp = try testStart(ta);
+    defer testFinish(&interp);
+
+    // Default join string is a space.
+    try interp.testExpectScriptResult("a b c", "join {a b c}");
+
+    // Explicit join string.
+    try interp.testExpectScriptResult("a,b,c", "join {a b c} ,");
+
+    // Empty join string.
+    try interp.testExpectScriptResult("abc", "join {a b c} {}");
+
+    // Empty list returns empty string.
+    try interp.testExpectScriptResult("", "join {}");
+
+    // Single element.
+    try interp.testExpectScriptResult("hello", "join {hello}");
+
+    // Elements with spaces in them.
+    try interp.testExpectScriptResult("hello world,foo bar", "join {{hello world} {foo bar}} ,");
+
+    // Multi-character join string.
+    try interp.testExpectScriptResult("a--b--c", "join {a b c} --");
+}
