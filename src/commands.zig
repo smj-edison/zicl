@@ -9,6 +9,8 @@ const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 const ioutil = @import("ioutil.zig");
+const pcre2 = @import("pcre2");
+const regex = @import("regex.zig");
 
 fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
@@ -827,7 +829,7 @@ pub fn stringCmd(interp: *Interp, args: []Handle) !void {
                 }
             },
             .length => {
-                try interp.setResultInteger(@intCast(try interp.getCodepointLength(&args[1])));
+                try interp.setResultInteger(@intCast(try interp.getCodepointLength(&sub_args[0])));
             },
             .map => {
                 var opt_case_insensitive = false;
@@ -2088,6 +2090,401 @@ pub fn errorinfoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     interp.setResultOwning(error_message);
 }
 
+pub fn regexpCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    var opt_nocase = false;
+    var opt_all = false;
+    var opt_inline = false;
+    var opt_indices = false;
+    var opt_expanded = false;
+    var opt_line = false;
+    var opt_linestop = false;
+    var opt_lineanchor = false;
+    var opt_start: i64 = 0;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (try args[i].equalsString("-nocase")) {
+            opt_nocase = true;
+        } else if (try args[i].equalsString("-all")) {
+            opt_all = true;
+        } else if (try args[i].equalsString("-inline")) {
+            opt_inline = true;
+        } else if (try args[i].equalsString("-indices")) {
+            opt_indices = true;
+        } else if (try args[i].equalsString("-expanded")) {
+            opt_expanded = true;
+        } else if (try args[i].equalsString("-line")) {
+            opt_line = true;
+        } else if (try args[i].equalsString("-linestop")) {
+            opt_linestop = true;
+        } else if (try args[i].equalsString("-lineanchor")) {
+            opt_lineanchor = true;
+        } else if (try args[i].equalsString("-start")) {
+            i += 1;
+            if (i >= args.len) return error.WrongUsage;
+            opt_start = try interp.getInteger(&args[i]);
+        } else if (try args[i].equalsString("--")) {
+            i += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+
+    const remaining = args[i..];
+    if (remaining.len < 2) return error.WrongUsage;
+    if (opt_inline and remaining.len > 2) return error.WrongUsage;
+
+    var compile_opts: u32 = pcre2.PCRE2_UTF | pcre2.PCRE2_UCP | pcre2.PCRE2_DOTALL;
+    if (opt_nocase) compile_opts |= pcre2.PCRE2_CASELESS;
+    if (opt_expanded) compile_opts |= pcre2.PCRE2_EXTENDED;
+    if (opt_line or opt_lineanchor) compile_opts |= pcre2.PCRE2_MULTILINE;
+    if (opt_line or opt_linestop) compile_opts &= ~@as(u32, pcre2.PCRE2_DOTALL);
+
+    var new: OptionalHandle = .none;
+    errdefer new.swapWithNone();
+
+    var det: objutil.ErrorDetails = undefined;
+    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, remaining[0], &new, compile_opts));
+    remaining[0].swapIfNew(new);
+
+    const re = remaining[0].getRegexpExtraData();
+
+    const subject = try remaining[1].getString();
+    const match_vars = remaining[2..];
+
+    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, null) orelse return error.OutOfMemory;
+    defer pcre2.pcre2_match_data_free_8(match_data);
+
+    var start_offset: usize = 0;
+    var skip_match = false;
+    if (opt_start != 0) {
+        const cp_len = try interp.getCodepointLength(&remaining[1]);
+        var start_char_idx = opt_start;
+        if (start_char_idx < 0) {
+            start_char_idx += @as(i64, @intCast(cp_len)) + 1;
+        }
+        if (start_char_idx <= 0) {
+            start_offset = 0;
+        } else if (start_char_idx > cp_len) {
+            skip_match = true;
+        } else {
+            start_offset = strutil.cpIndex(subject, @intCast(start_char_idx)) orelse subject.len;
+        }
+    }
+
+    var match_opts: u32 = 0;
+    if (start_offset > 0) match_opts |= pcre2.PCRE2_NOTBOL;
+
+    var result_list: OptionalHandle = .none;
+    if (opt_inline and opt_all) {
+        const list = try objutil.newList(&.{});
+        result_list = list.toOptional();
+    }
+    errdefer result_list.decrOptional();
+
+    var match_count: usize = 0;
+
+    if (!skip_match) while (true) {
+        if (start_offset > subject.len) break;
+        const rc = pcre2.pcre2_match_8(re, subject.ptr, subject.len, start_offset, match_opts, match_data, null);
+        if (rc == pcre2.PCRE2_ERROR_NOMATCH) break;
+        if (rc == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
+        if (rc < 0) {
+            var buf: [256]u8 = undefined;
+            const msg_len = pcre2.pcre2_get_error_message_8(rc, &buf, buf.len);
+            const msg = buf[0..@intCast(msg_len)];
+            try interp.setResultString(msg);
+            return error.EvalError;
+        }
+
+        match_count += 1;
+
+        const ovector = pcre2.pcre2_get_ovector_pointer_8(match_data);
+        const ovector_count = pcre2.pcre2_get_ovector_count_8(match_data);
+
+        if (opt_inline) {
+            if (opt_all) {
+                const match_list = try regex.matchToList(subject, ovector, ovector_count, opt_indices);
+                defer match_list.decrRefCount();
+                const match_len = objutil.listLengthRaw(match_list);
+                var result_list_handle = result_list.toHandle().?;
+                for (0..match_len) |j| {
+                    const item = objutil.listItemNoFollow(match_list, @intCast(j));
+                    _ = try interp.listAppend(&result_list_handle, item);
+                }
+                result_list = result_list_handle.toOptional();
+            } else {
+                const list = try regex.matchToList(subject, ovector, ovector_count, opt_indices);
+                interp.setResultOwning(list);
+                return;
+            }
+        } else {
+            try setRegexpCaptureVars(interp, subject, match_data, match_vars, opt_indices);
+        }
+
+        if (!opt_all) break;
+
+        const match_end = ovector[1];
+        const match_start = ovector[0];
+        if (match_end == match_start) {
+            start_offset = match_start + 1;
+        } else {
+            start_offset = match_end;
+        }
+        match_opts |= pcre2.PCRE2_NOTBOL;
+    };
+
+    if (opt_inline) {
+        if (opt_all) {
+            interp.setResultOwning(result_list.toHandle().?);
+        } else {
+            interp.setEmptyResult();
+        }
+    } else {
+        if (opt_all) {
+            try interp.setResultInteger(@intCast(match_count));
+        } else {
+            try interp.setResultBoolean(match_count > 0);
+        }
+    }
+}
+
+fn setRegexpCaptureVars(
+    interp: *Interp,
+    subject: []const u8,
+    match_data: *pcre2.pcre2_match_data_8,
+    match_vars: []Handle,
+    opt_indices: bool,
+) Interp.Error!void {
+    if (match_vars.len == 0) return;
+
+    const ovector = pcre2.pcre2_get_ovector_pointer_8(match_data);
+    const ovector_count = pcre2.pcre2_get_ovector_count_8(match_data);
+
+    for (match_vars, 0..) |*var_name, idx| {
+        if (idx < ovector_count) {
+            const start = ovector[idx * 2];
+            const end = ovector[idx * 2 + 1];
+            if (start == std.math.maxInt(usize)) {
+                if (opt_indices) {
+                    const pair = try regex.buildIndexPair(-1, -1);
+                    defer pair.decrRefCount();
+                    try interp.setVariableTo(var_name, pair);
+                } else {
+                    try interp.setVariableTo(var_name, Heap.local_heap.emptyHandle());
+                }
+            } else {
+                if (opt_indices) {
+                    const pair = try regex.buildIndexPair(@intCast(start), @intCast(end));
+                    defer pair.decrRefCount();
+                    try interp.setVariableTo(var_name, pair);
+                } else {
+                    const capture = subject[start..end];
+                    const capture_handle = try objutil.newString(capture);
+                    try interp.setVariableTo(var_name, capture_handle);
+                    capture_handle.decrRefCount();
+                }
+            }
+        } else {
+            if (opt_indices) {
+                const pair = try regex.buildIndexPair(-1, -1);
+                defer pair.decrRefCount();
+                try interp.setVariableTo(var_name, pair);
+            } else {
+                try interp.setVariableTo(var_name, Heap.local_heap.emptyHandle());
+            }
+        }
+    }
+}
+
+pub fn regsubCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    var opt_nocase = false;
+    var opt_all = false;
+    var opt_expanded = false;
+    var opt_line = false;
+    var opt_linestop = false;
+    var opt_lineanchor = false;
+    var opt_start: i64 = 0;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (try args[i].equalsString("-nocase")) {
+            opt_nocase = true;
+        } else if (try args[i].equalsString("-all")) {
+            opt_all = true;
+        } else if (try args[i].equalsString("-expanded")) {
+            opt_expanded = true;
+        } else if (try args[i].equalsString("-line")) {
+            opt_line = true;
+        } else if (try args[i].equalsString("-linestop")) {
+            opt_linestop = true;
+        } else if (try args[i].equalsString("-lineanchor")) {
+            opt_lineanchor = true;
+        } else if (try args[i].equalsString("-start")) {
+            i += 1;
+            if (i >= args.len) return error.WrongUsage;
+            opt_start = try interp.getInteger(&args[i]);
+        } else if (try args[i].equalsString("--")) {
+            i += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+
+    const remaining = args[i..];
+    if (remaining.len != 3 and remaining.len != 4) return error.WrongUsage;
+
+    var compile_opts: u32 = pcre2.PCRE2_UTF | pcre2.PCRE2_UCP | pcre2.PCRE2_DOTALL;
+    if (opt_nocase) compile_opts |= pcre2.PCRE2_CASELESS;
+    if (opt_expanded) compile_opts |= pcre2.PCRE2_EXTENDED;
+    if (opt_line or opt_lineanchor) compile_opts |= pcre2.PCRE2_MULTILINE;
+    if (opt_line or opt_linestop) compile_opts &= ~@as(u32, pcre2.PCRE2_DOTALL);
+
+    var new: OptionalHandle = .none;
+    errdefer new.swapWithNone();
+
+    var det: objutil.ErrorDetails = undefined;
+    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, remaining[0], &new, compile_opts));
+    remaining[0].swapIfNew(new);
+
+    const re = remaining[0].getRegexpExtraData();
+    const pattern_str = try remaining[0].getString();
+
+    const subject = try remaining[1].getString();
+    const sub_spec = try remaining[2].getString();
+
+    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, null) orelse return error.OutOfMemory;
+    defer pcre2.pcre2_match_data_free_8(match_data);
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(Heap.global_gpa);
+
+    var src_pos: usize = 0;
+    var start_offset: usize = 0;
+    if (opt_start != 0) {
+        const cp_len = try interp.getCodepointLength(&remaining[1]);
+        var start_char_idx = opt_start;
+        if (start_char_idx < 0) {
+            start_char_idx += @as(i64, @intCast(cp_len)) + 1;
+        }
+        if (start_char_idx <= 0) {
+            start_offset = 0;
+        } else if (start_char_idx > cp_len) {
+            start_offset = subject.len;
+        } else {
+            start_offset = strutil.cpIndex(subject, @intCast(start_char_idx)) orelse subject.len;
+        }
+        try result.appendSlice(Heap.global_gpa, subject[0..start_offset]);
+        src_pos = start_offset;
+    }
+
+    var match_opts: u32 = 0;
+    if (start_offset > 0) match_opts |= pcre2.PCRE2_NOTBOL;
+
+    var match_count: usize = 0;
+
+    while (true) {
+        if (start_offset > subject.len) break;
+        const rc = pcre2.pcre2_match_8(re, subject.ptr, subject.len, start_offset, match_opts, match_data, null);
+        if (rc == pcre2.PCRE2_ERROR_NOMATCH) break;
+        if (rc == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
+        if (rc < 0) {
+            var buf: [256]u8 = undefined;
+            const msg_len = pcre2.pcre2_get_error_message_8(rc, &buf, buf.len);
+            const msg = buf[0..@intCast(msg_len)];
+            try interp.setResultString(msg);
+            return error.EvalError;
+        }
+
+        match_count += 1;
+
+        const ovector = pcre2.pcre2_get_ovector_pointer_8(match_data);
+        const ovector_count = pcre2.pcre2_get_ovector_count_8(match_data);
+
+        const match_start = ovector[0];
+        const match_end = ovector[1];
+
+        try result.appendSlice(Heap.global_gpa, subject[src_pos..match_start]);
+        try applySubstitution(&result, subject, ovector, ovector_count, sub_spec);
+
+        src_pos = match_end;
+        start_offset = match_end;
+
+        if (!opt_all) break;
+
+        if (match_end == match_start) {
+            if (pattern_str.len > 0 and pattern_str[0] == '^') {
+                match_opts |= pcre2.PCRE2_NOTBOL;
+                // Don't advance; next iteration will try same position with NOTBOL.
+            } else {
+                const char_len = strutil.cpIndex(subject[src_pos..], 1) orelse 0;
+                if (char_len == 0) break;
+                try result.appendSlice(Heap.global_gpa, subject[src_pos .. src_pos + char_len]);
+                src_pos += char_len;
+                start_offset = src_pos;
+                match_opts |= pcre2.PCRE2_NOTBOL;
+            }
+        } else {
+            if (start_offset >= subject.len) break;
+            match_opts |= pcre2.PCRE2_NOTBOL;
+        }
+    }
+
+    try result.appendSlice(Heap.global_gpa, subject[src_pos..]);
+
+    const result_str = try objutil.newString(result.items);
+    defer result_str.decrRefCount();
+
+    if (remaining.len == 4) {
+        try interp.setVariableTo(&remaining[3], result_str);
+        try interp.setResultInteger(@intCast(match_count));
+    } else {
+        interp.setResult(result_str);
+    }
+}
+
+fn applySubstitution(
+    result: *std.ArrayList(u8),
+    subject: []const u8,
+    ovector: [*]usize,
+    ovector_count: u32,
+    sub_spec: []const u8,
+) !void {
+    var j: usize = 0;
+    while (j < sub_spec.len) : (j += 1) {
+        const c = sub_spec[j];
+        if (c == '&') {
+            if (ovector_count > 0 and ovector[0] != std.math.maxInt(usize)) {
+                try result.appendSlice(Heap.global_gpa, subject[ovector[0]..ovector[1]]);
+            }
+        } else if (c == '\\') {
+            if (j + 1 < sub_spec.len) {
+                j += 1;
+                const next_c = sub_spec[j];
+                if (next_c >= '0' and next_c <= '9') {
+                    const idx = next_c - '0';
+                    if (idx < ovector_count and ovector[idx * 2] != std.math.maxInt(usize)) {
+                        const start = ovector[idx * 2];
+                        const end = ovector[idx * 2 + 1];
+                        try result.appendSlice(Heap.global_gpa, subject[start..end]);
+                    }
+                } else if (next_c == '\\' or next_c == '&') {
+                    try result.append(Heap.global_gpa, next_c);
+                } else {
+                    try result.append(Heap.global_gpa, '\\');
+                    try result.append(Heap.global_gpa, next_c);
+                }
+            } else {
+                try result.append(Heap.global_gpa, '\\');
+            }
+        } else {
+            try result.append(Heap.global_gpa, c);
+        }
+    }
+}
+
 fn registerCommand(
     interp: *Interp,
     name: []const u8,
@@ -2138,6 +2535,8 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "llength", llengthCmd, "list", 1, 1, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
+    try registerCommand(interp, "regexp", regexpCmd, "?switches? exp string ?matchVar ...?", 2, null, null);
+    try registerCommand(interp, "regsub", regsubCmd, "?switches? exp string subSpec ?varName?", 3, null, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
     try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null, null);

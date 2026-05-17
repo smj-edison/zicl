@@ -5,6 +5,7 @@ test {
     _ = @import("eval.zig");
     _ = @import("list.zig");
     _ = @import("parsing.zig");
+    _ = @import("regex.zig");
     _ = @import("strings.zig");
     _ = @import("try_catch.zig");
     _ = @import("variables.zig");

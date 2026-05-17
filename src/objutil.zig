@@ -9,6 +9,8 @@ const expr_parse = @import("expr_parse.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
+const regex = @import("regex.zig");
+const pcre2 = @import("pcre2");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 
@@ -3048,4 +3050,48 @@ pub fn newBoolean(value: bool) !Handle {
     handle.peek().head.tag = .bool;
     handle.peek().body.bool = .{ .data = value };
     return handle;
+}
+
+pub fn shimmerToRegexp(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, compile_opts: u32) !void {
+    var handle = new.orElse(original);
+    if (handle.tag() == .regexp and handle.peek().body.regexp.options == compile_opts) return;
+    errdefer new.swapWithNone();
+
+    try Heap.ensureShimmerableOrDup(original, new);
+    handle = new.orElse(original);
+
+    const pattern = try handle.getString();
+
+    var err_code: c_int = 0;
+    var err_offset: usize = 0;
+    const compile_ctx = pcre2.pcre2_compile_context_create_8(regex.pcre2_ctx) orelse return error.OutOfMemory;
+    defer pcre2.pcre2_compile_context_free_8(compile_ctx);
+
+    const re = pcre2.pcre2_compile_8(
+        pattern.ptr,
+        pattern.len,
+        compile_opts,
+        &err_code,
+        &err_offset,
+        compile_ctx,
+    ) orelse {
+        if (err_code == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
+        if (det) |details| {
+            var buf: [256]u8 = undefined;
+            const msg_len = pcre2.pcre2_get_error_message_8(err_code, &buf, buf.len);
+            const msg = buf[0..@intCast(msg_len)];
+            details.* = .{ .message = try newString(msg) };
+        }
+        return error.BadRegexp;
+    };
+
+    const heap = handle.getHeap();
+    const extra = try heap.createExtraData();
+    errdefer heap.destroyExtraData(extra);
+
+    heap.getExtraData(extra).* = .{ .regexp = re };
+
+    try handle.prepareToShimmer();
+    handle.peek().head.tag = .regexp;
+    handle.peek().body.regexp = .{ .options = compile_opts, .extra_data = extra };
 }

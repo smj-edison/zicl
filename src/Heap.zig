@@ -14,6 +14,8 @@ const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const expr_parse = @import("expr_parse.zig");
+const regex = @import("regex.zig");
+const pcre2 = @import("pcre2");
 const objutil = @import("objutil.zig");
 
 pub const special_string_count = 2;
@@ -531,7 +533,7 @@ pub const Object = packed struct(u128) {
     };
 
     pub const Head = packed struct(u64) {
-        str: StrOrPtr,
+        str: StrOrPtr = Object.null_string,
         tag: Tag,
     };
 
@@ -591,6 +593,9 @@ pub const Object = packed struct(u128) {
             .hash_reference => {
                 obj.body.hash_reference.decrRefCount();
             },
+            .regexp => {
+                heap.destroyExtraData(obj.body.regexp.extra_data);
+            },
             .none,
             .index,
             .integer,
@@ -635,6 +640,7 @@ pub const Object = packed struct(u128) {
             .closure => try writer.print(" = {}", .{self.body.closure}),
             .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
             .hash_reference => try writer.print(" = {any}", .{self.body.hash_reference}),
+            .regexp => try writer.writeAll(" = <regexp>"),
         }
         try writer.writeAll(" } }");
     }
@@ -662,6 +668,7 @@ pub const Tag = enum(u5) {
     closure,
     custom_type,
     hash_reference,
+    regexp,
 };
 
 pub const Body = packed union(u64) {
@@ -751,6 +758,10 @@ pub const Body = packed union(u64) {
         extra_data: ExtraData,
     },
     hash_reference: Handle,
+    regexp: packed struct {
+        options: u32,
+        extra_data: ExtraData,
+    },
 };
 
 comptime {
@@ -815,6 +826,7 @@ pub const ExtraDataValue = union(enum) {
         second_ptr: *anyopaque,
     },
     closure: Closure,
+    regexp: *pcre2.pcre2_code_8,
     none: void,
 };
 
@@ -1329,6 +1341,11 @@ pub const Handle = packed struct(HandleBacking) {
         return &handle.getHeap().getExtraData(handle.peek().body.closure.extra_data).closure;
     }
 
+    pub fn getRegexpExtraData(handle: Handle) *pcre2.pcre2_code_8 {
+        handle.assert(handle.tag() == .regexp);
+        return handle.getHeap().getExtraData(handle.peek().body.regexp.extra_data).regexp;
+    }
+
     threadlocal var recursion_depth: usize = 0;
     const empty_string_value = "";
     /// This returns a temporary string. Whenever the object is mutated, it
@@ -1497,6 +1514,7 @@ pub const Handle = packed struct(HandleBacking) {
             .dict_sugar,
             .cached_local_var,
             .cached_lexical_var,
+            .regexp,
             => {
                 last_touched = handle;
                 std.debug.panic("{} should always have a string representation", .{obj.head.tag});
@@ -1577,6 +1595,7 @@ pub const Handle = packed struct(HandleBacking) {
             .bool,
             .string,
             .source,
+            .regexp,
             => {},
             .list => {
                 for (0..objutil.listLengthRaw(handle)) |i| {
@@ -1610,6 +1629,8 @@ pub const Handle = packed struct(HandleBacking) {
             .marked,
             => unreachable,
         }
+        // No need for atomics, because the caller is responsible for synchronizing the object
+        // to wherever it's going.
         handle.getMetadata().cross_thread = true;
     }
 
@@ -2529,6 +2550,15 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 .body = undefined,
             };
         },
+        .regexp => {
+            // PCRE2 compiled code is immutable and thread-safe, but duplicating the pointer
+            // would cause a double-free when both copies are destroyed. The pattern string
+            // is preserved; it will recompile on next use.
+            return .{
+                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .none },
+                .body = undefined,
+            };
+        },
         .closure => {
             const closure = handle.getClosureExtraData();
             const new_extra_data = try dest_heap.createExtraData();
@@ -3183,6 +3213,9 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
         .closure => |*closure| {
             closure.deinit();
         },
+        .regexp => |re| {
+            pcre2.pcre2_code_free_8(re);
+        },
         .none => {},
     }
 
@@ -3202,6 +3235,9 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     global_gpa = gpa;
     custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
     errdefer custom_types.deinit(global_gpa);
+
+    try regex.initGlobals();
+    errdefer regex.deinitGlobals();
 
     registered_hashes = .{};
     nativefn_registry = .{};
@@ -3283,6 +3319,7 @@ pub fn deinitAll() void {
         custom_types.deinit(global_gpa);
         nativefn_registry.deinit(global_gpa);
         registered_hashes.entries.deinit(global_gpa);
+        regex.deinitGlobals();
         state.initialized = false;
     }
     state.mutex.unlock(global_io);
@@ -3458,6 +3495,7 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) T {
 
 pub fn testStart(gpa: Allocator, io: std.Io) !*Heap {
     try initGlobals(gpa, io);
+    errdefer deinitAll();
     try initLocalHeap();
 
     return local_heap;

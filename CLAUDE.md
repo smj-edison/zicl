@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**zicl** (Zig Tcl) is a Tcl interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe Tcl implementation with optional threading support and modern memory management.
+**zicl** (Zig Tcl) is a Tcl interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe Tcl implementation with optional threading support and modern memory management. It is being developed mainly for the use in Folk Computer (https://folk.computer/), an interactive environment.
 
 ### Design Constraints
 -   **Out of memory is considered recoverable.** Zig has strong support for OOM scenarios, and so we follow this idiom and make sure our OOM paths recover correctly.
@@ -35,7 +35,7 @@ Run tests with specific filter:
 zig build test -Dtest-filter="test_name_pattern"
 ```
 
-Remember that the default zig test runner (the one we use) does not print anything on success, it only returns a successful code. Use `echo "exit: $?"` to check the status.
+Remember that the default zig test runner (the one we use) does not print anything on success, it only returns a successful code. To get feedback, use `zig build test --summary line`, alongside any other needed parameters.
 
 Build with specific options:
 
@@ -57,16 +57,16 @@ zig build -Dtoken-debugging=true
 
 **Heap (src/Heap.zig)**: Central memory management system using a buddy allocator for objects and strings. Supports:
 
--   Multi-heap architecture for potential threading
+-   Multi-heap architecture for threading
 -   Reference counting for objects
--   Two string storage modes: normal (in-heap) and long (external allocation with a 65535-byte threshold)
+-   Two string storage modes: normal (in-heap) and special (external allocation with a 65535-byte threshold, and room for mmaped files in the future)
 -   Cross-thread object sharing with atomic operations
--   Object "shimmering" - dynamic type conversion that preserves cached representations
+-   Object "shimmering" - internal type conversion that preserves cached representations based on the string
 
 **Object System (src/objutil.zig)**: Implements Tcl's dynamic typing through type shimmering:
 
 -   Objects can dynamically convert between types (string → list → dict, etc.)
--   Maintains string representation alongside typed representation when beneficial
+-   Maintains the string value alongside the internal typed representation, though this string value is often lazily computed
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
 -   Dictionary operations: `dictPut`, `dictPutRecursively`, `dictRemove`, `dictRemoveRecursively`, `dictLookupRecursively`, `dictLookupFollowLinks`
 -   Supports recursive key lookups for nested dictionaries
@@ -418,3 +418,6 @@ Not yet implemented:
 
 ## Available helper functions
 @.claude/helpers.md
+
+## Cookbook
+@.claude/cookbook.md
