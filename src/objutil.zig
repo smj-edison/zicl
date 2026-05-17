@@ -4,7 +4,8 @@ const Io = std.Io;
 const testing = std.testing;
 
 const options = @import("options");
-const stringutil = @import("stringutil.zig");
+const ioutil = @import("ioutil.zig");
+const strutil = @import("stringutil.zig");
 const expr_parse = @import("expr_parse.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
@@ -106,7 +107,7 @@ pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
             if (current_len) |val| return val;
 
             // String length hasn't been computed yet, so compute now.
-            const utf8_length = stringutil.codepointLength(long_str.getString());
+            const utf8_length = strutil.codepointLength(long_str.getString());
             long_str.setUtf8Length(utf8_length); // Cache utf8 length.
             return utf8_length;
         },
@@ -115,7 +116,7 @@ pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
                 return handle.peek().body.string.utf8_length;
             } else {
                 const bytes = try handle.getString();
-                const utf8_length = stringutil.codepointLength(bytes);
+                const utf8_length = strutil.codepointLength(bytes);
                 handle.peek().body.string = .{
                     .utf8_length = @intCast(utf8_length), // Cache utf8 length.
                     .length_determined = true,
@@ -193,7 +194,7 @@ pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
     // Unescaped will be equal or shorter than escaped version.
     const unescaped = try Heap.global_gpa.alloc(u8, escaped.len);
     defer Heap.global_gpa.free(unescaped);
-    const written = stringutil.removeEscaping(escaped, unescaped);
+    const written = strutil.removeEscaping(escaped, unescaped);
 
     try Heap.setString(handle, unescaped[0..written]);
 }
@@ -202,14 +203,14 @@ pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !boo
     const pattern_str = try pattern.getString();
     const to_check_str = try to_check.getString();
 
-    return stringutil.globMatch(pattern_str, to_check_str, case_insensitive);
+    return strutil.globMatch(pattern_str, to_check_str, case_insensitive);
 }
 
 pub fn compare(a: Handle, b: Handle, up_to_cp: ?usize, case_insensitive: bool) !std.math.Order {
     const a_str = try a.getString();
     const b_str = try b.getString();
 
-    return stringutil.compare(a_str, b_str, up_to_cp, case_insensitive);
+    return strutil.compare(a_str, b_str, up_to_cp, case_insensitive);
 }
 
 // Integer related functions
@@ -479,8 +480,8 @@ pub fn stringRange(
     const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
 
     // cpIndex is generic across ASCII and UTF-8.
-    const byte_start = stringutil.cpIndex(bytes, range.start);
-    const byte_end = stringutil.cpIndex(bytes, range.end);
+    const byte_start = strutil.cpIndex(bytes, range.start);
+    const byte_end = strutil.cpIndex(bytes, range.end);
 
     return try newStringWithCodepointLen(
         bytes[byte_start..byte_end],
@@ -509,8 +510,8 @@ pub fn stringReplace(
 
     const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
 
-    const byte_start = stringutil.cpIndex(bytes, range.start);
-    const byte_end = stringutil.cpIndex(bytes, range.end);
+    const byte_start = strutil.cpIndex(bytes, range.start);
+    const byte_end = strutil.cpIndex(bytes, range.end);
 
     const replaced: []u8 = blk: {
         // Is there anything to insert?
@@ -558,18 +559,18 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
     if (options.use_utf8) {
         // Go through once to calculate the length.
         var new_len: usize = 0;
-        var iter = stringutil.Iterator.init(bytes);
+        var iter = strutil.Iterator.init(bytes);
         var is_first_char = true;
         while (iter.next()) |cp| {
             const converted = blk: {
                 switch (mode) {
-                    .upper => break :blk stringutil.toUpper(cp),
-                    .lower => break :blk stringutil.toLower(cp),
+                    .upper => break :blk strutil.toUpper(cp),
+                    .lower => break :blk strutil.toLower(cp),
                     .title => {
                         if (is_first_char) {
-                            break :blk stringutil.toTitle(cp);
+                            break :blk strutil.toTitle(cp);
                         } else {
-                            break :blk stringutil.toLower(cp);
+                            break :blk strutil.toLower(cp);
                         }
                     },
                 }
@@ -583,19 +584,19 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
         defer Heap.global_gpa.free(new_bytes);
 
         // Now go through and write all the bytes.
-        iter = stringutil.Iterator.init(bytes);
+        iter = strutil.Iterator.init(bytes);
         var written: usize = 0;
         is_first_char = true;
         while (iter.next()) |cp| {
             const converted = blk: {
                 switch (mode) {
-                    .upper => break :blk stringutil.toUpper(cp),
-                    .lower => break :blk stringutil.toLower(cp),
+                    .upper => break :blk strutil.toUpper(cp),
+                    .lower => break :blk strutil.toLower(cp),
                     .title => {
                         if (is_first_char) {
-                            break :blk stringutil.toTitle(cp);
+                            break :blk strutil.toTitle(cp);
                         } else {
-                            break :blk stringutil.toLower(cp);
+                            break :blk strutil.toLower(cp);
                         }
                     },
                 }
@@ -612,9 +613,9 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
 
         for (bytes, new_bytes) |old_char, *new_char| {
             if (mode == .upper) {
-                new_char.* = stringutil.toUpper(old_char);
+                new_char.* = strutil.toUpper(old_char);
             } else {
-                new_char.* = stringutil.toLower(old_char);
+                new_char.* = strutil.toLower(old_char);
             }
         }
 
@@ -627,7 +628,7 @@ pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try str.getString();
     const trim_chars_bytes = try trim_chars.getString();
 
-    const start = stringutil.trimLeft(bytes, trim_chars_bytes);
+    const start = strutil.trimLeft(bytes, trim_chars_bytes);
 
     if (start == 0) {
         return str;
@@ -641,7 +642,7 @@ pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try str.getString();
     const trim_chars_bytes = try trim_chars.getString();
 
-    const end = stringutil.trimRight(bytes, trim_chars_bytes);
+    const end = strutil.trimRight(bytes, trim_chars_bytes);
 
     if (end == bytes.len) {
         return str;
@@ -655,8 +656,8 @@ pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     const bytes = try str.getString();
     const trim_chars_bytes = try trim_chars.getString();
 
-    const start = stringutil.trimLeft(bytes, trim_chars_bytes);
-    const end = stringutil.trimRight(bytes, trim_chars_bytes);
+    const start = strutil.trimLeft(bytes, trim_chars_bytes);
+    const end = strutil.trimRight(bytes, trim_chars_bytes);
 
     if (start == 0 and end == bytes.len) {
         return str;
@@ -968,18 +969,18 @@ pub fn stringIs(
             _ = getBoolean(null, str, new_class_to_check) catch break :blk false;
             break :blk true;
         },
-        .alpha => stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
-        .alnum => stringutil.checkAllAscii(bytes, std.ascii.isAlphanumeric),
-        .ascii => stringutil.checkAllAscii(bytes, std.ascii.isAscii),
-        .digit => stringutil.checkAllAscii(bytes, std.ascii.isDigit),
-        .lower => stringutil.checkAllAscii(bytes, std.ascii.isLower),
-        .upper => stringutil.checkAllAscii(bytes, std.ascii.isUpper),
-        .space => stringutil.checkAllAscii(bytes, std.ascii.isWhitespace),
-        .xdigit => stringutil.checkAllAscii(bytes, stringutil.isHexDigit),
-        .control => stringutil.checkAllAscii(bytes, std.ascii.isControl),
-        .print => stringutil.checkAllAscii(bytes, std.ascii.isPrint),
-        .graph => stringutil.checkAllAscii(bytes, stringutil.isGraph),
-        .punct => stringutil.checkAllAscii(bytes, stringutil.isPunct),
+        .alpha => strutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
+        .alnum => strutil.checkAllAscii(bytes, std.ascii.isAlphanumeric),
+        .ascii => strutil.checkAllAscii(bytes, std.ascii.isAscii),
+        .digit => strutil.checkAllAscii(bytes, std.ascii.isDigit),
+        .lower => strutil.checkAllAscii(bytes, std.ascii.isLower),
+        .upper => strutil.checkAllAscii(bytes, std.ascii.isUpper),
+        .space => strutil.checkAllAscii(bytes, std.ascii.isWhitespace),
+        .xdigit => strutil.checkAllAscii(bytes, strutil.isHexDigit),
+        .control => strutil.checkAllAscii(bytes, std.ascii.isControl),
+        .print => strutil.checkAllAscii(bytes, std.ascii.isPrint),
+        .graph => strutil.checkAllAscii(bytes, strutil.isGraph),
+        .punct => strutil.checkAllAscii(bytes, strutil.isPunct),
     };
 }
 
@@ -2624,7 +2625,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     if (options.token_debugging) {
         for (tokens.items, 0..) |token, i| {
-            std.log.debug("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"", .{
+            ioutil.debug("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"", .{
                 i,
                 token.loc.line_no,
                 @tagName(token.tag),
@@ -2794,7 +2795,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
         .values = new_token_values,
     };
     if (options.token_debugging) {
-        std.log.debug("Dumping tokens\n", .{});
+        ioutil.debug("Dumping tokens\n", .{});
         parsed_script.printTokens();
     }
 

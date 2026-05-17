@@ -10,6 +10,7 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
 const options = @import("options");
+const ioutil = @import("ioutil.zig");
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
@@ -456,13 +457,13 @@ pub const ParsedScript = struct {
             switch (token) {
                 .start_of_command => {
                     line = value.body.parsed_script_command.line;
-                    std.log.debug(formatting ++ "{}", .{ i, line, @tagName(token), value.body.parsed_script_command });
+                    ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.parsed_script_command });
                 },
-                .start_of_word => std.log.debug(formatting ++ "{}", .{ i, line, @tagName(token), value.body.integer }),
+                .start_of_word => ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
                 else => {
                     const item = objutil.listItem(script.values, @intCast(i));
                     const str = item.getString() catch "<oom string>";
-                    std.log.debug(formatting ++ "{s}", .{ i, line, @tagName(token), str });
+                    ioutil.debug(formatting ++ "{s}\n", .{ i, line, @tagName(token), str });
                 },
             }
         }
@@ -1782,7 +1783,7 @@ const ObjectAndMetadata = struct {
     object: Object,
     ref_count: u32,
     metadata: Metadata,
-    trace: std.debug.ConfigurableTrace(30, 16, options.trace_mem),
+    trace: ioutil.ConfigurableTrace(30, 16, options.trace_mem),
 };
 
 /// Used for the big backing objects, such as Heap.objects or Heap.strings.
@@ -1856,7 +1857,7 @@ pub fn init(heap: *Heap) !void {
     // Init objects.
     heap.object_tracking = try .init(global_gpa, global_io, cfg.object_heap_order);
     errdefer if (heap.object_tracking.deinit() == .leaked) {
-        std.debug.print("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
+        ioutil.debug("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
     };
 
     heap.objects = .empty;
@@ -1883,7 +1884,7 @@ pub fn init(heap: *Heap) !void {
     // Init strings.
     heap.string_tracking = try .init(global_gpa, global_io, cfg.string_heap_order);
     errdefer if (heap.string_tracking.deinit() == .leaked) {
-        std.debug.print("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
+        ioutil.debug("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
     };
 
     heap.strings = .empty;
@@ -3558,7 +3559,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
             const handle = heap.getHandle(@intCast(i));
             const str = handle.getString();
             if (str) |val| {
-                std.debug.print("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
+                ioutil.debug("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
                     handle.tag(),
                     i,
                     handle.getMetadata().order,
@@ -3566,7 +3567,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
                     val,
                 });
             } else |_| {
-                std.debug.print("Leaked {}, index {}, order: {}, ref count {}, <oom>\n", .{
+                ioutil.debug("Leaked {}, index {}, order: {}, ref count {}, <oom>\n", .{
                     handle.tag(),
                     i,
                     handle.getMetadata().order,
@@ -3577,20 +3578,20 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
     }
 
     if (options.trace_mem) {
-        std.debug.print("\n===== Leak details =====\n\n", .{});
+        ioutil.debug("\n===== Leak details =====\n\n", .{});
 
         for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
             if (metadata.in_use) {
                 const handle = heap.getHandle(@intCast(i));
                 if (handle.getString()) |val| {
-                    std.debug.print("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
+                    ioutil.debug("Trace for {}, index {}, ref count {}, \"{s}\"\n", .{
                         handle.tag(),
                         i,
                         handle.refCount(),
                         val,
                     });
                 } else |_| {
-                    std.debug.print("Trace for {}, index {}, ref count {}, <oom>\n", .{
+                    ioutil.debug("Trace for {}, index {}, ref count {}, <oom>\n", .{
                         handle.tag(),
                         i,
                         handle.refCount(),
@@ -3599,23 +3600,23 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
 
                 const trace = heap.objects.get(i).trace;
                 trace.dump();
-                if (trace.index > 0) std.debug.print("\n\n", .{});
+                if (trace.index > 0) ioutil.debug("\n\n", .{});
             }
         }
     }
 
-    std.debug.print("Leak dump normal 3\n", .{});
+    ioutil.debug("Leak dump normal 3\n", .{});
 }
 
 // Dot rendering is 95% LLM generated.
 fn escapeDotString(str: []const u8) !void {
     for (str) |c| switch (c) {
-        '"', '\\' => std.debug.print("\\{c}", .{c}),
-        '\n' => std.debug.print("\\n", .{}),
-        '\r' => std.debug.print("\\r", .{}),
-        '\t' => std.debug.print("\\t", .{}),
-        0...8, 11...12, 14...31, 127 => std.debug.print("\\x{X:0>2}", .{c}),
-        else => std.debug.print("{c}", .{c}),
+        '"', '\\' => ioutil.debug("\\{c}", .{c}),
+        '\n' => ioutil.debug("\\n", .{}),
+        '\r' => ioutil.debug("\\r", .{}),
+        '\t' => ioutil.debug("\\t", .{}),
+        0...8, 11...12, 14...31, 127 => ioutil.debug("\\x{X:0>2}", .{c}),
+        else => ioutil.debug("{c}", .{c}),
     };
 }
 
@@ -3640,13 +3641,13 @@ fn renderDotNodeLabel(handle: Handle, index: u32, max_str_len: u32) !void {
     const str = handle.getString() catch "oom";
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
-    std.debug.print("idx: {} | ", .{index});
-    std.debug.print("{s} | ", .{@tagName(handle.tag())});
-    std.debug.print("rc: {} | ", .{handle.refCount()});
-    std.debug.print("\\\"", .{});
+    ioutil.debug("idx: {} | ", .{index});
+    ioutil.debug("{s} | ", .{@tagName(handle.tag())});
+    ioutil.debug("rc: {} | ", .{handle.refCount()});
+    ioutil.debug("\\\"", .{});
     try escapeDotString(truncated_str);
-    if (str.len > max_str_len) std.debug.print("...", .{});
-    std.debug.print("\\\"", .{});
+    if (str.len > max_str_len) ioutil.debug("...", .{});
+    ioutil.debug("\\\"", .{});
 }
 
 fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
@@ -3667,31 +3668,31 @@ fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
     // Subgraph header.
-    std.debug.print("  subgraph cluster_{} {{\n", .{index});
-    std.debug.print("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.refCount(), used_len, allocated_len });
+    ioutil.debug("  subgraph cluster_{} {{\n", .{index});
+    ioutil.debug("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.refCount(), used_len, allocated_len });
     try escapeDotString(truncated_str);
-    if (str.len > max_str_len) std.debug.print("...", .{});
-    std.debug.print("\";\n", .{});
-    std.debug.print("    style=outlined;\n", .{});
-    std.debug.print("    fillcolor=\"{s}\";\n", .{if (handle.tag() == .list) "lightblue1" else "lightgreen1"});
-    std.debug.print("    node [style=filled];\n\n", .{});
+    if (str.len > max_str_len) ioutil.debug("...", .{});
+    ioutil.debug("\";\n", .{});
+    ioutil.debug("    style=outlined;\n", .{});
+    ioutil.debug("    fillcolor=\"{s}\";\n", .{if (handle.tag() == .list) "lightblue1" else "lightgreen1"});
+    ioutil.debug("    node [style=filled];\n\n", .{});
 
     // Collection head node.
-    std.debug.print("    obj{} [label=\"{{", .{index});
-    std.debug.print("HEAD | idx: {} | ", .{index});
-    std.debug.print("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.refCount(), getTagColor(handle.tag()) });
+    ioutil.debug("    obj{} [label=\"{{", .{index});
+    ioutil.debug("HEAD | idx: {} | ", .{index});
+    ioutil.debug("{s} | rc: {}}}\", fillcolor=\"{s}\"];\n", .{ @tagName(handle.tag()), handle.refCount(), getTagColor(handle.tag()) });
 
     // Collection items (all allocated slots, including unused ones).
     for (0..allocated_len) |offset| {
         const item_idx = index + 1 + offset;
         const item_handle = heap.getHandle(@intCast(item_idx));
 
-        std.debug.print("    obj{} [label=\"{{", .{item_idx});
+        ioutil.debug("    obj{} [label=\"{{", .{item_idx});
         try renderDotNodeLabel(item_handle, @intCast(item_idx), max_str_len);
-        std.debug.print("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.tag())});
+        ioutil.debug("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.tag())});
     }
 
-    std.debug.print("  }}\n\n", .{});
+    ioutil.debug("  }}\n\n", .{});
 }
 
 fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
@@ -3702,7 +3703,7 @@ fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
                 const item_handle = objutil.listItemNoFollow(handle, @intCast(item_idx));
-                std.debug.print("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
+                ioutil.debug("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
             }
         },
         .dict => {
@@ -3711,33 +3712,33 @@ fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
                 const key_handle = objutil.dictItem(handle, item_idx);
                 const val_handle = objutil.dictItem(handle, item_idx + 1);
 
-                std.debug.print("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
-                std.debug.print("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
+                ioutil.debug("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
+                ioutil.debug("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });
             }
         },
         .reference => {
             const ref_handle = obj.body.reference;
-            std.debug.print("  obj{} -> obj{} [label=\"ref\", color=red];\n", .{ index, ref_handle.index });
+            ioutil.debug("  obj{} -> obj{} [label=\"ref\", color=red];\n", .{ index, ref_handle.index });
         },
         .source => {
             if (objutil.getSourceInfo(handle).?.file_name.toHandle()) |file_name| {
-                std.debug.print("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name.index });
+                ioutil.debug("  obj{} -> obj{} [label=\"file\"];\n", .{ index, file_name.index });
             }
         },
         .cached_local_var => {
-            std.debug.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
+            ioutil.debug("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, obj.body.cached_local_var.cached_index });
         },
         .cached_lexical_var => {
             const lexical_variable = heap.getExtraData(obj.body.cached_lexical_var.extra_data).lexical_variable;
-            std.debug.print("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, lexical_variable.ref.index });
+            ioutil.debug("  obj{} -> obj{} [label=\"var\", style=dashed];\n", .{ index, lexical_variable.ref.index });
         },
         .dict_sugar => {
-            std.debug.print("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.dict_name_index });
-            std.debug.print("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.path_index });
+            ioutil.debug("  obj{} -> obj{} [label=\"var\"];\n", .{ index, obj.body.dict_sugar.dict_name_index });
+            ioutil.debug("  obj{} -> obj{} [label=\"val\"];\n", .{ index, obj.body.dict_sugar.path_index });
         },
         .upvar_link => {
             const upvar_link = obj.body.upvar_link;
-            std.debug.print(
+            ioutil.debug(
                 "  obj{} -> obj{} [label=\"linked_name\"];\n",
                 .{ index, upvar_link.linked_name },
             );
@@ -3747,10 +3748,10 @@ fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
 }
 
 fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
-    std.debug.print("digraph LeakGraph {{\n", .{});
-    std.debug.print("  rankdir=LR;\n", .{});
-    std.debug.print("  node [shape=record];\n", .{});
-    std.debug.print("  compound=true;\n\n", .{});
+    ioutil.debug("digraph LeakGraph {{\n", .{});
+    ioutil.debug("  rankdir=LR;\n", .{});
+    ioutil.debug("  node [shape=record];\n", .{});
+    ioutil.debug("  compound=true;\n\n", .{});
 
     // First pass: output collections as subgraphs with their items grouped.
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
@@ -3773,12 +3774,12 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         if (handle.tag() == .list or handle.tag() == .dict) continue;
         if (!handle.isAllocHead()) continue;
 
-        std.debug.print("  obj{} [label=\"{{", .{i});
+        ioutil.debug("  obj{} [label=\"{{", .{i});
         try renderDotNodeLabel(handle, @intCast(i), 60);
-        std.debug.print("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(handle.tag())});
+        ioutil.debug("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(handle.tag())});
     }
 
-    std.debug.print("\n", .{});
+    ioutil.debug("\n", .{});
 
     // Third pass: output all edges.
     for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
@@ -3786,7 +3787,7 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         try renderObjectEdges(heap, heap.getHandle(@intCast(i)), @intCast(i));
     }
 
-    std.debug.print("}}\n", .{});
+    ioutil.debug("}}\n", .{});
 }
 
 var already_panicking: std.atomic.Value(bool) = .init(false);

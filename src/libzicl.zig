@@ -206,6 +206,10 @@ export fn Zicl_DeinitAll() callconv(.c) void {
     Heap.deinitAll();
 }
 
+export fn Zicl_LeakCheckAll() callconv(.c) void {
+    Heap.leakCheckAll();
+}
+
 // Interpreter functions.
 export fn Zicl_CreateInterp() callconv(.c) ?*Interp {
     // Store the interpreter on the heap, so it's an opaque pointer.

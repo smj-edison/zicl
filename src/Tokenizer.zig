@@ -10,7 +10,8 @@ const testing = std.testing;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-const stringutil = @import("stringutil.zig");
+const strutil = @import("stringutil.zig");
+const ioutil = @import("ioutil.zig");
 const options = @import("options");
 
 const Tokenizer = @This();
@@ -454,8 +455,7 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
                 self.advance(1);
                 continue;
             }
-            // None of the above, so we've reached the end of this variable
-            // (excluding dictionary sugar, which we'll address next).
+            // None of the above, so we've reached the end of this variable.
             break;
         }
 
@@ -1186,7 +1186,7 @@ test "parser" {
 
 fn testNextToken(parser: *Tokenizer, expected_type: Token.Tag, expected_value: []const u8) !void {
     const next = parser.nextScriptToken() catch |err| {
-        std.debug.print("Error caught when parsing: {}", .{err});
+        ioutil.debug("Error caught when parsing: {}", .{err});
         return error.TestUnexpectedResult;
     };
 

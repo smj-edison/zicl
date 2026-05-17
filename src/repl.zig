@@ -9,5 +9,5 @@ pub fn main() void {
     cp = 0x00DF; // ß
     const res = uucode.get(.uppercase_mapping, cp).with(&buffer, cp);
 
-    std.debug.print("res: {any}.", .{res});
+    ioutil.debug("res: {any}.", .{res});
 }

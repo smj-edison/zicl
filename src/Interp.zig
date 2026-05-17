@@ -3,11 +3,12 @@ const assert = std.debug.assert;
 const testing = std.testing;
 
 const Tokenizer = @import("Tokenizer.zig");
+const objutil = @import("objutil.zig");
+const memutil = @import("memutil.zig");
+const ioutil = @import("ioutil.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
-const objutil = @import("objutil.zig");
-const memutil = @import("memutil.zig");
 const expr_parse = @import("expr_parse.zig");
 
 const Interp = @This();
@@ -1260,8 +1261,6 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     const has_args: bool = closure.has_args_parameter;
     const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
     if (too_few_arguments or too_many_arguments) {
-        std.log.debug("Too few arguments? {} Too many arguments? {}\n", .{ too_few_arguments, too_many_arguments });
-
         // Wrong argument count, error accordingly.
         var sf = std.heap.stackFallback(64, Heap.global_gpa);
         const scratch = sf.get();
@@ -2502,9 +2501,7 @@ test "eval expression" {
 
     var expr = try objutil.newStringInner(heap, "5 + 10");
     defer expr.decrRefCount();
-    var new_expr: OptionalHandle = .none;
-    const result = try interp.evalExpression(expr, &new_expr);
-    expr.swapIfNew(new_expr);
+    const result = try interp.evalExpression(expr);
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
 }
 
@@ -3466,8 +3463,8 @@ pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []c
     if (result) |success| {
         try testing.expectEqualStrings(expected, try success.getString());
     } else |err| {
-        std.debug.print("Test failed with zig error {}", .{err});
-        std.debug.print(" and error message \"{f}\"\n", .{interp.result});
+        ioutil.debug("Test failed with zig error {}", .{err});
+        ioutil.debug(" and error message \"{f}\"\n", .{interp.result});
         return err;
     }
 }

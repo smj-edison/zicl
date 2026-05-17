@@ -25,6 +25,7 @@ void Zicl_SetGlobalStderr(int fd);
 int Zicl_InitGlobals(void);
 int Zicl_InitLocalHeap(void);
 void Zicl_DeinitAll(void);
+void Zicl_LeakCheckAll(void);
 
 Zicl_Interp *Zicl_CreateInterp(void);
 void Zicl_InterpDestroy(Zicl_Interp *interp);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ioutil = @import("ioutil.zig");
 const objutil = @import("objutil.zig");
 const Heap = @import("Heap.zig");
 const Interp = @import("Interp.zig");
@@ -52,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         const str_handle = try objutil.newString(line_read.items);
         defer str_handle.decrRefCount();
         interp.evalObject(str_handle) catch |err| {
-            std.debug.print("Error code: {s}\n", .{@errorName(err)});
+            ioutil.debug("Error code: {s}\n", .{@errorName(err)});
         };
         try stdout.writeAll(try interp.result.getString());
         try stdout.writeAll("\n");

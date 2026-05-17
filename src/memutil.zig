@@ -11,6 +11,7 @@ const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
 const options = @import("options");
+const ioutil = @import("ioutil.zig");
 
 /// Uses blake3 to make a hash that, in theory, should never
 /// overlap with any other byte string.
@@ -151,10 +152,10 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             }
 
             if (leaked) {
-                std.debug.print("Heap alloc counts: {any}\n", .{self.alloc_count});
+                ioutil.debug("Heap alloc counts: {any}\n", .{self.alloc_count});
                 for (self.free_lists[0..], 0..) |free_list, order| {
                     if (free_list.count() > 0) {
-                        std.debug.print("Free list for order {}: {any}\n", .{ order, free_list.entries.items(.key) });
+                        ioutil.debug("Free list for order {}: {any}\n", .{ order, free_list.entries.items(.key) });
                     }
                 }
             }
@@ -361,11 +362,11 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
         }
 
         fn print_buddy_state(self: Self, beginning: []const u8) void {
-            std.debug.print("{s}", .{beginning});
+            ioutil.debug("{s}", .{beginning});
             for (0..self.free_lists.len) |order| {
-                std.debug.print("Order: {} ({any}), ", .{ order, self.free_lists[order].items });
+                ioutil.debug("Order: {} ({any}), ", .{ order, self.free_lists[order].items });
             }
-            std.debug.print("\n", .{});
+            ioutil.debug("\n", .{});
         }
     };
 }
@@ -674,7 +675,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
 
             for (0..self.len) |i| {
                 if (!not_leaked.contains(i)) {
-                    std.debug.print(fmt, .{ i, self.items[i] });
+                    ioutil.debug(fmt, .{ i, self.items[i] });
                 }
             }
         }

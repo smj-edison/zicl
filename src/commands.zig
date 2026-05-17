@@ -665,7 +665,7 @@ test "loop commands" {
     );
 
     // [foreach] continue inside foreach.
-    try interp.testExpectScriptResult("9",
+    try interp.testExpectScriptResult("12",
         \\ set sum 0
         \\ foreach i {1 2 3 4 5} {
         \\   if {$i == 3} { continue }
@@ -2017,6 +2017,7 @@ pub fn errorCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     if (args.len >= 3) {
         // Store the error code so [catch]/[try] can pick it up.
+        try interp.shimmerToList(&args[2]);
         interp.pending_error_code.swapRef(args[2].borrow());
     }
 
