@@ -391,6 +391,10 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 interp.setResult(dict);
             }
         },
+        .exists => {
+            const dict = &args[2];
+            try interp.setResultBoolean((try interp.getDictValueRecursively(dict, args[3..])) != .none);
+        },
         .merge => {
             const dicts = args[2..];
 
