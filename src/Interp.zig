@@ -1944,6 +1944,26 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
     }
 }
 
+pub const IntegerOrFloat = union(enum) {
+    int: i64,
+    float: f64,
+};
+pub fn getIntegerOrFloat(interp: *Interp, handle: *Handle) !IntegerOrFloat {
+    if (handle.tag() == .integer) {
+        return .{ .int = handle.peek().body.integer };
+    } else if (handle.tag() == .float) {
+        return .{ .float = handle.peek().body.float };
+    }
+
+    var new_handle: OptionalHandle = .none;
+    const int_result = objutil.integerGet(null, handle.*, &new_handle) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .float = try interp.getFloat(handle) },
+    };
+    handle.swapIfNew(new_handle);
+    return .{ .int = int_result };
+}
+
 fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
     switch (result.*) {
         .int => |int| return int != 0,
@@ -1964,28 +1984,16 @@ fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
     switch (result.*) {
         .int, .float => return result.*,
         .owned_handle => |string| {
-            var new_handle: OptionalHandle = .none;
-            const int_result = objutil.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    // Try parsing it as a float.
-                    return .{ .float = try interp.getFloat(string) };
-                },
-            };
-            string.swapIfNew(new_handle);
-            return .{ .int = int_result };
+            switch (try getIntegerOrFloat(interp, string)) {
+                .int => |val| return .{ .int = val },
+                .float => |val| return .{ .float = val },
+            }
         },
         .stack_handle => |*string| {
-            var new_handle: OptionalHandle = .none;
-            const int_result = objutil.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    // Try parsing it as a float.
-                    return .{ .float = try interp.getFloat(string) };
-                },
-            };
-            string.swapIfNew(new_handle);
-            return .{ .int = int_result };
+            switch (try getIntegerOrFloat(interp, string)) {
+                .int => |val| return .{ .int = val },
+                .float => |val| return .{ .float = val },
+            }
         },
     }
 }
@@ -2813,12 +2821,9 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
 
                 if (argument_expansion) {
                     // Argument expansion, so we'll need to shimmer the result to a list.
-                    det = undefined;
-                    var new_list: OptionalHandle = .none;
-                    const len = try wrapError(interp, &det, objutil.listLength(&det, resultant_word, &new_list));
-                    resultant_word.swapIfNew(new_list);
-                    // Free the list backing without running destructors, since we're going to steal the items
-                    // directly from the list.
+                    const len = try interp.getListLength(&resultant_word);
+                    // Free the list backing without running destructors, since we're going to
+                    // borrow all of its items.
                     defer resultant_word.decrRefCount();
 
                     if (len > 1) {

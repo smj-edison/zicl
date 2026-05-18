@@ -106,6 +106,7 @@ anything that might already exist.
 - `convertTokenizerError(heap, err)` -- Convert a `Tokenizer.Error` into a heap-allocated `ErrorDetails`.
 - `createHashReference(referent)` -- Create a new `.hash_reference` object pointing to the given referent.
 - `shimmerToHashReference(det, original, new)` -- Shimmer a handle to a hash reference, resolving the hash string to a registered object.
+- `shimmerToRegexp(det, original, new, compile_opts)` -- Shimmer to `.regexp`; compiles the string rep as a PCRE2 regex.
 
 ### Enums
 - `enumNames(T)` -- Comptime: return enum variant names joined by `", "`.
@@ -161,6 +162,10 @@ anything that might already exist.
 - `handle.swapIntermediate(provided_handle, maybe_new)` -- Like `swapIfNew`, but releases the old only if it differs from `provided_handle` (safe when ref and provided may alias).
 - `handle.dupOrRef()` -- Duplicate or create a `.reference` using the local heap (shorthand for `local_heap.dupOrReference(handle)`).
 - `handle.makeCrossthread()` -- Recursively mark a handle and all its children as cross-thread safe.
+- `handle.equalsString(value)` -- Compare a handle's string rep to a byte slice for equality.
+- `handle.referenceOwning()` -- Create a `.reference` object without incrementing ref count (returns raw `Object`).
+- `handle.getHashNoRegister()` -- Return a `u256` content hash without registering in the hash registry.
+- `handle.getRegexpExtraData()` -- Access the `.regexp` extra data pointer.
 
 ### OptionalHandle operations
 - `optional.toHandle()` -- Convert to `?Handle`.
@@ -174,6 +179,13 @@ anything that might already exist.
 - `optional.borrowOptional()` -- Borrow the contained handle (nop if none).
 - `optional.decrOptional()` -- Decrement ref count if non-null.
 - `optional.makeCrossthread()` -- Mark the contained handle (if any) as cross-thread safe.
+- `optional.fromHandle(handle)` -- Convert `?Handle` to `OptionalHandle`.
+- `optional.incrOptional()` -- Increment ref count if non-null (no return value).
+
+### Object operations
+- `Object.deinitSingle(obj, heap)` -- Free a single object and its backing storage.
+- `Object.deinitString(obj, heap)` -- Free only the string representation of an object.
+- `Object.deinitBodySingle(obj, heap)` -- Free only the body/backing storage of an object.
 
 ### Heap-level operations
 - `Heap.ensureMutableOrDup(handle, new_handle)` -- Duplicate if the handle cannot be mutated in-place.
@@ -375,6 +387,10 @@ anything that might already exist.
 ### Commands
 - `registerCommand(interp, name, call_info)` -- Register a native Zig function as a Tcl command.
 - `getCommand(interp, name, ...)` -- Look up a registered command by name; returns null if not found.
+- `NativeCommand.getUsageInfo(command, gpa, command_name)` -- Build a usage string for a command.
+- `NativeCommand.minArity(command)` -- Return minimum required argument count.
+- `NativeCommand.maxArity(command)` -- Return maximum allowed argument count (null if unlimited).
+- `NativeCommand.multipleOf(command)` -- Return argument count multiple requirement (null if none).
 
 ### Variables
 - `setVariableTo(interp, name, handle)` -- Set a variable by name to a handle, handling upvar links.
@@ -421,6 +437,7 @@ anything that might already exist.
 ### Closures
 - `parseClosure(det, bytes)` -- Parse a closure definition from raw bytes; returns `Heap.Closure`.
 - `parseClosureArgList(det, args)` -- Parse a closure argument-list handle into a `ParsedArgList`.
+- `ParsedArgList.deinit(self)` -- Free a parsed closure argument list.
 - `createClosureObject(closure)` -- Wrap a `Heap.Closure` in a heap handle.
 - `getClosure(interp, handle)` -- Extract a `Closure` and its cache key from a handle.
 - `callClosure(interp, closure, cache_key, args)` -- Invoke a closure with the given argument handles.
@@ -432,6 +449,11 @@ anything that might already exist.
 ### ExprResult
 - `ExprResult.release(result)` -- Release an expression result (decrements ref count if it holds a handle).
 - `ExprResult.toObject(result)` -- Convert an expression result to a heap handle (may allocate).
+
+### ReturnCode
+- `ReturnCode.fromErrorUnion(value)` -- Convert `Error!void` to a `ReturnCode`.
+- `ReturnCode.fromError(err)` -- Convert an `Error` to a `ReturnCode`.
+- `ReturnCode.toError(self)` -- Convert a `ReturnCode` back to `Error!void`.
 
 ### Testing helpers
 - `testExpectScriptResult(interp, expected, script)` -- Assert `script` evaluates to `expected` string.

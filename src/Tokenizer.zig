@@ -242,6 +242,13 @@ pub fn nextScriptToken(self: *Tokenizer) Error!Token {
     }
 }
 
+const SubstFlags = packed struct {
+    command_subst: bool = true,
+    variable_subst: bool = true,
+    
+};
+pub fn nextSubstToken(self: *Tokenizer, flags: )
+
 pub fn nextStringToken(self: *Tokenizer) !Token {
     switch (self.last_token_type) {
         .none, .word_separator, .command_separator, .argument_expansion => {

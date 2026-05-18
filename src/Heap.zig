@@ -671,6 +671,7 @@ pub const Tag = enum(u5) {
     custom_type,
     hash_reference,
     regexp,
+    subst,
 };
 
 pub const Body = packed union(u64) {
@@ -764,6 +765,7 @@ pub const Body = packed union(u64) {
         options: u32,
         extra_data: ExtraData,
     },
+    subst: packed struct { extra_data: ExtraData, padding: u32 = 0 },
 };
 
 comptime {

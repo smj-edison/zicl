@@ -78,37 +78,14 @@ fn addMulHelper(interp: *Interp, args: []Handle, comptime operator: enum { add, 
         };
     }
 
-    interp.setResultOwning(try objutil.newFloat(result));
+    try interp.setResultFloat(result);
 }
 
-const IntegerOrFloat = union(enum) {
-    int: i64,
-    float: f64,
-};
 fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, div }) Interp.Error!void {
     if (args.len == 2) {
         // The arity = 2 case is different. For [- x] returns -x,
         // while [/ x] returns 1/x.
-        const value: IntegerOrFloat = blk: {
-            if (args[1].tag() == .integer) {
-                break :blk .{ .int = args[1].peek().body.integer };
-            } else if (args[1].tag() == .float) {
-                break :blk .{ .float = args[1].peek().body.float };
-            }
-
-            var new_handle: OptionalHandle = .none;
-            const as_int = objutil.integerGet(null, args[1], &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.IntegerOverflow, error.BadInteger => {
-                    // Try parsing it as a float if it's not an integer.
-                    assert(new_handle == .none);
-                    break :blk .{ .float = try interp.getFloat(&args[1]) };
-                },
-            };
-            args[1].swapIfNew(new_handle);
-
-            break :blk .{ .int = as_int };
-        };
+        const value = try interp.getIntegerOrFloat(&args[1]);
 
         switch (operator) {
             .sub => {
@@ -221,7 +198,7 @@ fn subDivHelper(interp: *Interp, args: []Handle, comptime operator: enum { sub, 
         };
     }
 
-    interp.setResultOwning(try objutil.newFloat(result));
+    try interp.setResultFloat(result);
 }
 
 pub fn addCmd(interp: *Interp, args: []Handle) Interp.Error!void {
@@ -438,9 +415,7 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 while (pair_i < pair_count) : (pair_i += 1) {
                     const k = objutil.dictItemFollowRefs(dict, pair_i * 2);
                     const v = objutil.dictItemFollowRefs(dict, pair_i * 2 + 1);
-                    var new: OptionalHandle = .none;
-                    _ = try objutil.dictPut(result, &new, k, v);
-                    result.swapIfNew(new);
+                    _ = try interp.putDictValueInPlace(&result, k, v);
                 }
             }
 
@@ -790,21 +765,14 @@ pub fn incrCmd(interp: *Interp, args: []Handle) !void {
         if (val.canMutate()) {
             // Can modify directly.
             val.invalidateBoth();
-            val.peek().head.tag = .integer;
-            val.peek().body = .{ .integer = new_contents };
+            val.peek().* = objutil.integerObject(new_contents);
             interp.setResult(val);
         } else {
-            try interp.setVariableToObject(var_name, .{
-                .head = .{ .str = Heap.Object.null_string, .tag = .integer },
-                .body = .{ .integer = new_contents },
-            });
+            try interp.setVariableToObject(var_name, objutil.integerObject(new_contents));
             interp.setResult((interp.getVariable(var_name) catch unreachable).toHandle().?);
         }
     } else {
-        try interp.setVariableToObject(var_name, .{
-            .head = .{ .str = Heap.Object.null_string, .tag = .integer },
-            .body = .{ .integer = increment_by },
-        });
+        try interp.setVariableToObject(var_name, objutil.integerObject(increment_by));
         interp.setResult((try interp.getVariable(var_name)).toHandle().?);
     }
 }
@@ -1080,9 +1048,7 @@ pub fn stringCmd(interp: *Interp, args: []Handle) !void {
                 try interp.setResultString(result.items);
             },
             .index => {
-                var new_str: OptionalHandle = .none;
-                const codepoint_len = try objutil.getCodepointLength(sub_args[0], &new_str);
-                sub_args[0].swapIfNew(new_str);
+                const codepoint_len = try interp.getCodepointLength(&sub_args[0]);
                 const bytes = try sub_args[0].getString();
                 const index = try interp.getIndex(&sub_args[1]);
 
@@ -2137,18 +2103,18 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         .dirname => {
             const path = try args[2].getString();
             const dir = std.Io.Dir.path.dirname(path) orelse ".";
-            interp.setResultOwning(try objutil.newString(dir));
+            try interp.setResultString(dir);
         },
         .tail => {
             const path = try args[2].getString();
             const base = std.Io.Dir.path.basename(path);
-            interp.setResultOwning(try objutil.newString(base));
+            try interp.setResultString(base);
         },
         .rootname => {
             const path = try args[2].getString();
             const ext = std.Io.Dir.path.extension(path);
             const root = if (ext.len > 0) path[0 .. path.len - ext.len] else path;
-            interp.setResultOwning(try objutil.newString(root));
+            try interp.setResultString(root);
         },
         .join => {
             var path_parts: std.ArrayList([]const u8) = .empty;
@@ -2158,7 +2124,7 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             }
             const joined = try std.Io.Dir.path.join(Heap.global_gpa, path_parts.items);
             defer Heap.global_gpa.free(joined);
-            interp.setResultOwning(try objutil.newString(joined));
+            try interp.setResultString(joined);
         },
         .mkdir => {
             const path = try args[2].getString();
@@ -2221,7 +2187,7 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 try interp.setResultFormatted("could not read link: {s}", .{@errorName(err)});
                 return error.EvalError;
             };
-            interp.setResultOwning(try objutil.newString(buf[0..len]));
+            try interp.setResultString(buf[0..len]);
         },
         .tempfile => std.debug.panic("tempfile not fully implemented", .{}),
     }
@@ -2355,7 +2321,7 @@ pub fn infoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 try interp.setResultFormatted("could not get hostname: {s}", .{@errorName(err)});
                 return error.EvalError;
             };
-            interp.setResultOwning(try objutil.newString(name));
+            try interp.setResultString(name);
         },
     }
 }
