@@ -508,12 +508,15 @@ pub fn setVariableUpvarInner(
     const target_name_bytes = try target_name.getString();
 
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) |_| {
-        // Variable already exists.
-        if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt("variable \"{s}\" already exists", .{name_bytes}),
-        };
+        if (name.tag() == .cached_local_var) {
+            // Variable already exists.
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt("variable \"{s}\" already exists", .{name_bytes}),
+            };
 
-        return error.VariableAlreadyExists;
+            return error.VariableAlreadyExists;
+        }
+        // Else fall through, as we can shadow a lexical variable.
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.LinkLookupFailed => {
@@ -1708,7 +1711,6 @@ fn interpolateTokens(
     value_list: Handle,
     value_start: u32,
     value_len: u32,
-    substitution_only: bool,
 ) !Handle {
     var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
     const tokens_alloc = sf.get();
@@ -1721,38 +1723,16 @@ fn interpolateTokens(
     for (tags, value_start..(value_start + value_len)) |tag, value_index| {
         if (interp.substituteOneToken(tag, objutil.listItem(value_list, @intCast(value_index)))) |new_value| {
             new_values.appendAssumeCapacity(new_value);
-        } else |err| {
-            // Due to the error, we're actually going to return early, after we take care
-            // of giving a useful error to the user.
-            var new_err = err;
-
-            if (substitution_only) {
-                switch (err) {
-                    error.Break => {
-                        // Stop here.
-                        break;
-                    },
-                    error.Continue => {
-                        new_values.appendAssumeCapacity(Heap.local_heap.emptyHandle());
-                        continue;
-                    },
-                    else => {},
-                }
-            } else {
-                switch (err) {
-                    error.Break => {
-                        try interp.setResultString("invoked \"break\" outside of a loop");
-                        new_err = error.EvalError;
-                    },
-                    error.Continue => {
-                        try interp.setResultString("invoked \"continue\" outside of a loop");
-                        new_err = error.EvalError;
-                    },
-                    else => {},
-                }
-            }
-
-            return new_err;
+        } else |err| switch (err) {
+            error.Break => {
+                try interp.setResultString("invoked \"break\" outside of a loop");
+                return error.EvalError;
+            },
+            error.Continue => {
+                try interp.setResultString("invoked \"continue\" outside of a loop");
+                return error.EvalError;
+            },
+            else => return err,
         }
     }
 
@@ -2474,7 +2454,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
 }
 
 pub fn evalExpression(interp: *Interp, handle: Handle) !ExprResult {
-    // Combine the call frame's cache ID with the expression's content
+    // Combine the signature's cache id with the expression's content
     // hash, so identical expressions at different call sites get their
     // own cached variable lookups.
     var det: objutil.ErrorDetails = undefined;
@@ -2511,6 +2491,22 @@ test "eval expression" {
     defer expr.decrRefCount();
     const result = try interp.evalExpression(expr);
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
+}
+
+pub fn evalSubstitution(interp: *Interp, handle: Handle, flags: Tokenizer.SubstFlags) !Handle {
+    var cache_key: u256 = try handle.getHashNoRegister();
+    // Combine the signature's cache id with the expression's content
+    // hash, so identical expressions at different call sites get their
+    // own cached variable lookups.
+    cache_key ^= @as(u256, interp.callFrame().signature.cache_id);
+    // Also make sure to include the flags in the cache id.
+    cache_key ^= @as(u256, @as(u3, @bitCast(flags))) << @sizeOf(@TypeOf(interp.callFrame().signature.cache_id));
+
+    var det: objutil.ErrorDetails = undefined;
+    const subst: Heap.Substitution = try interp.wrapError(&det, objutil.getSubstitution(&det, handle, cache_key, flags));
+    assert(subst.flags == flags); // Integrity check.
+
+    return try interp.interpolateTokens(subst.subst.tags.items, subst.subst.values, 0, @intCast(subst.subst.tags.items.len));
 }
 
 pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
@@ -2812,7 +2808,6 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
                             parsed.values,
                             word_token_i,
                             word_parts,
-                            false,
                         );
                         word_token_i += word_parts;
                         break :blk res;
@@ -3476,13 +3471,15 @@ pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []c
 
 pub fn testExpectScriptError(interp: *Interp, expected_error: anyerror, expected_str: []const u8, script: []const u8) !void {
     if (testRunScript(interp, script)) |_| {
+        ioutil.debug("Expected error {}, but got success\n", .{expected_error});
         return error.TestUnexpectedResult;
     } else |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         const error_str = try interp.result.getString();
-        if (err == expected_error and std.mem.eql(u8, expected_str, error_str)) {
-            // All good!
+        if (err == expected_error) {
+            try testing.expectEqualStrings(expected_str, error_str);
         } else {
+            ioutil.debug("Expected error {}, but got {} instead\n", .{ expected_error, err });
             return error.TestUnexpectedResult;
         }
     }

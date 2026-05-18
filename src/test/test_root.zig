@@ -9,4 +9,5 @@ test {
     _ = @import("strings.zig");
     _ = @import("try_catch.zig");
     _ = @import("variables.zig");
+    _ = @import("subst.zig");
 }

@@ -36,9 +36,11 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
     defer unlockStderr();
     var buffer: [64]u8 = undefined;
     var writer = stderr.writer(Heap.global_io, &buffer);
+    defer writer.flush() catch {};
     writer.interface.print(fmt, args) catch return;
 }
 
+/// This is mostly copied from std.debug.ConfigurableTrace.
 pub fn ConfigurableTrace(comptime size: usize, comptime stack_frame_count: usize, comptime is_enabled: bool) type {
     return struct {
         addrs: [actual_size][stack_frame_count]usize,
@@ -72,14 +74,21 @@ pub fn ConfigurableTrace(comptime size: usize, comptime stack_frame_count: usize
         pub fn addAddr(t: *@This(), addr: usize, note: []const u8) void {
             if (!enabled) return;
 
-            if (t.index < size) {
-                t.notes[t.index] = note;
-                const addrs = &t.addrs[t.index];
-                const st = std.debug.captureCurrentStackTrace(.{ .first_address = addr }, addrs);
-                if (st.return_addresses.len < addrs.len) {
-                    @memset(addrs[st.return_addresses.len..], 0); // zero unused frames to indicate end of trace
-                }
+            const index_to_use = if (t.index >= size) blk: {
+                // Shift out the last value, so we can fit the new one. In my experience, the most
+                // recent traces are the most useful.
+                @memmove(t.notes[0..(size - 1)], t.notes[1..]);
+                @memmove(t.addrs[0..(size - 1)], t.addrs[1..]);
+                break :blk size - 1;
+            } else t.index;
+
+            t.notes[index_to_use] = note;
+            const addrs = &t.addrs[index_to_use];
+            const st = std.debug.captureCurrentStackTrace(.{ .first_address = addr }, addrs);
+            if (st.return_addresses.len < addrs.len) {
+                @memset(addrs[st.return_addresses.len..], 0); // zero unused frames to indicate end of trace
             }
+
             // Keep counting even if the end is reached so that the
             // user can find out how much more size they need.
             t.index += 1;
@@ -92,10 +101,8 @@ pub fn ConfigurableTrace(comptime size: usize, comptime stack_frame_count: usize
             defer unlockStderr();
             var buffer: [64]u8 = undefined;
             var writer = stderr.writer(Heap.global_io, &buffer);
-            var terminal: Io.Terminal = .{
-                .writer = &writer.interface,
-                .mode = .escape_codes,
-            };
+            defer writer.flush() catch {};
+            var terminal: Io.Terminal = .{ .writer = &writer.interface, .mode = .escape_codes };
             terminal.setColor(.reset) catch return;
             const end = @min(t.index, size);
             for (t.addrs[0..end], 0..) |frames_array, i| {
@@ -110,7 +117,7 @@ pub fn ConfigurableTrace(comptime size: usize, comptime stack_frame_count: usize
                 std.debug.writeStackTrace(&stack_trace, terminal) catch return;
             }
             if (t.index > end) {
-                terminal.writer.print("{d} more traces not shown; consider increasing trace size\n", .{
+                terminal.writer.print("{d} traces dropped; consider increasing trace size\n", .{
                     t.index - end,
                 }) catch return;
             }

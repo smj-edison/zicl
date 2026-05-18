@@ -282,6 +282,7 @@ extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
 parsed_exprs: ParsedExpressions,
 parsed_closures: ParsedClosures,
+parsed_substs: ParsedSubstitutions,
 
 pub const HeapId = u16;
 
@@ -312,6 +313,12 @@ const FullHashContext = struct {
 const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
 const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
 const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullHashContext);
+pub const Substitution = struct {
+    subst: ParsedScript,
+    /// Mainly used for integrity checks.
+    flags: Tokenizer.SubstFlags,
+};
+const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
 
 pub const InternedString = enum {
     @"apply lambdaExpr",
@@ -671,7 +678,6 @@ pub const Tag = enum(u5) {
     custom_type,
     hash_reference,
     regexp,
-    subst,
 };
 
 pub const Body = packed union(u64) {
@@ -765,7 +771,6 @@ pub const Body = packed union(u64) {
         options: u32,
         extra_data: ExtraData,
     },
-    subst: packed struct { extra_data: ExtraData, padding: u32 = 0 },
 };
 
 comptime {
@@ -1916,6 +1921,8 @@ pub fn init(heap: *Heap) !void {
     errdefer heap.parsed_exprs.deinit(global_gpa);
     heap.parsed_closures = try .initWithCapacity(global_gpa, cfg.cache_size);
     errdefer heap.parsed_closures.deinit(global_gpa);
+    heap.parsed_substs = try .initWithCapacity(global_gpa, cfg.cache_size);
+    errdefer heap.parsed_substs.deinit(global_gpa);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
@@ -1983,6 +1990,12 @@ fn clearParsedScripts(self: *Heap) void {
         entry.closure.deinit();
     }
     self.parsed_closures.clearRetainingCapacity();
+
+    var parsed_substs_iter = self.parsed_substs.valueIterator();
+    while (parsed_substs_iter.next()) |entry| {
+        entry.subst.deinit();
+    }
+    self.parsed_substs.clearRetainingCapacity();
 }
 
 pub fn deinit(heap: *Heap) void {
@@ -1991,6 +2004,7 @@ pub fn deinit(heap: *Heap) void {
     heap.parsed_scripts.deinit(global_gpa);
     heap.parsed_exprs.deinit(global_gpa);
     heap.parsed_closures.deinit(global_gpa);
+    heap.parsed_substs.deinit(global_gpa);
 
     for ((special_object_count + interned_string_count)..heap.objects.len) |i| {
         const metadata = heap.objects.get(i).metadata;
@@ -2735,9 +2749,9 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
 }
 
 const hash_prepend = "blake3^";
-const hash_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789~.";
-const hash_encoder = std.base64.Base64Encoder.init(hash_chars.*, null);
-const hash_decoder = std.base64.Base64Decoder.init(hash_chars.*, null);
+const hash_chars = std.base64.url_safe_alphabet_chars;
+const hash_encoder = std.base64.Base64Encoder.init(hash_chars, null);
+const hash_decoder = std.base64.Base64Decoder.init(hash_chars, null);
 const hash_len = hash_encoder.calcSize(32);
 const hash_and_prepend_len = hash_prepend.len + hash_len;
 fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u256) {
@@ -3839,8 +3853,12 @@ pub export fn dumpLastTouchedTrace(fd: i32) void {
         const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
         printLastTouchedTrace(terminal) catch {};
     } else {
-        const stderr = std.debug.lockStderr(&.{}).terminal();
-        defer std.debug.unlockStderr();
-        printLastTouchedTrace(stderr) catch {};
+        const stderr = ioutil.lockStderr();
+        defer ioutil.unlockStderr();
+        var buffer: [64]u8 = undefined;
+        var writer = stderr.writer(Heap.global_io, &buffer);
+        defer writer.flush() catch {};
+        const terminal: std.Io.Terminal = .{ .writer = &writer.interface, .mode = .escape_codes };
+        printLastTouchedTrace(terminal) catch {};
     }
 }

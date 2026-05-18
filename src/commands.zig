@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const assert = std.debug.assert;
 
+const Tokenizer = @import("Tokenizer.zig");
 const strutil = @import("strutil.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
@@ -1209,6 +1210,33 @@ pub fn joinCmd(interp: *Interp, args: []Handle) !void {
     try interp.setResultString(buf.items);
 }
 
+pub fn substCmd(interp: *Interp, args: []Handle) !void {
+    var flags: Tokenizer.SubstFlags = .{
+        .command_subst = true,
+        .variable_subst = true,
+        .escape_subst = true,
+    };
+
+    for (1..(args.len - 1)) |arg_index| {
+        if (try args[arg_index].equalsString("-nocommands")) {
+            flags.command_subst = false;
+        } else if (try args[arg_index].equalsString("-novariables")) {
+            flags.variable_subst = false;
+        } else if (try args[arg_index].equalsString("-nobackslashes")) {
+            flags.escape_subst = false;
+        }
+
+        try interp.setResultFormatted(
+            "bad option \"{f}\": must be -nocommands, -novariables, or -nobackslashes",
+            .{args[arg_index]},
+        );
+        return error.EvalError;
+    }
+
+    const to_substitute = args[args.len - 1];
+    interp.setResultOwning(try interp.evalSubstitution(to_substitute, flags));
+}
+
 pub fn launderCmd(interp: *Interp, args: []Handle) !void {
     const str = try args[1].getString();
     try interp.setResultString(str);
@@ -2401,6 +2429,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
     try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
+    try registerCommand(interp, "subst", substCmd, "?options? string", 1, 4, null);
     try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
     try registerCommand(interp, "tailcall", tallcallCommand, "command ?arg ...?", 1, null, null);
     try registerCommand(interp, "try", tryCmd, "script ?handler ...? ?finally body?", 1, null, null);

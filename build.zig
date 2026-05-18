@@ -103,6 +103,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lz_mod,
         .use_llvm = use_llvm,
     });
+    lz.bundle_compiler_rt = true;
     const install_header = b.addInstallFile(b.path("include/libzicl.h"), "include/libzicl.h");
     b.getInstallStep().dependOn(&install_header.step);
 

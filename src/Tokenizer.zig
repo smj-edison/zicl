@@ -191,17 +191,16 @@ pub fn nextScriptToken(self: *Tokenizer) Error!Token {
                 },
                 '$' => {
                     self.comment_possible = false;
-                    break :blk self.nextVariableToken() catch |err| {
-                        if (err == Error.NotVariable) {
+                    break :blk self.nextVariableToken() catch |err| switch (err) {
+                        error.NotVariable => {
                             // An orphan '$'. Create a token for it.
                             var token = self.newToken();
                             token.tag = .simple_string;
                             self.advance(1);
                             token.loc.end = self.index;
                             break :blk token;
-                        } else {
-                            return err;
-                        }
+                        },
+                        else => return err,
                     };
                 },
                 '#' => {
@@ -219,9 +218,9 @@ pub fn nextScriptToken(self: *Tokenizer) Error!Token {
         break :blk null;
     };
 
-    if (token) |unwrapped| {
-        self.last_token_type = unwrapped.tag;
-        return unwrapped;
+    if (token) |val| {
+        self.last_token_type = val.tag;
+        return val;
     } else {
         // If nothing was returned, it means we've reached the end of the file.
 
@@ -242,12 +241,51 @@ pub fn nextScriptToken(self: *Tokenizer) Error!Token {
     }
 }
 
-const SubstFlags = packed struct {
+pub const SubstFlags = packed struct(u3) {
     command_subst: bool = true,
     variable_subst: bool = true,
-    
+    escape_subst: bool = true,
 };
-pub fn nextSubstToken(self: *Tokenizer, flags: )
+pub fn nextSubstToken(self: *Tokenizer, flags: SubstFlags) !Token {
+    if (self.atEnd()) return .{
+        .tag = .end_of_file,
+        .loc = .{
+            .start = self.index,
+            .end = self.index,
+            .line_no = self.line_no,
+        },
+    };
+
+    var token = self.newToken();
+    token.tag = .simple_string;
+
+    const char = self.current();
+    if (char == '[' and flags.command_subst) return self.nextCommandToken();
+    if (char == '$' and flags.variable_subst) {
+        return self.nextVariableToken() catch |err| switch (err) {
+            error.NotVariable => {
+                // An orphan '$'. Create a token for it.
+                token.tag = .simple_string;
+                self.advance(1);
+                token.loc.end = self.index;
+                return token;
+            },
+            else => return err,
+        };
+    }
+
+    while (!self.atEnd()) : (self.advance(1)) {
+        if (self.current() == '[' and flags.command_subst) break;
+        if (self.current() == '$' and flags.variable_subst) break;
+        if (self.current() == '\\' and flags.escape_subst and self.peek(1) != null) {
+            token.tag = .escaped_string;
+            self.advance(1);
+        }
+    }
+
+    token.loc.end = self.index;
+    return token;
+}
 
 pub fn nextStringToken(self: *Tokenizer) !Token {
     switch (self.last_token_type) {
@@ -1131,7 +1169,7 @@ fn startsWith(self: *Tokenizer, str: []const u8) bool {
 }
 
 fn atEnd(self: *Tokenizer) bool {
-    return self.index == self.buffer.len;
+    return self.index >= self.buffer.len;
 }
 
 test "parser" {
