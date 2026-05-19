@@ -8,7 +8,6 @@ const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const memutil = @import("memutil.zig");
-const expr_parse = @import("expr_parse.zig");
 
 const Interp = @This();
 /// The result from a procedure or eval call
@@ -437,9 +436,13 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     const closure_value = try objutil.newString(Heap.local_heap, bytes[8..]);
     defer closure_value.decrRefCount();
 
-    const name = try objutil.dictLookupFollowRefs(closure_value, Heap.local_heap.getInternedString(.name));
-    const impl_raw = try objutil.dictLookupFollowRefs(closure_value, Heap.local_heap.getInternedString(.impl));
-    const scope = try objutil.dictLookupFollowRefs(closure_value, Heap.local_heap.getInternedString(.scope));
+    const name_str = try objutil.newString(Heap.local_heap, "name");
+    const impl_str = try objutil.newString(Heap.local_heap, "impl");
+    const scope_str = try objutil.newString(Heap.local_heap, "scope");
+
+    const name = try objutil.dictLookupFollowRefs(closure_value, name_str);
+    const impl_raw = try objutil.dictLookupFollowRefs(closure_value, impl_str);
+    const scope = try objutil.dictLookupFollowRefs(closure_value, scope_str);
 
     const args = objutil.listItem(impl_raw.toHandle().?, 0);
     const body = objutil.listItem(impl_raw.toHandle().?, 1);
@@ -511,23 +514,13 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
         defer arg_new.swapWithNone();
         objutil.shimmerToList(null, arg_raw, &arg_new) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg_raw}),
-                };
-                return error.BadClosure;
-            },
+            else => unreachable,
         };
         const arg = arg_new.orElse(arg_raw);
         const arg_len = objutil.listLengthRaw(arg);
 
         assert(arg_len == 1);
-        if (optional_values != null) {
-            if (det) |details| details.* = .{
-                .message = try objutil.newString(Heap.local_heap, "required parameter after optional parameter not allowed"),
-            };
-            return error.BadClosure;
-        }
+        if (optional_values != null) unreachable;
 
         const arg_name = try objutil.listItem(arg, 0).getString();
         if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
@@ -1033,50 +1026,7 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
     interp.eval_depth += 1;
     defer interp.eval_depth -= 1;
 
-    // Loop the calling section, as there may be a tailcall.
-    var current_args = args;
-    var tailcall_info: ?Tailcall = null;
-    while (true) {
-        interp.currentEvalFrame().args = current_args;
-        // TODO implement tracing.
-
-        // Be sure to clear the previous result.
-        interp.setEmptyResult();
-
-        const result = blk: {
-            switch (command_or_closure) {
-                .command => |command| {
-                    break :blk interp.callNative(command, current_args);
-                },
-                .closure => |closure| {
-                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args);
-                },
-            }
-        };
-
-        if (result) {
-            if (interp.currentCallFrame().tailcall) |tailcall| {
-                // Be sure to free the previous tailcall.
-                if (tailcall_info) |prev_tailcall| {
-                    for (prev_tailcall.args) |arg| arg.decrRefCount();
-                    Heap.global_gpa.free(prev_tailcall.args);
-                }
-
-                tailcall_info = tailcall;
-                current_args = tailcall.args;
-                interp.currentCallFrame().tailcall = null;
-            } else {
-                tailcall_info = null;
-            }
-        } else |err| {
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return err,
-            }
-        }
-
-        if (tailcall_info == null) break;
-    }
+    try interp.callNative(command_or_closure.command, args);
 }
 
 fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
@@ -1112,89 +1062,6 @@ const ExprResult = union(enum) {
         }
     }
 };
-fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !ExprResult {
-    const node_tag = nodes.items(.tag)[@intFromEnum(node_index)];
-    const node_data: *expr_parse.Node.Data = &nodes.items(.data)[@intFromEnum(node_index)];
-    switch (node_tag) {
-        .string_equal => {
-            const children = node_data.binary;
-            const lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
-            const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
-            defer lhs_value.release();
-            defer rhs_value.release();
-
-            var lhs_buffer: [50]u8 = @splat(0);
-            var lhs_writer = std.Io.Writer.fixed(lhs_buffer[0..]);
-            const lhs_string = switch (lhs_value) {
-                .float => |val| blk: {
-                    lhs_writer.print("{}", .{val}) catch unreachable;
-                    break :blk lhs_writer.buffered();
-                },
-                .int => |val| blk: {
-                    lhs_writer.print("{}", .{val}) catch unreachable;
-                    break :blk lhs_writer.buffered();
-                },
-                .owned_handle => |val| (try val.getString())[0..],
-                .stack_handle => |val| (try val.getString())[0..],
-            };
-            var rhs_buffer: [50]u8 = @splat(0);
-            var rhs_writer = std.Io.Writer.fixed(rhs_buffer[0..]);
-            const rhs_string = switch (lhs_value) {
-                .float => |val| blk: {
-                    rhs_writer.print("{}", .{val}) catch unreachable;
-                    break :blk rhs_writer.buffered();
-                },
-                .int => |val| blk: {
-                    rhs_writer.print("{}", .{val}) catch unreachable;
-                    break :blk rhs_writer.buffered();
-                },
-                .owned_handle => |val| (try val.getString())[0..],
-                .stack_handle => |val| (try val.getString())[0..],
-            };
-
-            const result = switch (node_tag) {
-                .string_equal => std.mem.eql(u8, lhs_string, rhs_string),
-                else => unreachable,
-            };
-
-            return if (result) .{ .int = 1 } else .{ .int = 0 };
-        },
-        else => unreachable,
-    }
-}
-
-pub fn evalExpression(interp: *Interp, handle: Handle, new_handle: *OptionalHandle) !ExprResult {
-    errdefer new_handle.swapWithNone();
-
-    // Combine the call frame's cache ID with the expression's content
-    // hash, so identical expressions at different call sites get their
-    // own cached variable lookups.
-    var det: objutil.ErrorDetails = undefined;
-    const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try handle.getHash();
-    const expr = try interp.wrapError(&det, objutil.getExpression(&det, handle, cache_key));
-
-    return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-    };
-}
-
-pub fn evalExpressionInPlace(interp: *Interp, handle: *Handle) !ExprResult {
-    var new_handle: OptionalHandle = .none;
-    const res = try evalExpression(interp, handle.*, &new_handle);
-    handle.swapIfNew(new_handle);
-    return res;
-}
-
-pub fn getBoolFromExpression(interp: *Interp, handle: *Handle) !bool {
-    var expr_result = try interp.evalExpressionInPlace(handle);
-    defer expr_result.release();
-    const value = interp.exprResultAsBool(&expr_result) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => error.EvalError,
-    };
-    return value;
-}
-
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
@@ -1239,51 +1106,17 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         var word_token_i: u32 = command_token_i;
         for (0..command_info.arg_count) |_| {
             var word_parts: u32 = 1;
-            const argument_expansion = tags[word_token_i] == .argument_expansion;
-            if (tags[word_token_i] == .start_of_word or argument_expansion) {
+            if (tags[word_token_i] == .start_of_word) {
                 word_parts = @intCast(values[word_token_i].body.integer);
                 word_token_i += 1;
             }
+            assert(word_parts == 1);
 
-            var resultant_word: Handle = blk: {
-                if (word_parts == 1) {
-                    // Simple one-to-one substitution, so an easy case.
-                    const res = try interp.substituteOneToken(tags[word_token_i], objutil.listItem(parsed.values, word_token_i));
-                    word_token_i += 1;
-                    break :blk res;
-                } else {
-                    // Helper function that'll interpolate all the word parts and merge them into a string.
-                    const res = try interp.interpolateTokens(tags[word_token_i..][0..word_parts], parsed.values, word_token_i, word_parts, false);
-                    word_token_i += word_parts;
-                    break :blk res;
-                }
-            };
+            const resultant_word = try interp.substituteOneToken(tags[word_token_i], objutil.listItem(parsed.values, word_token_i));
+            word_token_i += 1;
 
-            if (argument_expansion) {
-                // Argument expansion, so we'll need to shimmer the result to a list.
-                det = undefined;
-                var new_list: OptionalHandle = .none;
-                const len = try wrapError(interp, &det, objutil.listLength(&det, resultant_word, &new_list));
-                resultant_word.swapIfNew(new_list);
-                // Free the list backing without running destructors, since we're going to steal the items
-                // directly from the list.
-                defer Heap.freeObjectBacking(resultant_word);
-
-                if (len > 1) {
-                    // Expanded into multiple tokens, so we'll need to resize args.
-                    args = try args_alloc.realloc(args, args.len - 1 + len);
-                }
-
-                assert(resultant_word.canMutate());
-                for (0..len) |list_idx| {
-                    // Steal each object from the list.
-                    args[args_written] = try Heap.steal(objutil.listItem(resultant_word, @intCast(list_idx)));
-                    args_written += 1;
-                }
-            } else {
-                args[args_written] = resultant_word;
-                args_written += 1;
-            }
+            args[args_written] = resultant_word;
+            args_written += 1;
         }
 
         command_token_i = word_token_i;

@@ -8,14 +8,6 @@ const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
-pub fn exprCmd(interp: *Interp, args: []const Handle) Interp.Error!void {
-    var expr = args[1].borrow();
-    defer expr.decrRefCount();
-    const result = try (try interp.evalExpressionInPlace(&expr)).toObject();
-    defer result.decrRefCount();
-    interp.setResult(result);
-}
-
 /// [set]
 pub fn setCmd(interp: *Interp, args: []const Handle) !void {
     var var_name = args[1].borrow();
@@ -63,7 +55,6 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("expr", .{ .to_call = exprCmd, .description = "expression", .min_arity = 1, .max_arity = 1 });
     try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
     try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
 }

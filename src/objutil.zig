@@ -118,26 +118,17 @@ pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
     const handle = try heap.createObject();
     errdefer handle.decrRefCount();
 
-    if (len < Heap.LongString.split_point) {
-        const new_str = try heap.createString(@intCast(len));
-        const new_str_end = new_str + @as(u32, @intCast(len));
-        @memset(heap.getHeapString(new_str, new_str_end), 0);
+    const new_str = try heap.createString(@intCast(len));
+    const new_str_end = new_str + @as(u32, @intCast(len));
+    @memset(heap.getHeapString(new_str, new_str_end), 0);
 
-        // New object, so we can set directly.
-        handle.peek().head.str = .{
-            .u = .{
-                .str = .{ .index = new_str, .len = @intCast(len) },
-            },
-            .is_ptr = false,
-        };
-    } else {
-        // Create new string.
-        const new_str = try Heap.global_gpa.allocSentinel(u8, len, 0);
-        errdefer Heap.global_gpa.free(new_str);
-        @memset(new_str, 0);
-        const did_take = try heap.setLongString(handle.index, .{ .normal = new_str });
-        assert(did_take);
-    }
+    // New object, so we can set directly.
+    handle.peek().head.str = .{
+        .u = .{
+            .str = .{ .index = new_str, .len = @intCast(len) },
+        },
+        .is_ptr = false,
+    };
 
     return handle;
 }
@@ -179,20 +170,8 @@ pub fn setStringFromEscaped(handle: Handle, escaped: []const u8) !void {
     const written = stringutil.removeEscaping(escaped, unescaped);
     unescaped[written] = 0; // null terminator
 
-    const did_set = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
-    if (did_set) {
-        Heap.global_gpa.free(unescaped);
-    } else {
-        // Too large for normal string, so we'll try setting as a long string.
-        const did_take = try handle.getHeap().setLongString(
-            handle.index,
-            .{ .different_capacity = .{
-                .string = unescaped[0..written :0],
-                .original_capacity = unescaped.len,
-            } },
-        );
-        if (!did_take) Heap.global_gpa.free(unescaped);
-    }
+    _ = try handle.getHeap().setNormalString(handle.index, unescaped[0..written]);
+    Heap.global_gpa.free(unescaped);
 }
 
 pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !bool {

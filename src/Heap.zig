@@ -13,7 +13,6 @@ const options = @import("options");
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
-const expr_parse = @import("expr_parse.zig");
 const objutil = @import("objutil.zig");
 
 // These numbers are final, and can be depended on to be their current values.
@@ -28,7 +27,7 @@ pub const HeapSettings = struct {
     /// Maximum of `1 << heap_order` items.
     object_heap_order: u6 = 16,
     /// Maximum of `1 << heap_order` bytes for all strings.
-    string_heap_order: u6 = 28,
+    string_heap_order: u6 = 16,
     /// Maximum number of custom types.
     max_custom_types: usize = 65536,
     /// Maximum number of evaluating scripts.
@@ -80,15 +79,10 @@ object_tracking: ObjectTracker,
 objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
-interned_strings: std.EnumArray(InternedString, Heap.Handle),
-/// Preallocated fallback used by `[catch]` when a script OOMs and building
-/// the real opts dict also OOMs. Pinned at init; released via `freeOomOptsDict`.
-oom_error_options_dict: ?Handle,
 
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
-parsed_exprs: ParsedExpressions,
 parsed_closures: ParsedClosures,
 
 pub const HeapId = u16;
@@ -118,60 +112,7 @@ const FullHashContext = struct {
     }
 };
 const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
-const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
 const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullHashContext);
-
-pub const InternedString = enum {
-    @"apply lambdaExpr",
-    @"fn",
-    impl,
-    scope,
-    name,
-    @"division by zero",
-    // Error handling.
-    NONE,
-    @"ZICL OOM",
-    @"ZICL LOOKUP VARNAME",
-    @"out of memory",
-    @"-code",
-    @"-level",
-    @"-errorstack",
-    @"-errorcode",
-    @"-during",
-    // Signal names, for use in the signal mask list.
-    SIGHUP,
-    SIGINT,
-    SIGQUIT,
-    SIGILL,
-    SIGTRAP,
-    SIGABRT,
-    SIGBUS,
-    SIGFPE,
-    SIGKILL,
-    SIGUSR1,
-    SIGSEGV,
-    SIGUSR2,
-    SIGPIPE,
-    SIGALRM,
-    SIGTERM,
-    SIGCHLD,
-    SIGCONT,
-    SIGSTOP,
-    SIGTSTP,
-    SIGTTIN,
-    SIGTTOU,
-    SIGURG,
-    SIGXCPU,
-    SIGXFSZ,
-    SIGVTALRM,
-    SIGPROF,
-    SIGWINCH,
-    SIGIO,
-    SIGPWR,
-    SIGSYS,
-};
-
-const interned_string_count = std.enums.values(InternedString).len;
 
 /// This is the script object internal representation. It is an array
 /// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
@@ -275,15 +216,6 @@ pub const ParsedScript = struct {
     }
 };
 
-pub const ParsedExpression = struct {
-    root_node: expr_parse.Node.Index,
-    nodes: std.MultiArrayList(expr_parse.Node),
-
-    pub fn deinit(expr: *ParsedExpression) void {
-        expr.* = undefined;
-    }
-};
-
 pub const Object = packed struct(u128) {
     pub const null_string: StrOrPtr = .{
         .u = .{ .str = .{ .index = 0, .len = 0 } },
@@ -309,9 +241,6 @@ pub const Object = packed struct(u128) {
 
         pub fn deinit(str: StrOrPtr, heap: *Heap) void {
             switch (heap.getLocalStringDetails(str)) {
-                .long => |long_str| {
-                    long_str.decrRefCount(global_gpa);
-                },
                 .normal => {
                     heap.freeString(str.u.str.index, str.u.str.len);
                 },
@@ -320,16 +249,13 @@ pub const Object = packed struct(u128) {
         }
 
         pub fn format(self: StrOrPtr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            if (self.is_ptr) {
-                try writer.print(".{{ .ptr = {*} }}", .{LongString.fromInt(self.u.ptr)});
-            } else {
-                try writer.print("{}", .{self.u.str});
-            }
+            assert(!self.is_ptr);
+            try writer.print("{}", .{self.u.str});
         }
     };
 
     pub const Head = packed struct(u64) {
-        str: StrOrPtr,
+        str: StrOrPtr = Object.null_string,
         tag: Tag,
     };
 
@@ -847,7 +773,7 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn canShimmer(handle: Handle) bool {
         // Specialty objects can't shimmer.
-        if (handle.index < special_object_count + interned_string_count) return false;
+        if (handle.index < special_object_count) return false;
 
         // Can't shimmer if it's shared between threads.
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
@@ -926,7 +852,7 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn incrRefCount(handle: Handle) void {
-        if (handle.index < special_object_count + interned_string_count) return;
+        if (handle.index < special_object_count) return;
         // Make sure we never try to borrow a freed object.
         handle.assert(handle.debugRefCount() > 0);
         handle.assert(handle.tag() != .reference);
@@ -980,7 +906,7 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn decrRefCount(handle: Handle) void {
-        if (handle.index < special_object_count + interned_string_count) return;
+        if (handle.index < special_object_count) return;
 
         const metadata = handle.getMetadata();
         const obj_heap = handle.getHeap();
@@ -1023,7 +949,6 @@ pub const Handle = packed struct(HandleBacking) {
             .null => return null,
             .empty => return "",
             .normal => |str| return str,
-            .long => |long_str| return long_str.getString(),
         }
     }
 
@@ -1064,9 +989,6 @@ pub const Handle = packed struct(HandleBacking) {
         const obj = handle.peek();
 
         switch (handle.getStringDetails()) {
-            .long => |long_str| {
-                return long_str.getString();
-            },
             .normal => |str| {
                 return str;
             },
@@ -1135,28 +1057,29 @@ pub const Handle = packed struct(HandleBacking) {
                 const outer = try objutil.newListWithCapacity(7);
                 defer outer.decrRefCount();
 
-                objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.@"fn"));
+                const fn_str = try objutil.newString(local_heap, "fn");
+                const name_str = try objutil.newString(local_heap, "name");
+                const impl_str = try objutil.newString(local_heap, "impl");
+                const scope_str = try objutil.newString(local_heap, "scope");
 
+                objutil.listAppendAssumeCapacity(outer, fn_str.referenceTakeOwnership());
                 if (closure.name.toHandle()) |name_handle| {
-                    objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.name));
+                    objutil.listAppendAssumeCapacity(outer, name_str.referenceTakeOwnership());
                     objutil.listAppendAssumeCapacity(outer, name_handle.dupOrRef());
                 }
 
-                objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.impl));
+                objutil.listAppendAssumeCapacity(outer, impl_str.referenceTakeOwnership());
                 objutil.listAppendAssumeCapacity(outer, impl_val.dupOrRef());
 
                 if (closure.scope.toHandle()) |scope_handle| {
-                    objutil.listAppendAssumeCapacity(outer, heap.internedStringRef(.scope));
+                    objutil.listAppendAssumeCapacity(outer, scope_str.referenceTakeOwnership());
                     objutil.listAppendAssumeCapacity(outer, scope_handle.dupOrRef());
                 }
 
                 const result = try getListString(heap, outer.index + 1, objutil.listLengthRaw(outer));
                 break :blk result;
             },
-            .custom_type => {
-                const custom_type = obj.body.custom_type;
-                break :blk try custom_types.items[custom_type.type_id].get_string(handle.getHeap(), handle.peek());
-            },
+            .custom_type => unreachable,
             .reference => {
                 // Intentionally return early, since we should always use
                 // the reference's string, not our own.
@@ -1212,8 +1135,7 @@ pub const Handle = packed struct(HandleBacking) {
         // Ensure new_str is freed if setStringOwning fails (e.g., OOM during LongString allocation).
         {
             errdefer global_gpa.free(new_str);
-            const took_ownership = try setStringOwning(handle, new_str);
-            if (!took_ownership) global_gpa.free(new_str);
+            try setString(handle, new_str);
         }
 
         // Rerun this function to figure out where the new string is.
@@ -1227,9 +1149,6 @@ pub const Handle = packed struct(HandleBacking) {
                     @setEvalBranchQuota(10000);
                     break :blk memutil.hashBytes("");
                 };
-            },
-            .long => |long_str| {
-                return long_str.getHash();
             },
             .null, .normal => {
                 // Fall through.
@@ -1289,14 +1208,6 @@ fn invalidateStringInner(handle: Handle) void {
         .null => handle.trace("Invalidate string (was null)", .{}),
         .empty => handle.trace("Invalidate string (was empty)", .{}),
         .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
-        .long => |long_str| handle.trace("Invalidate string (was {s})", .{long_str.getString()}),
-    }
-    if (handle.tag() == .source) {
-        // Why store unordered? Because there's no way to do the atomics
-        // correctly here, so I'd much rather tsan complained. It _shouldn't_
-        // be an issue, since strings shared between threads can't be invalidated,
-        // except in the case of deiniting an object.
-        handle.getSourceExtraData().hash.state.store(.not_computed, .unordered);
     }
     handle.peek().deinitString(handle.getHeap());
 }
@@ -1346,6 +1257,7 @@ fn invalidateCollection(handle: Handle) void {
 
 fn invalidateBodyInner(handle: Handle) void {
     handle.trace("Invalidate body", .{});
+    std.debug.print("Handle: {any}, ptr: {*}\n", .{ handle, &handle.peek().head });
 
     switch (handle.tag()) {
         .list => {
@@ -1392,55 +1304,6 @@ fn heapBackingAlloc() Allocator {
     } else {
         return global_gpa;
     }
-}
-
-fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
-    const interned = try heap.createObject();
-    errdefer freeObjectBackingInner(interned);
-    const cast_len: u26 = @intCast(str.len);
-    const str_index = try heap.createString(cast_len);
-    errdefer heap.freeString(str_index, cast_len);
-    assert(interned.index == (expected_index + special_object_count));
-
-    @memcpy(heap.getHeapString(str_index, str_index + cast_len), str);
-    assert(heap.exchangeString(interned.index, Object.null_string, .{
-        .is_ptr = false,
-        .u = .{ .str = .{ .index = str_index, .len = cast_len } },
-    }));
-
-    return interned;
-}
-
-fn createInternedStrings(heap: *Heap) !void {
-    @setEvalBranchQuota(10000);
-    const values = comptime blk: {
-        break :blk std.enums.values(InternedString);
-    };
-    var converted_mapping: std.enums.EnumFieldStruct(InternedString, Handle, null) = undefined;
-
-    // Init all the interned strings, handling failure as needed.
-    var converted: usize = 0;
-    errdefer {
-        // Since we can't loop up to `converted` at comptime, we'll generate
-        // an if-ladder that only deinits fields that have been initialized.
-        inline for (0..values.len) |i| {
-            const key = @tagName(values[i]);
-            if (i < converted) {
-                const handle: Handle = @field(converted_mapping, key);
-                handle.peek().head.str.deinit(heap);
-                freeObjectBackingInner(handle);
-            }
-        }
-    }
-    // Fill the mapping.
-    inline for (0..values.len) |i| {
-        const value = @tagName(values[i]);
-        const new_str = try heap.createInternedString(i, value);
-        converted += 1; // After `new_str` is successfully created
-        @field(converted_mapping, value) = new_str;
-    }
-
-    heap.interned_strings = .init(converted_mapping);
 }
 
 pub fn init(heap: *Heap) !void {
@@ -1507,8 +1370,6 @@ pub fn init(heap: *Heap) !void {
 
     heap.parsed_scripts = try .initWithCapacity(global_gpa, cfg.cache_size);
     errdefer heap.parsed_scripts.deinit(global_gpa);
-    heap.parsed_exprs = try .initWithCapacity(global_gpa, cfg.cache_size);
-    errdefer heap.parsed_exprs.deinit(global_gpa);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
@@ -1535,27 +1396,6 @@ pub fn init(heap: *Heap) !void {
     assert(empty_object.index == empty_object_idx);
     empty_object.peek().head.str = Object.empty_string;
     errdefer freeObjectBackingInner(empty_object);
-
-    // Create all the interned strings.
-    try heap.createInternedStrings();
-    errdefer {
-        for (special_object_count..(special_object_count + interned_string_count)) |i| {
-            // Need to free these objects directly, since they're not normally allowed
-            // to be mutated.
-            const interned = heap.getHandle(@intCast(i));
-            interned.peek().head.str.deinit(heap);
-            freeObjectBackingInner(interned);
-        }
-    }
-
-    const oom_dict = try createOomErrorOptionsDict(heap);
-    // Pin so it stays immutable.
-    oom_dict.incrRefCount();
-    heap.oom_error_options_dict = oom_dict;
-    errdefer {
-        oom_dict.decrRefCount();
-        oom_dict.decrRefCount();
-    }
 }
 
 fn clearParsedScripts(self: *Heap) void {
@@ -1564,21 +1404,14 @@ fn clearParsedScripts(self: *Heap) void {
         parsed_script.script.deinit();
     }
     self.parsed_scripts.clearRetainingCapacity();
-
-    var parsed_expr_iter = self.parsed_exprs.valueIterator();
-    while (parsed_expr_iter.next()) |parsed_expr| {
-        parsed_expr.expr.deinit();
-    }
-    self.parsed_exprs.clearRetainingCapacity();
 }
 
 pub fn deinit(heap: *Heap) void {
     // Parsed scripts have references to objects, so we'll deinit scripts before objects.
     heap.clearParsedScripts();
     heap.parsed_scripts.deinit(global_gpa);
-    heap.parsed_exprs.deinit(global_gpa);
 
-    for ((special_object_count + interned_string_count)..heap.objects.len) |i| {
+    for ((special_object_count)..heap.objects.len) |i| {
         const metadata = heap.objects.get(i).metadata;
         if (metadata.in_use) {
             // We don't use free object here, as it may cause a double-free when
@@ -1588,17 +1421,6 @@ pub fn deinit(heap: *Heap) void {
             invalidateBothInner(heap.getHandle(@intCast(i)));
         }
     }
-
-    for (special_object_count..(special_object_count + interned_string_count)) |i| {
-        // Need to free these objects directly, since they're not normally allowed
-        // to be mutated.
-        const interned = heap.getHandle(@intCast(i));
-        interned.peek().head.str.deinit(heap);
-        freeObjectBackingInner(interned);
-    }
-
-    // Clean up the OOM error dict.
-    heap.deinitOomErrorOptions();
 
     // Be sure to free the specialty objects and strings.
     assert(special_object_count == 2);
@@ -1625,14 +1447,6 @@ pub fn deinit(heap: *Heap) void {
     heap.* = undefined;
 }
 
-fn deinitOomErrorOptions(heap: *Heap) void {
-    if (heap.oom_error_options_dict) |dict| {
-        dict.decrRefCount();
-        dict.decrRefCount();
-        heap.oom_error_options_dict = null;
-    }
-}
-
 pub inline fn heapId(self: *Heap) HeapId {
     return @intCast(self - &heaps);
 }
@@ -1649,14 +1463,6 @@ pub fn emptyHandle(self: *Heap) Handle {
         .index = empty_object_idx,
         .heap = self.heapId(),
     };
-}
-
-pub fn getInternedString(heap: *Heap, string: InternedString) Heap.Handle {
-    return heap.interned_strings.get(string);
-}
-
-pub fn internedStringRef(heap: *Heap, string: InternedString) Heap.Object {
-    return heap.getInternedString(string).reference();
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -1683,22 +1489,6 @@ pub fn splitAlloc(self: *Heap, index: u32, new_order: u5) void {
             "Split from index {} (order {}) to order {}",
             .{ index, metadata.order, new_order },
         );
-    }
-}
-
-test "split allocations" {
-    defer Heap.testFinish();
-    var heap = try Heap.testStart(testing.allocator, testing.io);
-
-    const index = try heap.createObjects(8);
-    heap.splitAlloc(index, 1);
-
-    for (index..(index + 8)) |i| {
-        try testing.expectEqual(1, heap.objects.get(i).metadata.order);
-    }
-
-    for (0..4) |i| {
-        heap.getHandle(@intCast(index + i * 2)).decrRefCount();
     }
 }
 
@@ -1903,7 +1693,6 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
 
     blk: {
         const a_long_str = switch (a_details) {
-            .long => |unwrapped| unwrapped,
             // The only case where an object can have a null string after getting
             // its string value is a reference.
             .null => {
@@ -1914,7 +1703,6 @@ pub fn checkIfEqual(a: Handle, b: Handle) !bool {
         };
 
         const b_long_str = switch (b_details) {
-            .long => |unwrapped| unwrapped,
             .null => {
                 assert(b.tag() == .reference);
                 break :blk;
@@ -1952,13 +1740,6 @@ pub fn steal(handle: Handle) !Handle {
 
 pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     switch (handle.getStringDetails()) {
-        .long => |long_str| {
-            long_str.incrRefCount();
-            return .{
-                .u = .{ .ptr = LongString.toInt(long_str) },
-                .is_ptr = true,
-            };
-        },
         .normal => |bytes| {
             const new_string = try dest_heap.createString(@intCast(bytes.len));
             const len: u26 = @intCast(bytes.len);
@@ -2064,23 +1845,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 error.OutOfMemory => return error.OutOfMemory,
             };
         },
-        .custom_type => {
-            const custom_type = src.body.custom_type;
-
-            var new_object: Object = .{
-                // TODO make sure this doesn't leak
-                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .custom_type },
-                .body = .{
-                    .custom_type = .{
-                        .extra_data = try dest_heap.createExtraData(),
-                        .type_id = custom_type.type_id,
-                    },
-                },
-            };
-            new_object = try custom_types.items[custom_type.type_id].duplicate(dest_heap, src);
-
-            return new_object;
-        },
+        .custom_type => unreachable,
         .dict_sugar, .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
@@ -2259,28 +2024,13 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
     const heap = handle.getHeap();
 
     // Try setting as a normal string first.
-    const did_set = try heap.setNormalString(handle.index, bytes);
-    if (!did_set) {
-        // Setting it as a long string will most likely take ownership,
-        // so we need to copy.
-        const new_str = try global_gpa.dupeZ(u8, bytes);
-        errdefer global_gpa.free(new_str);
-        const took_ownership = try heap.setLongString(handle.index, .{ .normal = new_str });
-        if (!took_ownership) global_gpa.free(new_str);
-    }
+    assert(try heap.setNormalString(handle.index, bytes));
 }
 
 /// Get the string to modify (must not write any longer than current len).
 /// Not threadsafe.
 pub fn getStringMut(handle: Handle) ![:0]u8 {
     switch (handle.getStringDetails()) {
-        .long => |long_str| {
-            switch (long_str.string_type) {
-                .normal => |normal| return normal,
-                .temp => @panic("Can't modify a temp object"),
-                .different_capacity => |info| return info.string,
-            }
-        },
         .normal => {
             const str = handle.peek().head.str.u.str;
             return handle.getHeap().getHeapString(str.index, str.index + str.len);
@@ -2293,64 +2043,15 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
 /// Returns whether the exchange was successful (if not, caller is responsible
 /// for cleaning up).
 pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set_to: Object.StrOrPtr) bool {
-    const success = blk: {
-        const obj: *Object = self.getLocalObject(index);
-        if (options.threading and self.objects.get(index).metadata.cross_thread) {
-            // Atomically swap only the first half of the object
-            if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
-            if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
-            if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
+    _ = expected;
 
-            const str_mask: u64 = (1 << 59) - 1;
-
-            const object_head: *u64 = @ptrCast(obj);
-            var current_head = @atomicLoad(u64, object_head, .acquire);
-
-            while (true) {
-                // Is the string pointer what we expected?
-                if (current_head & str_mask != @as(u59, @bitCast(expected))) {
-                    // If not, somebody else must've won this, so let the caller know.
-                    break :blk false;
-                }
-
-                const to_set_to_bits: u59 = @bitCast(to_set_to);
-                // Preserve type tag from current_head.
-                var new_head = current_head & ~str_mask;
-                new_head |= to_set_to_bits;
-
-                const res: ?u64 = @cmpxchgWeak(u64, object_head, current_head, new_head, .release, .acquire);
-
-                if (res) |winning_head| {
-                    current_head = winning_head;
-                    continue;
-                } else {
-                    // Successfully swapped.
-                    break :blk true;
-                }
-            }
-        } else {
-            obj.head.str = to_set_to;
-            break :blk true;
-        }
-    };
+    const obj: *Object = self.getLocalObject(index);
+    obj.head.str = to_set_to;
 
     const handle = self.getHandle(index);
     handle.trace("Set string to \"{f}\"", .{handle});
 
-    return success;
-}
-
-/// Returns whether the heap took ownership. It may copy the bytes into
-/// the heap, so it can succeed while also not taking ownership.
-pub fn setStringOwning(handle: Handle, bytes: [:0]u8) error{OutOfMemory}!bool {
-    const heap = handle.getHeap();
-
-    if (try heap.setNormalString(handle.index, bytes)) {
-        // Successfully set as normal string.
-        return false;
-    } else {
-        return try heap.setLongString(handle.index, .{ .normal = bytes });
-    }
+    return true;
 }
 
 /// Low-level function. You probably want `Heap.setString()`.
@@ -2361,7 +2062,7 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
         // No need to check the result of the exchange, as there's nothing to clean up
         assert(self.exchangeString(index, Object.null_string, Object.empty_string));
         return true;
-    } else if (bytes.len < LongString.split_point) {
+    } else {
         const string = try self.createString(@intCast(bytes.len));
         const len: u26 = @intCast(bytes.len);
         @memcpy(
@@ -2382,27 +2083,7 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
         }
 
         return true;
-    } else {
-        return false;
     }
-}
-
-/// Low-level function. You probably want `Heap.setString()`.
-/// Returns whether the object heap took ownership of the string.
-/// The only case where this would fail is OOM or if someone else
-/// exchanged the string right before us.
-pub fn setLongString(self: *Heap, index: u32, string_type: LongString.Type) Allocator.Error!bool {
-    const long_string = &(try global_gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
-    errdefer global_gpa.free(long_string);
-    long_string.* = .{ .string_type = string_type };
-
-    const string_header = Object.StrOrPtr{
-        .u = .{ .ptr = LongString.toInt(long_string) },
-        .is_ptr = true,
-    };
-
-    const res = self.exchangeString(index, Object.null_string, string_header);
-    return res;
 }
 
 fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
@@ -2459,209 +2140,30 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
 }
 
 fn generateDictString(handle: Handle) ![:0]u8 {
-    const extra_data = handle.getDictExtraData();
-    const table = try objutil.dictGetTable(handle);
-
-    // If we've lost our string rep, we sure as heck should not have duplicate
-    // keys. Any other way of handling this would be self-contradictory.
-    handle.assert(table.size * 2 == handle.peek().body.dict.len);
-    if (extra_data.parent_link == .none) {
-        // Easy case: no parent link.
-        return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
-    }
-
-    // This uses an array hash map, so insertion order is maintained. This
-    // means that if we go through it in reverse order, we'll get oldest
-    // to newest (since we descend starting at newest and go down to oldest).
-    var keys_used = std.ArrayHashMapUnmanaged(Handle, Handle, struct {
-        pub fn hash(ctx: @This(), key: Handle) u32 {
-            _ = ctx;
-            const str = key.getString() catch unreachable;
-            return std.array_hash_map.hashString(str);
-        }
-
-        pub fn eql(ctx: @This(), a: Handle, b: Handle, b_index: usize) bool {
-            _ = ctx;
-            _ = b_index;
-            return checkIfEqual(a, b) catch unreachable;
-        }
-    }, true).empty;
-    defer keys_used.deinit(global_gpa);
-
-    // Traverse all linked dicts.
-    var current_dict = handle;
-    var depth: u64 = 0;
-    while (true) {
-        // Make sure to reverse the order we go through the dictionary,
-        // so when we reverse again at the end, everything will be in the
-        // correct order.
-        depth += 1;
-        var item_index = objutil.dictItemLength(current_dict);
-        while (item_index > 0) {
-            item_index -= 2;
-
-            const key = objutil.dictItemFollowRefs(current_dict, item_index);
-            const value = objutil.dictItemFollowRefs(current_dict, item_index + 1);
-
-            _ = try key.getString(); // Make sure it has a string rep.
-            const entry = try keys_used.getOrPut(global_gpa, key);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = value;
-            }
-        }
-
-        if (current_dict.getDictExtraData().parent_link.toHandle()) |next| {
-            current_dict = next;
-        } else break;
-    }
-
-    const item_count: u32 = @intCast(keys_used.entries.len * 2);
-    const merged_handle = try objutil.newListWithCapacity(item_count);
-    defer merged_handle.decrRefCount();
-    merged_handle.peek().body.list.len = item_count;
-    const items = objutil.listItems(merged_handle);
-
-    var pair_index = keys_used.entries.len;
-    while (pair_index > 0) {
-        pair_index -= 1;
-        const entry = keys_used.entries.get(pair_index);
-        const reflected_pair_index = keys_used.entries.len - pair_index - 1;
-        items[reflected_pair_index * 2] = entry.key.reference();
-        items[reflected_pair_index * 2 + 1] = entry.value.reference();
-    }
-
-    const result = try getListString(merged_handle.getHeap(), merged_handle.index + 1, item_count);
-    return result;
+    return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
 }
 
 const StringDetails = union(enum) {
     null: void,
     empty: void,
     normal: [:0]u8,
-    long: *align(LongString.align_amt) LongString,
 };
 
 fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
     // Normal string or long string?
-    if (str_or_ptr.is_ptr) {
-        // Convert to LongString ptr (guaranteed to be non-null).
-        return .{
-            .long = LongString.fromInt(str_or_ptr.u.ptr),
-        };
+    assert(!str_or_ptr.is_ptr);
+
+    const str = str_or_ptr.u.str;
+    if (str.index == null_string) {
+        return .null;
+    } else if (str.index == empty_string) {
+        return .empty;
     } else {
-        const str = str_or_ptr.u.str;
-        if (str.index == null_string) {
-            return .null;
-        } else if (str.index == empty_string) {
-            return .empty;
-        } else {
-            return .{
-                .normal = heap.getHeapString(str.index, str.index + str.len),
-            };
-        }
+        return .{
+            .normal = heap.getHeapString(str.index, str.index + str.len),
+        };
     }
 }
-
-pub const LongString = struct {
-    /// At what point should we switch to using a long string?
-    /// Whenever the string length >= `split_point`.
-    pub const split_point = 100_000;
-    pub const align_amt = 128;
-    pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
-
-    /// Long strings are special in that they can have
-    /// extended properties (mmaping is in the plans,
-    /// for example). Since it has special properties,
-    /// we have to track them so it can be freed correctly.
-    pub const Type = union(enum) {
-        normal: [:0]u8,
-        /// A temporary string has its bytes managed by someone else,
-        /// so when this `LongString` is freed, we won't free the string.
-        temp: [:0]const u8,
-        /// If the string was allocated with a different capacity
-        /// than its current reported length, set this field.
-        different_capacity: struct {
-            string: [:0]u8,
-            original_capacity: u64,
-        },
-    };
-
-    string_type: Type,
-    /// Length has not been determined if == `maxInt(u64)`. Be sure to use
-    /// atomics!
-    utf8_length: u64 = std.math.maxInt(u64),
-    hash: struct {
-        value: ?u256 = null,
-        // TODO PERF this probably can be done with acquire/release, the mutex is a bit overkill.
-        mutex: std.Io.Mutex = .init,
-    } = .{},
-    ref_count: usize = 1,
-
-    pub fn fromInt(int: u58) *align(align_amt) LongString {
-        return @ptrFromInt(int << 6);
-    }
-
-    pub fn toInt(ptr: *align(align_amt) LongString) u58 {
-        return @intCast(@intFromPtr(ptr) >> 6);
-    }
-
-    pub fn getHash(self: *align(align_amt) LongString) u256 {
-        self.hash.mutex.lockUncancelable(global_io);
-        defer self.hash.mutex.unlock(global_io);
-
-        if (self.hash.value) |hash| {
-            return hash;
-        } else {
-            const hash = memutil.hashBytes(self.getString());
-            self.hash.value = hash;
-            return hash;
-        }
-    }
-
-    pub fn getUtf8Length(self: *align(align_amt) LongString) ?u64 {
-        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
-        if (value == std.math.maxInt(u64)) return null else return value;
-    }
-
-    /// Value is `u64`, not `?u64`, since utf8 length should not ever
-    /// change (excluding `LongString` temp strings).
-    pub fn setUtf8Length(self: *align(align_amt) LongString, value: u64) void {
-        assert(value != std.math.maxInt(u64));
-        @atomicStore(u64, &self.utf8_length, value, .monotonic);
-    }
-
-    pub fn getString(self: *align(align_amt) LongString) [:0]const u8 {
-        switch (self.string_type) {
-            .normal => |string| return string,
-            .temp => |temp| return temp,
-            .different_capacity => |info| return info.string,
-        }
-    }
-
-    pub fn incrRefCount(self: *align(align_amt) LongString) void {
-        incrRefCountOf(usize, &self.ref_count, options.threading);
-    }
-
-    pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
-        if (decrRefCountOf(usize, &self.ref_count, options.threading)) {
-            self.freeInner(gpa);
-        }
-    }
-
-    pub fn freeInner(self: *align(align_amt) LongString, gpa: Allocator) void {
-        switch (self.string_type) {
-            .normal => |string| gpa.free(string),
-            .different_capacity => |info| {
-                gpa.free(info.string.ptr[0..info.original_capacity :0]);
-            },
-            .temp => {
-                // We don't want to free the string, as it's managed by someone else.
-            },
-        }
-
-        gpa.destroy(self);
-    }
-};
 
 pub fn createExtraData(self: *Heap) !ExtraData {
     // TODO PERF make a fast case where this uses a heap-local list of
@@ -2752,30 +2254,6 @@ pub fn initLocalHeap() !void {
         return error.OutOfMemory;
     }
 }
-
-fn createOomErrorOptionsDict(heap: *Heap) !Handle {
-    const zero = try objutil.newInteger(heap, 0);
-    defer zero.decrRefCount();
-    const one = try objutil.newInteger(heap, 1);
-    defer one.decrRefCount();
-
-    const pairs = [_]Handle{
-        heap.getInternedString(.@"-code"),      one,
-        heap.getInternedString(.@"-level"),     zero,
-        heap.getInternedString(.@"-errorcode"), heap.getInternedString(.@"ZICL OOM"),
-    };
-
-    const new_dict = try objutil.newDict(heap, &pairs);
-    errdefer new_dict.decrRefCount();
-
-    // Make sure it has a dict and a string rep, so it's useful in an
-    // OOM situation.
-    _ = try new_dict.getString();
-    _ = try objutil.dictGetTable(new_dict);
-
-    return new_dict;
-}
-
 pub fn deinitAll() void {
     state.mutex.lockUncancelable(global_io);
     const heap_count = state.next_open_heap;
@@ -2920,10 +2398,9 @@ pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
     // Make sure to free any parsed scripts and system fixtures before scanning,
     // as they're allowed to leak (they have references to heap objects, causing false positives).
     heap.clearParsedScripts();
-    heap.deinitOomErrorOptions();
 
     // Go through once to print the summary, then print each individual trace.
-    const skip_count = special_object_count + interned_string_count;
+    const skip_count = special_object_count;
     for (heap.objects.items(.metadata)[skip_count..]) |metadata| {
         if (metadata.in_use) break;
     } else return false;
