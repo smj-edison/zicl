@@ -599,11 +599,11 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
     const arg_list_len = objutil.listLengthRaw(args);
 
     // Pre-allocate for optional default values. arg_list_len is an upper bound.
-    var optional_values: ?Handle = null;
+    const optional_values: ?Handle = null;
     errdefer if (optional_values) |val| val.decrRefCount();
     var args_parameter_found = false;
     var required_arity: u32 = 0;
-    var optional_arity: u32 = 0;
+    const optional_arity: u32 = 0;
 
     for (0..arg_list_len) |i| {
         if (args_parameter_found) {
@@ -628,53 +628,18 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
         const arg = arg_new.orElse(arg_raw);
         const arg_len = objutil.listLengthRaw(arg);
 
-        if (arg_len == 0) {
+        assert(arg_len == 1);
+        if (optional_values != null) {
             if (det) |details| details.* = .{
-                .message = try objutil.newString(Heap.local_heap, "argument with no name"),
+                .message = try objutil.newString(Heap.local_heap, "required parameter after optional parameter not allowed"),
             };
             return error.BadClosure;
-        } else if (arg_len > 2) {
-            if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "too many fields in argument specifier \"{f}\"", .{arg}),
-            };
-            return error.BadClosure;
-        } else if (arg_len == 2) {
-            // Optional parameter.
-            if (optional_values == null) {
-                optional_values = try objutil.newListWithCapacity(arg_list_len);
-            }
-
-            if (try Heap.stringEquals(objutil.listItem(arg, 0), "args")) {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newString(Heap.local_heap, "'args' must be a required parameter"),
-                };
-                return error.BadClosure;
-            }
-
-            // Add the optional parameter onto the optional parameters list.
-            var never_new: OptionalHandle = .none;
-            _ = try objutil.listAppend(det, optional_values.?, &never_new, objutil.listItem(arg, 1));
-            assert(never_new == .none);
-
-            // Replace {name default} with just the name in the args list.
-            const new_item = objutil.listItem(arg, 0).dupOrRef();
-            try objutil.listSetObject(null, args, &never_new, @intCast(i), new_item);
-            assert(never_new == .none);
-
-            optional_arity += 1;
-        } else {
-            if (optional_values != null) {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newString(Heap.local_heap, "required parameter after optional parameter not allowed"),
-                };
-                return error.BadClosure;
-            }
-
-            const arg_name = try objutil.listItem(arg, 0).getString();
-            if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
-
-            required_arity += 1;
         }
+
+        const arg_name = try objutil.listItem(arg, 0).getString();
+        if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
+
+        required_arity += 1;
     }
 
     return .{

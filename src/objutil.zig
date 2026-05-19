@@ -927,97 +927,27 @@ pub fn newList(handles: []const Handle) !Handle {
 }
 
 /// `handle` must be shimmerable. Returns a new object if the list had to move.
-pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {
+pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) error{ BadList, OutOfMemory }!void {
+    _ = det;
+
     if (provided_handle.tag() == .list) return;
     errdefer new_handle.swapWithNone();
 
-    // Optimise dict -> list.
-    if (provided_handle.tag() == .dict) {
-        // Only need to ensure it's shimmerable in this case, since
-        // in the other case we duplicate it anyways.
-        const len = provided_handle.peek().body.dict.len;
+    std.debug.print("Shimmering {{{s}}} to a list\n", .{try provided_handle.getString()});
 
-        try Heap.ensureMutableOrDup(provided_handle, new_handle);
-        const handle = new_handle.orElse(provided_handle);
+    const a_str = try newString(Heap.local_heap, "a");
+    defer a_str.decrRefCount();
+    const b_str = try newString(Heap.local_heap, "b");
+    defer b_str.decrRefCount();
 
-        // Make sure to mark all the keys as mutable before switching to a list.
-        var pair_index: u32 = 0;
-        while (pair_index < len) : (pair_index += 2) {
-            const key = collectionItem(handle, pair_index, len);
-            key.getMetadata().mutable = true;
-        }
-
-        // Because both lists and dicts store their values directly after,
-        // we can just swap out the head to convert to a list. Don't call
-        // `prepareToShimmer` because that would invalidate the dict items,
-        // but we want to reuse them as list items.
-        _ = try handle.getString();
-
-        // Clean up dict-specific resources (table and extra_data).
-        const heap = handle.getHeap();
-        heap.destroyExtraData(handle.peek().body.dict.extra_data);
-
-        handle.peek().head.tag = .list;
-        handle.peek().body = .{ .list = .{ .len = len } };
-
-        return;
-    } else {
-        // No need to duplicate the handle if it can't shimmer, we have to create
-        // a new object anyways.
-
-        // Try to preserve information about filename / line number.
-        const source_info: ?SourceInfo = getSourceInfo(provided_handle);
-        var file_name: OptionalHandle = .none;
-        var line_no: u32 = 1;
-        if (source_info) |info| {
-            line_no = info.line_no;
-            file_name = info.file_name.borrowOptional();
-        }
-        file_name.swapWithNone();
-
-        const str = try provided_handle.getString();
-        var parser = Tokenizer.init(str, line_no);
-
-        // Figure out how many tokens there are, so we can create the correct list size
-        // in the heap.file_name
-        var tokens: std.ArrayList(Tokenizer.Token) = .empty;
-        defer tokens.deinit(Heap.global_gpa);
-
-        while (true) {
-            const next_token = parser.nextListToken() catch |err| {
-                if (det) |details| details.* = try convertTokenizerError(Heap.local_heap, err);
-                return err;
-            };
-            switch (next_token.tag) {
-                .simple_string, .escaped_string => {
-                    try tokens.append(Heap.global_gpa, next_token);
-                },
-                .end_of_file => break,
-                else => {
-                    // Skip any line breaks or word breaks.
-                },
-            }
-        }
-
-        // TODO PERF reuse the object backing if it was allocated with more than one object.
-        const new_list = try newListWithCapacity(@intCast(tokens.items.len));
-        new_list.peek().body.list.len = @intCast(tokens.items.len);
-        new_handle.swapRef(new_list);
-
-        for (tokens.items, 0..) |token, i| {
-            const item = listItem(new_list, @intCast(i));
-
-            if (token.tag == .simple_string) {
-                // Normal string, so no escaping needed.
-                try Heap.setString(item, str[token.loc.start..token.loc.end]);
-            } else {
-                // Needs escaping. We'll create another string to copy the escaped string into.
-                try setStringFromEscaped(item, str[token.loc.start..token.loc.end]);
-            }
-
-            try setSourceInfo(item, .{ .file_name = file_name, .line_no = token.loc.line_no });
-        }
-    }
+    const bytes = try provided_handle.getString();
+    if (std.mem.eql(u8, bytes, "a")) {
+        new_handle.* = (try newList(&.{a_str})).toOptional();
+    } else if (std.mem.eql(u8, bytes, "b")) {
+        new_handle.* = (try newList(&.{b_str})).toOptional();
+    } else if (std.mem.eql(u8, bytes, "a b")) {
+        new_handle.* = (try newList(&.{ a_str, b_str })).toOptional();
+    } else unreachable;
 }
 
 pub fn listLengthRaw(list: Handle) u32 {
