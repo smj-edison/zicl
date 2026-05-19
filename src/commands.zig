@@ -72,3 +72,15 @@ pub fn testFinish(interp: *Interp) void {
     interp.deinit();
     Heap.testFinish();
 }
+
+test "fn command" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Closure captures scope.
+    try interp.testExpectScriptResult("15",
+        \\ fn add {a b} { + $a $b }
+        \\ set x 10
+        \\ fn addx {a} { + $a $x }
+    );
+}

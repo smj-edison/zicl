@@ -62,7 +62,6 @@ pub var global_gpa: std.mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
 pub threadlocal var local_heap: *Heap = undefined;
-pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
 
 const Heap = @This();
 
@@ -281,12 +280,6 @@ pub const Object = packed struct(u128) {
     pub fn deinitBodySingle(obj: *Object, heap: *Heap) void {
         // Deinit body
         switch (obj.head.tag) {
-            .custom_type => {
-                const custom_type = obj.body.custom_type;
-                const type_fns = custom_types.items[custom_type.type_id];
-
-                type_fns.invalidate_body(heap, obj);
-            },
             .reference => {
                 obj.body.reference.decrRefCount();
             },
@@ -322,7 +315,7 @@ pub const Object = packed struct(u128) {
             .invalid,
             .cached_local_var,
             => {},
-            .dict, .list => unreachable,
+            .dict, .list, .custom_type => unreachable,
         }
 
         obj.body = undefined;
@@ -623,16 +616,6 @@ pub const Closure = struct {
         closure.scope.decrOptional();
         closure.optional_values.decrOptional();
     }
-};
-
-pub const CustomType = struct {
-    /// Type name.
-    name: []u8,
-    /// Must be threadsafe.
-    invalidate_body: *const fn (heap: *Heap, obj: *Object) void,
-    duplicate: *const fn (heap: *Heap, src: *const Object) Allocator.Error!Object,
-    get_string: *const fn (heap: *Heap, obj: *const Object) Allocator.Error![:0]u8,
-    make_immutable: *const fn (heap: *Heap, obj: *Object) Allocator.Error!void,
 };
 
 const HeapIndex = u32;
@@ -967,11 +950,6 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.getHeap().getLocalStringDetails(str_or_ptr);
     }
 
-    pub fn getSourceExtraData(handle: Handle) *@FieldType(ExtraDataValue, "source") {
-        handle.assert(handle.tag() == .source);
-        return &handle.getHeap().getExtraData(handle.peek().body.source.extra_data).source;
-    }
-
     pub fn getDictExtraData(handle: Handle) *ExtraDataValue.Dictionary {
         handle.assert(handle.tag() == .dict);
         return &handle.getHeap().getExtraData(handle.peek().body.dict.extra_data).dict;
@@ -1005,15 +983,6 @@ pub const Handle = packed struct(HandleBacking) {
             .index => {
                 break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.index}, 0);
             },
-            .integer => {
-                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.integer}, 0);
-            },
-            .float => {
-                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.float}, 0);
-            },
-            .bool => {
-                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{@intFromBool(obj.body.bool.data)}, 0);
-            },
             .list => {
                 const list = obj.body.list;
                 break :blk try getListString(handle.getHeap(), handle.index + 1, list.len);
@@ -1021,112 +990,26 @@ pub const Handle = packed struct(HandleBacking) {
             .dict => {
                 break :blk try generateDictString(handle);
             },
-            .closure => {
-                const closure = handle.getClosureExtraData();
-                const heap = handle.getHeap();
-                const total_args = objutil.listLengthRaw(closure.args);
-                const opt_values = closure.optional_values.toHandle();
-
-                // Build the args spec list. Required/args params use the name directly;
-                // optional params become 2-element lists {name default}.
-                const args_spec = try objutil.newListWithCapacity(total_args);
-                defer args_spec.decrRefCount();
-                args_spec.peek().body.list.len = total_args;
-                const arg_items = objutil.listItems(args_spec);
-
-                for (0..total_args) |i| {
-                    const arg_name = objutil.listItem(closure.args, @intCast(i));
-                    const is_args_param = closure.has_args_parameter and i == total_args - 1;
-                    const is_optional = !is_args_param and i >= closure.required_arity;
-
-                    if (is_optional) {
-                        const opt_idx = i - closure.required_arity;
-                        const default_val = objutil.listItem(opt_values.?, @intCast(opt_idx));
-                        const spec = try objutil.newList(&.{ arg_name, default_val });
-                        arg_items[i] = spec.referenceTakeOwnership();
-                    } else {
-                        arg_items[i] = heap.dupOrReference(arg_name);
-                    }
-                }
-
-                // impl is a 2-element list: {args_spec body}.
-                const impl_val = try objutil.newList(&.{ args_spec, closure.body });
-                defer impl_val.decrRefCount();
-
-                // Build the outer list: fn ?name <name>? impl <impl> ?scope <scope>?
-                const outer = try objutil.newListWithCapacity(7);
-                defer outer.decrRefCount();
-
-                const fn_str = try objutil.newString(local_heap, "fn");
-                const name_str = try objutil.newString(local_heap, "name");
-                const impl_str = try objutil.newString(local_heap, "impl");
-                const scope_str = try objutil.newString(local_heap, "scope");
-
-                objutil.listAppendAssumeCapacity(outer, fn_str.referenceTakeOwnership());
-                if (closure.name.toHandle()) |name_handle| {
-                    objutil.listAppendAssumeCapacity(outer, name_str.referenceTakeOwnership());
-                    objutil.listAppendAssumeCapacity(outer, name_handle.dupOrRef());
-                }
-
-                objutil.listAppendAssumeCapacity(outer, impl_str.referenceTakeOwnership());
-                objutil.listAppendAssumeCapacity(outer, impl_val.dupOrRef());
-
-                if (closure.scope.toHandle()) |scope_handle| {
-                    objutil.listAppendAssumeCapacity(outer, scope_str.referenceTakeOwnership());
-                    objutil.listAppendAssumeCapacity(outer, scope_handle.dupOrRef());
-                }
-
-                const result = try getListString(heap, outer.index + 1, objutil.listLengthRaw(outer));
-                break :blk result;
-            },
+            .closure => unreachable,
             .custom_type => unreachable,
             .reference => {
                 // Intentionally return early, since we should always use
                 // the reference's string, not our own.
                 return getString(obj.body.reference);
             },
-            .parsed_script_command => {
-                if (builtin.mode == .Debug and state.running_leak_check) {
-                    const script_command = obj.body.parsed_script_command;
-                    break :blk try std.fmt.allocPrintSentinel(
-                        global_gpa,
-                        "<script command: args: {}, line: {}>",
-                        .{ script_command.arg_count, script_command.line },
-                        0,
-                    );
-                } else @panic("Script line is an internal object only");
-            },
-            .none => {
-                if (builtin.mode == .Debug and state.running_leak_check) {
-                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<none>", .{}, 0);
-                } else {
-                    last_touched = handle;
-                    @panic("Tried to generate a string for .none");
-                }
-            },
-            .invalid => {
-                if (builtin.mode == .Debug and state.running_leak_check) {
-                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<invalid>", .{}, 0);
-                } else {
-                    last_touched = handle;
-                    @panic("Tried to generate a string for .invalid");
-                }
-            },
-            .marked => {
-                if (builtin.mode == .Debug and state.running_leak_check) {
-                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<marked>", .{}, 0);
-                } else @panic("Tried to generate a string for .marked");
-            },
-            .upvar_link => {
-                if (builtin.mode == .Debug and state.running_leak_check) {
-                    break :blk try std.fmt.allocPrintSentinel(global_gpa, "<upvar_link>", .{}, 0);
-                } else @panic("Tried to generate a string for .upvar_link");
-            },
+            .parsed_script_command,
+            .none,
+            .invalid,
+            .marked,
+            .upvar_link,
             .string,
             .source,
             .dict_sugar,
             .cached_local_var,
             .cached_lexical_var,
+            .bool,
+            .integer,
+            .float,
             => {
                 std.debug.panic("{} should always have a string representation", .{obj.head.tag});
             },
@@ -1153,20 +1036,6 @@ pub const Handle = packed struct(HandleBacking) {
             .null, .normal => {
                 // Fall through.
             },
-        }
-
-        if (handle.tag() == .source) {
-            const source = handle.getSourceExtraData();
-            // If it's a source object, it may contain a cached hash.
-            const hash_state = source.hash.state.load(.acquire);
-            if (hash_state == .computed) {
-                return source.hash.hash;
-            } else {
-                const hash = memutil.hashBytes(try handle.getString());
-                source.hash.hash = hash;
-                source.hash.state.store(.computed, .release);
-                return hash;
-            }
         }
 
         // We don't save the hash when it's not a long string, since
@@ -2214,8 +2083,6 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     defer state.mutex.unlock(global_io);
 
     global_gpa = gpa;
-    custom_types = try .initWithCapacity(global_gpa, if (options.threading) cfg.max_custom_types else 32);
-    errdefer custom_types.deinit(global_gpa);
 
     state.initialized = true;
 }
@@ -2262,7 +2129,6 @@ pub fn deinitAll() void {
     // Deinit global state.
     state.mutex.lockUncancelable(global_io);
     if (state.initialized) {
-        custom_types.deinit(global_gpa);
         state.initialized = false;
     }
     state.mutex.unlock(global_io);

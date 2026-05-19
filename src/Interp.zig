@@ -542,112 +542,6 @@ pub fn createClosureObject(closure: Heap.Closure) !Handle {
     return obj;
 }
 
-const ClosureAndCacheKey = struct {
-    closure: Heap.Closure,
-    cache_key: u256,
-};
-/// Caller is responsible for borrowing the returned closure
-/// if they intend to use it beyond temporarily.
-pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
-    _ = interp;
-    assert(handle.tag() == .closure);
-    const closure = handle.getClosureExtraData().*;
-    return .{ .closure = closure, .cache_key = @as(u256, closure.cache_id) };
-}
-
-pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
-    const arg_count = args.len - 1; // - 1 to skip command name as first argument.
-
-    // Check arity.
-    const too_few_arguments: bool = arg_count < closure.required_arity;
-    const has_args: bool = closure.has_args_parameter;
-    const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
-    if (too_few_arguments or too_many_arguments) {
-        unreachable;
-    }
-
-    // Check for infinite recursion.
-    if (interp.currentCallFrame().level >= interp.max_call_depth) {
-        try interp.setResultString("Too many nested calls. Infinite recursion?");
-        return error.InfiniteRecursion;
-    }
-
-    const parent_idx = interp.currentCallFrameIndex();
-    const call_frame_idx = try interp.pushCallFrame(parent_idx, args, closure);
-    defer {
-        var frame = interp.call_frames.pop().?;
-        frame.deinit();
-    }
-
-    // Next, we'll populate the call frame.
-
-    // Where we are in the arguments that this was called with.
-    var called_idx: usize = 1;
-    // Where we are in the signature.
-    var signature_idx: u32 = 0;
-    const signature_len = objutil.listLengthRaw(closure.args);
-
-    while (signature_idx < signature_len) : (signature_idx += 1) {
-        const var_name = objutil.listItem(closure.args, signature_idx);
-
-        // Are we at the last argument? If so, is it `args`?
-        if (signature_idx == signature_len - 1 and closure.has_args_parameter) {
-            // Assign remaining arguments to `args`.
-            const list = try objutil.newList(args[called_idx..]);
-            defer list.decrRefCount();
-            interp.setVariableInner(null, call_frame_idx, var_name, list.reference()) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // It's impossible to hit bad dict when initializing a brand new call frame.
-                error.BadDict => unreachable,
-            };
-        } else if (signature_idx >= closure.required_arity) {
-            // This is an optional argument.
-
-            // Are there any remaining unassigned arguments?
-            if (called_idx < args.len) {
-                interp.setVariableInner(
-                    null,
-                    call_frame_idx,
-                    var_name,
-                    args[called_idx].dupOrRef(),
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    // It's impossible to hit bad dict when initializing a brand new call frame.
-                    error.BadDict => unreachable,
-                };
-                called_idx += 1;
-            } else {
-                // Else populate it with its default value.
-                const default_value = objutil.listItem(closure.optional_values.toHandle().?, signature_idx - closure.required_arity);
-                interp.setVariableInner(
-                    null,
-                    call_frame_idx,
-                    var_name,
-                    default_value.dupOrRef(),
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    // It's impossible to hit bad dict when initializing a brand new call frame.
-                    error.BadDict => unreachable,
-                };
-            }
-        } else {
-            interp.setVariableInner(
-                null,
-                call_frame_idx,
-                var_name,
-                args[called_idx].dupOrRef(),
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // It's impossible to hit bad dict when initializing a brand new call frame.
-                error.BadDict => unreachable,
-            };
-            called_idx += 1;
-        }
-    }
-
-    try interp.evalObjectInner(closure.body, cache_key);
-}
-
 fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
     const signature = command.call_info.zig;
 
@@ -918,33 +812,14 @@ fn interpolateTokens(
     return new_str;
 }
 
-const CommandOrClosure = union(enum) {
-    closure: ClosureAndCacheKey,
-    command: *NativeCommand,
-};
-
 /// `name` must be from the threadlocal heap.
-fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !CommandOrClosure {
+fn getCommandInner(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame: u32, name: Handle) !*NativeCommand {
     if (interp.getVariableInner(null, call_frame, name)) |var_val| {
-        if (var_val.tag() == .closure) {
-            return .{ .closure = try interp.getClosure(var_val) };
-        }
-
         // TODO PERF figure out whether caching nativefn lookup would be beneficial.
         const bytes = try var_val.getString();
-        if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
-            // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
-            const command = interp.global_commands.getPtr(bytes[9..]) orelse {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "invalid native command name \"{s}\"", .{bytes[9..]}),
-                };
-                return error.CommandNotFound;
-            };
-            return .{ .command = command };
-        } else {
-            const closure = try interp.getClosure(var_val);
-            return .{ .closure = closure };
-        }
+        assert(std.mem.eql(u8, bytes[0..9], "nativefn "));
+        // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
+        return interp.global_commands.getPtr(bytes[9..]) orelse unreachable;
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound, error.BadDict => {
@@ -962,7 +837,7 @@ pub fn getCommand(
     call_frame_idx: u32,
     provided_handle: Handle,
     new_handle: *OptionalHandle,
-) !CommandOrClosure {
+) !*NativeCommand {
     errdefer new_handle.swapWithNone();
     try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
 
@@ -972,10 +847,10 @@ pub fn getCommand(
 fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
     var new_command: OptionalHandle = .none;
     var det: objutil.ErrorDetails = undefined;
-    const command_or_closure = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch unreachable;
+    const command = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch unreachable;
     args[0].swapIfNew(new_command);
 
-    try interp.callNative(command_or_closure.command, args);
+    try interp.callNative(command, args);
 }
 
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
@@ -994,10 +869,6 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
     _ = try interp.pushEvalFrame();
     defer interp.popEvalFrame();
 
-    // Used for allocating the arguments passed into a command call.
-    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
-    var args_alloc = sf.get();
-
     // Execute every command sequentially until the end of the script or an error occurs.
     var command_token_i: u32 = 0;
 
@@ -1013,8 +884,7 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         // This is not always the same as which word token we're on, as argument expansion
         // may write multiple arguments from one word.
         var args_written: usize = 0;
-        var args = try args_alloc.alloc(Handle, command_info.arg_count);
-        defer args_alloc.free(args);
+        var args = try Heap.global_gpa.alloc(Handle, command_info.arg_count);
         defer for (args[0..args_written]) |arg| arg.decrRefCount();
 
         // Populate the arguments by looping through each word of the command and
@@ -1034,16 +904,8 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         // fails. The slice is still live at that point (before the loop body `defer` frees it),
         // mirroring Jim's `evalFrame->argv` pattern.
         interp.currentEvalFrame().args = args[0..args_written];
-        defer interp.currentEvalFrame().args = &.{};
 
-        const cmd_result = interp.invokeCommand(interp.currentCallFrameIndex(), args);
-
-        // TODO actually check for signals.
-        if (false) {
-            return error.Signal;
-        } else {
-            cmd_result catch unreachable;
-        }
+        interp.invokeCommand(interp.currentCallFrameIndex(), args) catch unreachable;
     }
 }
 
@@ -1129,15 +991,6 @@ pub fn setVariableToObject(interp: *Interp, name: *Handle, obj: Heap.Object) !vo
     name.swapIfNew(new_name);
     var det: objutil.ErrorDetails = undefined;
     try interp.wrapError(&det, interp.setVariableInner(&det, interp.currentCallFrameIndex(), name.*, obj));
-}
-
-pub fn setVariableSilent(interp: *Interp, name: *Handle, handle: Handle) !void {
-    var new_name: OptionalHandle = .none;
-    try Heap.ensureShimmerableOrDup(name.*, &new_name);
-    name.swapIfNew(new_name);
-
-    const handle_to_obj = handle.dupOrRef();
-    try interp.setVariableInner(null, interp.currentCallFrameIndex(), name.*, handle_to_obj);
 }
 
 pub fn setVariableTo(interp: *Interp, name: *Handle, handle: Handle) !void {

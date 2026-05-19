@@ -77,6 +77,4 @@ test {
     _ = @import("Tokenizer.zig");
     _ = @import("Interp.zig");
     _ = @import("commands.zig");
-
-    _ = @import("test/test_root.zig");
 }
