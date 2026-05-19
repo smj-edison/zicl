@@ -30,10 +30,6 @@ current_call_epoch: u32,
 global_procedure_epoch: u32,
 global_commands: CommandHashTable,
 
-eval_depth: usize,
-max_eval_depth: usize,
-max_call_depth: usize,
-
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
 pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
@@ -72,10 +68,6 @@ pub fn narrowToEvalError(result: anytype) blk: {
         return val;
     } else |err| return narrowError(err);
 }
-
-const Tailcall = struct {
-    args: []Handle,
-};
 
 fn wrapErrorDetailsReturnType(ResultType: type) type {
     if (comptime std.meta.activeTag(@typeInfo(ResultType)) == .error_set) {
@@ -557,26 +549,10 @@ const ClosureAndCacheKey = struct {
 /// Caller is responsible for borrowing the returned closure
 /// if they intend to use it beyond temporarily.
 pub fn getClosure(interp: *Interp, handle: Handle) !ClosureAndCacheKey {
-    if (handle.tag() == .closure) {
-        const closure = handle.getClosureExtraData().*;
-        return .{ .closure = closure, .cache_key = @as(u256, closure.cache_id) };
-    }
-
-    const cache_key = try handle.getHash();
-
-    if (Heap.local_heap.parsed_closures.get(cache_key)) |cached| {
-        return .{ .closure = cached.closure, .cache_key = cache_key };
-    } else {
-        // We need to parse the closure.
-        var det: objutil.ErrorDetails = undefined;
-        const closure: Heap.Closure = try interp.wrapError(&det, parseClosure(&det, try handle.getString()));
-        if (Heap.local_heap.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
-            var old = old_value;
-            old.closure.deinit();
-        }
-        const cached = Heap.local_heap.parsed_closures.get(cache_key).?;
-        return .{ .closure = cached.closure, .cache_key = cache_key };
-    }
+    _ = interp;
+    assert(handle.tag() == .closure);
+    const closure = handle.getClosureExtraData().*;
+    return .{ .closure = closure, .cache_key = @as(u256, closure.cache_id) };
 }
 
 pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args: []Handle) !void {
@@ -750,8 +726,6 @@ const CallFrame = struct {
     /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
     /// but when it overflows it'll scan the heap and reset all cached lookups.
     call_epoch: u32,
-    /// Set this during evaluation to trigger a tailcall.
-    tailcall: ?Tailcall,
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
@@ -829,7 +803,6 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
         .signature = borrowed_signature,
         // TODO PERF recycle variable hash table if possible.
         .variables = vars_handle,
-        .tailcall = null,
     });
 
     return @intCast(new_call_frame_idx);
@@ -861,14 +834,6 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
                 interp.getVariableInner(&det, interp.currentCallFrame().level, value),
             );
             return var_target.borrow();
-        },
-        .expression_sugar => {
-            @panic("Expression sugar unimplemented");
-        },
-        .command_subst => {
-            const nested_cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try value.getHash();
-            try interp.evalObjectInner(value, nested_cache_key);
-            return interp.result.borrow();
         },
         else => {
             std.debug.panic("Tried to substitute token {}", .{tag});
@@ -1007,61 +972,12 @@ pub fn getCommand(
 fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
     var new_command: OptionalHandle = .none;
     var det: objutil.ErrorDetails = undefined;
-    const command_or_closure = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.EvalError => return error.EvalError,
-        error.CommandNotFound => {
-            // TODO invoke jim unknown
-            std.debug.print("Tried to call command: {s}\n", .{args[0].getString() catch "<oom>"});
-            @panic("unimplemented");
-        },
-    };
+    const command_or_closure = interp.getCommand(&det, call_frame_idx, args[0], &new_command) catch unreachable;
     args[0].swapIfNew(new_command);
-
-    if (interp.eval_depth >= interp.max_eval_depth) {
-        try interp.setResultString("Infinite eval recursion");
-        return error.InfiniteRecursion;
-    }
-
-    interp.eval_depth += 1;
-    defer interp.eval_depth -= 1;
 
     try interp.callNative(command_or_closure.command, args);
 }
 
-fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
-    _ = interp;
-    _ = result;
-    return true;
-}
-
-const ExprResult = union(enum) {
-    int: i64,
-    float: f64,
-    /// An owned handle is owned by the expression. It can be shimmered, replaced, etc.
-    owned_handle: *Handle,
-    /// A temp handle is on the stack, so it needs to be referenced every time.
-    stack_handle: Handle,
-
-    pub fn release(result: ExprResult) void {
-        switch (result) {
-            .stack_handle => |handle| handle.decrRefCount(),
-            .owned_handle => {
-                // Owned by the expr, so no need to decr ref count.
-            },
-            .int, .float => {},
-        }
-    }
-
-    pub fn toObject(result: ExprResult) !Handle {
-        switch (result) {
-            .int => |int| return try objutil.newInteger(Heap.local_heap, int),
-            .float => |float| return try objutil.newFloat(float),
-            .owned_handle => |handle| return handle.borrow(),
-            .stack_handle => |handle| return handle,
-        }
-    }
-};
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
@@ -1105,13 +1021,6 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         // substituting.
         var word_token_i: u32 = command_token_i;
         for (0..command_info.arg_count) |_| {
-            var word_parts: u32 = 1;
-            if (tags[word_token_i] == .start_of_word) {
-                word_parts = @intCast(values[word_token_i].body.integer);
-                word_token_i += 1;
-            }
-            assert(word_parts == 1);
-
             const resultant_word = try interp.substituteOneToken(tags[word_token_i], objutil.listItem(parsed.values, word_token_i));
             word_token_i += 1;
 
@@ -1120,11 +1029,6 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         }
 
         command_token_i = word_token_i;
-
-        // Now that we've populated the arguments for this command, we'll go ahead and run it.
-        std.debug.print("Calling command: ", .{});
-        for (args) |arg| std.debug.print("{{{s}}} ", .{try arg.getString()});
-        std.debug.print("\n", .{});
 
         // `args` is stored in the eval frame so `buildErrorStack` can read it if this command
         // fails. The slice is still live at that point (before the loop body `defer` frees it),
@@ -1156,9 +1060,6 @@ pub fn init() !Interp {
         .current_call_epoch = 0,
         .global_procedure_epoch = 0,
         .global_commands = .empty,
-        .eval_depth = 0,
-        .max_eval_depth = 1000,
-        .max_call_depth = 1000,
     };
 
     _ = try new_interp.pushCallFrame(null, &.{}, .{
