@@ -541,60 +541,15 @@ pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeComma
 }
 
 pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closure {
-    if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..8], "closure ")) {
-        if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure: \"{s}\"", .{bytes}),
-        };
-        return error.BadClosure;
-    }
-
     const closure_value = try objutil.newString(Heap.local_heap, bytes[8..]);
     defer closure_value.decrRefCount();
 
-    var new_handle: OptionalHandle = .none;
-    objutil.shimmerToDict(null, closure_value, &new_handle) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure: \"{s}\"", .{bytes}),
-            };
-            return error.BadClosure;
-        },
-    };
-    assert(new_handle == .none);
+    const name = try objutil.dictLookupFollowRefs(closure_value, Heap.local_heap.getInternedString(.name));
+    const impl_raw = try objutil.dictLookupFollowRefs(closure_value, Heap.local_heap.getInternedString(.impl));
+    const scope = try objutil.dictLookupFollowRefs(closure_value, Heap.local_heap.getInternedString(.scope));
 
-    const name = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.name));
-    const impl_raw = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.impl));
-    const scope = try objutil.dictLookupFollowLinks(closure_value, Heap.local_heap.getInternedString(.scope));
-
-    const args, const body = blk: {
-        if (impl_raw.toHandle()) |impl| {
-            objutil.shimmerToList(null, impl, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure implementation: \"{s}\"", .{bytes}),
-                    };
-                    return error.BadClosure;
-                },
-            };
-            assert(new_handle == .none);
-
-            if (objutil.listLengthRaw(impl) != 2) {
-                if (det) |details| details.* = .{
-                    .message = try objutil.newStringFmt(Heap.local_heap, "not a valid closure implementation: \"{s}\"", .{bytes}),
-                };
-                return error.BadClosure;
-            }
-
-            break :blk .{ objutil.listItem(impl, 0), objutil.listItem(impl, 1) };
-        } else {
-            if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt(Heap.local_heap, "closure missing implementation: \"{s}\"", .{bytes}),
-            };
-            return error.BadClosure;
-        }
-    };
+    const args = objutil.listItem(impl_raw.toHandle().?, 0);
+    const body = objutil.listItem(impl_raw.toHandle().?, 1);
 
     // Make sure args is a list.
     var args_new: OptionalHandle = .none;
