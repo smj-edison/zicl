@@ -1029,15 +1029,6 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             // Be sure to free the abandoned items when we shrink.
             for (0..freed_count) |to_free| {
                 const to_free_handle = collectionItem(provided_handle, @intCast(current_len - freed_count + to_free), current_len);
-                // If a dict, be sure to remove the keys from the table.
-                if (provided_handle.tag() == .dict and @mod(to_free, 2) == 0) {
-                    if (provided_handle.getDictExtraData().table) |*table| {
-                        _ = table.remove(to_free_handle);
-                    }
-                    // Also mark keys as mutable again.
-                    to_free_handle.getMetadata().mutable = true;
-                }
-
                 to_free_handle.invalidateBoth();
             }
 
@@ -1060,11 +1051,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
     // We've exhausted all other options, so we'll need to make a new collection.
     const new_handle = switch (provided_handle.tag()) {
         .list => try newListWithCapacity(new_len),
-        .dict => blk: {
-            const new_dict = try newDictWithCapacity(Heap.local_heap, new_len);
-            new_dict.getDictExtraData().parent_link = provided_handle.getDictExtraData().parent_link.borrowOptional();
-            break :blk new_dict;
-        },
+        .dict => try newDictWithCapacity(Heap.local_heap, new_len),
         else => unreachable,
     };
     errdefer new_handle.decrRefCount();
