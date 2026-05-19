@@ -572,83 +572,6 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
     }
 }
 
-fn interpolateTokens(
-    interp: *Interp,
-    tags: []const Tokenizer.Token.Tag,
-    value_list: Handle,
-    value_start: u32,
-    value_len: u32,
-    substitution_only: bool,
-) !Handle {
-    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
-    const tokens_alloc = sf.get();
-
-    var new_values = try std.ArrayList(Handle).initCapacity(tokens_alloc, value_len);
-    defer new_values.deinit(tokens_alloc);
-    defer for (new_values.items) |value| value.decrRefCount();
-
-    // Substitute all the tokens, placing them in `new_values`.
-    for (tags, value_start..(value_start + value_len)) |tag, value_index| {
-        if (interp.substituteOneToken(tag, objutil.listItemFollowRefs(value_list, @intCast(value_index)))) |new_value| {
-            new_values.appendAssumeCapacity(new_value);
-        } else |err| {
-            // Due to the error, we're actually going to return early, after we take care
-            // of giving a useful error to the user.
-            var new_err = err;
-
-            if (substitution_only) {
-                switch (err) {
-                    error.Break => {
-                        // Stop here.
-                        break;
-                    },
-                    error.Continue => {
-                        new_values.appendAssumeCapacity(Heap.local_heap.emptyHandle());
-                        continue;
-                    },
-                    else => {},
-                }
-            } else {
-                switch (err) {
-                    error.Break => {
-                        try interp.setResultString("invoked \"break\" outside of a loop");
-                        new_err = error.EvalError;
-                    },
-                    error.Continue => {
-                        try interp.setResultString("invoked \"continue\" outside of a loop");
-                        new_err = error.EvalError;
-                    },
-                    else => {},
-                }
-            }
-
-            return new_err;
-        }
-    }
-
-    var new_str_len: usize = 0;
-    for (new_values.items) |new_value| {
-        new_str_len += (try new_value.getString()).len;
-    }
-
-    if (new_str_len == 0) return Heap.local_heap.emptyHandle();
-
-    const new_str = try objutil.newStringToFill(Heap.local_heap, new_str_len);
-    errdefer new_str.decrRefCount();
-    if (Heap.getStringMut(new_str)) |new_str_mut| {
-        var written: usize = 0;
-        for (new_values.items) |new_value| {
-            const value_str = try new_value.getString();
-            @memcpy(new_str_mut[written..][0..value_str.len], value_str);
-            written += value_str.len;
-        }
-    } else |err| switch (err) {
-        error.NotMutable => unreachable,
-    }
-
-    return new_str;
-}
-
 /// `name` must be from the threadlocal heap.
 fn getCommandInner(interp: *Interp, call_frame: u32, name: Handle) !*NativeCommand {
     if (interp.getVariableInner(call_frame, name)) |var_val| {
@@ -682,9 +605,7 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
 }
 
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
-    // Try to get the script, parsing if necessary.
-    var det: objutil.ErrorDetails = undefined;
-    const parsed = objutil.getScript(&det, script, cache_key) catch unreachable;
+    const parsed = objutil.getScript(script, cache_key) catch unreachable;
 
     _ = try interp.pushEvalFrame();
     defer interp.popEvalFrame();
