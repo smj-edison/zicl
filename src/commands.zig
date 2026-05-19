@@ -21,14 +21,7 @@ pub fn setCmd(interp: *Interp, args: []const Handle) !void {
     var var_name = args[1].borrow();
     defer var_name.decrRefCount();
 
-    if (args.len == 2) {
-        // Return the value.
-        interp.setResult(try interp.getVariableOrError(&var_name));
-    } else {
-        try interp.setVariableTo(&var_name, args[2]);
-        // Return the stored value (may differ from args[2] after upvar follow).
-        interp.setResult(try interp.getVariableOrError(&var_name));
-    }
+    try interp.setVariableTo(&var_name, args[2]);
 }
 
 /// [fn] - creates a closure capturing the current scope and sets it as a
@@ -67,7 +60,6 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     defer closure_obj.decrRefCount();
 
     try interp.setVariableTo(fn_name, closure_obj);
-    interp.setResult(try interp.getVariableOrError(fn_name));
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
