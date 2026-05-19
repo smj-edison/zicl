@@ -1,0 +1,296 @@
+--- /proc/self/fd/11	2026-05-18 22:25:00.319134269 -0600
++++ /proc/self/fd/12	2026-05-18 22:25:00.319134269 -0600
+@@ -197600,7 +197600,7 @@
+ 	mov	byte ptr [rcx + r8], al
+ 	mov	rdi, r14
+ 	xor	esi, esi
+-	movabs	rdx, -4294967296
++	movabs	rdx, 356482285568
+ 	call	objutil.listAppendAssumeCapacity
+ 	mov	rdi, r14
+ 	call	objutil.listLengthRaw
+@@ -197634,7 +197634,7 @@
+ 	mov	byte ptr [rax + r8], 1
+ 	mov	rdi, r14
+ 	xor	esi, esi
+-	movabs	rdx, 73014378496
++	xor	edx, edx
+ 	call	objutil.listAppendAssumeCapacity
+ 	mov	rdi, r14
+ 	call	objutil.listLengthRaw
+@@ -245840,10 +245840,10 @@
+ 	jbe	.LBB
+ 	mov	qword ptr [rsp + 64], r12
+ 	shl	r12, 4
+-	mov	r13, qword ptr [rax + r12]
+-	shr	r13, 59
+-	mov	byte ptr [rsp + 36], r13b
+-	mov	rbx, qword ptr [rip + Heap.global_io]
++	mov	rbx, qword ptr [rax + r12]
++	shr	rbx, 59
++	mov	byte ptr [rsp + 36], bl
++	mov	r13, qword ptr [rip + Heap.global_io]
+ 	mov	r14, qword ptr [rip + Heap.global_io+8]
+ 	mov	ecx, 1
+ 	xor	eax, eax
+@@ -245859,7 +245859,7 @@
+ 	mov	qword ptr [rsp + 176], 0
+ 	mov	qword ptr [rsp + 184], offset __anon_X
+ 	mov	qword ptr [rsp + 192], 1
+-	lea	rbx, [rsp + 184]
++	lea	r13, [rsp + 184]
+ 	vxorps	xmm0, xmm0, xmm0
+ 	vmovups	xmmword ptr [rsp + 200], xmm0
+ 	mov	qword ptr [rsp + 216], 2
+@@ -245868,22 +245868,22 @@
+ 	mov	byte ptr [rsp + 230], 1
+ 	mov	esi, offset __anon_X
+ 	mov	edx, 16
+-	mov	rdi, rbx
++	mov	rdi, r13
+ 	call	Io.Writer.writeAll
+ 	test	ax, ax
+ 	jne	.LBB
+-	movzx	esi, r13b
+-	mov	rdi, rbx
+-	call	Io.Writer.printValue__anon_X
++	mov	rdi, r13
++	mov	rsi, rbx
++	call	Io.Writer.printIntAny__anon_X
+ 	test	ax, ax
+ 	jne	.LBB
+ 	mov	esi, offset __anon_X
+ 	mov	edx, 1
+-	mov	rdi, rbx
++	mov	rdi, r13
+ 	call	Io.Writer.writeAll
+ .LBB:
+ 	mov	rax, qword ptr [rsp + 184]
+-	mov	rdi, rbx
++	mov	rdi, r13
+ 	call	qword ptr [rax + 16]
+ 	test	ax, ax
+ 	jne	.LBB
+@@ -245918,10 +245918,10 @@
+ 	mov	edx, 1
+ 	call	qword ptr [rax + 112]
+ .LBB:
+-	movabs	r13, 1152921504606846975
++	movabs	r14, 1152921504606846975
+ 	lea	r15, [r15 + Heap.heaps]
+ 	mov	rax, qword ptr [r15 + 2408]
+-	cmp	rax, r13
++	cmp	rax, r14
+ 	ja	.LBB
+ 	test	rax, rax
+ 	mov	rdi, qword ptr [rsp + 64]
+@@ -245940,6 +245940,7 @@
+ 	add	rbx, r12
+ 	jmp	qword ptr [8*rax + .LJTI]
+ .LBB:
++	mov	r13, r14
+ 	mov	r14, qword ptr [rsp]
+ 	mov	word ptr [r14 + 16], 0
+ 	lea	rdi, [rsp + 384]
+@@ -245990,9 +245991,8 @@
+ 	and	rax, qword ptr [rdx + r12]
+ 	mov	rdx, qword ptr [rbx + 8]
+ 	or	rax, rcx
+-	mov	rcx, qword ptr [rsp]
+-	mov	qword ptr [rcx + 8], rdx
+-	mov	qword ptr [rcx], rax
++	mov	qword ptr [r14 + 8], rdx
++	mov	qword ptr [r14], rax
+ 	jmp	.LBB
+ .LBB:
+ 	vmovups	ymm0, ymmword ptr [rip + __anon_X]
+@@ -246074,7 +246074,7 @@
+ 	mov	ecx, eax
+ 	and	cl, 7
+ 	cmp	cl, 2
+-	movzx	ecx, byte ptr [rsp + 64]
++	mov	r15, qword ptr [rsp]
+ 	jne	.LBB
+ 	mov	rax, qword ptr [rsp + 48]
+ 	mov	qword ptr [r12], rax
+@@ -246177,7 +246177,7 @@
+ 	mov	qword ptr [r14], rax
+ 	jmp	.LBB
+ .LBB:
+-	mov	r12, rdx
++	mov	r14, rdx
+ 	lea	rdi, [rsp + 288]
+ 	mov	r15, qword ptr [rsp + 16]
+ 	mov	rsi, r15
+@@ -246191,11 +246191,11 @@
+ 	call	Heap.createExtraData
+ 	movzx	eax, word ptr [rsp + 148]
+ 	test	ax, ax
+-	mov	r14, qword ptr [rsp]
+ 	jne	.LBB
+-	mov	edi, r12d
++	mov	edi, r14d
+ 	mov	rsi, qword ptr [rip + Heap.custom_types+8]
+ 	cmp	rdi, rsi
++	mov	r14, qword ptr [rsp]
+ 	jae	.LBB
+ 	mov	rax, qword ptr [rip + Heap.custom_types]
+ 	lea	rcx, [rdi + 2*rdi]
+@@ -246219,7 +246219,7 @@
+ 	test	eax, eax
+ 	jne	.LBB
+ 	mov	rax, qword ptr [r15 + 2408]
+-	cmp	rax, r13
++	cmp	rax, r14
+ 	mov	rdi, qword ptr [rsp + 64]
+ 	ja	.LBB
+ 	mov	rbx, qword ptr [rsp + 256]
+@@ -246253,11 +246253,11 @@
+ 	mov	ecx, eax
+ 	and	cl, 7
+ 	cmp	cl, 2
+-	movzx	ecx, byte ptr [rsp + 64]
++	mov	r15, qword ptr [rsp]
+ 	jne	.LBB
+ .LBB:
+-	mov	byte ptr [r12 + 32], cl
+-	mov	r15, qword ptr [rsp]
++	movzx	eax, byte ptr [rsp + 64]
++	mov	byte ptr [r12 + 32], al
+ 	mov	word ptr [r15 + 16], 0
+ 	lea	rdi, [rsp + 240]
+ 	mov	r12, qword ptr [rsp + 16]
+@@ -246303,12 +246303,12 @@
+ 	mov	byte ptr [rsp + 38], r14b
+ 	mov	byte ptr [rsp + 37], bl
+ 	mov	r15, qword ptr [rip + Heap.global_io]
+-	mov	r13, qword ptr [rip + Heap.global_io+8]
++	mov	r12, qword ptr [rip + Heap.global_io+8]
+ 	mov	ecx, 1
+ 	xor	eax, eax
+ 	lock		cmpxchg	dword ptr [rip + ioutil.stderr_mutex], ecx
+ 	setne	byte ptr [rsp + 160]
+-	lea	r12, [rsp + 200]
++	lea	rdx, [rsp + 200]
+ 	setne	cl
+ 	test	cl, cl
+ 	jne	.LBB
+@@ -246320,44 +246320,42 @@
+ 	mov	qword ptr [rsp + 184], offset __anon_X
+ 	mov	qword ptr [rsp + 192], 1
+ 	vxorps	xmm0, xmm0, xmm0
+-	vmovups	xmmword ptr [r12], xmm0
++	vmovups	xmmword ptr [rdx], xmm0
+ 	mov	qword ptr [rsp + 216], 2
+ 	mov	dword ptr [rsp + 224], 0
+ 	mov	word ptr [rsp + 228], 0
+ 	mov	byte ptr [rsp + 230], 1
+ 	mov	esi, offset __anon_X
+ 	mov	edx, 20
+-	lea	r15, [rsp + 184]
+-	mov	rdi, r15
++	mov	rdi, r13
+ 	call	Io.Writer.writeAll
+ 	test	ax, ax
+ 	jne	.LBB
+-	mov	rdi, r15
++	mov	rdi, r13
+ 	mov	rsi, r14
+ 	call	Io.Writer.printIntAny__anon_X
+ 	test	ax, ax
+ 	jne	.LBB
+ 	mov	esi, offset __anon_X
+ 	mov	edx, 9
+-	mov	rdi, r15
++	mov	rdi, r13
+ 	call	Io.Writer.writeAll
+ 	test	ax, ax
+ 	jne	.LBB
+-	mov	rdi, r15
++	mov	rdi, r13
+ 	mov	rsi, rbx
+ 	call	Io.Writer.printIntAny__anon_X
+ 	test	ax, ax
+ 	jne	.LBB
+ 	mov	esi, offset __anon_X
+ 	mov	edx, 1
+-	mov	rdi, r15
++	mov	rdi, r13
+ 	call	Io.Writer.writeAll
+ .LBB:
+ 	mov	rax, qword ptr [rsp + 184]
+-	mov	rdi, r15
++	mov	rdi, r13
+ 	call	qword ptr [rax + 16]
+ 	test	ax, ax
+-	mov	rbx, qword ptr [rsp]
+ 	jne	.LBB
+ .LBB:
+ 	mov	rdi, qword ptr [rip + Heap.global_io]
+@@ -246365,6 +246363,7 @@
+ 	xor	ecx, ecx
+ 	xchg	dword ptr [rip + ioutil.stderr_mutex], ecx
+ 	test	ecx, ecx
++	mov	rbx, qword ptr [rsp]
+ 	je	.LBB
+ 	cmp	ecx, 1
+ 	je	.LBB
+@@ -246425,13 +246424,32 @@
+ .LBB:
+ 	cmp	eax, 2
+ 	jne	.LBB
++	mov	esi, offset ioutil.stderr_mutex
++	mov	rdi, r15
++	mov	edx, 2
++	call	qword ptr [r12 + 104]
++.LBB:
++	mov	eax, 2
++	xchg	dword ptr [rip + ioutil.stderr_mutex], eax
++	test	eax, eax
++	lea	rdx, [rsp + 200]
++	je	.LBB
++.LBB:
++	mov	esi, offset ioutil.stderr_mutex
++	mov	rdi, r15
++	mov	edx, 2
++	call	qword ptr [r12 + 104]
++	lea	rdx, [rsp + 200]
++	mov	eax, 2
++	xchg	dword ptr [rip + ioutil.stderr_mutex], eax
++	test	eax, eax
++	jne	.LBB
+ 	jmp	.LBB
+ .LBB:
+ 	movzx	eax, ax
+ 	cmp	eax, 102
+ 	jne	.LBB
+ 	cmp	word ptr [rsp + 224], 0
+-	mov	rbx, qword ptr [rsp]
+ 	jne	.LBB
+ 	jmp	.LBB
+ .LBB:
+@@ -246489,23 +246507,12 @@
+ 	call	"debug.FullPanic((function 'panicFn')).inactiveUnionField__anon_X"
+ .LBB:
+ 	mov	esi, offset ioutil.stderr_mutex
+-	mov	rdi, rbx
++	mov	rdi, r13
+ 	mov	edx, 2
+ 	call	qword ptr [r14 + 104]
+ .LBB:
+ 	mov	eax, 2
+ 	xchg	dword ptr [rip + ioutil.stderr_mutex], eax
+-	test	eax, eax
+-	jne	.LBB
+-	jmp	.LBB
+-.LBB:
+-	mov	esi, offset ioutil.stderr_mutex
+-	mov	rdi, r15
+-	mov	edx, 2
+-	call	qword ptr [r13 + 104]
+-.LBB:
+-	mov	eax, 2
+-	xchg	dword ptr [rip + ioutil.stderr_mutex], eax
+ 	test	eax, eax
+ 	jne	.LBB
+ 	jmp	.LBB

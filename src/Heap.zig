@@ -30,7 +30,7 @@ pub const HeapSettings = struct {
     /// Maximum of `1 << heap_order` items.
     object_heap_order: u6 = 16,
     /// Maximum of `1 << heap_order` bytes for all strings.
-    string_heap_order: u6 = 28,
+    string_heap_order: u6 = 16,
     /// Maximum number of custom types.
     max_custom_types: usize = 65536,
     /// Maximum number of evaluating scripts.
@@ -43,7 +43,7 @@ pub const HeapSettings = struct {
 const cfg: HeapSettings = .{};
 
 threadlocal var debugging_buffer: [16 * 1024 * 1024]u8 = undefined;
-threadlocal var debugging_gpa: if (builtin.mode == .Debug) memutil.RingBufferAllocator else void = undefined;
+threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 threadlocal var debug_gpa: Allocator = undefined;
 /// Set this right before doing an operation that may cause a panic. The runtime will dump its
@@ -259,7 +259,7 @@ pub const HashRegistry = struct {
 const Heap = @This();
 pub threadlocal var local_heap: *Heap = undefined;
 
-const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
+const object_heap_max_count: usize = (@as(usize, 1) << cfg.object_heap_order) - 1;
 const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
 const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
@@ -615,7 +615,7 @@ pub const Object = packed struct(u128) {
             .invalid,
             .cached_local_var,
             => {},
-            .dict, .list => unreachable,
+            .dict, .list, .probably_undefined => unreachable,
         }
 
         obj.body = undefined;
@@ -678,6 +678,9 @@ pub const Tag = enum(u5) {
     custom_type,
     hash_reference,
     regexp,
+    /// For a u5, on Zig 0.16, `undefined = 0b10101 = 21` in ReleaseSafe. Well,
+    /// at least when offset by `StrOrPtr`, which has an odd length.
+    probably_undefined = 21,
 };
 
 pub const Body = packed union(u64) {
@@ -771,6 +774,7 @@ pub const Body = packed union(u64) {
         options: u32,
         extra_data: ExtraData,
     },
+    probably_undefined: u64,
 };
 
 comptime {
@@ -1528,6 +1532,7 @@ pub const Handle = packed struct(HandleBacking) {
                 last_touched = handle;
                 std.debug.panic("{} should always have a string representation", .{obj.head.tag});
             },
+            .probably_undefined => unreachable,
         };
 
         // Ensure new_str is freed if setStringOwning fails (e.g. OOM during LongString allocation).
@@ -2061,7 +2066,7 @@ fn deinitOomErrorOptions(heap: *Heap) void {
     }
 }
 
-pub inline fn heapId(self: *Heap) HeapId {
+pub fn heapId(self: *Heap) HeapId {
     return @intCast(self - &heaps);
 }
 
@@ -2148,14 +2153,11 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
     // Make sure object list has space for new objects.
     if (self.objects.len < index + aligned_count) {
-        const start_of_new = self.objects.len;
-        if (!options.threading) try self.objects.resize(heapBackingAlloc(), index + aligned_count);
-        @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
-            .order = 31,
-            .cross_thread = false,
-            .in_use = false,
-            .hash_registered = false,
-        });
+        if (options.threading) {
+            return error.OutOfMemory;
+        } else {
+            try self.objects.resize(global_gpa, index + aligned_count);
+        }
     }
 
     self.getHandle(index).trace(
@@ -2422,7 +2424,7 @@ pub fn steal(handle: Handle) !Handle {
     return new_obj;
 }
 
-pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
+pub noinline fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     switch (handle.getStringDetails()) {
         .long => |long_str| {
             long_str.incrRefCount();
@@ -2491,7 +2493,12 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
 }
 
 /// If called with a multi-item object, will return `error.MultiItemObject`.
-pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
+pub noinline fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
+    // Makes it work
+    // ioutil.debug("Magic sparkles: {}\n", .{handle.tag()});
+    // Doesn't make it work
+    ioutil.debug("Magic sparkles: {}\n", .{@intFromEnum(handle.tag())});
+
     const src = handle.peek();
     if (options.trace_mem) last_touched = handle;
     switch (handle.tag()) {
@@ -2542,11 +2549,22 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
             };
         },
         .reference => {
-            // Try to duplicate what it's referencing, else create a new reference to it.
-            return dest_heap.duplicateSingle(src.body.reference) catch |err| switch (err) {
-                error.MultiItemObject => return src.body.reference.reference(),
+            // Since this is just a shallow duplication, we only duplicate single items,
+            // while referencing collection items.
+            if (dest_heap.duplicateSingle(src.body.reference)) |duped| {
+                ioutil.debug(
+                    "Single dup, src tag {} dup tag {}\n",
+                    .{ @intFromEnum(handle.peek().head.tag), @intFromEnum(duped.head.tag) },
+                );
+                return duped;
+            } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-            };
+                error.MultiItemObject => {
+                    const refed = src.body.reference.reference();
+                    ioutil.debug("Multi dup, tag {}\n", .{@intFromEnum(refed.head.tag)});
+                    return refed;
+                },
+            }
         },
         .custom_type => {
             const custom_type = src.body.custom_type;
@@ -2609,6 +2627,9 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         },
         .upvar_link => @panic("Cannot duplicate an upvar"),
         .invalid => @panic("Tried to duplicate an invalid object."),
+        .probably_undefined => {
+            std.debug.panic("Hit .probably_undefiend, head addr: {*}", .{&handle.peek().head});
+        },
     }
 }
 
@@ -2695,14 +2716,15 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
 
             // Duplicate items of dict.
             for (new_items, 0..) |*new_item, i| {
-                new_item.* = dest_heap.duplicateSingle(.{
-                    .index = @intCast(old_start + i),
-                    .heap = src_handle.heap,
-                }) catch |e| switch (e) {
+                const src_item: Handle = .{ .index = @intCast(old_start + i), .heap = src_handle.heap };
+                new_item.* = dest_heap.duplicateSingle(src_item) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    // Dicts can't contain multi item objects.
+                    // Dicts can't contain multi item objects, as they'll contain references instead.
                     error.MultiItemObject => unreachable,
                 };
+                if (new_item.head.tag == .probably_undefined) {
+                    ioutil.debug("src item: {any}, tag: {}, value: {f}\n", .{ src_item, src_item.tag(), src_item });
+                }
             }
 
             return dest_heap.getHandle(new_dict_idx);
@@ -3268,7 +3290,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
 }
 
 pub fn initLocalHeap() !void {
-    if (builtin.mode == .Debug) {
+    if (options.trace_mem) {
         debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer[0..]);
         debug_gpa = debugging_gpa.allocator();
     }

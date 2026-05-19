@@ -34,10 +34,16 @@ pub fn unlockStderr() void {
 pub fn debug(comptime fmt: []const u8, args: anytype) void {
     const stderr = lockStderr();
     defer unlockStderr();
-    var buffer: [64]u8 = undefined;
-    var writer = stderr.writer(Heap.global_io, &buffer);
+    var writer = stderr.writer(Heap.global_io, &.{});
     defer writer.flush() catch {};
     writer.interface.print(fmt, args) catch return;
+}
+
+export var __seq_cst_synchronize: u64 = 0;
+pub fn debugWithBarrier(comptime fmt: []const u8, args: anytype) void {
+    _ = @atomicLoad(u64, &__seq_cst_synchronize, .seq_cst);
+    debug(fmt, args);
+    _ = @atomicLoad(u64, &__seq_cst_synchronize, .seq_cst);
 }
 
 /// This is mostly copied from std.debug.ConfigurableTrace.

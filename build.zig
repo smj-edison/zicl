@@ -125,6 +125,12 @@ pub fn build(b: *std.Build) void {
         .root_module = root,
         .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .server },
     });
+    // Getting asm from tests
+    const asm_file = tests.getEmittedAsm();
+    const write_asm = b.addUpdateSourceFiles();
+    write_asm.addCopyFileToSource(asm_file, "test_as_asm.s");
+
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&write_asm.step);
 }
