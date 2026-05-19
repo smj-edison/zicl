@@ -1085,6 +1085,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
         }
 
         if (found_shared_items) {
+            assert(current_len > 0);
             // Because we found shared items, we can't free the backing directly, as that would
             // free an item that someone else is currently referencing. Instead, we'll split the
             // allocation, and free all non-shared objects.
@@ -1856,46 +1857,6 @@ pub fn dictPutRecursively(
     new_dict.orElse(provided_dict).invalidateString();
 
     return child_put_result;
-}
-
-pub fn dictRemoveRecursively(det: ?*ErrorDetails, provided_dict: Handle, keys: []const Handle) !DictAndRemovedResult {
-    var new_dict: OptionalHandle = .none;
-    errdefer new_dict.swapWithNone();
-    try shimmerToDict(det, provided_dict, &new_dict);
-
-    assert(keys.len > 0);
-
-    if (keys.len == 1) {
-        const remove_result = try dictRemove(new_dict.orElse(provided_dict), keys[0]);
-        new_dict.swapRefIfNew(remove_result.new_dict);
-        return .{ .new_dict = new_dict, .did_remove = remove_result.did_remove };
-    }
-
-    // Find the child dict.
-    if ((try dictLookupFollowRefs(new_dict.orElse(provided_dict), keys[0])).toHandle()) |child_dict| {
-        const child_remove_result = try dictRemoveRecursively(det, child_dict, keys[1..]);
-        // If the child dict was modified (either in place or by duplication), we need to
-        // update our dict to point to the modified version.
-        if (child_remove_result.new_dict.toHandle()) |new_child| {
-            errdefer new_child.decrRefCount();
-            // The child dict was duplicated, so we need to replace the old reference with the new one.
-            const put_result = try dictPutInner(new_dict.orElse(provided_dict), keys[0], new_child.referenceTakeOwnership());
-            new_dict.swapRefIfNew(put_result.new_dict);
-        }
-
-        new_dict.orElse(provided_dict).invalidateString();
-
-        return .{ .new_dict = new_dict, .did_remove = child_remove_result.did_remove };
-    } else {
-        if (det) |details| details.* = .{
-            .message = try newStringFmt(
-                Heap.local_heap,
-                "key \"{f}\" not known in dictionary \"{f}\"",
-                .{ keys[0], provided_dict },
-            ),
-        };
-        return error.MissingDictKey;
-    }
 }
 
 pub fn dictLookupRecursively(

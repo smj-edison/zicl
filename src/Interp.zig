@@ -271,6 +271,7 @@ pub fn setVariableInner(
     name: Handle,
     value: Heap.Object,
 ) error{ OutOfMemory, BadDict }!void {
+    _ = det;
     // TODO PERF a lot of functions look the variable back up after setting it. We should probably
     // return the variable's new handle after setting it. After doing so, be sure to audit all
     // the call sites.
@@ -290,44 +291,15 @@ pub fn setVariableInner(
                 const dict_sugar = name.peek().body.dict_sugar;
                 const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
                 const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
-                const path_len = objutil.listLengthRaw(dict_path);
 
-                var resolved_dict = blk: {
-                    if (interp.getVariableInner(null, call_frame_idx, dict_name)) |dict| {
-                        break :blk dict.borrow();
-                    } else |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.BadDict => {
-                            if (det) |details| details.* = .{
-                                .message = try objutil.newStringFmt(
-                                    Heap.local_heap,
-                                    "variable \"{f}\" is not a valid dictionary",
-                                    .{dict_name},
-                                ),
-                            };
-                            return error.BadDict;
-                        },
-                        error.VariableNotFound => {
-                            // If it's not found, then we'll just create it.
-                            break :blk try objutil.newDict(Heap.local_heap, &.{});
-                        },
-                    }
-                };
-                defer resolved_dict.decrRefCount();
+                var resolved_dict = interp.getVariableInner(null, call_frame_idx, dict_name) catch unreachable;
 
-                var keys = try std.ArrayList(Handle).initCapacity(Heap.global_gpa, path_len);
-                defer keys.deinit(Heap.global_gpa);
-                for (0..path_len) |i| {
-                    keys.appendAssumeCapacity(objutil.listItem(dict_path, @intCast(i)));
-                }
-
-                var new_dict: OptionalHandle = .none;
                 value_taken = true;
-                _ = objutil.dictPutRecursively(null, resolved_dict, &new_dict, keys.items, value) catch |err| switch (err) {
+                const result = objutil.dictPutInner(resolved_dict, objutil.listItem(dict_path, 0), value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => unreachable,
                 };
-                resolved_dict.swapIfNew(new_dict);
+                resolved_dict.swapIfNew(result.new_dict);
 
                 try interp.setVariableInner(null, call_frame_idx, dict_name, resolved_dict.reference());
             },
@@ -406,53 +378,11 @@ pub fn getVariableInner(
             const extra_data = name_heap.getExtraData(name_obj.body.cached_lexical_var.extra_data);
             return extra_data.lexical_variable.ref;
         },
-        .dict_sugar => {
-            const dict_sugar = name.peek().body.dict_sugar;
-            const dict_name = name.getHeap().getHandle(dict_sugar.dict_name_index);
-            const dict_path = name.getHeap().getHandle(dict_sugar.path_index);
-            const path_len = objutil.listLengthRaw(dict_path);
-
-            var resolved_dict = (try interp.getVariableInner(det, call_frame_idx, dict_name)).borrow();
-            defer resolved_dict.decrRefCount();
-
-            var keys = try std.ArrayList(Handle).initCapacity(Heap.global_gpa, path_len);
-            defer keys.deinit(Heap.global_gpa);
-            for (0..path_len) |i| {
-                keys.appendAssumeCapacity(objutil.listItem(dict_path, @intCast(i)));
-            }
-
-            var new_dict: OptionalHandle = .none;
-            const result = objutil.dictLookupRecursively(null, resolved_dict, &new_dict, keys.items) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt(
-                            Heap.local_heap,
-                            "variable \"{f}\" is not a valid dictionary",
-                            .{dict_name},
-                        ),
-                    };
-                    return error.BadDict;
-                },
-            };
-            resolved_dict.swapIfNew(new_dict);
-
-            try interp.setVariableInner(det, call_frame_idx, dict_name, dict_name.reference());
-
-            if (result.toHandle()) |val| return val else return error.VariableNotFound;
-        },
+        .dict_sugar => unreachable,
         else => unreachable,
     }
 }
 
-pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !void {
-    if (actual_error_union) |_| {
-        try testing.expectError(expected_error, actual_error_union);
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => try testing.expectError(expected_error, actual_error_union),
-    }
-}
 pub const NativeCommand = struct {
     pub const ZigCommand = struct {
         to_call: *const CommandFn,
@@ -477,44 +407,7 @@ pub const NativeCommand = struct {
         zig: ZigCommand,
         c: CCommand,
     },
-
-    /// Returns a string containing all the usage information. Allocates the string
-    /// onto `gpa`. Produces something like `cmd ...`, or `cmd arg1 arg2 ?arg3?`
-    pub fn getUsageInfo(command: *NativeCommand, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
-        var aw = std.Io.Writer.Allocating.init(gpa);
-        defer aw.deinit();
-
-        // Write command name.
-        aw.writer.writeAll(command_name) catch return error.OutOfMemory;
-
-        switch (command.call_info) {
-            .zig => |call_info| {
-                if (call_info.description) |description| {
-                    aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
-                } else {
-                    aw.writer.writeAll(" ...") catch return error.OutOfMemory;
-                }
-            },
-            .c => |call_info| {
-                if (call_info.description) |description| {
-                    aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
-                } else {
-                    aw.writer.writeAll(" ...") catch return error.OutOfMemory;
-                }
-            },
-        }
-
-        return try aw.toOwnedSlice();
-    }
 };
-
-fn wrongArgumentCountError(det: ?*objutil.ErrorDetails, command_usage: []const u8) !void {
-    if (det) |details| details.* = .{
-        .message = try objutil.newStringFmt(Heap.local_heap, "wrong # args: should be \"{s}\"", .{command_usage}),
-    };
-
-    return Error.WrongUsage;
-}
 
 /// `name` should be a static variable guaranteed to exist as long as the
 /// interpreter exists.
@@ -701,9 +594,7 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     const has_args: bool = closure.has_args_parameter;
     const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
     if (too_few_arguments or too_many_arguments) {
-        // Wrong argument count, error accordingly.
-        var det: objutil.ErrorDetails = undefined;
-        return interp.wrapError(&det, wrongArgumentCountError(&det, "FIXME"));
+        unreachable;
     }
 
     // Check for infinite recursion.
@@ -806,13 +697,7 @@ fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
         return;
     }
 
-    var sf = std.heap.stackFallback(64, Heap.global_gpa);
-    const scratch = sf.get();
-    const command_name = try args[0].getString();
-    const command_usage = try command.getUsageInfo(scratch, command_name);
-    defer scratch.free(command_usage);
-    var det: objutil.ErrorDetails = undefined;
-    return interp.wrapError(&det, wrongArgumentCountError(&det, command_usage));
+    unreachable;
 }
 
 fn freeLastResult(interp: *Interp) void {
@@ -1310,20 +1195,6 @@ pub fn getBoolFromExpression(interp: *Interp, handle: *Handle) !bool {
     return value;
 }
 
-test "eval expression" {
-    defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator, testing.io);
-    var interp = try Interp.init();
-    defer interp.deinit();
-
-    var expr = try objutil.newString(heap, "5 + 10");
-    defer expr.decrRefCount();
-    var new_expr: OptionalHandle = .none;
-    const result = try interp.evalExpression(expr, &new_expr);
-    expr.swapIfNew(new_expr);
-    try testing.expectEqual(ExprResult{ .int = 15 }, result);
-}
-
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: objutil.ErrorDetails = undefined;
@@ -1496,30 +1367,6 @@ pub fn wrapShimmerFn(
     handle.swapIfNew(new_handle);
 }
 
-/// Replaces `handle` in-place. Use `objutil.shimmerToInteger` if you need finer-grained
-/// control.
-pub fn getInteger(interp: *Interp, handle: *Handle) !i64 {
-    try interp.wrapShimmerFn(handle, objutil.shimmerToInteger);
-    return handle.peek().body.integer;
-}
-
-pub fn getIntegerNoShimmer(interp: *Interp, handle: Handle) Interp.Error!i64 {
-    var det: objutil.ErrorDetails = undefined;
-    return interp.wrapError(&det, objutil.integerGetNoShimmer(&det, handle));
-}
-
-/// Replaces `handle` in-place. Use `objutil.shimmerToFloat` if you need finer-grained
-/// control.
-pub fn getFloat(interp: *Interp, handle: *Handle) !f64 {
-    try interp.wrapShimmerFn(handle, objutil.shimmerToFloat);
-    return handle.peek().body.float;
-}
-
-pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
-    var det: objutil.ErrorDetails = undefined;
-    return interp.wrapError(&det, objutil.floatGetNoShimmer(&det, handle));
-}
-
 /// Shimmers a handle to a list, updating it in place if a duplicate was
 /// created. Converts errors to EvalError via the interpreter result.
 pub fn shimmerToList(interp: *Interp, handle: *Handle) !void {
@@ -1532,17 +1379,6 @@ pub fn shimmerToList(interp: *Interp, handle: *Handle) !void {
 pub fn getListLength(interp: *Interp, handle: *Handle) !u32 {
     try interp.shimmerToList(handle);
     return handle.peek().body.list.len;
-}
-
-pub fn listAppend(interp: *Interp, list: *Handle, item: Handle) !Handle {
-    var det: objutil.ErrorDetails = undefined;
-    var new_list: OptionalHandle = .none;
-
-    try interp.wrapError(&det, objutil.shimmerToList(&det, list.*, &new_list));
-    const result = try interp.wrapError(&det, objutil.listAppend(&det, new_list.orElse(list.*), &new_list, item));
-    list.swapIfNew(new_list);
-
-    return result;
 }
 
 pub fn ensureShimmerable(interp: *Interp, handle: *Handle) !void {
