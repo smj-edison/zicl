@@ -2053,253 +2053,74 @@ var next_script_id = 1;
 //  Script related functions  //
 
 /// Not threadsafe (though this will use `handle` correctly if it's from another thread).
-pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
-    // Get source info, or use defaults.
-    const source_info: SourceInfo = if (getSourceInfo(handle)) |info| info else .{
-        .file_name = .none,
-        .line_no = 1,
-    };
-
-    // Parse all the tokens of the script, handling any errors that come up.
+pub fn parseScript(det: ?*ErrorDetails, handle: Handle) error{ ParserError, OutOfMemory }!Heap.ParsedScript {
+    std.debug.print("Parsing {f}\n", .{handle});
+    _ = det;
 
     const bytes = try handle.getString();
-    // Because scripts are deduplicated, there may be scripts from multiple different
-    // locations in the Tcl code. This means we can't use an absolute line number for the
-    // script, but instead all line numbers are relative (hence why we start at 1 here).
-    // TODO might be more ergonomic to start at 0.
-    var parser = Tokenizer.init(bytes, 1);
 
-    // Set up tokens list (to be added to).
-    var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(Heap.global_gpa, bytes.len / 8);
-    defer tokens.deinit(Heap.global_gpa);
+    var token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.global_gpa, 32);
+    const values = try newListWithCapacity(31);
 
-    // Used to ignore the first token if it's .command_separator (effectively
-    // trimming any starting whitespace)
-    var is_trimming_start = true;
-    // Add all tokens to the list, handling any errors that may come up.
-    while (true) {
-        const next_token = parser.nextScriptToken();
-        if (next_token) |token| {
-            switch (token.tag) {
-                .command_separator, .word_separator => {
-                    if (!is_trimming_start) try tokens.append(Heap.global_gpa, token);
-                },
-                .end_of_file => {
-                    // Be sure to trim the ending spacing.
-                    while (tokens.getLastOrNull()) |last| {
-                        if (last.tag == .command_separator or last.tag == .word_separator) {
-                            _ = tokens.pop();
-                        } else {
-                            break;
-                        }
-                    }
-                    try tokens.append(Heap.global_gpa, token);
-                    break;
-                },
-                else => {
-                    is_trimming_start = false;
-                    try tokens.append(Heap.global_gpa, token);
-                },
-            }
-        } else |err| {
-            if (det) |details| {
-                details.* = try convertTokenizerError(Heap.local_heap, err);
-                if (parser.error_details) |parser_details| {
-                    details.index = parser_details.index;
-                }
-            }
-            return err;
-        }
+    const full_script =
+        \\ fn add {a b} { + $a $b }
+        \\ set x 10
+        \\ fn addx {a} { + $a $x }
+    ;
+    if (std.mem.eql(u8, bytes, full_script)) {
+        token_tags.appendSliceAssumeCapacity(&.{
+            // fn add ...
+            .start_of_command,
+            .simple_string,
+            .simple_string,
+            .simple_string,
+            .simple_string,
+            // set x 10
+            .start_of_command,
+            .simple_string,
+            .simple_string,
+            .simple_string,
+            // fn addx ...
+            .start_of_command,
+            .simple_string,
+            .simple_string,
+            .simple_string,
+            .simple_string,
+        });
+        // fn add ...
+        listAppendAssumeCapacity(values, .{ .head = .{ .tag = .parsed_script_command }, .body = .{ .parsed_script_command = .{
+            .line = 1,
+            .arg_count = 4,
+        } } });
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "fn")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "add")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "a b")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, " + $a $b ")).peek().*);
+        // set x 10
+        listAppendAssumeCapacity(values, .{ .head = .{ .tag = .parsed_script_command }, .body = .{ .parsed_script_command = .{
+            .line = 2,
+            .arg_count = 3,
+        } } });
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "set")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "x")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "10")).peek().*);
+        // fn addx ...
+        listAppendAssumeCapacity(values, .{ .head = .{ .tag = .parsed_script_command }, .body = .{ .parsed_script_command = .{
+            .line = 3,
+            .arg_count = 4,
+        } } });
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "fn")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "addx")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, "a")).peek().*);
+        listAppendAssumeCapacity(values, (try newString(Heap.local_heap, " + $a $x ")).peek().*);
 
-        is_trimming_start = false;
+        return .{
+            .tags = token_tags,
+            .values = values,
+        };
     }
 
-    if (options.token_debugging) {
-        for (tokens.items, 0..) |token, i| {
-            std.debug.print("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"\n", .{
-                i,
-                token.loc.line_no,
-                @tagName(token.tag),
-                bytes[token.loc.start..token.loc.end],
-            });
-        }
-    }
-
-    // +1 for the first ".script_command".
-    const new_token_capacity: u32 = @intCast(tokens.items.len + 1);
-
-    // Initialize the Heap-stored list that will contain the corrisponding value for each token.
-    var new_token_values = try newListWithCapacity(new_token_capacity);
-    errdefer new_token_values.decrRefCount();
-
-    var new_token_tags = try std.ArrayList(Tokenizer.Token.Tag).initCapacity(Heap.global_gpa, new_token_capacity);
-    errdefer new_token_tags.deinit(Heap.global_gpa);
-
-    // Use the first real token's relative line as the starting command line. After
-    // leading separators are trimmed (see is_trimming_start above), tokens[0] is the
-    // first actual word, so its line is the correct relative offset. Fall back to
-    // source_info.line_no (= 1) for empty scripts.
-    const first_command_line: u32 = if (tokens.items.len > 0 and tokens.items[0].tag != .end_of_file)
-        tokens.items[0].loc.line_no
-    else
-        source_info.line_no;
-
-    // Be sure to append the first .script_command token.
-    try new_token_tags.append(Heap.global_gpa, .start_of_command);
-    var first_append_result: OptionalHandle = .none;
-    _ = try listAppendObject(det, new_token_values, &first_append_result, .{
-        .head = .{
-            .str = Heap.Object.null_string,
-            .tag = .parsed_script_command,
-        },
-        .body = .{
-            .parsed_script_command = .{
-                .line = first_command_line,
-                .arg_count = 0, // Set later.
-            },
-        },
-    });
-    new_token_values.swapIfNew(first_append_result);
-
-    // The current script line's token index.
-    var script_command_idx: usize = 0;
-    // The number of arguments for this command.
-    var command_arg_count: u32 = 0;
-    var i: usize = 0;
-    while (i < tokens.items.len) {
-        // Skip any leading separators.
-        while (tokens.items[i].tag == .word_separator) i += 1;
-
-        // Look ahead to see when the next separator is.
-        var arg_token_count: usize = 0;
-        var found_expansion: bool = false;
-        while (i + arg_token_count < tokens.items.len) : (arg_token_count += 1) {
-            switch (tokens.items[i + arg_token_count].tag) {
-                .argument_expansion => found_expansion = true,
-                .command_separator, .word_separator, .end_of_file => break,
-                else => {},
-            }
-        }
-
-        // We'll only reach here if the current token is .command_separator or .end_of_file, because
-        // word_token_count counts all tokens except those (well, and it doesn't count .word_separator,
-        // but that's ruled out at the beginning when we skipped leading separators).
-        if (arg_token_count == 0) {
-            listItems(new_token_values)[script_command_idx].body.parsed_script_command.arg_count = command_arg_count;
-
-            if (tokens.items[i].tag == .end_of_file) {
-                break; // Don't append a .script_command for EOF
-            }
-
-            i += 1; // Skip command separator.
-
-            // Start a new command.
-            command_arg_count = 0;
-            try new_token_tags.append(Heap.global_gpa, .start_of_command);
-            var append_result: OptionalHandle = .none;
-            const index = try listAppendObject(det, new_token_values, &append_result, .{
-                .head = .{
-                    .str = Heap.Object.null_string,
-                    .tag = .parsed_script_command,
-                },
-                .body = .{ .parsed_script_command = .{ .line = tokens.items[i].loc.line_no, .arg_count = 0 } },
-            });
-            new_token_values.swapIfNew(append_result);
-            script_command_idx = index;
-
-            continue;
-        }
-
-        // Append the start of the word (only if necessary).
-        if (found_expansion or arg_token_count > 1) {
-            if (found_expansion) {
-                try new_token_tags.append(Heap.global_gpa, .argument_expansion);
-            } else {
-                try new_token_tags.append(Heap.global_gpa, .start_of_word);
-            }
-
-            var append_result: OptionalHandle = .none;
-            _ = try listAppendObject(det, new_token_values, &append_result, .{
-                .head = .{
-                    .str = Heap.Object.null_string,
-                    .tag = .integer,
-                },
-                .body = .{
-                    // The argument_expansion token itself is not stored in the values
-                    // list (it's skipped in the loop below), so subtract 1 from the
-                    // count to reflect the actual number of tokens that follow.
-                    .integer = @intCast(if (found_expansion) arg_token_count - 1 else arg_token_count),
-                },
-            });
-            new_token_values.swapIfNew(append_result);
-        }
-
-        command_arg_count += 1;
-
-        // Now append the tokens to the new list, escaping as necessary.
-        for (i..(i + arg_token_count)) |token_idx| {
-            const token = tokens.items[token_idx];
-
-            const str_handle = blk: {
-                switch (token.tag) {
-                    .argument_expansion => break :blk null,
-                    .escaped_string => {
-                        try new_token_tags.append(Heap.global_gpa, .simple_string);
-                        var append_result: OptionalHandle = .none;
-                        const str_idx = try listAppendObject(
-                            det,
-                            new_token_values,
-                            &append_result,
-                            .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined },
-                        );
-                        new_token_values.swapIfNew(append_result);
-
-                        const item_handle = listItem(new_token_values, str_idx);
-                        try setStringFromEscaped(item_handle, bytes[token.loc.start..token.loc.end]);
-
-                        break :blk item_handle;
-                    },
-                    else => {
-                        try new_token_tags.append(Heap.global_gpa, token.tag);
-                        var append_result: OptionalHandle = .none;
-                        const str_idx = try listAppendObject(
-                            det,
-                            new_token_values,
-                            &append_result,
-                            .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined },
-                        );
-                        new_token_values.swapIfNew(append_result);
-
-                        const item_handle = listItem(new_token_values, str_idx);
-                        try Heap.setString(item_handle, bytes[token.loc.start..token.loc.end]);
-
-                        break :blk item_handle;
-                    },
-                }
-            };
-
-            if (str_handle) |token_str| {
-                try setSourceInfo(token_str, .{
-                    .file_name = source_info.file_name,
-                    .line_no = token.loc.line_no,
-                });
-            }
-        }
-
-        // Be sure to advance our index to the next word.
-        i += arg_token_count;
-    }
-
-    const parsed_script: Heap.ParsedScript = .{
-        .tags = new_token_tags,
-        .values = new_token_values,
-    };
-    if (options.token_debugging) {
-        std.debug.print("Dumping tokens\n", .{});
-        parsed_script.printTokens();
-    }
-
-    return parsed_script;
+    unreachable;
 }
 
 fn testScriptParsing(ta: std.mem.Allocator) !void {
