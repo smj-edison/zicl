@@ -1041,13 +1041,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
                 to_free_handle.invalidateBoth();
             }
 
-            switch (provided_handle.tag()) {
-                .list => provided_handle.peek().body.list.len = new_len,
-                .dict => provided_handle.peek().body.dict.len = new_len,
-                else => unreachable,
-            }
-
-            return .none;
+            unreachable;
         } else {
             // Even if there's not enough length, there may be enough capacity.
             const capacity = memutil.getOrderSize(provided_handle.getMetadata().order) - 1; // -1 for list head
