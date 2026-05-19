@@ -906,9 +906,7 @@ pub fn newList(handles: []const Handle) !Handle {
 }
 
 /// `handle` must be shimmerable. Returns a new object if the list had to move.
-pub fn shimmerToList(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) error{ BadList, OutOfMemory }!void {
-    _ = det;
-
+pub fn shimmerToList(provided_handle: Handle, new_handle: *OptionalHandle) error{ BadList, OutOfMemory }!void {
     if (provided_handle.tag() == .list) return;
     errdefer new_handle.swapWithNone();
 
@@ -1059,7 +1057,6 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
                     },
                     .body = undefined,
                 };
-                old_item.trace("Object stolen", .{});
             }
         }
 
@@ -1096,7 +1093,6 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             provided_handle.getHeap().destroyExtraData(provided_handle.peek().body.dict.extra_data);
         }
         provided_handle.invalidateString();
-        provided_handle.trace("Invalidated old dict", .{});
         provided_handle.peek().head.tag = .invalid;
         provided_handle.peek().body = undefined;
 
@@ -1571,7 +1567,6 @@ fn dictRemoveDuplicates(provided_dict: Handle, new_dict: *OptionalHandle, to_tra
             },
             .body = undefined,
         };
-        item_handle.trace("Zero out removed", .{});
         // Make sure to mark removed keys as mutable again.
         item_handle.getMetadata().mutable = true;
     }
@@ -1679,8 +1674,6 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
 
                     const new_key_handle = dictItem(dict, new_key_index);
                     const new_value_handle = dictItem(dict, new_value_index);
-
-                    new_key_handle.trace("Setting as new key to {f}", .{key_obj});
 
                     // Set the new key and value.
                     new_key_handle.peek().* = key_obj;

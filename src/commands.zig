@@ -16,8 +16,7 @@ pub fn setCmd(interp: *Interp, args: []const Handle) !void {
     try interp.setVariableTo(&var_name, args[2]);
 }
 
-/// [fn] - creates a closure capturing the current scope and sets it as a
-/// variable in the current scope.
+/// [fn]
 pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     assert(args.len == 4);
     const fn_name = &args[1];
@@ -26,15 +25,14 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
     // Shimmer to list via the interp helper, which handles the case where
     // the handle can't be shimmered in place.
-    try interp.shimmerToList(arglist);
+    Interp.shimmerToList(arglist);
 
-    var det: objutil.ErrorDetails = undefined;
-    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist.*));
+    const parsed_args = Interp.parseClosureArgList(arglist.*) catch unreachable;
     defer parsed_args.deinit();
 
     // Capture the current scope.
-    const scope = try interp.captureCurrentScope();
-    defer scope.decrRefCount();
+    const frame = interp.currentCallFrame();
+    const scope = frame.variables.borrow();
 
     // Build a non-owning closure descriptor. createClosureObject borrows
     // all fields, so we don't need to borrow here.
@@ -44,9 +42,6 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         .name = fn_name.toOptional(),
         .scope = scope.toOptional(),
         .required_arity = parsed_args.required_arity,
-        .optional_arity = parsed_args.optional_arity,
-        .optional_values = parsed_args.optional_values,
-        .has_args_parameter = parsed_args.has_args_parameter,
         .cache_id = Heap.nextCacheId(),
     });
     defer closure_obj.decrRefCount();

@@ -28,8 +28,6 @@ pub const HeapSettings = struct {
     object_heap_order: u6 = 16,
     /// Maximum of `1 << heap_order` bytes for all strings.
     string_heap_order: u6 = 16,
-    /// Maximum number of custom types.
-    max_custom_types: usize = 65536,
     /// Maximum number of evaluating scripts.
     max_scripts: usize = 65536,
     /// Maximum number of heaps (not necessarily initialized).
@@ -39,25 +37,7 @@ pub const HeapSettings = struct {
 };
 const cfg: HeapSettings = .{};
 
-var debugging_buffer: [1024 * 1024]u8 = undefined;
-var debugging_gpa = if (builtin.mode == .Debug) memutil.RingBufferAllocator.init(debugging_buffer[0..]) else undefined;
-/// Use this for debugging objects (traces, etc) that can afford to leak.
-var debug_gpa: Allocator = undefined;
-/// Set this right before doing an operation that may cause a panic. The runtime will dump its
-/// traces on panic if set.
-pub threadlocal var last_touched: ?Handle = null;
-
-pub const GlobalHeapState = struct {
-    initialized: bool = false,
-    /// Use to lock `custom_types` or `script_metadata` when adding or removing
-    /// (no need to lock when using).
-    mutex: std.Io.Mutex = .init,
-    next_open_heap: usize = 0,
-    /// Used to turn some panics into useful messages.
-    running_leak_check: bool = false,
-};
-
-pub var state: GlobalHeapState = .{};
+pub var next_open_heap: usize = 0;
 pub var global_gpa: std.mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
@@ -82,7 +62,6 @@ strings: StringList,
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
-parsed_closures: ParsedClosures,
 
 pub const HeapId = u16;
 
@@ -112,102 +91,12 @@ const FullHashContext = struct {
 };
 const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
 const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullHashContext);
-
-/// This is the script object internal representation. It is an array
-/// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
-///
-/// For example the script:
-///
-/// puts hello
-/// set $i $x$y [foo]BAR
-///
-/// will produce a ParsedScript with the following token/object pairs:
-///
-/// | .start_of_command  | 2     |
-/// | .simple_string     | puts  |
-/// | .simple_string     | hello |
-/// | .start_of_command  | 4     |
-/// | .simple_string     | set   |
-/// | .variable_subst    | i     |
-/// | .start_of_word     | 2     |
-/// | .variable_subst    | x     |
-/// | .variable_subst    | y     |
-/// | .start_of_word     | 2     |
-/// | .command_subst     | foo   |
-/// | .simple_string     | BAR   |
-///
-/// "puts hello" has two args (.start_of_command 2), composed of single tokens.
-/// (Note that the .start_of_command token is omitted for the common case of a
-/// single token.)
-///
-/// "set $i $x$y [foo]BAR" has four (.start_of_command 4) args, the first word
-/// has 1 token (.simple_string set), and the last has two tokens
-/// (.start_of_word 2 .command_subst foo .simple_string BAR)
-///
-/// The precomputation of the command structure makes eval() faster,
-/// and simpler because there aren't dynamic lengths / allocations.
-///
-/// -- {*} handling --
-///
-/// Expand is handled in a special way.
-///
-///   If a "word" begins with {*}, the corrisponding object type is ".none".
-///
-/// For example the command:
-///
-/// list {*}{a b}
-///
-/// Will produce the following pairs:
-///
-/// | .start_of_command | 2     |
-/// | .simple_string | list  |
-/// | .start_of_word | .none |
-/// | .braced_string | a b   |
-///
-/// Note that the '.start_of_command' token also contains the source information
-/// for the first word of the line for error reporting purposes
-///
-/// -- the substFlags field of the structure --
-///
-/// The `scriptObj` structure is used to represent both "script" objects
-/// and "subst" objects. In the second case, there are no `LIN` and `WRD`
-/// tokens. Instead `SEP` and `EOL` tokens are added as-is.
-/// In addition, the field `substFlags` is used to represent the flags used to turn
-/// the string into the internal representation.
-/// If these flags do not match what the application requires,
-/// the scriptObj is created again. For example the script:
-///
-/// subst -nocommands $string
-/// subst -novariables $string
-///
-/// Will (re)create the internal representation of the $string object
-/// two times.
-///
 pub const ParsedScript = struct {
     /// A handle pointing to a Tcl list that has the same length as `tokens`,
     /// that stores all the string values that the script references.
     values: Handle,
     /// Tokens array.
     tags: std.ArrayList(Tokenizer.Token.Tag),
-
-    pub fn printTokens(script: *const ParsedScript) void {
-        const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
-
-        var line: u64 = 0;
-        for (script.tags.items, objutil.listItems(script.values), 0..) |token, value, i| {
-            switch (token) {
-                .start_of_command => {
-                    line = value.body.parsed_script_command.line;
-                    std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.parsed_script_command });
-                },
-                .start_of_word => std.debug.print(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
-                else => {
-                    const item = objutil.listItem(script.values, @intCast(i));
-                    std.debug.print(formatting ++ "{s}\n", .{ i, line, @tagName(token), item.getString() catch "<oom string>" });
-                },
-            }
-        }
-    }
 
     pub fn deinit(parsed: *ParsedScript) void {
         parsed.tags.deinit(global_gpa);
@@ -320,36 +209,6 @@ pub const Object = packed struct(u128) {
 
         obj.body = undefined;
         obj.head.tag = .none;
-    }
-
-    pub fn format(self: Object, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print(
-            ".{{ .head = {{ .str = {f} }}, .body = .{{ .{s}",
-            .{ self.head.str, @tagName(self.head.tag) },
-        );
-        switch (self.head.tag) {
-            .invalid,
-            .none,
-            .marked,
-            => {},
-            .index => try writer.print(" = {}", .{self.body.index}),
-            .integer => try writer.print(" = {}", .{self.body.integer}),
-            .float => try writer.print(" = {}", .{self.body.float}),
-            .bool => try writer.print(" = {}", .{self.body.bool}),
-            .string => try writer.print(" = {}", .{self.body.string}),
-            .source => try writer.print(" = {}", .{self.body.source}),
-            .list => try writer.print(" = {}", .{self.body.list}),
-            .dict => try writer.print(" = {}", .{self.body.dict}),
-            .dict_sugar => try writer.print(" = {}", .{self.body.dict_sugar}),
-            .parsed_script_command => try writer.print(" = {}", .{self.body.parsed_script_command}),
-            .reference => try writer.print(" = {any}", .{self.body.reference}),
-            .cached_local_var => try writer.print(" = {}", .{self.body.cached_local_var}),
-            .cached_lexical_var => try writer.print(" = {}", .{self.body.cached_lexical_var}),
-            .upvar_link => try writer.print(" = {}", .{self.body.upvar_link}),
-            .closure => try writer.print(" = {}", .{self.body.closure}),
-            .custom_type => try writer.print(" = {}", .{self.body.custom_type}),
-        }
-        try writer.writeAll(" } }");
     }
 };
 
@@ -585,13 +444,6 @@ pub const Closure = struct {
     scope: OptionalHandle,
     /// Required number of arguments.
     required_arity: u32,
-    /// Optional number of arguments.
-    optional_arity: u32,
-    /// Default values of optional arguments, if any.
-    optional_values: OptionalHandle,
-    /// Whether `args` is provided as an argument name. `args`, if present, is always
-    /// the last argument name.
-    has_args_parameter: bool,
     /// Unique identifier for cache keying.
     cache_id: u64,
 
@@ -602,9 +454,6 @@ pub const Closure = struct {
             .name = closure.name.borrowOptional(),
             .scope = closure.scope.borrowOptional(),
             .required_arity = closure.required_arity,
-            .optional_arity = closure.optional_arity,
-            .optional_values = closure.optional_values.borrowOptional(),
-            .has_args_parameter = closure.has_args_parameter,
             .cache_id = closure.cache_id,
         };
     }
@@ -614,7 +463,6 @@ pub const Closure = struct {
         closure.body.decrRefCount();
         closure.name.decrOptional();
         closure.scope.decrOptional();
-        closure.optional_values.decrOptional();
     }
 };
 
@@ -842,8 +690,6 @@ pub const Handle = packed struct(HandleBacking) {
 
         const metadata = handle.getMetadata();
         incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
-
-        handle.trace("Incr ref count of index {} (now {})", .{ handle.index, handle.debugRefCount() });
     }
 
     pub fn referenceTakeOwnership(handle: Handle) Object {
@@ -903,9 +749,6 @@ pub const Handle = packed struct(HandleBacking) {
             }
         }
 
-        handle.trace("Decr ref count of index {} (now {})", .{ handle.index, @as(i64, handle.debugRefCount()) - 1 });
-
-        if (options.trace_mem) last_touched = handle;
         if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
             freeObject(handle);
         }
@@ -1043,25 +886,10 @@ pub const Handle = packed struct(HandleBacking) {
         return memutil.hashBytes(try handle.getString());
     }
 
-    pub fn trace(handle: Handle, comptime fmt: []const u8, args: anytype) void {
-        if (options.trace_mem) {
-            // We need to create the message before locking the mutex, since `allocPrint` may
-            // call `getString`, which in turn traces setting the string.
-            const msg = std.fmt.allocPrint(debug_gpa, "\n" ++ fmt, args) catch unreachable;
-
-            handle.getHeap().trace_mutex.lockUncancelable(global_io);
-            defer handle.getHeap().trace_mutex.unlock(global_io);
-            const trace_field = &handle.getHeap().objects.items(.trace)[handle.index];
-            trace_field.addAddr(@returnAddress(), msg);
-        }
-    }
-
     /// Helper function that dumps the object's trace if the assertion fails.
     pub fn assert(handle: Handle, ok: bool) void {
+        _ = handle;
         if (!ok) {
-            if (options.trace_mem) {
-                last_touched = handle;
-            }
             unreachable;
         }
     }
@@ -1073,11 +901,6 @@ fn invalidateBothInner(handle: Handle) void {
 }
 
 fn invalidateStringInner(handle: Handle) void {
-    switch (handle.getStringDetails()) {
-        .null => handle.trace("Invalidate string (was null)", .{}),
-        .empty => handle.trace("Invalidate string (was empty)", .{}),
-        .normal => |str| handle.trace("Invalidate string (was {s})", .{str}),
-    }
     handle.peek().deinitString(handle.getHeap());
 }
 
@@ -1125,7 +948,6 @@ fn invalidateCollection(handle: Handle) void {
 }
 
 fn invalidateBodyInner(handle: Handle) void {
-    handle.trace("Invalidate body", .{});
     std.debug.print("Handle: {any}, ptr: {*}\n", .{ handle, &handle.peek().head });
 
     switch (handle.tag()) {
@@ -1351,13 +1173,8 @@ pub fn splitAlloc(self: *Heap, index: u32, new_order: u5) void {
 
     self.object_tracking.splitBlock(metadata.order, new_order);
 
-    for (self.objects.items(.metadata)[index..][0..memutil.getOrderSize(metadata.order)], 0..) |*new_metadata, i| {
+    for (self.objects.items(.metadata)[index..][0..memutil.getOrderSize(metadata.order)]) |*new_metadata| {
         new_metadata.order = new_order;
-
-        self.getHandle(@intCast(index + i)).trace(
-            "Split from index {} (order {}) to order {}",
-            .{ index, metadata.order, new_order },
-        );
     }
 }
 
@@ -1387,16 +1204,6 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
             .in_use = false,
             .mutable = false,
         });
-    }
-
-    self.getHandle(index).trace("Alloc at index {} of order {} with ref count 1", .{ index, order });
-    if (aligned_count > 1) {
-        for ((index + 1)..end) |collection_item| {
-            self.getHandle(@intCast(collection_item)).trace(
-                "Item {} allocated while allocating at {} of order {} with ref count 1",
-                .{ collection_item, index, order },
-            );
-        }
     }
 
     // Make sure the items we're allocating are free (used to
@@ -1442,12 +1249,6 @@ fn freeObjectBackingInner(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
 
-    if (options.trace_mem) last_touched = handle;
-    handle.trace("Free {} of order {}", .{ handle.index, metadata.order });
-    for ((handle.index + 1)..(handle.index + memutil.getOrderSize(metadata.order))) |index| {
-        obj_heap.getHandle(@intCast(index)).trace("Item {} freed while freeing {} of order {}", .{ index, handle.index, metadata.order });
-    }
-
     if (!metadata.in_use) {
         @panic("Double free!");
     }
@@ -1470,8 +1271,6 @@ fn freeObjectBackingInner(handle: Handle) void {
 
 /// Does not run any destructors, frees the object directly.
 pub fn freeObjectBacking(handle: Handle) void {
-    // HACK: should use a custom panic handler for this.
-    if (options.trace_mem) last_touched = handle;
     assert(handle.isAllocHead());
 
     freeObjectBackingInner(handle);
@@ -1500,12 +1299,6 @@ pub fn ensureShimmerableOrDup(handle: Handle, new_handle: *OptionalHandle) !void
     }
 }
 
-pub fn ensureSameHeapOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
-    if (handle.heap != local_heap.heapId()) {
-        new_handle.swapRef(try local_heap.duplicate(handle));
-    }
-}
-
 /// Get a string slice from heap string storage.
 pub fn getHeapString(self: *Heap, start: u32, end: u32) [:0]u8 {
     return self.strings.items[start..end :0];
@@ -1516,19 +1309,7 @@ pub fn createString(self: *Heap, len: u32) !u32 {
     const length_with_null = len + 1;
     const order = memutil.getOrder(length_with_null);
 
-    const new_string = blk: {
-        if (self == local_heap) {
-            break :blk try self.string_tracking.allocFromOwningThread(order);
-        } else {
-            break :blk try self.string_tracking.allocFromAnyThread(order);
-        }
-    };
-    errdefer self.string_tracking.freeFromAnyThread(new_string, order);
-    if (!options.threading) {
-        try self.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + length_with_null);
-        self.strings.items.len = @max(self.strings.items.len, new_string + length_with_null);
-    }
-
+    const new_string = try self.string_tracking.allocFromAnyThread(order);
     self.strings.items[new_string + len] = 0; // Set null byte.
     return new_string;
 }
@@ -1538,67 +1319,16 @@ pub fn freeString(self: *Heap, index: u32, len: u32) void {
 
     const length_with_null = len + 1;
     const order = memutil.getOrder(length_with_null);
-    if (self == local_heap) {
-        self.string_tracking.freeFromOwningThread(index, order);
-    } else {
-        self.string_tracking.freeFromAnyThread(index, order);
-    }
+    self.string_tracking.freeFromAnyThread(index, order);
 }
 
 pub fn checkIfEqual(a: Handle, b: Handle) !bool {
     if (a == b) return true;
 
-    // Make sure they have a string rep before checking the details.
     const a_str = try a.getString();
     const b_str = try b.getString();
-    const a_details = a.getStringDetails();
-    const b_details = b.getStringDetails();
-
-    blk: {
-        const a_long_str = switch (a_details) {
-            // The only case where an object can have a null string after getting
-            // its string value is a reference.
-            .null => {
-                assert(a.tag() == .reference);
-                break :blk;
-            },
-            else => break :blk,
-        };
-
-        const b_long_str = switch (b_details) {
-            .null => {
-                assert(b.tag() == .reference);
-                break :blk;
-            },
-            else => break :blk,
-        };
-
-        // If both strings are long strings, we can just
-        // compare their hashes instead of the whole string.
-        return a_long_str.getHash() == b_long_str.getHash();
-    }
 
     return std.mem.eql(u8, a_str, b_str);
-}
-
-/// Steal an object. This allocates a new object and sets its contents to the
-/// provided object's contents. Be very careful when using this.
-///
-/// Some things to keep in mind:
-///  * Caller is responsible for freeing the object's previous allocation,
-///    _without_ triggering `invalidateBody` or `invalidateString`. You'll
-///    want to use `freeObjectBacking` instead of `freeObject`.
-///  * This allocates a single object, not a range, so you can't use this to
-///    steal a list or dict.
-///  * This can't be used with a shared object.
-pub fn steal(handle: Handle) !Handle {
-    assert(local_heap.heapId() == handle.heap);
-    assert(handle.canMutate());
-
-    const new_obj = try local_heap.createObject();
-    new_obj.peek().* = handle.peek().*;
-
-    return new_obj;
 }
 
 pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
@@ -1619,15 +1349,6 @@ pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     }
 }
 
-pub fn dupSingleOrReference(dest_heap: *Heap, handle: Handle) !Object {
-    if (dest_heap.duplicateSingle(handle)) |new_obj| {
-        return new_obj;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.MultiItemObject => return handle.reference(),
-    }
-}
-
 /// Duplicates the object if it's a fast duplication, else references it.
 pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
     _ = dest_heap;
@@ -1636,16 +1357,6 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
     if (tag == .reference) {
         // We can't reference a reference, so we'll create a new reference.
         return handle.peek().body.reference.reference();
-    } else if (handle.peek().head.str == Object.null_string and tag == .float or tag == .integer) {
-        // We can't just use a number if it has a string rep, because the string may
-        // be different than how the number will be rendered.
-        return .{
-            .head = .{
-                .str = Object.null_string,
-                .tag = tag,
-            },
-            .body = handle.peek().body,
-        };
     } else {
         return handle.reference();
     }
@@ -1664,43 +1375,6 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 .body = src.body,
             };
         },
-        .source => {
-            const source = src.body.source;
-            const src_extra_data = handle.getHeap().getExtraData(source.extra_data).source;
-            const extra_data_index = try dest_heap.createExtraData();
-            errdefer dest_heap.destroyExtraData(extra_data_index);
-
-            const new_extra_data = dest_heap.getExtraData(extra_data_index);
-            new_extra_data.* = .{
-                .source = .{
-                    .file_name = src_extra_data.file_name.borrowOptional(),
-                    .line_no = src_extra_data.line_no,
-                    .hash = .{
-                        .state = undefined,
-                        .hash = undefined,
-                    },
-                },
-            };
-
-            const parsed_state = src_extra_data.hash.state.load(.acquire);
-            switch (parsed_state) {
-                .not_computed => {
-                    new_extra_data.source.hash.state.store(.not_computed, .release);
-                },
-                .computed => {
-                    new_extra_data.source.hash.hash = src_extra_data.hash.hash;
-                    new_extra_data.source.hash.state.store(.computed, .release);
-                },
-            }
-
-            return .{
-                .head = .{
-                    .str = try dest_heap.duplicateObjString(handle),
-                    .tag = .source,
-                },
-                .body = .{ .source = .{ .extra_data = extra_data_index } },
-            };
-        },
         .reference => {
             // Try to duplicate what it's referencing, else create a new reference to it.
             return dest_heap.duplicateSingle(src.body.reference) catch |err| switch (err) {
@@ -1708,8 +1382,8 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 error.OutOfMemory => return error.OutOfMemory,
             };
         },
-        .custom_type => unreachable,
-        .dict_sugar, .cached_local_var, .cached_lexical_var => {
+        .custom_type, .source, .dict_sugar => unreachable,
+        .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
                 .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .none },
@@ -1742,51 +1416,7 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
     const src = src_handle.peek();
 
     switch (src_handle.tag()) {
-        .list => {
-            const old_body = src.body.list;
-            const old_start = src_handle.index + 1;
-
-            const new_list_idx = try dest_heap.createObjects(1 + old_body.len);
-            errdefer {
-                // Free elements before freeing the head, as the head could
-                // be swapped out if freed too early.
-                for (0..old_body.len) |i| {
-                    freeObject(.{
-                        .index = @intCast(new_list_idx + 1 + i),
-                        .heap = src_handle.heap,
-                    });
-                }
-                freeObject(.{ .index = new_list_idx, .heap = src_handle.heap });
-            }
-            const new_head: *Object = dest_heap.getLocalObject(new_list_idx);
-            const new_start = new_list_idx + 1;
-            const new_items = dest_heap.objectSlice(new_start, new_start + old_body.len);
-
-            // Duplicate head of list.
-            new_head.* = .{
-                .head = .{
-                    .str = try dest_heap.duplicateObjString(src_handle),
-                    .tag = .list,
-                },
-                .body = .{
-                    .list = .{ .len = old_body.len },
-                },
-            };
-
-            // Duplicate items of list.
-            for (new_items, 0..) |*new_item, i| {
-                new_item.* = dest_heap.duplicateSingle(.{
-                    .heap = src_handle.heap,
-                    .index = @intCast(old_start + i),
-                }) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    // Lists can't contain multi item objects
-                    error.MultiItemObject => unreachable,
-                };
-            }
-
-            return dest_heap.getHandle(new_list_idx);
-        },
+        .list => unreachable,
         .dict => {
             const old_len = src.body.dict.len;
             const old_start = src_handle.index + 1;
@@ -1876,17 +1506,9 @@ fn getLocalRefCount(self: *Heap, index: u32) u32 {
     }
 }
 
-// TODO PERF might be worthwhile doing something like Jim's compared string type.
-pub fn stringEquals(handle: Handle, value: []const u8) !bool {
-    const bytes = try handle.getString();
-    return std.mem.eql(u8, bytes, value);
-}
-
 /// Copies provided string.
 pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
     const heap = handle.getHeap();
-
-    // Try setting as a normal string first.
     assert(try heap.setNormalString(handle.index, bytes));
 }
 
@@ -1911,15 +1533,9 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
     const obj: *Object = self.getLocalObject(index);
     obj.head.str = to_set_to;
 
-    const handle = self.getHandle(index);
-    handle.trace("Set string to \"{f}\"", .{handle});
-
     return true;
 }
 
-/// Low-level function. You probably want `Heap.setString()`.
-/// Attempts to copy the provided string into the object heap.
-/// Returns false if the string is too big.
 pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
     if (bytes.len == 0) {
         // No need to check the result of the exchange, as there's nothing to clean up
@@ -2074,64 +1690,22 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
 
 pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     global_io = io;
-
-    if (builtin.mode == .Debug) {
-        debug_gpa = debugging_gpa.allocator();
-    }
-
-    state.mutex.lockUncancelable(global_io);
-    defer state.mutex.unlock(global_io);
-
     global_gpa = gpa;
-
-    state.initialized = true;
 }
 
 pub fn initLocalHeap() !void {
-    const slot_index = blk: {
-        state.mutex.lockUncancelable(global_io);
-        defer state.mutex.unlock(global_io);
+    const slot_index = next_open_heap;
+    next_open_heap += 1;
 
-        assert(state.initialized);
-
-        const heap_index = state.next_open_heap;
-        state.next_open_heap += 1;
-
-        break :blk heap_index;
-    };
-    errdefer {
-        // Roll back heap index if it failed to initialize correctly.
-        state.mutex.lockUncancelable(global_io);
-        state.next_open_heap -= 1;
-        state.mutex.unlock(global_io);
-    }
-
-    if (slot_index < cfg.max_heaps) {
-        const new_heap = &heaps[slot_index];
-        try new_heap.init();
-        local_heap = new_heap;
-        errdefer new_heap.deinit();
-    } else {
-        return error.OutOfMemory;
-    }
+    const new_heap = &heaps[slot_index];
+    try new_heap.init();
+    local_heap = new_heap;
 }
 pub fn deinitAll() void {
-    state.mutex.lockUncancelable(global_io);
-    const heap_count = state.next_open_heap;
-    state.next_open_heap = 0;
-    state.mutex.unlock(global_io);
-
     // Deinit heaps without holding the mutex, as they may lock.
-    for (heaps[0..heap_count]) |*heap| {
+    for (heaps[0..next_open_heap]) |*heap| {
         heap.deinit();
     }
-
-    // Deinit global state.
-    state.mutex.lockUncancelable(global_io);
-    if (state.initialized) {
-        state.initialized = false;
-    }
-    state.mutex.unlock(global_io);
 }
 
 /// Atomically adds, if multithreading is enabled. Returns value before adding.
