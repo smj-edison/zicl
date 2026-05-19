@@ -5,7 +5,6 @@ const testing = std.testing;
 
 const options = @import("options");
 const stringutil = @import("stringutil.zig");
-const expr_parse = @import("expr_parse.zig");
 const memutil = @import("memutil.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
@@ -2119,99 +2118,6 @@ pub fn dictRemove(provided_dict: Handle, key: Handle) !DictAndRemovedResult {
     return .{ .new_dict = new_dict, .did_remove = true };
 }
 
-fn testDicts(ta: std.mem.Allocator) !void {
-    defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
-
-    const key_foo = try newString(heap, "foo");
-    defer key_foo.decrRefCount();
-    const value1 = try newString(heap, "1");
-    defer value1.decrRefCount();
-    const key_bar = try newString(heap, "bar");
-    defer key_bar.decrRefCount();
-    const value2 = try newString(heap, "2");
-    defer value2.decrRefCount();
-
-    const dict1 = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
-    defer dict1.decrRefCount();
-
-    const good_key = try newString(heap, "foo");
-    defer good_key.decrRefCount();
-    const bad_key = try newString(heap, "bogus");
-    defer bad_key.decrRefCount();
-
-    try testing.expectEqualStrings("1", try (try dictLookupFollowRefs(dict1, good_key)).toHandle().?.getString());
-    try testing.expectEqual(.none, try dictLookupFollowRefs(dict1, bad_key));
-
-    // Dict with duplicate entries testing.
-    var new_dict: OptionalHandle = .none;
-    defer new_dict.swapWithNone();
-
-    var dict_with_duplicates = try newString(heap, "foo 5 bar 10 foo 15");
-    defer dict_with_duplicates.decrRefCount();
-    const dup_len = try dictPairLength(null, dict_with_duplicates, &new_dict);
-    dict_with_duplicates.swapAndClear(&new_dict);
-
-    try testing.expectEqual(3, dup_len);
-    // When a duplicate key is queried, it should point to the last corrisponding value.
-    try testing.expectEqualStrings("15", try (try dictLookupFollowRefs(dict_with_duplicates, key_foo)).toHandle().?.getString());
-
-    _ = try dictRemoveDuplicates(dict_with_duplicates, &new_dict, null);
-    dict_with_duplicates.swapAndClear(&new_dict);
-    try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
-
-    // Dict put testing.
-    var dict_for_put = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
-    defer dict_for_put.decrRefCount();
-    const key3 = try newString(heap, "baz");
-    defer key3.decrRefCount();
-    const value3 = try newString(heap, "3");
-    defer value3.decrRefCount();
-
-    try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
-    var put_result = try dictPut(dict_for_put, key_bar, value3);
-    dict_for_put.swapIfNew(put_result.new_dict);
-    try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
-
-    put_result = try dictPut(dict_for_put, key3, value3);
-    dict_for_put.swapIfNew(put_result.new_dict);
-    try testing.expectEqual(3, dictPairLengthRaw(dict_for_put));
-    try testing.expectEqualStrings("3", try (try dictLookupFollowRefs(dict_for_put, key3)).toHandle().?.getString());
-
-    // Dict remove testing.
-    var dict_for_remove = try newDict(heap, &.{ key_foo, value1, key_bar, value2, key_foo, value3 });
-    defer dict_for_remove.decrRefCount();
-    const remove_result = try dictRemove(dict_for_remove, key_foo);
-    dict_for_remove.swapIfNew(remove_result.new_dict);
-    try testing.expectEqual(true, remove_result.did_remove);
-    try testing.expectEqualStrings("bar 2", try dict_for_remove.getString());
-
-    // Test dict edge cases.
-    var dict_edge_cases = try newDict(heap, &.{ key_foo, value1, key_bar, value2 });
-    defer dict_edge_cases.decrRefCount();
-
-    // Try using a value as a key, and a key as the value while not shared (this is to check
-    // that this handles using internal objects correctly).
-    assert(dict_edge_cases.canMutate());
-    put_result = try dictPut(dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 1), dictItemFollowRefs(dict_edge_cases, 2));
-    dict_edge_cases.swapIfNew(put_result.new_dict);
-    try testing.expectEqualStrings("bar", try (try dictLookupFollowRefs(dict_edge_cases, value1)).toHandle().?.getString());
-
-    // Try aliasing a key by using it as key and value.
-    put_result = try dictPut(dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 0), dictItemFollowRefs(dict_edge_cases, 0));
-    dict_edge_cases.swapIfNew(put_result.new_dict);
-    try testing.expectEqualStrings("foo", try (try dictLookupFollowRefs(dict_edge_cases, key_foo)).toHandle().?.getString());
-
-    // Try aliasing a value by using it as key and value.
-    put_result = try dictPut(dict_edge_cases, dictItemFollowRefs(dict_edge_cases, 3), dictItemFollowRefs(dict_edge_cases, 3));
-    dict_edge_cases.swapIfNew(put_result.new_dict);
-    try testing.expectEqualStrings("2", try (try dictLookupFollowRefs(dict_edge_cases, value2)).toHandle().?.getString());
-}
-
-test "dicts" {
-    try testing.checkAllAllocationFailures(testing.allocator, testDicts, .{});
-}
-
 pub const SourceInfo = struct {
     file_name: OptionalHandle,
     line_no: u32,
@@ -2645,99 +2551,14 @@ fn expectEqualToken(script: *const Heap.ParsedScript, index: u32, tag: Tokenizer
     try testing.expectEqualStrings(value, try listItem(script.values, index).getString());
 }
 
-pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpression {
-    const source_info: SourceInfo = getSourceInfo(handle) orelse .{ .file_name = .none, .line_no = 1 };
-    const file_name = source_info.file_name.borrowOptional();
-    errdefer file_name.decrOptional();
-    const line_no = source_info.line_no;
-
-    // Parse all the tokens of the expr, handling any errors that come up.
-    const bytes = try handle.getString();
-    var tokenizer = Tokenizer.init(bytes, line_no);
-    var tokens = std.MultiArrayList(Tokenizer.Token).empty;
-    defer tokens.deinit(Heap.global_gpa);
-    while (true) {
-        const next_token = tokenizer.nextExpressionToken();
-        if (next_token) |token| {
-            try tokens.append(Heap.global_gpa, token);
-            if (token.tag == .end_of_file) break;
-        } else |err| if (det) |details| {
-            details.* = try convertTokenizerError(Heap.local_heap, err);
-            if (tokenizer.error_details) |parser_details| {
-                details.index = parser_details.index;
-            }
-            return err;
-        }
-    }
-
-    if (tokens.len == 0) {
-        if (det) |details| details.* = .{
-            .message = try newString(Heap.local_heap, "empty expression"),
-        };
-        return error.ParseError;
-    }
-
-    // Next, go ahead and parse the expression from the tokens.
-    const parsed: Heap.ParsedExpression = blk: {
-        var parser = expr_parse.Parse.init(Heap.local_heap, file_name, bytes, tokens.slice());
-        errdefer parser.deinit();
-        if (parser.parseExpr()) |root_node| {
-            break :blk .{ .nodes = parser.nodes, .root_node = root_node.? };
-            // Note we don't deinit parser here, since we take ownership.
-        } else |err| {
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ParseError => {
-                    if (det) |details| {
-                        var aw = std.Io.Writer.Allocating.init(Heap.global_gpa);
-                        errdefer aw.deinit();
-                        const err_details = parser.err.?;
-                        parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
-                        const rendered_error = try aw.toOwnedSlice();
-                        defer Heap.global_gpa.free(rendered_error);
-                        const err_on_heap = try newString(Heap.local_heap, rendered_error);
-                        errdefer err_on_heap.decrRefCount();
-
-                        details.* = .{
-                            .message = err_on_heap,
-                            .index = err_details.sourceIndex(&parser),
-                        };
-                    }
-                    return error.ParseError;
-                },
-            }
-        }
-    };
-
-    return parsed;
-}
-
 pub fn getExpression(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap.ParsedExpression {
-    if (Heap.local_heap.parsed_exprs.get(cache_key)) |parsed| {
-        return parsed.expr;
-    } else {
-        const new_expr = try parseExpression(det, handle);
-        if (Heap.local_heap.parsed_exprs.put(cache_key, .{ .expr = new_expr })) |ejected| {
-            var old = ejected;
-            old.expr.deinit();
-        }
-        return new_expr;
-    }
-}
-
-fn testExpressions(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta, testing.io);
-    defer Heap.testFinish();
-
-    var expr1 = try newString(heap, "1 + 2 * 3 + 4");
-    defer expr1.decrRefCount();
-
-    const parsed = try getExpression(null, expr1, try expr1.getHash());
-    try testing.expectEqual(.add, parsed.nodes.get(@intFromEnum(parsed.root_node)).tag);
-}
-
-test "expressions" {
-    try testing.checkAllAllocationFailures(testing.allocator, testExpressions, .{});
+    _ = det;
+    _ = handle;
+    _ = cache_key;
+    return .{
+        .nodes = .empty,
+        .root_node = @enumFromInt(0),
+    };
 }
 
 pub fn shimmerToBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !void {

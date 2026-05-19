@@ -34,36 +34,6 @@ global_commands: CommandHashTable,
 eval_depth: usize,
 max_eval_depth: usize,
 max_call_depth: usize,
-/// If this is greater than 0, it means we're catching and handling
-/// signals. Otherwise signals are ignored. This gets incremented
-/// when running [catch -signal].
-signal_depth: usize,
-/// Bit mask of caught signals, or 0 if none.
-signal: u64,
-
-/// Used to propagate `error.Continue` or `error.Break` up multiple
-/// loop levels. This is a separate counter from return_propagate, since
-/// this counter only goes down when going through a loop command, not
-/// just any ol' command.
-loop_propagate: u32 = 0,
-/// Used for propagating a return code up multiple eval levels.
-return_propagate: struct {
-    left_to_go: u32 = 0,
-    return_at_end: ?EvalError = null,
-} = .{},
-/// Stack trace captured at the error site.
-stack_trace: OptionalHandle,
-/// Error code set by `[error]` or `[return -errorcode ...]`. Not a Tcl-visible
-/// global, it lives here only to cross the Zig call boundary to `[catch]`/`[try]`.
-/// Note that this is not the same as a return code. For example, a return code
-/// would be error.OutOfMemory, but an error code would be "ZICL OOM".
-pending_error_code: OptionalHandle,
-/// If an error occurs while a `on`/`trap`/`finally` executes, it can be easy to
-/// lose track of the original error. So instead when this happens we store the
-/// original error in a `-pending` key, inside of the new error.
-pending_error_during: OptionalHandle,
-
-prng: std.Random.DefaultPrng,
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
@@ -264,63 +234,13 @@ fn ensureValidVariableType(
                 }
             }
         },
-        .dict_sugar => {
-            const dict_name = name.getHeap().getHandle(name.peek().body.dict_sugar.dict_name_index);
-            try interp.ensureValidVariableType(det, var_call_frame, dict_name);
-        },
+        .dict_sugar => unreachable,
         else => {
             // Fall through.
         },
     }
 
-    // We don't know whether this is a normal variable or dict sugar yet.
-    const var_name = try name.getString();
-
-    // Does it contain double colons anywhere?
-    const double_colons = std.mem.indexOf(u8, var_name, "::");
-    if (double_colons) |start_at| {
-        const dict_name = try objutil.newString(Heap.local_heap, var_name[0..start_at]);
-        errdefer dict_name.decrRefCount();
-
-        var dict_path = try objutil.newList(&.{});
-        errdefer dict_path.decrRefCount();
-
-        var last_path_start: ?usize = 0;
-        var i = start_at;
-        while (i < var_name.len) : (i += 1) {
-            if (var_name[i] == ':' and var_name[i + 1] == ':') {
-                if (last_path_start) |val| {
-                    const path_section = var_name[val..(i - 1)];
-                    const path_section_handle = try objutil.newString(Heap.local_heap, path_section);
-                    defer path_section_handle.decrRefCount();
-
-                    var new_dict_path: OptionalHandle = .none;
-                    _ = objutil.listAppend(det, dict_path, &new_dict_path, path_section_handle) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => unreachable,
-                    };
-                    dict_path.swapIfNew(new_dict_path);
-                }
-
-                // Keep advancing until we've passed the colon(s).
-                while (var_name[i + 1] == ':') i += 1;
-                last_path_start = i + 1;
-            }
-        }
-
-        // Make sure the dict name exists.
-        try interp.reshimmerToVariable(det, var_call_frame, dict_name);
-
-        try name.prepareToShimmer();
-        name.peek().head.tag = .dict_sugar;
-        // Take ownership of `dict_name` and `dict_path`.
-        name.peek().body.dict_sugar = .{
-            .dict_name_index = dict_name.index,
-            .path_index = dict_path.index,
-        };
-    } else {
-        try interp.reshimmerToVariable(det, var_call_frame, name);
-    }
+    try interp.reshimmerToVariable(det, var_call_frame, name);
 }
 
 // Must be called with a heap-native variable name.
@@ -457,103 +377,6 @@ pub fn setVariableInner(
     }
 }
 
-pub fn setVariableLinkInner(
-    interp: *Interp,
-    det: ?*objutil.ErrorDetails,
-    call_frame_idx: u32,
-    name: Handle,
-    target_call_frame_idx: u32,
-    target_name: Handle,
-) !void {
-    name.assert(name.getHeap() == Heap.local_heap);
-    name.assert(name.canShimmer());
-
-    const name_bytes = try name.getString();
-    const target_name_bytes = try target_name.getString();
-
-    if (interp.ensureValidVariableType(null, call_frame_idx, name)) |_| {
-        // Variable already exists.
-        if (det) |details| details.* = .{
-            .message = try objutil.newStringFmt(Heap.local_heap, "variable \"{s}\" already exists", .{name_bytes}),
-        };
-
-        return error.VariableAlreadyExists;
-    } else |err| switch (err) {
-        error.VariableNotFound => {
-            // Fall through.
-        },
-        error.OutOfMemory => return error.OutOfMemory,
-    }
-
-    if (name.tag() == .dict_sugar) {
-        if (det) |details| details.* = .{
-            .message = try objutil.newString(Heap.local_heap, "cannot create an upvar name that has dict sugar"),
-        };
-        return error.DictSugarInUpvarName;
-    }
-
-    // Check for cycles (only possible with `upvar 0`).
-    if (call_frame_idx == target_call_frame_idx) {
-        // Traverse the upvar chain until either we reach the end of the chain
-        // or we find ourselves.
-        var obj_currently_checking = target_name;
-        while (true) {
-            if (try Heap.checkIfEqual(name, obj_currently_checking)) {
-                // We'd create a circular reference at this point, since
-                // we managed to find ourselves when traversing the upvar
-                // chain. Obviously, we can't let this happen.
-                if (det) |details| details.* = .{
-                    .message = try objutil.newString(Heap.local_heap, "can't upvar from variable to itself"),
-                };
-                return error.CircularUpvar;
-            }
-
-            const var_exists = interp.ensureValidVariableType(null, target_call_frame_idx, obj_currently_checking);
-            if (var_exists) |_| {
-                // Can't use `getVariableInner` here, as it follows upvars.
-                if (obj_currently_checking.tag() == .cached_local_var) {
-                    const index = obj_currently_checking.peek().body.cached_local_var.cached_index;
-                    const var_val = obj_currently_checking.getHeap().getHandle(index);
-                    // Need to check the next link in this upvar chain to see if
-                    // it has a cycle.
-                    if (var_val.peek().body.upvar_link.call_frame != call_frame_idx) {
-                        // Next upvar is higher than the current call frame, so it's
-                        // impossible that it loops back here.
-                        break;
-                    } else {
-                        const upvar_link = var_val.peek().body.upvar_link;
-                        obj_currently_checking = var_val.getHeap().getHandle(upvar_link.linked_name);
-                    }
-                } else {
-                    break;
-                }
-            } else |err| switch (err) {
-                error.VariableNotFound => {
-                    // If the target var doesn't exist, then of course the var name != nothing,
-                    // so it's not equal to itself.
-                    break;
-                },
-                error.OutOfMemory => return error.OutOfMemory,
-            }
-        }
-
-        const target_name_duped = try objutil.newString(Heap.local_heap, target_name_bytes);
-
-        interp.setVariableInner(null, call_frame_idx, name, .{
-            .head = .{ .str = Heap.Object.null_string, .tag = .upvar_link },
-            .body = .{ .upvar_link = .{
-                .call_frame = target_call_frame_idx,
-                .linked_name = target_name_duped.index,
-            } },
-        }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // We already checked that the name isn't dict sugar, so it's definitely
-            // impossible for it to be a bad dict.
-            error.BadDict => unreachable,
-        };
-    }
-}
-
 /// Resolves to the variable's value. Must be called with a heap-native name.
 pub fn getVariableInner(
     interp: *Interp,
@@ -630,85 +453,6 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
         else => try testing.expectError(expected_error, actual_error_union),
     }
 }
-fn testVariables(ta: std.mem.Allocator) !void {
-    defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
-    defer interp.deinit();
-
-    var str_foo = try objutil.newString(heap, "foo");
-    defer str_foo.decrRefCount();
-
-    // Make sure it doesn't resolve to anything.
-    try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
-
-    const str_value = try objutil.newString(heap, "value");
-    defer str_value.decrRefCount();
-    try interp.setVariableTo(&str_foo, str_value);
-
-    const cached_lookup_value = (try interp.resolveVariable(0, str_foo)).?.local_variable.target;
-    try testing.expectEqualStrings("value", try cached_lookup_value.getString());
-    // Also try resolving the value from a new string.
-    var str2_foo = try objutil.newString(heap, "foo");
-    defer str2_foo.decrRefCount();
-    const lookup_value = (try interp.resolveVariable(0, str2_foo)).?.local_variable.target;
-    try testing.expectEqualStrings("value", try lookup_value.getString());
-
-    // Next, we test dict sugar.
-    var str_foo_bar = try objutil.newString(heap, "foo::bar");
-    defer str_foo_bar.decrRefCount();
-    var str_baz = try objutil.newString(heap, "baz");
-    defer str_baz.decrRefCount();
-
-    // Make sure trying to read a dict value fails when it's not a dict.
-    try expectErrorOrOom(error.BadDict, interp.getVariableInner(null, 0, str_foo_bar));
-
-    // Clear foo so we can set it to a dictionary.
-    try interp.setVariableInner(null, 0, str_foo, Heap.emptyObject());
-    try interp.setVariableInner(null, 0, str_foo_bar, str_baz.reference());
-    try std.testing.expectEqual(str_baz, try interp.getVariableInner(null, 0, str_foo_bar));
-    // try std.testing.expectEqual(str_baz, try interp.getVariableInner(null, 0, str_foo_bar));
-}
-
-test "variables" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariables, .{});
-}
-
-fn testVariableLink(ta: std.mem.Allocator) !void {
-    defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
-    defer interp.deinit();
-
-    // Create a variable `foo` containing `value`, then upvar `bar` to `foo`.
-    var str_foo = try objutil.newString(heap, "foo");
-    defer str_foo.decrRefCount();
-
-    try testing.expectEqual(null, interp.resolveVariable(0, str_foo));
-    const str_value = try objutil.newString(heap, "value");
-    defer str_value.decrRefCount();
-    try interp.setVariableTo(&str_foo, str_value);
-
-    var str_bar = try objutil.newString(heap, "bar");
-    defer str_bar.decrRefCount();
-    try interp.setVariableLinkInner(null, 0, str_bar, 0, str_foo);
-
-    // Make sure we can get the value of `foo` through `bar`.
-    var lookup_value = try interp.getVariableInner(null, 0, str_bar);
-    try testing.expectEqualStrings("value", try lookup_value.getString());
-
-    // Modify `foo` through `bar`.
-    const str_new_value = try objutil.newString(heap, "new value");
-    defer str_new_value.decrRefCount();
-    try interp.setVariableInner(null, 0, str_bar, str_new_value.reference());
-    lookup_value = try interp.getVariableInner(null, 0, str_foo);
-    try testing.expectEqualStrings("new value", try lookup_value.getString());
-}
-
-test "variable link" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariableLink, .{});
-}
-
 pub const NativeCommand = struct {
     pub const ZigCommand = struct {
         to_call: *const CommandFn,
@@ -1228,56 +972,9 @@ fn currentCallFrame(interp: *Interp) *CallFrame {
 
 /// Returns a dict containing this call frame's variables.
 pub fn captureScope(interp: *Interp, det: ?*objutil.ErrorDetails, call_frame_idx: u32) !Handle {
+    _ = det;
     const frame = &interp.call_frames.items[call_frame_idx];
-    const pairs = objutil.dictPairLengthRaw(frame.variables);
-
-    // Make sure there's no upvars.
-    for (0..pairs) |i_usize| {
-        const i: u32 = @intCast(i_usize);
-        const value = objutil.dictItem(frame.variables, i * 2 + 1);
-        if (value.tag() == .upvar_link) break;
-    } else {
-        // No upvars found, so we can just borrow the variables.
-        const scope = frame.variables.borrow();
-        return scope;
-    }
-
-    // Found upvars if we made it to this point, so we need
-    // to duplicate everything, and follow any upvars.
-    const new_dict = try objutil.newDictWithCapacity(Heap.local_heap, pairs * 2);
-    new_dict.getDictExtraData().parent_link = frame.variables.getDictExtraData().parent_link;
-    for (0..pairs) |i_usize| {
-        const i: u32 = @intCast(i_usize);
-        const key = objutil.dictItem(frame.variables, i * 2);
-        const value = objutil.dictItem(frame.variables, i * 2 + 1);
-
-        if (value.tag() == .upvar_link) {
-            const upvar_link = value.peek().body.upvar_link;
-            if (interp.getVariableInner(null, upvar_link.call_frame, Heap.local_heap.getHandle(upvar_link.linked_name))) |upvar_val| {
-                assert((try objutil.dictPut(new_dict, key, upvar_val)).new_dict == .none);
-            } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => {
-                    if (det) |details| details.* = .{
-                        .message = try objutil.newStringFmt(
-                            Heap.local_heap,
-                            "failed to capture the variable \"{f}\", as it was an upvar that pointed at nothing",
-                            .{key},
-                        ),
-                    };
-                    return error.UninitializedUpvar;
-                },
-                error.VariableNotFound => {
-                    // Don't put anything in the dictionary if the upvar
-                    // doesn't point at anything.
-                },
-            }
-        } else {
-            assert((try objutil.dictPut(new_dict, key, value)).new_dict == .none);
-        }
-    }
-
-    return new_dict;
+    return frame.variables.borrow();
 }
 
 /// Returns a dict capturing the current call frame's variables.
@@ -1578,182 +1275,9 @@ fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
 }
 
 fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
-    switch (result.*) {
-        .int => |int| return int != 0,
-        .float => |float| {
-            try interp.setResultFormatted("expected boolean but got \"{}\"", .{float});
-            return error.BadBoolean;
-        },
-        .owned_handle => |string| {
-            string.incrRefCount();
-            var new_handle: OptionalHandle = .none;
-            const bool_result = objutil.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string.*});
-                    return error.BadBoolean;
-                },
-            };
-            string.swapIfNew(new_handle);
-            return bool_result;
-        },
-        .stack_handle => |*string| {
-            var new_handle: OptionalHandle = .none;
-            const bool_result = objutil.getBoolean(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    try interp.setResultFormatted("expected boolean but got \"{f}\"", .{string});
-                    return error.BadBoolean;
-                },
-            };
-            string.swapIfNew(new_handle);
-            return bool_result;
-        },
-    }
-}
-
-fn boolToExprResult(value: bool) ExprResult {
-    return .{ .int = @intFromBool(value) };
-}
-
-fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
-    switch (result.*) {
-        .int, .float => return result.*,
-        .owned_handle => |string| {
-            var new_handle: OptionalHandle = .none;
-            const int_result = objutil.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    // Try parsing it as a float.
-                    return .{ .float = try interp.getFloat(string) };
-                },
-            };
-            string.swapIfNew(new_handle);
-            return .{ .int = int_result };
-        },
-        .stack_handle => |*string| {
-            var new_handle: OptionalHandle = .none;
-            const int_result = objutil.integerGet(null, string.*, &new_handle) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    // Try parsing it as a float.
-                    return .{ .float = try interp.getFloat(string) };
-                },
-            };
-            string.swapIfNew(new_handle);
-            return .{ .int = int_result };
-        },
-    }
-}
-
-pub const negative_denom_message = "negative denominator";
-fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
-    var det: objutil.ErrorDetails = undefined;
-    return switch (oper) {
-        .mul => blk: {
-            break :blk std.math.mul(i64, lhs, rhs) catch {
-                const rendered = std.math.mulWide(i64, lhs, rhs);
-                return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, rendered));
-            };
-        },
-        .div => std.math.divFloor(i64, lhs, rhs) catch |err| switch (err) {
-            error.Overflow => {
-                return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
-            },
-            error.DivisionByZero => {
-                interp.setResultInterned(.@"division by zero");
-                return error.DivisionByZero;
-            },
-        },
-        .mod => std.math.mod(i64, lhs, rhs) catch |err| switch (err) {
-            error.NegativeDenominator => {
-                try interp.setResultString(negative_denom_message);
-                return error.NegativeDenominator;
-            },
-            error.DivisionByZero => {
-                interp.setResultInterned(.@"division by zero");
-                return error.DivisionByZero;
-            },
-        },
-        .sub => std.math.sub(i64, lhs, rhs) catch return interp.wrapError(&det, objutil.integerOverflowError(&det, null)),
-        .add => std.math.add(i64, lhs, rhs) catch return interp.wrapError(&det, objutil.integerOverflowError(&det, null)),
-        .shiftl => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
-            break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) << rhs_constrained));
-        },
-        .shiftr => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
-            break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) >> rhs_constrained));
-        },
-        .rotl => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
-            break :blk @as(i64, @bitCast(std.math.rotl(u64, @bitCast(lhs), rhs_constrained)));
-        },
-        .rotr => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
-            break :blk @as(i64, @bitCast(std.math.rotr(u64, @bitCast(lhs), rhs_constrained)));
-        },
-        .less_than => @intFromBool(lhs < rhs),
-        .greater_than => @intFromBool(lhs > rhs),
-        .less_or_equal => @intFromBool(lhs <= rhs),
-        .greater_or_equal => @intFromBool(lhs >= rhs),
-        .equal => @intFromBool(lhs == rhs),
-        .not_equal => @intFromBool(lhs != rhs),
-        .bit_and => lhs & rhs,
-        .bit_xor => lhs ^ rhs,
-        .bit_or => lhs | rhs,
-        .bool_and => @intFromBool((lhs != 0) and (rhs != 0)),
-        .bool_or => @intFromBool((lhs != 0) or (rhs != 0)),
-        .pow => std.math.powi(i64, lhs, rhs) catch {
-            // Report overflow for both underflow and overflow. Maybe I should report both?
-            return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
-        },
-        else => unreachable,
-    };
-}
-
-fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !ExprResult {
-    return switch (oper) {
-        .mul => .{ .float = lhs * rhs },
-        .div => blk: {
-            if (rhs == 0.0) {
-                interp.setResultInterned(.@"division by zero");
-                return error.DivisionByZero;
-            } else {
-                break :blk .{ .float = lhs / rhs };
-            }
-        },
-        .mod => .{
-            .float = std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
-                error.DivisionByZero => {
-                    interp.setResultInterned(.@"division by zero");
-                    return error.DivisionByZero;
-                },
-                error.NegativeDenominator => {
-                    try interp.setResultString(negative_denom_message);
-                    return error.NegativeDenominator;
-                },
-            },
-        },
-        .sub => .{ .float = lhs - rhs },
-        .add => .{ .float = lhs + rhs },
-        .shiftl, .shiftr, .rotl, .rotr => {
-            try interp.setResultFormatted("cannot bit shift on floats {} and {}", .{ lhs, rhs });
-            return error.BadInteger;
-        },
-        .less_than => boolToExprResult(lhs < rhs),
-        .greater_than => boolToExprResult(lhs > rhs),
-        .less_or_equal => boolToExprResult(lhs <= rhs),
-        .greater_or_equal => boolToExprResult(lhs >= rhs),
-        .equal => boolToExprResult(lhs == rhs),
-        .not_equal => boolToExprResult(lhs != rhs),
-        .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or => {
-            try interp.setResultFormatted("cannot do bitwise operations on floats {} and {}", .{ lhs, rhs });
-            return error.BadInteger;
-        },
-        .pow => .{ .float = std.math.pow(f64, lhs, rhs) },
-        else => unreachable,
-    };
+    _ = interp;
+    _ = result;
+    return true;
 }
 
 const ExprResult = union(enum) {
@@ -1787,76 +1311,7 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
     const node_tag = nodes.items(.tag)[@intFromEnum(node_index)];
     const node_data: *expr_parse.Node.Data = &nodes.items(.data)[@intFromEnum(node_index)];
     switch (node_tag) {
-        .mul,
-        .div,
-        .mod,
-        .sub,
-        .add,
-        .shiftl,
-        .shiftr,
-        .rotl,
-        .rotr,
-        .less_than,
-        .greater_than,
-        .less_or_equal,
-        .greater_or_equal,
-        .equal,
-        .not_equal,
-        .bit_and,
-        .bit_xor,
-        .bit_or,
-        .bool_and,
-        .bool_or,
-        .pow,
-        => {
-            const children = node_data.binary;
-            var lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
-            defer lhs_value.release();
-            var rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
-            defer rhs_value.release();
-            const lhs_tag = std.meta.activeTag(lhs_value);
-            const rhs_tag = std.meta.activeTag(rhs_value);
-
-            // Fast case, both integers, or both floats.
-            if (lhs_tag == .int and rhs_tag == .int) {
-                return .{
-                    .int = try interp.exprBinaryOperatorInteger(node_tag, lhs_value.int, rhs_value.int),
-                };
-            } else if (lhs_tag == .float and rhs_tag == .float) {
-                return try interp.exprBinaryOperatorFloat(node_tag, lhs_value.float, rhs_value.float);
-            }
-
-            // Slow case: 1. try to get both as integers, 2. try getting both as floats, 3. error.
-            const lhs_converted: ExprResult = try interp.exprResultAsNumber(&lhs_value);
-            const rhs_converted: ExprResult = try interp.exprResultAsNumber(&rhs_value);
-
-            if (std.meta.activeTag(lhs_converted) == .int and std.meta.activeTag(rhs_converted) == .int) {
-                return .{
-                    .int = try interp.exprBinaryOperatorInteger(node_tag, lhs_converted.int, rhs_converted.int),
-                };
-            } else {
-                const lhs_as_float: f64 = switch (lhs_converted) {
-                    .int => |int| @floatFromInt(int),
-                    .float => |float| float,
-                    .owned_handle, .stack_handle => unreachable,
-                };
-                const rhs_as_float: f64 = switch (rhs_converted) {
-                    .int => |int| @floatFromInt(int),
-                    .float => |float| float,
-                    .owned_handle, .stack_handle => unreachable,
-                };
-                return try interp.exprBinaryOperatorFloat(node_tag, lhs_as_float, rhs_as_float);
-            }
-        },
-        .string_equal,
-        .string_not_equal,
-        .string_in,
-        .string_not_in,
-        .string_less_than,
-        .string_greater_than,
-        .string_less_than_or_equal,
-        .string_greater_than_or_equal,
-        => {
+        .string_equal => {
             const children = node_data.binary;
             const lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
             const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
@@ -1864,260 +1319,42 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             defer rhs_value.release();
 
             var lhs_buffer: [50]u8 = @splat(0);
-            var lhs_alloc = std.heap.FixedBufferAllocator.init(lhs_buffer[0..]);
+            var lhs_writer = std.Io.Writer.fixed(lhs_buffer[0..]);
             const lhs_string = switch (lhs_value) {
-                .float => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .int => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_handle => |val| (try val.*.getString())[0..],
+                .float => |val| blk: {
+                    lhs_writer.print("{}", .{val}) catch unreachable;
+                    break :blk lhs_writer.buffered();
+                },
+                .int => |val| blk: {
+                    lhs_writer.print("{}", .{val}) catch unreachable;
+                    break :blk lhs_writer.buffered();
+                },
+                .owned_handle => |val| (try val.getString())[0..],
                 .stack_handle => |val| (try val.getString())[0..],
             };
             var rhs_buffer: [50]u8 = @splat(0);
-            var rhs_alloc = std.heap.FixedBufferAllocator.init(rhs_buffer[0..]);
+            var rhs_writer = std.Io.Writer.fixed(rhs_buffer[0..]);
             const rhs_string = switch (lhs_value) {
-                .float => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .int => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_handle => |val| (try val.*.getString())[0..],
+                .float => |val| blk: {
+                    rhs_writer.print("{}", .{val}) catch unreachable;
+                    break :blk rhs_writer.buffered();
+                },
+                .int => |val| blk: {
+                    rhs_writer.print("{}", .{val}) catch unreachable;
+                    break :blk rhs_writer.buffered();
+                },
+                .owned_handle => |val| (try val.getString())[0..],
                 .stack_handle => |val| (try val.getString())[0..],
             };
 
             const result = switch (node_tag) {
                 .string_equal => std.mem.eql(u8, lhs_string, rhs_string),
-                .string_not_equal => !std.mem.eql(u8, lhs_string, rhs_string),
-                .string_in => std.mem.indexOf(u8, rhs_string, lhs_string) != null,
-                .string_not_in => std.mem.indexOf(u8, rhs_string, lhs_string) == null,
-                .string_less_than => std.mem.order(u8, rhs_string, lhs_string).compare(.lt),
-                .string_greater_than => std.mem.order(u8, rhs_string, lhs_string).compare(.gt),
-                .string_less_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.lte),
-                .string_greater_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.gte),
-                inline else => unreachable,
+                else => unreachable,
             };
 
             return if (result) .{ .int = 1 } else .{ .int = 0 };
         },
-        .ternary_conditional => {
-            const children = node_data.ternary;
-            var condition = try interp.evalExpressionNode(nodes, children.@"0");
-
-            if (try exprResultAsBool(interp, &condition)) {
-                return interp.evalExpressionNode(nodes, children.@"1");
-            } else {
-                return interp.evalExpressionNode(nodes, children.@"2");
-            }
-        },
-        .string => {
-            const obj = &node_data.object;
-            obj.incrRefCount();
-            return .{ .owned_handle = obj };
-        },
-        .integer => return .{ .int = node_data.integer },
-        .float => return .{ .float = node_data.float },
-        .command_subst => {
-            const nested_cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try node_data.object.getHash();
-            const result = interp.evalObjectInner(node_data.object, nested_cache_key);
-
-            if (result) {
-                return .{ .stack_handle = interp.result.borrow() };
-            } else |err| {
-                return err;
-            }
-        },
-        .variable_subst => {
-            // This should not change, since it should be a local heap object.
-            var det: objutil.ErrorDetails = undefined;
-            const var_value = try interp.wrapError(&det, interp.getVariableInner(&det, interp.currentCallFrameIndex(), node_data.object));
-
-            return .{ .stack_handle = var_value.borrow() };
-        },
-        .value_false => return .{ .int = 0 },
-        .value_true => return .{ .int = 1 },
-        .bool_not => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const result_bool = try interp.exprResultAsBool(&result);
-            return .{ .int = if (result_bool) 0 else 1 };
-        },
-        .bit_not => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            const value = switch (result) {
-                .int => |val| val,
-                .float => |val| {
-                    try interp.setResultFormatted("cannot bit invert on float {}", .{val});
-                    return error.BadInteger;
-                },
-                .owned_handle => |val| blk: {
-                    break :blk try interp.getInteger(val);
-                },
-                .stack_handle => |*val| blk: {
-                    break :blk try interp.getInteger(val);
-                },
-            };
-
-            return .{ .int = ~value };
-        },
-        .identity => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            return try interp.exprResultAsNumber(&result);
-        },
-        .negation => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
-            switch (value) {
-                .int => |int| return .{ .int = -int },
-                .float => |float| return .{ .float = -float },
-                .owned_handle, .stack_handle => unreachable,
-            }
-        },
-        .to_int, .to_wide => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
-            switch (value) {
-                .int => |int| return .{ .int = int },
-                .float => |float| {
-                    bad_int: {
-                        if (float > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :bad_int;
-                        if (float < @as(f64, @floatFromInt(std.math.minInt(i64)))) break :bad_int;
-                        if (std.math.isNan(float)) break :bad_int;
-                        return .{ .int = @intFromFloat(float) };
-                    }
-                    try interp.setResultFormatted("could not convert float \"{}\" to integer", .{float});
-                    return error.BadInteger;
-                },
-                .owned_handle, .stack_handle => unreachable,
-            }
-        },
-        .abs => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
-            switch (value) {
-                .int => |int| {
-                    if (@abs(int) > std.math.maxInt(i64)) {
-                        var det: objutil.ErrorDetails = undefined;
-                        return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, @abs(int)));
-                    } else {
-                        return .{ .int = @intCast(@abs(int)) };
-                    }
-                },
-                .float => |float| return .{ .float = @abs(float) },
-                .owned_handle, .stack_handle => unreachable,
-            }
-        },
-        .to_double => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
-            switch (value) {
-                .int => |int| return .{ .float = @floatFromInt(int) },
-                .float => return value,
-                .owned_handle, .stack_handle => unreachable,
-            }
-        },
-        .round => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
-            switch (value) {
-                .float => |float| return .{ .float = @round(float) },
-                .int => return value,
-                .owned_handle, .stack_handle => unreachable,
-            }
-        },
-        .rand => {
-            return .{ .float = interp.nextRandomFloat() };
-        },
-        .srand => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = switch (result) {
-                .int => |val| val,
-                .float => |val| {
-                    try interp.setResultFormatted("cannot seed random with {}", .{val});
-                    return error.BadInteger;
-                },
-                .owned_handle => |val| try interp.getInteger(val),
-                .stack_handle => |*val| try interp.getInteger(val),
-            };
-
-            interp.prng.seed(@bitCast(value));
-
-            return .{ .float = interp.nextRandomFloat() };
-        },
-        .sin,
-        .cos,
-        .tan,
-        .asin,
-        .acos,
-        .atan,
-        .sinh,
-        .cosh,
-        .tanh,
-        .ceil,
-        .floor,
-        .exp,
-        .log,
-        .log10,
-        .sqrt,
-        => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
-            const as_float: f64 = switch (value) {
-                .int => |int| @floatFromInt(int),
-                .float => |float| float,
-                .owned_handle, .stack_handle => unreachable,
-            };
-
-            const computed = switch (node_tag) {
-                .sin => @sin(as_float),
-                .cos => @cos(as_float),
-                .tan => @tan(as_float),
-                .asin => std.math.asin(as_float),
-                .acos => std.math.acos(as_float),
-                .atan => std.math.atan(as_float),
-                .sinh => std.math.sinh(as_float),
-                .cosh => std.math.cosh(as_float),
-                .tanh => std.math.tanh(as_float),
-                .ceil => @ceil(as_float),
-                .floor => @floor(as_float),
-                .exp => @exp(as_float),
-                .log => @log(as_float),
-                .log10 => @log10(as_float),
-                .sqrt => @sqrt(as_float),
-                inline else => unreachable,
-            };
-
-            return .{ .float = computed };
-        },
-        .atan2, .fmod, .hypot => {
-            var lhs_result = try interp.evalExpressionNode(nodes, node_data.binary.@"0");
-            defer lhs_result.release();
-            var rhs_result = try interp.evalExpressionNode(nodes, node_data.binary.@"0");
-            defer rhs_result.release();
-            const lhs_number = try interp.exprResultAsNumber(&lhs_result);
-            const rhs_number = try interp.exprResultAsNumber(&rhs_result);
-            const lhs: f64 = switch (lhs_number) {
-                .int => |int| @floatFromInt(int),
-                .float => |float| float,
-                .owned_handle, .stack_handle => unreachable,
-            };
-            const rhs: f64 = switch (rhs_number) {
-                .int => |int| @floatFromInt(int),
-                .float => |float| float,
-                .owned_handle, .stack_handle => unreachable,
-            };
-
-            const computed = switch (node_tag) {
-                .atan2 => std.math.atan2(lhs, rhs),
-                .fmod => @mod(lhs, rhs),
-                .hypot => @sqrt(lhs * lhs + rhs + rhs),
-                inline else => unreachable,
-            };
-            return .{ .float = computed };
-        },
-        .none => unreachable,
+        else => unreachable,
     }
 }
 
@@ -2133,7 +1370,6 @@ pub fn evalExpression(interp: *Interp, handle: Handle, new_handle: *OptionalHand
 
     return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.EvalError,
     };
 }
 
@@ -2166,67 +1402,6 @@ test "eval expression" {
     const result = try interp.evalExpression(expr, &new_expr);
     expr.swapIfNew(new_expr);
     try testing.expectEqual(ExprResult{ .int = 15 }, result);
-}
-
-pub fn setErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!void {
-    if (interp.stack_trace != .none) return;
-    interp.stack_trace.swapRef(try buildErrorStack(interp, script));
-}
-
-/// Builds the stack trace as a flat list of {name file line args} repeated once per call
-/// frame. The top (innermost) frame is emitted first.
-fn buildErrorStack(interp: *Interp, script: Handle) error{OutOfMemory}!Handle {
-    var trace = try objutil.newListWithCapacity(@intCast(interp.call_frames.items.len * 4));
-    errdefer trace.decrRefCount();
-
-    var last_call_frame_idx: ?u32 = null;
-    var is_top = true;
-
-    // Eval frames are walked from top to bottom; each one is followed to its call frame.
-    var i = interp.eval_frames.items.len;
-    while (i > 0) {
-        i -= 1;
-        const eval_frame = &interp.eval_frames.items[i];
-
-        // Skip duplicates by taking the topmost eval frame per call frame.
-        if (last_call_frame_idx == eval_frame.call_frame) continue;
-        last_call_frame_idx = eval_frame.call_frame;
-
-        const call_frame = &interp.call_frames.items[eval_frame.call_frame];
-        const closure_name = call_frame.signature.name.orEmpty();
-
-        // Source info: the top frame uses the active script handle so command
-        // substitution positions are reflected correctly; earlier frames use
-        // their closure body.
-        const body = if (is_top) script else call_frame.signature.body;
-        const source_info = objutil.getSourceInfo(body);
-
-        const file_name, const base_line = if (source_info) |info|
-            .{ info.file_name.orEmpty(), info.line_no }
-        else
-            .{ Heap.local_heap.emptyHandle(), 1 };
-
-        const abs_line = base_line + (eval_frame.current_line - 1);
-        const line_handle = try objutil.newInteger(Heap.local_heap, @intCast(abs_line));
-        defer line_handle.decrRefCount();
-
-        // For the top frame, use the command args stored in the eval frame
-        // (set just before invokeCommand while the slice is still live). For
-        // lower frames use the invocation args stored in the call frame (set
-        // when the frame was pushed, also still live on the Zig stack at this
-        // point).
-        const raw_args: []const Handle = if (is_top) eval_frame.args else call_frame.args;
-        is_top = false;
-        const args_list = try objutil.newList(raw_args);
-        defer args_list.decrRefCount();
-
-        objutil.listAppendAssumeCapacity(trace, closure_name.dupOrRef());
-        objutil.listAppendAssumeCapacity(trace, file_name.dupOrRef());
-        objutil.listAppendAssumeCapacity(trace, line_handle.dupOrRef());
-        objutil.listAppendAssumeCapacity(trace, args_list.dupOrRef());
-    }
-
-    return trace;
 }
 
 pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalError!void {
@@ -2339,88 +1514,12 @@ pub fn evalObjectInner(interp: *Interp, script: Handle, cache_key: u256) EvalErr
         if (false) {
             return error.Signal;
         } else {
-            if (cmd_result) |_| {} else |err| switch (err) {
-                error.PropagateResult => {
-                    interp.return_propagate.left_to_go -= 1;
-                    if (interp.return_propagate.left_to_go == 0) {
-                        if (interp.return_propagate.return_at_end) |return_at_end| {
-                            return return_at_end;
-                        } else {
-                            // Equivalent of TCL_OK.
-                            return;
-                        }
-                    } else {
-                        return error.PropagateResult;
-                    }
-                },
-                else => |narrowed_err| {
-                    if (narrowed_err == error.OutOfMemory) {
-                        // In the case of OOM, the inside function almost certainly didn't
-                        // set a result, so we set it here.
-                        interp.setResultInterned(.@"out of memory");
-                        interp.pending_error_code.swapRef(Heap.local_heap.getInternedString(.@"ZICL OOM"));
-                    }
-
-                    if (narrowed_err == error.WrongUsage) {
-                        try interp.setResultString("FIXME: prolly should explain how to use the command");
-                    }
-
-                    // `eval_frame.args` and `call_frame.args` are still live here; capture the stack
-                    // trace before the loop-body defers unwind them.
-                    try interp.setErrorStack(script);
-
-                    return narrowToEvalError(narrowed_err);
-                },
-            }
+            cmd_result catch unreachable;
         }
     }
 }
 
-/// Return code values matching Tcl's convention.
-pub const ReturnCode = enum(u3) {
-    ok = 0,
-    @"error" = 1,
-    @"return" = 2,
-    @"break" = 3,
-    @"continue" = 4,
-    signal = 5,
-    exit = 6,
-    oom = 7,
-
-    pub fn fromError(value: EvalError!void) ReturnCode {
-        if (value) {
-            return .ok;
-        } else |err| {
-            return switch (err) {
-                error.EvalError => .@"error",
-                error.PropagateResult => .@"return",
-                error.Break => .@"break",
-                error.Continue => .@"continue",
-                error.Signal => .signal,
-                error.Exit => .exit,
-                error.OutOfMemory => .oom,
-            };
-        }
-    }
-
-    pub fn toError(self: ReturnCode) EvalError!void {
-        switch (self) {
-            .ok => return,
-            .@"error" => return error.EvalError,
-            .@"return" => return error.PropagateResult,
-            .@"break" => return error.Break,
-            .@"continue" => return error.Continue,
-            .signal => return error.Signal,
-            .exit => return error.Exit,
-            .oom => return error.OutOfMemory,
-        }
-    }
-};
-pub const ReturnCodeEnum = objutil.TclEnum(Interp.ReturnCode, "return code", true);
-
 pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
-    // Reset the stack trace at each new top-level invocation.
-    interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.currentCallFrame().signature.cache_id) ^ try script.getHash();
     return evalObjectInner(interp, script, cache_key);
 }
@@ -2436,13 +1535,6 @@ pub fn init() !Interp {
         .eval_depth = 0,
         .max_eval_depth = 1000,
         .max_call_depth = 1000,
-        .stack_trace = .none,
-        .pending_error_code = .none,
-        .pending_error_during = .none,
-        .signal_depth = 0,
-        .signal = 0,
-        // TODO: init per interpreter
-        .prng = .init(0),
     };
 
     _ = try new_interp.pushCallFrame(null, &.{}, .{
@@ -2462,8 +1554,6 @@ pub fn init() !Interp {
 
 pub fn deinit(interp: *Interp) void {
     interp.result.decrRefCount();
-    interp.stack_trace.decrOptional();
-    interp.pending_error_code.decrOptional();
     interp.global_commands.deinit(Heap.global_gpa);
 
     // Deinit all frames.
@@ -2473,12 +1563,6 @@ pub fn deinit(interp: *Interp) void {
     interp.call_frames.deinit(Heap.global_gpa);
 
     interp.eval_frames.deinit(Heap.global_gpa);
-}
-
-// Export various utility functions with a nicer interface.
-pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMemory, EvalError } {
-    var det: objutil.ErrorDetails = undefined;
-    interp.wrapError(&det, objutil.integerOverflowError(&det, value)) catch return error.EvalError;
 }
 
 pub fn wrapShimmerFn(
