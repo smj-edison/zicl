@@ -8,14 +8,6 @@ const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
-/// [set]
-pub fn setCmd(interp: *Interp, args: []const Handle) !void {
-    var var_name = args[1].borrow();
-    defer var_name.decrRefCount();
-
-    try interp.setVariableTo(&var_name, args[2]);
-}
-
 /// [fn]
 pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     assert(args.len == 4);
@@ -23,25 +15,16 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     const arglist = &args[2];
     const body = args[3];
 
-    // Shimmer to list via the interp helper, which handles the case where
-    // the handle can't be shimmered in place.
-    Interp.shimmerToList(arglist);
-
-    const parsed_args = Interp.parseClosureArgList(arglist.*) catch unreachable;
-    defer parsed_args.deinit();
-
     // Capture the current scope.
     const frame = interp.currentCallFrame();
     const scope = frame.variables.borrow();
 
-    // Build a non-owning closure descriptor. createClosureObject borrows
-    // all fields, so we don't need to borrow here.
     const closure_obj = try Interp.createClosureObject(.{
         .args = arglist.*,
         .body = body,
         .name = fn_name.toOptional(),
         .scope = scope.toOptional(),
-        .required_arity = parsed_args.required_arity,
+        .required_arity = 1,
         .cache_id = Heap.nextCacheId(),
     });
     defer closure_obj.decrRefCount();
@@ -49,28 +32,14 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     try interp.setVariableTo(fn_name, closure_obj);
 }
 
-pub fn registerCoreCommands(interp: *Interp) !void {
-    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
-    try interp.registerCommand("set", .{ .to_call = setCmd, .description = "varName ?newValue?", .min_arity = 1, .max_arity = 2 });
-}
-
-pub fn testStart(ta: std.mem.Allocator) !Interp {
-    errdefer Heap.testFinish();
-    _ = try Heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
-    errdefer interp.deinit();
-    try registerCoreCommands(&interp);
-    return interp;
-}
-
-pub fn testFinish(interp: *Interp) void {
-    interp.deinit();
-    Heap.testFinish();
-}
-
 test "fn command" {
-    var interp = try testStart(testing.allocator);
-    defer testFinish(&interp);
+    _ = try Heap.testStart(testing.allocator, testing.io);
+    var interp = try Interp.init();
+    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
+    defer {
+        interp.deinit();
+        Heap.testFinish();
+    }
 
     const fn_str = try objutil.newString(Heap.local_heap, "fn");
     const add_str = try objutil.newString(Heap.local_heap, "add");
