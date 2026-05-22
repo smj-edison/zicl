@@ -10,14 +10,14 @@ const Interp = @import("Interp.zig");
 
 /// [fn]
 pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    _ = interp;
     assert(args.len == 4);
     const fn_name = &args[1];
     const arglist = &args[2];
     const body = args[3];
 
     // Capture the current scope.
-    const frame = interp.currentCallFrame();
-    const scope = frame.variables.borrow();
+    const scope = Interp.variables.borrow();
 
     const closure_obj = try Interp.createClosureObject(.{
         .args = arglist.*,
@@ -29,7 +29,7 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     });
     defer closure_obj.decrRefCount();
 
-    try interp.setVariableTo(fn_name, closure_obj);
+    Interp.setVariableTo(fn_name, closure_obj) catch unreachable;
 }
 
 test "fn command" {
