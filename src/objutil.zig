@@ -453,9 +453,9 @@ pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *Op
     if (provided_handle.tag() == .dict) return;
     errdefer new_dict.swapWithNone();
 
-    // Get length, potentially shimmering.
-    const len = try listLength(det, provided_handle, new_dict);
+    shimmerToList(provided_handle, new_dict) catch unreachable;
     const shimmerable = new_dict.orElse(provided_handle);
+    const len = listLengthRaw(shimmerable);
     const handle_heap = shimmerable.getHeap();
 
     if (@mod(len, 2) == 1) {
@@ -648,29 +648,9 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
 
             const table = try dictGetTable(dict);
             // Does the key already exist?
-            if (table.get(key)) |existing_value_index| {
+            if (table.get(key)) |_| {
                 // Key exists, so replace the value in place.
-                var value_handle = dictItem(dict, existing_value_index);
-                if (value_handle.isShared()) {
-                    // Looks like this dictionary value is shared, so we can't replace the value in place
-                    // (else we'd smash up a value someone else is using). Instead, we'll use a new dict
-                    // which, due to duplication, must have non-shared elements.
-                    new_dict.swapRef(try Heap.duplicate(dict.getHeap(), dict));
-                }
-
-                value_handle.assert(value_handle.getHeap() == Heap.local_heap);
-                const old_value = value_handle.peek().*; // Copy.
-
-                // We can't fail at this point, so we don't need to worry about
-                // `value` being freed after assignment.
-                errdefer comptime unreachable;
-                value_handle.peek().* = value;
-
-                break :next_state .{ .changed_value = .{
-                    .new_dict = new_dict,
-                    .old_value = old_value,
-                    .value_index = existing_value_index,
-                } };
+                unreachable;
             } else {
                 const original_len = dict.peek().body.dict.len;
                 const new_length = original_len + 2;

@@ -10,6 +10,7 @@ const objutil = @import("objutil.zig");
 const memutil = @import("memutil.zig");
 
 const Interp = @This();
+
 /// The result from a procedure or eval call
 result: Handle,
 /// Eval frames are separate from call frames, as eval calls can be
@@ -22,12 +23,6 @@ eval_frames: std.ArrayList(EvalFrame),
 /// when you run `uplevel`, it creates a new call frame, it doesn't
 /// jump back.
 call_frames: std.ArrayList(CallFrame),
-/// Used to invalidate cached variable lookups. Will overflow, but
-/// when it overflows the interpreter will scan through the heap and
-/// invalidate all variables.
-current_call_epoch: u32,
-/// Used to invalidate cached procedures.
-global_procedure_epoch: u32,
 global_commands: CommandHashTable,
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
@@ -116,13 +111,11 @@ fn reshimmerToVariable(
 ) error{ OutOfMemory, VariableNotFound }!void {
     name.assert(name.canShimmer());
 
-    const call_frame = &interp.call_frames.items[var_call_frame];
-
     if (try interp.resolveVariable(var_call_frame, name)) |local_var| {
         try name.prepareToShimmer();
         name.peek().head.tag = .cached_local_var;
         name.peek().body.cached_local_var = .{
-            .call_epoch = call_frame.call_epoch,
+            .call_epoch = undefined,
             .cached_index = local_var.index,
         };
     } else {
@@ -138,27 +131,6 @@ fn ensureValidVariableType(
     name: Handle,
 ) error{ OutOfMemory, VariableNotFound }!void {
     assert(name.canShimmer());
-
-    const call_frame = interp.call_frames.items[var_call_frame];
-
-    switch (name.tag()) {
-        .cached_local_var => {
-            // Fast case: if we're in the same epoch as last time, so we don't
-            // need to do anything.
-            if (name.peek().body.cached_local_var.call_epoch == call_frame.call_epoch) {
-                return;
-            } else {
-                // Need to re-resolve the variable in the current call frame.
-                // `name` will be valid after this function completes.
-                try interp.reshimmerToVariable(var_call_frame, name);
-                return;
-            }
-        },
-        else => {
-            // Fall through.
-        },
-    }
-
     try interp.reshimmerToVariable(var_call_frame, name);
 }
 
@@ -167,7 +139,6 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
     name.assert(name.canShimmer());
 
     const call_frame = &interp.call_frames.items[call_frame_idx];
-    call_frame.call_epoch = interp.nextCallEpoch();
 
     // Add variable.
     const put_result = try objutil.dictPutInner(call_frame.variables, name, value);
@@ -176,7 +147,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: Handle, value: Hea
     try name.prepareToShimmer();
     name.peek().head.tag = .cached_local_var;
     name.peek().body.cached_local_var = .{
-        .call_epoch = call_frame.call_epoch,
+        .call_epoch = undefined,
         .cached_index = put_result.new_value.index,
     };
 }
@@ -214,11 +185,10 @@ pub fn setVariableInner(
                 if (put_result.new_dict.toHandle()) |new_dict| {
                     // Did the dict change locations? If so, all cached lookups are now invalid.
                     var_call_frame.variables.swap(new_dict);
-                    var_call_frame.call_epoch = interp.nextCallEpoch();
                 }
 
                 cached_var.* = .{
-                    .call_epoch = var_call_frame.call_epoch,
+                    .call_epoch = undefined,
                     .cached_index = put_result.new_value.index,
                 };
             },
@@ -291,9 +261,6 @@ pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeComma
     const var_value = try objutil.newString(Heap.local_heap, combined.items);
 
     try interp.setVariableToObject(&var_name, var_value.referenceTakeOwnership());
-
-    // FIXME need to handle this if it wraps around.
-    interp.global_procedure_epoch += 1;
 }
 
 pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closure {
@@ -473,9 +440,6 @@ const CallFrame = struct {
     args: []Handle,
     /// Signature of this procedure.
     signature: Heap.Closure,
-    /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
-    /// but when it overflows it'll scan the heap and reset all cached lookups.
-    call_epoch: u32,
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
@@ -490,12 +454,6 @@ pub fn currentCallFrameIndex(interp: *Interp) u32 {
 
 pub fn currentCallFrame(interp: *Interp) *CallFrame {
     return &interp.call_frames.items[interp.currentCallFrameIndex()];
-}
-
-fn nextCallEpoch(interp: *Interp) u32 {
-    const epoch = interp.current_call_epoch;
-    interp.current_call_epoch = std.math.add(u32, interp.current_call_epoch, 1) catch @panic("TODO handle overflow properly");
-    return epoch;
 }
 
 /// Evaluation frame.
@@ -535,7 +493,6 @@ fn pushCallFrame(interp: *Interp, parent: ?u32, args: []Handle, signature: Heap.
     try interp.call_frames.append(Heap.global_gpa, .{
         .parent = parent,
         .args = args,
-        .call_epoch = interp.nextCallEpoch(),
         .level = level,
         .signature = borrowed_signature,
         // TODO PERF recycle variable hash table if possible.
@@ -660,8 +617,6 @@ pub fn init() !Interp {
         .result = Heap.local_heap.emptyHandle(),
         .eval_frames = .empty,
         .call_frames = .empty,
-        .current_call_epoch = 0,
-        .global_procedure_epoch = 0,
         .global_commands = .empty,
     };
 
