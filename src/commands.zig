@@ -29,7 +29,7 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     });
     defer closure_obj.decrRefCount();
 
-    Interp.setVariableTo(fn_name, closure_obj) catch unreachable;
+    Interp.setVariableInner(fn_name.*, closure_obj.dupOrRef()) catch unreachable;
 }
 
 test "fn command" {
