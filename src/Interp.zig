@@ -12,31 +12,14 @@ const memutil = @import("memutil.zig");
 const Interp = @This();
 
 pub var variables: Handle = undefined;
-var global_commands: std.StringArrayHashMapUnmanaged(NativeCommand) = .empty;
-
-pub const CommandFn = fn (args: []Handle) Error!void;
-
-pub const EvalError = error{
-    OutOfMemory,
-    EvalError,
-    PropagateResult,
-    Break,
-    Continue,
-    Signal,
-    Exit,
-};
-pub const Error = EvalError || error{
-    WrongUsage,
-};
 
 fn resolveVariable(var_name: Handle) !?Handle {
     const in_local_variables = try objutil.dictLookupInner(variables, var_name);
     return in_local_variables.toHandle();
 }
 
-/// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
-/// Must be called with a heap-native variable name, so it can shimmer in place.
-fn reshimmerToVariable(name: Handle) error{ OutOfMemory, VariableNotFound }!void {
+/// This always recalculates .variable.
+fn shimmerToVariable(name: Handle) error{ OutOfMemory, VariableNotFound }!void {
     if (try resolveVariable(name)) |local_var| {
         try name.prepareToShimmer();
         name.peek().head.tag = .cached_local_var;
@@ -75,7 +58,7 @@ pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, Ba
 
     name.assert(name.canShimmer());
 
-    if (reshimmerToVariable(name)) {
+    if (shimmerToVariable(name)) {
         switch (name.tag()) {
             .cached_local_var => {
                 const cached_var = &name.peek().body.cached_local_var;
@@ -102,23 +85,6 @@ pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, Ba
         },
     }
 }
-
-pub const NativeCommand = struct {
-    pub const ZigCommand = struct {
-        to_call: *const CommandFn,
-        description: ?[]const u8 = "",
-        min_arity: usize = 0,
-        max_arity: ?usize = null,
-        /// If the command argument length needs to be a multiple of some
-        /// amount, set this. A good example is `dict create`, as it needs
-        /// an even number of arguments.
-        multiple_of: ?usize = null,
-    };
-
-    call_info: union(enum) {
-        zig: ZigCommand,
-    },
-};
 
 /// `name` should be a static variable guaranteed to exist as long as the
 /// interpreter exists.

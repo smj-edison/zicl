@@ -9,7 +9,7 @@ const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
 /// [fn]
-pub fn fnCmd(args: []Handle) Interp.Error!void {
+pub fn fnCmd(args: []Handle) !void {
     assert(args.len == 4);
     const fn_name = &args[1];
     const arglist = &args[2];
