@@ -2,7 +2,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;

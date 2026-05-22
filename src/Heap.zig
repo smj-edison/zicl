@@ -12,7 +12,6 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const options = @import("options");
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
-const Tokenizer = @import("Tokenizer.zig");
 const objutil = @import("objutil.zig");
 
 // These numbers are final, and can be depended on to be their current values.
@@ -96,7 +95,9 @@ pub const ParsedScript = struct {
     /// that stores all the string values that the script references.
     values: Handle,
     /// Tokens array.
-    tags: std.ArrayList(Tokenizer.Token.Tag),
+    tags: std.ArrayList(Token),
+
+    const Token = struct {};
 
     pub fn deinit(parsed: *ParsedScript) void {
         parsed.tags.deinit(global_gpa);

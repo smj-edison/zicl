@@ -6,7 +6,6 @@ const testing = std.testing;
 const options = @import("options");
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
-const Tokenizer = @import("Tokenizer.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
