@@ -34,7 +34,7 @@ fn shimmerToVariable(name: Handle) error{ OutOfMemory, VariableNotFound }!void {
 
 // Must be called with a heap-native variable name.
 fn createVariable(name: Handle, value: Heap.Object) !void {
-    name.assert(name.canShimmer());
+    assert(name.canShimmer());
 
     // Add variable.
     const put_result = try objutil.dictPutInner(variables, name, value);
@@ -55,8 +55,6 @@ pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, Ba
         var value_mut = value;
         value_mut.deinitSingle(Heap.local_heap);
     };
-
-    name.assert(name.canShimmer());
 
     if (shimmerToVariable(name)) {
         switch (name.tag()) {
@@ -99,31 +97,68 @@ pub fn registerCommand(name: []const u8) !void {
     try setVariableInner(var_name, var_value.referenceTakeOwnership());
 }
 
-const ParsedArgList = struct {
-    required_arity: u32,
-    optional_arity: u32,
-    optional_values: OptionalHandle,
-    has_args_parameter: bool,
-
-    pub fn deinit(self: ParsedArgList) void {
-        self.optional_values.decrOptional();
-    }
-};
-
 /// Creates a heap object with the `.closure` tag and associated extra data.
 /// The closure's fields are borrowed, so the caller retains ownership of the
 /// inputs. Returns an owned handle.
 pub fn createClosureObject(closure: Heap.Closure) !Handle {
     const obj = try Heap.local_heap.createObject();
-    errdefer obj.decrRefCount();
     const extra_data = try Heap.local_heap.createExtraData();
-    errdefer Heap.local_heap.destroyExtraData(extra_data);
+
     Heap.local_heap.getExtraData(extra_data).* = .{ .closure = closure.borrow() };
     obj.peek().head.tag = .closure;
     obj.peek().body = .{ .closure = .{ .extra_data = extra_data } };
+
     return obj;
 }
 
 pub fn init() !void {
     variables = try objutil.newDict(Heap.local_heap, &.{});
+}
+
+/// [fn]
+pub fn fnCmd(args: []Handle) !void {
+    assert(args.len == 4);
+    const fn_name = &args[1];
+    const arglist = &args[2];
+    const body = args[3];
+
+    // Capture the current scope.
+    const scope = Interp.variables.borrow();
+
+    const closure_obj = try Interp.createClosureObject(.{
+        .args = arglist.*,
+        .body = body,
+        .name = fn_name.toOptional(),
+        .scope = scope.toOptional(),
+        .required_arity = 1,
+        .cache_id = Heap.nextCacheId(),
+    });
+    defer closure_obj.decrRefCount();
+
+    Interp.setVariableInner(fn_name.*, closure_obj.dupOrRef()) catch unreachable;
+}
+
+test "fn command" {
+    _ = try Heap.testStart(testing.allocator, testing.io);
+    try init();
+    try registerCommand("fn");
+
+    const fn_str = try objutil.newString(Heap.local_heap, "fn");
+    const add_str = try objutil.newString(Heap.local_heap, "add");
+    const a_b_str = try objutil.newString(Heap.local_heap, "a b");
+    const fn1_body_str = try objutil.newString(Heap.local_heap, " + $a $b ");
+    var fn1_args: [4]Handle = .{ fn_str, add_str, a_b_str, fn1_body_str };
+
+    for (fn1_args) |arg| arg.incrRefCount();
+    fnCmd(&fn1_args) catch unreachable;
+    for (fn1_args) |arg| arg.decrRefCount();
+
+    const addx_str = try objutil.newString(Heap.local_heap, "add");
+    const a_str = try objutil.newString(Heap.local_heap, "a b");
+    const fn2_body_str = try objutil.newString(Heap.local_heap, " + $a $x ");
+    var fn2_args: [4]Handle = .{ fn_str, addx_str, a_str, fn2_body_str };
+
+    for (fn2_args) |arg| arg.incrRefCount();
+    fnCmd(&fn2_args) catch unreachable;
+    for (fn2_args) |arg| arg.decrRefCount();
 }

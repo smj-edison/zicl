@@ -76,5 +76,4 @@ test {
     _ = @import("objutil.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("Interp.zig");
-    _ = @import("commands.zig");
 }
