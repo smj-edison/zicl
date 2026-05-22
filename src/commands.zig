@@ -9,8 +9,7 @@ const objutil = @import("objutil.zig");
 const Interp = @import("Interp.zig");
 
 /// [fn]
-pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
-    _ = interp;
+pub fn fnCmd(args: []Handle) Interp.Error!void {
     assert(args.len == 4);
     const fn_name = &args[1];
     const arglist = &args[2];
@@ -34,12 +33,8 @@ pub fn fnCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 
 test "fn command" {
     _ = try Heap.testStart(testing.allocator, testing.io);
-    var interp = try Interp.init();
-    try interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
-    defer {
-        interp.deinit();
-        Heap.testFinish();
-    }
+    try Interp.init();
+    try Interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
 
     const fn_str = try objutil.newString(Heap.local_heap, "fn");
     const add_str = try objutil.newString(Heap.local_heap, "add");
@@ -48,7 +43,7 @@ test "fn command" {
     var fn1_args: [4]Handle = .{ fn_str, add_str, a_b_str, fn1_body_str };
 
     for (fn1_args) |arg| arg.incrRefCount();
-    fnCmd(&interp, &fn1_args) catch unreachable;
+    fnCmd(&fn1_args) catch unreachable;
     for (fn1_args) |arg| arg.decrRefCount();
 
     const addx_str = try objutil.newString(Heap.local_heap, "add");
@@ -57,6 +52,6 @@ test "fn command" {
     var fn2_args: [4]Handle = .{ fn_str, addx_str, a_str, fn2_body_str };
 
     for (fn2_args) |arg| arg.incrRefCount();
-    fnCmd(&interp, &fn2_args) catch unreachable;
+    fnCmd(&fn2_args) catch unreachable;
     for (fn2_args) |arg| arg.decrRefCount();
 }

@@ -12,14 +12,9 @@ const memutil = @import("memutil.zig");
 const Interp = @This();
 
 pub var variables: Handle = undefined;
+var global_commands: std.StringArrayHashMapUnmanaged(NativeCommand) = .empty;
 
-/// The result from a procedure or eval call
-result: Handle,
-global_commands: CommandHashTable,
-
-pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
-pub const CommandFn = fn (interp: *Interp, args: []Handle) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) c_int;
+pub const CommandFn = fn (args: []Handle) Error!void;
 
 pub const EvalError = error{
     OutOfMemory,
@@ -34,59 +29,6 @@ pub const Error = EvalError || error{
     WrongUsage,
 };
 
-fn narrowError(err: anyerror) EvalError {
-    return switch (err) {
-        error.Break => error.Break,
-        error.Continue => error.Continue,
-        error.EvalError => error.EvalError,
-        error.Exit => error.Exit,
-        error.OutOfMemory => error.OutOfMemory,
-        error.Signal => error.Signal,
-        else => error.EvalError,
-    };
-}
-pub fn narrowToEvalError(result: anytype) blk: {
-    const info = @typeInfo(@TypeOf(result));
-    break :blk if (info == .error_set) EvalError else EvalError!info.error_union.payload;
-} {
-    if (@typeInfo(@TypeOf(result)) == .error_set) {
-        return narrowError(result);
-    } else if (result) |val| {
-        return val;
-    } else |err| return narrowError(err);
-}
-
-fn wrapErrorDetailsReturnType(ResultType: type) type {
-    if (comptime std.meta.activeTag(@typeInfo(ResultType)) == .error_set) {
-        return error{ OutOfMemory, EvalError };
-    } else {
-        return error{ OutOfMemory, EvalError }!@typeInfo(ResultType).error_union.payload;
-    }
-}
-/// Used to convert from an object error to an interpreter error (e.g. putting
-/// it in the interpreter result, instead of det)
-pub fn wrapError(interp: *Interp, det: *objutil.ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
-    if (comptime std.meta.activeTag(@typeInfo(@TypeOf(result))) == .error_set) {
-        if (result == error.OutOfMemory) {
-            return error.OutOfMemory;
-        } else {
-            interp.setResultOwning(det.message);
-            return error.EvalError;
-        }
-    }
-
-    if (result) |val| {
-        return val;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            // This error should have error details, if it's not OOM.
-            interp.setResultOwning(det.message);
-            return error.EvalError;
-        },
-    }
-}
-
 fn resolveVariable(var_name: Handle) !?Handle {
     const in_local_variables = try objutil.dictLookupInner(variables, var_name);
     return in_local_variables.toHandle();
@@ -95,8 +37,6 @@ fn resolveVariable(var_name: Handle) !?Handle {
 /// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name, so it can shimmer in place.
 fn reshimmerToVariable(name: Handle) error{ OutOfMemory, VariableNotFound }!void {
-    name.assert(name.canShimmer());
-
     if (try resolveVariable(name)) |local_var| {
         try name.prepareToShimmer();
         name.peek().head.tag = .cached_local_var;
@@ -107,13 +47,6 @@ fn reshimmerToVariable(name: Handle) error{ OutOfMemory, VariableNotFound }!void
     } else {
         return error.VariableNotFound;
     }
-}
-
-/// Ensures that this is a valid variable, dict sugar, or upvar. If not, it'll shimmer it to whichever one applies.
-/// Must be called with a heap-native variable name.
-fn ensureValidVariableType(name: Handle) error{ OutOfMemory, VariableNotFound }!void {
-    assert(name.canShimmer());
-    try Interp.reshimmerToVariable(name);
 }
 
 // Must be called with a heap-native variable name.
@@ -142,7 +75,7 @@ pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, Ba
 
     name.assert(name.canShimmer());
 
-    if (ensureValidVariableType(name)) {
+    if (reshimmerToVariable(name)) {
         switch (name.tag()) {
             .cached_local_var => {
                 const cached_var = &name.peek().body.cached_local_var;
@@ -170,28 +103,6 @@ pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, Ba
     }
 }
 
-/// Resolves to the variable's value. Must be called with a heap-native name.
-pub fn getVariableInner(
-    interp: *Interp,
-    call_frame_idx: u32,
-    name: Handle,
-) error{ OutOfMemory, VariableNotFound, BadDict }!Handle {
-    try interp.ensureValidVariableType(call_frame_idx, name);
-
-    const name_obj = name.peek();
-    const name_heap = name.getHeap();
-
-    switch (name.tag()) {
-        .cached_local_var => {
-            const resolved = name_heap.getHandle(name_obj.body.cached_local_var.cached_index);
-            // The cached index points at the dict slot, which may
-            // hold a reference to the actual value.
-            return objutil.followIfRef(resolved);
-        },
-        else => unreachable,
-    }
-}
-
 pub const NativeCommand = struct {
     pub const ZigCommand = struct {
         to_call: *const CommandFn,
@@ -211,8 +122,8 @@ pub const NativeCommand = struct {
 
 /// `name` should be a static variable guaranteed to exist as long as the
 /// interpreter exists.
-pub fn registerCommand(interp: *Interp, name: []const u8, call_info: NativeCommand.ZigCommand) !void {
-    try interp.global_commands.put(Heap.global_gpa, name, .{
+pub fn registerCommand(name: []const u8, call_info: NativeCommand.ZigCommand) !void {
+    try global_commands.put(Heap.global_gpa, name, .{
         .call_info = .{ .zig = call_info },
     });
 
@@ -356,104 +267,6 @@ fn callNative(interp: *Interp, command: *NativeCommand, args: []Handle) !void {
     unreachable;
 }
 
-fn freeLastResult(interp: *Interp) void {
-    interp.result.decrRefCount();
-    interp.result = Heap.local_heap.emptyHandle();
-}
-
-pub fn setResult(interp: *Interp, handle: Handle) void {
-    interp.freeLastResult();
-    interp.result = handle.borrow();
-}
-
-pub fn setResultOwning(interp: *Interp, handle: Handle) void {
-    interp.freeLastResult();
-    interp.result = handle;
-}
-
-pub fn setResultInteger(interp: *Interp, value: i64) !void {
-    interp.setResultOwning(try objutil.newInteger(Heap.local_heap, value));
-}
-
-pub fn setResultFloat(interp: *Interp, value: f64) !void {
-    interp.setResultOwning(try objutil.newFloat(value));
-}
-
-pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
-    const bytes_handle = try objutil.newString(Heap.local_heap, bytes);
-    interp.setResultOwning(bytes_handle);
-}
-
-pub fn setResultInterned(interp: *Interp, interned: Heap.InternedString) void {
-    interp.setResultOwning(Heap.local_heap.getInternedString(interned));
-}
-
-pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
-    const fmt_handle = try objutil.newStringFmt(Heap.local_heap, fmt, args);
-
-    interp.setResultOwning(fmt_handle);
-}
-
-pub fn setEmptyResult(interp: *Interp) void {
-    interp.freeLastResult();
-}
-
-/// Caller should release return value when they're done.
-fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) !Handle {
-    switch (tag) {
-        .simple_string => {
-            return value.borrow();
-        },
-        .variable_subst => {
-            const var_target = interp.getVariableInner(interp.currentCallFrame().level, value) catch unreachable;
-            return var_target.borrow();
-        },
-        else => unreachable,
-    }
-}
-
-/// `name` must be from the threadlocal heap.
-fn getCommandInner(interp: *Interp, call_frame: u32, name: Handle) !*NativeCommand {
-    if (interp.getVariableInner(call_frame, name)) |var_val| {
-        const bytes = try var_val.getString();
-        assert(std.mem.eql(u8, bytes[0..9], "nativefn "));
-        return interp.global_commands.getPtr(bytes[9..]) orelse unreachable;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.VariableNotFound, error.BadDict => return error.CommandNotFound,
-    }
-}
-
-pub fn getCommand(
-    interp: *Interp,
-    call_frame_idx: u32,
-    provided_handle: Handle,
-    new_handle: *OptionalHandle,
-) !*NativeCommand {
-    errdefer new_handle.swapWithNone();
-    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-
-    return interp.getCommandInner(call_frame_idx, new_handle.orElse(provided_handle));
-}
-
-fn invokeCommand(interp: *Interp, call_frame_idx: u32, args: []Handle) !void {
-    var new_command: OptionalHandle = .none;
-    const command = interp.getCommand(call_frame_idx, args[0], &new_command) catch unreachable;
-    args[0].swapIfNew(new_command);
-
-    try interp.callNative(command, args);
-}
-
-pub fn init() !Interp {
+pub fn init() !void {
     variables = try objutil.newDict(Heap.local_heap, &.{});
-
-    return .{
-        .result = Heap.local_heap.emptyHandle(),
-        .global_commands = .empty,
-    };
-}
-
-pub fn deinit(interp: *Interp) void {
-    interp.result.decrRefCount();
-    interp.global_commands.deinit(Heap.global_gpa);
 }
