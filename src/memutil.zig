@@ -197,7 +197,6 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             defer self.mutex.unlock(self.io);
             return self.freeOnMainList(index, order);
         }
-
         pub fn allocFromOwningThread(self: *Self, requested_order: u5) !u32 {
             // Try allocating from the pool, if available.
             if (self.allocOnPool(requested_order)) |pool_alloc| {

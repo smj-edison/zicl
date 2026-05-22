@@ -31,9 +31,11 @@ const need_simple = switch (builtin.zig_backend) {
     else => false,
 };
 
+extern const ptr_to_result: *std.ArrayList(u8);
 pub const panic = std.debug.FullPanic(panicFn);
 pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
+    std.debug.print("Final string: {s}\n", .{ptr_to_result.items});
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
 

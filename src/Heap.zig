@@ -1245,6 +1245,9 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     return index;
 }
 
+var result: std.ArrayList(u8) = .empty;
+export const ptr_to_result: *std.ArrayList(u8) = &result;
+
 fn freeObjectBackingInner(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy

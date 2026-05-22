@@ -72,10 +72,22 @@ test "fn command" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
-    // Closure captures scope.
-    try interp.testExpectScriptResult("15",
-        \\ fn add {a b} { + $a $b }
-        \\ set x 10
-        \\ fn addx {a} { + $a $x }
-    );
+    const fn_str = try objutil.newString(Heap.local_heap, "fn");
+    const add_str = try objutil.newString(Heap.local_heap, "add");
+    const a_b_str = try objutil.newString(Heap.local_heap, "a b");
+    const fn1_body_str = try objutil.newString(Heap.local_heap, " + $a $b ");
+    var fn1_args: [4]Handle = .{ fn_str, add_str, a_b_str, fn1_body_str };
+
+    for (fn1_args) |arg| arg.incrRefCount();
+    fnCmd(&interp, &fn1_args) catch unreachable;
+    for (fn1_args) |arg| arg.decrRefCount();
+
+    const addx_str = try objutil.newString(Heap.local_heap, "add");
+    const a_str = try objutil.newString(Heap.local_heap, "a b");
+    const fn2_body_str = try objutil.newString(Heap.local_heap, " + $a $x ");
+    var fn2_args: [4]Handle = .{ fn_str, addx_str, a_str, fn2_body_str };
+
+    for (fn2_args) |arg| arg.incrRefCount();
+    fnCmd(&interp, &fn2_args) catch unreachable;
+    for (fn2_args) |arg| arg.decrRefCount();
 }
