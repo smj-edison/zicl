@@ -61,39 +61,6 @@ pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
     return handle;
 }
 
-pub fn newStringFmt(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
-    const new_count = std.fmt.count(fmt, args);
-    const str = try newStringToFill(heap, new_count);
-    // Don't try setting the string of an empty object.
-    if (str == heap.emptyHandle()) return str;
-
-    const written = std.fmt.bufPrint(Heap.getStringMut(str) catch unreachable, fmt, args) catch return error.OutOfMemory;
-    assert(written.len == new_count);
-
-    return str;
-}
-
-pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
-    if (len == 0) return heap.emptyHandle();
-
-    const handle = try heap.createObject();
-    errdefer handle.decrRefCount();
-
-    const new_str = try heap.createString(@intCast(len));
-    const new_str_end = new_str + @as(u32, @intCast(len));
-    @memset(heap.getHeapString(new_str, new_str_end), 0);
-
-    // New object, so we can set directly.
-    handle.peek().head.str = .{
-        .u = .{
-            .str = .{ .index = new_str, .len = @intCast(len) },
-        },
-        .is_ptr = false,
-    };
-
-    return handle;
-}
-
 pub fn newListWithCapacity(capacity: u32) !Handle {
     // `1 +` to make space for the list's head
     const list_index = try Heap.local_heap.createObjects(1 + capacity);
@@ -127,39 +94,10 @@ pub fn newList(handles: []const Handle) !Handle {
     return list;
 }
 
-/// `handle` must be shimmerable. Returns a new object if the list had to move.
-pub fn shimmerToList(provided_handle: Handle, new_handle: *OptionalHandle) error{ BadList, OutOfMemory }!void {
-    if (provided_handle.tag() == .list) return;
-    errdefer new_handle.swapWithNone();
-
-    std.debug.print("Shimmering {{{s}}} to a list\n", .{try provided_handle.getString()});
-
-    const a_str = try newString(Heap.local_heap, "a");
-    defer a_str.decrRefCount();
-    const b_str = try newString(Heap.local_heap, "b");
-    defer b_str.decrRefCount();
-
-    const bytes = try provided_handle.getString();
-    if (std.mem.eql(u8, bytes, "a")) {
-        new_handle.* = (try newList(&.{a_str})).toOptional();
-    } else if (std.mem.eql(u8, bytes, "b")) {
-        new_handle.* = (try newList(&.{b_str})).toOptional();
-    } else if (std.mem.eql(u8, bytes, "a b")) {
-        new_handle.* = (try newList(&.{ a_str, b_str })).toOptional();
-    } else unreachable;
-}
-
-pub fn listLengthRaw(list: Handle) u32 {
+pub fn listLength(list: Handle) u32 {
     assert(list.tag() == .list);
 
     return list.peek().body.list.len;
-}
-
-pub fn listLength(det: ?*ErrorDetails, provided_list: Handle, new_list: *OptionalHandle) !u32 {
-    errdefer new_list.swapWithNone();
-
-    try shimmerToList(det, provided_list, new_list);
-    return new_list.orElse(provided_list).peek().body.list.len;
 }
 
 pub fn followIfRef(handle: Handle) Handle {
@@ -542,7 +480,7 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
             // Does the key already exist?
             if (table.get(key)) |_| {
                 // Key exists, so replace the value in place.
-                unreachable;
+                unreachable; // Currently no code uses this branch.
             } else {
                 const original_len = dict.peek().body.dict.len;
                 const new_length = original_len + 2;
