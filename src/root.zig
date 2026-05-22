@@ -5,7 +5,6 @@ const Interp = @import("Interp.zig");
 
 test {
     _ = @import("memutil.zig");
-    _ = @import("stringutil.zig");
     _ = @import("objutil.zig");
     _ = @import("Interp.zig");
 }

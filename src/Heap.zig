@@ -10,7 +10,6 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
 const options = @import("options");
-const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const objutil = @import("objutil.zig");
 
@@ -77,7 +76,7 @@ const StringTracker = memutil.BuddyUnmanaged(.{
 });
 const StringList = std.ArrayList(u8);
 
-const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, options.threading);
+const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, true);
 const FullHashContext = struct {
     pub fn hash(self: @This(), full_hash: u256) u64 {
         _ = self;
@@ -611,17 +610,6 @@ pub const Handle = packed struct(HandleBacking) {
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
     }
 
-    /// Note: this has a very specific definition (is `ref_count` > 1 or is `cross_thread`).
-    /// You should probably be using `canMutate` or `canShimmer`, as they have slightly
-    /// different but important semantics.
-    pub fn isShared(handle: Handle) bool {
-        const obj_heap = handle.getHeap();
-        const metadata = obj_heap.getLocalMetadata(handle.index);
-
-        if (metadata.cross_thread) return true;
-        return obj_heap.getLocalRefCount(handle.index) > 1;
-    }
-
     pub fn canMutate(handle: Handle) bool {
         // Note: a crossthread object can _never_ mutate. A lot of asserts around
         // the codebase assume that `canMutate` means that an object is not crossthread.
@@ -674,8 +662,8 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     /// This should not be used for checking if an object is shared, use `isShared` instead.
-    pub fn debugRefCount(handle: Handle) u32 {
-        return getLocalRefCount(handle.getHeap(), handle.index);
+    pub fn getRefCount(handle: Handle) u32 {
+        return handle.getHeap().objects.items(.ref_count)[handle.index];
     }
 
     pub fn borrow(handle: Handle) Handle {
@@ -686,7 +674,7 @@ pub const Handle = packed struct(HandleBacking) {
     pub fn incrRefCount(handle: Handle) void {
         if (handle.index < special_object_count) return;
         // Make sure we never try to borrow a freed object.
-        handle.assert(handle.debugRefCount() > 0);
+        handle.assert(handle.getRefCount() > 0);
         handle.assert(handle.tag() != .reference);
 
         const metadata = handle.getMetadata();
@@ -744,7 +732,7 @@ pub const Handle = packed struct(HandleBacking) {
         // We should never go below one for an item owned by another object.
         if (!handle.isAllocHead()) {
             if (handle.getMetadata().in_use) {
-                handle.assert(handle.debugRefCount() > 1);
+                handle.assert(handle.getRefCount() > 1);
             } else {
                 // If it's not in use, we want to fall through to the UAF panic.
             }
@@ -771,27 +759,8 @@ pub const Handle = packed struct(HandleBacking) {
         };
     }
 
-    pub fn getStringIfExists(handle: Handle) ?[:0]const u8 {
-        switch (handle.getStringDetails()) {
-            .null => return null,
-            .empty => return "",
-            .normal => |str| return str,
-        }
-    }
-
     pub fn getStringDetails(handle: Handle) StringDetails {
-        const str_or_ptr: Object.StrOrPtr = blk: {
-            // TODO PERF I should probably benchmark whether it's faster
-            // to check the metadata, or just to do an acquire load.
-            if (options.threading and handle.getMetadata().cross_thread) {
-                const head = @atomicLoad(Object.Head, @as(*Object.Head, @ptrCast(&handle.peek().head)), .acquire);
-                break :blk head.str;
-            } else {
-                break :blk handle.peek().head.str;
-            }
-        };
-
-        return handle.getHeap().getLocalStringDetails(str_or_ptr);
+        return handle.getHeap().getLocalStringDetails(handle.peek().head.str);
     }
 
     pub fn getDictExtraData(handle: Handle) *ExtraDataValue.Dictionary {
@@ -808,8 +777,6 @@ pub const Handle = packed struct(HandleBacking) {
     /// This returns a temporary string. Whenever the object is mutated, it
     /// may become invalid. Guaranteed to be valid, barring OOM.
     pub fn getString(handle: Handle) error{OutOfMemory}![:0]const u8 {
-        const obj = handle.peek();
-
         switch (handle.getStringDetails()) {
             .normal => |str| {
                 return str;
@@ -823,68 +790,10 @@ pub const Handle = packed struct(HandleBacking) {
         }
 
         // No representation, so we better generate it.
-        const new_str = blk: switch (obj.head.tag) {
-            .index => {
-                break :blk try std.fmt.allocPrintSentinel(global_gpa, "{}", .{obj.body.index}, 0);
-            },
-            .list => {
-                const list = obj.body.list;
-                break :blk try getListString(handle.getHeap(), handle.index + 1, list.len);
-            },
-            .dict => {
-                break :blk try generateDictString(handle);
-            },
-            .closure => unreachable,
-            .custom_type => unreachable,
-            .reference => {
-                // Intentionally return early, since we should always use
-                // the reference's string, not our own.
-                return getString(obj.body.reference);
-            },
-            .parsed_script_command,
-            .none,
-            .invalid,
-            .marked,
-            .upvar_link,
-            .string,
-            .source,
-            .dict_sugar,
-            .cached_local_var,
-            .cached_lexical_var,
-            .bool,
-            .integer,
-            .float,
-            => {
-                std.debug.panic("{} should always have a string representation", .{obj.head.tag});
-            },
-        };
-
-        // Ensure new_str is freed if setStringOwning fails (e.g., OOM during LongString allocation).
-        {
-            errdefer global_gpa.free(new_str);
-            try setString(handle, new_str);
-        }
+        try setString(handle, "intentionally blank");
 
         // Rerun this function to figure out where the new string is.
         return handle.getString();
-    }
-
-    pub fn getHash(handle: Handle) !u256 {
-        switch (handle.getStringDetails()) {
-            .empty => {
-                return comptime blk: {
-                    @setEvalBranchQuota(10000);
-                    break :blk memutil.hashBytes("");
-                };
-            },
-            .null, .normal => {
-                // Fall through.
-            },
-        }
-
-        // We don't save the hash when it's not a long string, since
-        // it should be pretty cheap to compute it again.
-        return memutil.hashBytes(try handle.getString());
     }
 
     /// Helper function that dumps the object's trace if the assertion fails.
@@ -918,7 +827,7 @@ fn invalidateCollection(handle: Handle) void {
                 .heap = handle.heap,
             };
 
-            if (item_handle.isShared()) {
+            if (item_handle.getRefCount() > 1) {
                 break :blk true;
             }
         } else break :blk false;
@@ -1567,63 +1476,6 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
 
         return true;
     }
-}
-
-fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
-    var fallback = std.heap.stackFallback(64, global_gpa);
-    var stack_alloc = fallback.get();
-    var quoting_types = try stack_alloc.alloc(stringutil.QuotingType, len);
-    defer stack_alloc.free(quoting_types);
-
-    // Step 1: calculate the list's string length.
-    var total_length: usize = 0;
-    for (0..len) |i| {
-        const element_string = try self.getHandle(@intCast(index + i)).getString();
-        quoting_types[i] = stringutil.calculateNeededQuotingType(element_string);
-        if (i == 0 and quoting_types[i] == .bare and
-            element_string.len > 0 and element_string[0] == '#')
-        {
-            // Make sure the first element has # escaped in braces
-            quoting_types[i] = .brace;
-        }
-        total_length += stringutil.quoteSize(quoting_types[i], element_string.len);
-        total_length += 1; // space between each element
-    }
-
-    // Step 2: actually create said string.
-    var unfinished_str = try global_gpa.alloc(u8, total_length + 1);
-    errdefer global_gpa.free(unfinished_str);
-    var written: usize = 0;
-
-    for (0..len) |i| {
-        const element_string = try self.getHandle(@intCast(index + i)).getString();
-        written += stringutil.quoteString(
-            quoting_types[i],
-            element_string,
-            unfinished_str[written..],
-            i == 0,
-        );
-
-        // Add a space (except at the end of the list).
-        if (i + 1 < len) {
-            unfinished_str[written] = ' ';
-            written += 1;
-        }
-    }
-
-    // Slap a nul on the end.
-    unfinished_str[written] = 0x00;
-    written += 1;
-
-    // We actually need to realloc, because allocator.free needs the
-    // original slice length (and we don't track the original slice
-    // length, only the accessible length).
-    const finished_str = try global_gpa.realloc(unfinished_str, written);
-    return finished_str[0..(written - 1) :0];
-}
-
-fn generateDictString(handle: Handle) ![:0]u8 {
-    return try getListString(handle.getHeap(), handle.index + 1, handle.peek().body.dict.len);
 }
 
 const StringDetails = union(enum) {

@@ -4,7 +4,6 @@ const Io = std.Io;
 const testing = std.testing;
 
 const options = @import("options");
-const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
@@ -47,43 +46,6 @@ pub fn shimmerToString(provided_handle: Handle, new_handle: *OptionalHandle) !vo
             .length_determined = false,
         },
     };
-}
-
-pub fn getCodepointLength(provided_handle: Handle, new_handle: *OptionalHandle) !usize {
-    errdefer new_handle.swapWithNone();
-
-    try shimmerToString(provided_handle, new_handle);
-    const handle = new_handle.orElse(provided_handle);
-
-    assert(handle.tag() == .string);
-
-    // See if we already calculated the utf8 length.
-    switch (Heap.getStringDetails(handle)) {
-        .long => |long_str| {
-            const current_len = long_str.getUtf8Length();
-            if (current_len != std.math.maxInt(u64)) return current_len;
-
-            // String length hasn't been computed yet, so compute now.
-            const utf8_length = stringutil.codepointLength(long_str.getString());
-            long_str.setUtf8Length(utf8_length); // Cache utf8 length.
-            return utf8_length;
-        },
-        .normal => {
-            if (handle.peek().body.string.length_determined) {
-                return handle.peek().body.string.utf8_length;
-            } else {
-                const bytes = try handle.getString();
-                const utf8_length = stringutil.codepointLength(bytes);
-                handle.peek().body.string = .{
-                    .utf8_length = utf8_length, // Cache utf8 length.
-                    .length_determined = true,
-                };
-                return utf8_length;
-            }
-        },
-        .empty => 0,
-        .null => unreachable,
-    }
 }
 
 /// Copies provided string.
@@ -260,7 +222,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
                 const to_free_handle = listItem(provided_handle, @intCast(current_len - freed_count + to_free));
-                if (to_free_handle.isShared()) break :new_collection_needed;
+                if (to_free_handle.getRefCount() > 1) break :new_collection_needed;
             }
 
             // Be sure to free the abandoned items when we shrink.
@@ -304,7 +266,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             // However, if an item within the list was shared, we can't move it, we instead have to reference
             // it. (Why not use `item_handle.reference()`? Because that would create one too many references
             // as the list already has one ref count for owning the item.)
-            if (old_item.isShared()) {
+            if (old_item.getRefCount() > 1) {
                 found_shared_items = true;
                 new_item.* = old_item.referenceTakeOwnership();
             } else {
@@ -332,7 +294,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
 
                 // Only free the backing of non-shared objects, so we don't release the backing of a shared item.
                 // Why only a backing free? Because the non-shared objectes were moved to the new collection.
-                if (item_handle.isShared()) {
+                if (item_handle.getRefCount() > 1) {
                     // If this was a dict, and a key was marked as not mutable, we need to be sure to undo that.
                     // This is fine to do on list items, since they're already mutable.
                     item_handle.getMetadata().mutable = true;
@@ -448,53 +410,6 @@ pub fn dictInvalidateTable(dict: Handle) void {
     }
 }
 
-pub fn shimmerToDict(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *OptionalHandle) !void {
-    if (provided_handle.tag() == .dict) return;
-    errdefer new_dict.swapWithNone();
-
-    shimmerToList(provided_handle, new_dict) catch unreachable;
-    const shimmerable = new_dict.orElse(provided_handle);
-    const len = listLengthRaw(shimmerable);
-    const handle_heap = shimmerable.getHeap();
-
-    if (@mod(len, 2) == 1) {
-        // Unmatched key.
-        if (det) |details| details.* = .{
-            .message = try newStringFmt(
-                Heap.local_heap,
-                "Missing value to go with key when converting \"{f}\" to a dictionary.",
-                .{shimmerable},
-            ),
-        };
-        return error.BadDict;
-    }
-
-    // Set dict body using the final handle.
-    const metadata_index = try handle_heap.createExtraData();
-    errdefer handle_heap.destroyExtraData(metadata_index);
-
-    const metadata = handle_heap.getExtraData(metadata_index);
-    metadata.* = .{ .dict = .{ .table = null, .parent_link = .none } };
-
-    // Make sure to mark all the keys as immutable, so they never change.
-    // If they could change, they'd make the table invalid, and there's
-    // no good way to check if a sub-object has changed and update the
-    // table without adding checks everywhere.
-    var pair: u32 = 0;
-    while (pair < len) : (pair += 2) {
-        const key = collectionItem(shimmerable, pair, len);
-        key.getMetadata().mutable = false;
-    }
-
-    // Because both lists and dicts store their values directly after,
-    // we can just swap out the head to convert to a dict.
-    shimmerable.peek().head.tag = .dict;
-    shimmerable.peek().body.dict = .{
-        .extra_data = metadata_index,
-        .len = len,
-    };
-}
-
 pub fn dictItems(handle: Handle) []Heap.Object {
     assert(handle.tag() == .dict);
     const dict_len = handle.peek().body.dict.len;
@@ -519,15 +434,6 @@ pub fn dictItemLength(handle: Handle) u32 {
 pub fn dictPairLengthRaw(handle: Handle) u32 {
     assert(handle.tag() == .dict);
     return handle.peek().body.dict.len / 2;
-}
-
-/// Length in pairs (total length / 2).
-pub fn dictPairLength(det: ?*ErrorDetails, provided_handle: Handle, new_dict: *OptionalHandle) !u32 {
-    errdefer new_dict.swapWithNone();
-    try shimmerToDict(det, provided_handle, new_dict);
-
-    const handle = new_dict.orElse(provided_handle);
-    return dictPairLengthRaw(handle);
 }
 
 pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
@@ -574,20 +480,7 @@ pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
     return dict;
 }
 
-/// Asserts `dict` is a .dict.
-/// Like `dictLookupFollowRefs`, but returns the raw dict slot handle
-/// without following references.
-pub fn dictLookupInner(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
-    dict.assert(dict.tag() == .dict);
-    _ = try key.getString();
-
-    const table = try dictGetTable(dict);
-    if (table.get(key)) |value_offset| {
-        return dictItem(dict, value_offset).toOptional();
-    } else return .none;
-}
-
-pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
+pub fn dictLookup(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
     dict.assert(dict.tag() == .dict);
     // Make sure key has a string representation, as table.get isn't allowed to fail.
     _ = try key.getString();
