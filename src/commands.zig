@@ -34,7 +34,7 @@ pub fn fnCmd(args: []Handle) Interp.Error!void {
 test "fn command" {
     _ = try Heap.testStart(testing.allocator, testing.io);
     try Interp.init();
-    try Interp.registerCommand("fn", .{ .to_call = fnCmd, .description = "name argList body", .min_arity = 2, .max_arity = 3 });
+    try Interp.registerCommand("fn");
 
     const fn_str = try objutil.newString(Heap.local_heap, "fn");
     const add_str = try objutil.newString(Heap.local_heap, "add");
