@@ -147,11 +147,6 @@ pub const Object = packed struct(u128) {
                 const upvar_link = obj.body.upvar_link;
                 heap.getHandle(upvar_link.linked_name).decrRefCount();
             },
-            .dict_sugar => {
-                const dict_sugar = obj.body.dict_sugar;
-                heap.getHandle(dict_sugar.dict_name_index).decrRefCount();
-                heap.getHandle(dict_sugar.path_index).decrRefCount();
-            },
             .none,
             .index,
             .integer,
@@ -181,7 +176,6 @@ pub const Tag = enum(u5) {
     string,
     list,
     dict,
-    dict_sugar,
     reference,
     cached_local_var,
     cached_lexical_var,
@@ -198,7 +192,7 @@ pub const Body = packed union(u64) {
     /// Used internally in places where a value needs to be temporarily marked.
     marked: Empty,
     /// List index.
-    index: packed struct { data: ListIndex, padding: u30 = 0 },
+    index: packed struct { padding: u64 = 0 },
     integer: i64,
     float: f64,
     bool: packed struct { data: bool, padding: u63 = 0 },
@@ -220,19 +214,6 @@ pub const Body = packed union(u64) {
         /// keys when shimmering from list.
         len: u32,
         extra_data: ExtraData,
-    },
-    /// Both objects must be in the parent object's heap. `dict_name_index` points
-    /// to an object that contains the name of the dictionary (and most likely
-    /// specializes to whatever type of variable caching is necessary), while
-    /// `path_index` points to a list containing all parts of the path. For
-    /// example, `foo::bar::baz` would turn into roughly
-    /// ```
-    /// dict_name_index: "foo"
-    /// path_index: ["bar", "baz"]
-    /// ```
-    dict_sugar: packed struct {
-        dict_name_index: HeapIndex,
-        path_index: HeapIndex,
     },
     reference: Handle,
     cached_local_var: packed struct {
@@ -296,7 +277,10 @@ pub const ExtraDataValue = union(enum) {
             pub fn eql(ctx: @This(), a: Handle, b: Handle) bool {
                 _ = ctx;
 
-                return checkIfEqual(a, b) catch unreachable;
+                const a_str = a.getString() catch @panic("OOM");
+                const b_str = b.getString() catch @panic("OOM");
+
+                return std.mem.eql(u8, a_str, b_str);
             }
         }, 80);
 
@@ -334,28 +318,6 @@ pub const ExtraDataValue = union(enum) {
     },
     closure: Closure,
     none: void,
-};
-
-pub const IndexError = error{BadIndex};
-/// Tcl list index. Indexes are inclusive both for start and end in Tcl. Additionally,
-/// an index may be relative, such as "end" or "end-1".
-pub const ListIndex = packed struct(u34) {
-    u: packed union {
-        index: packed struct { data: u32, padding: u1 = 0 },
-        end_offset: i33,
-    },
-    /// Whether this is a relative index, such as "end", "end-1", "end+5", etc.
-    is_relative: bool,
-
-    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
-
-    pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) i33 {
-        if (self.is_relative) {
-            return self.u.end_offset + (list_len -| 1);
-        } else {
-            return self.u.index;
-        }
-    }
 };
 
 /// Monotonic counter for parsed script and expression cache keys.
@@ -471,10 +433,6 @@ pub const OptionalHandle = enum(HandleBacking) {
         return ref.toHandle() orelse other;
     }
 
-    pub fn orEmpty(ref: OptionalHandle) Handle {
-        return ref.orElse(Heap.local_heap.emptyHandle());
-    }
-
     pub fn borrowOptional(ref: OptionalHandle) OptionalHandle {
         if (ref.toHandle()) |val| val.incrRefCount();
         return ref;
@@ -498,14 +456,6 @@ pub const Handle = packed struct(HandleBacking) {
     heap: HeapId,
     _padding: u16 = 0,
 
-    pub fn format(
-        self: Handle,
-        writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
-        const str = getString(self) catch "<oom string>";
-        try writer.writeAll(str);
-    }
-
     pub fn peek(handle: Handle) *Object {
         return getHeap(handle).getLocalObject(handle.index);
     }
@@ -520,10 +470,6 @@ pub const Handle = packed struct(HandleBacking) {
 
     pub fn toOptional(handle: Handle) OptionalHandle {
         return @enumFromInt(@as(HandleBacking, @bitCast(handle)));
-    }
-
-    pub fn toOptionalRef(ref: *Handle) *OptionalHandle {
-        return @ptrCast(ref);
     }
 
     /// Must be shimmerable.
@@ -575,12 +521,6 @@ pub const Handle = packed struct(HandleBacking) {
         before_duplicating.decrRefCount();
     }
 
-    /// If `optional` is non-null, it will transfer ownership to `ref` and be set to null.
-    pub fn swapAndClear(ref: *Handle, optional: *OptionalHandle) void {
-        if (optional.toHandle()) |handle| ref.swap(handle);
-        optional.* = .none;
-    }
-
     /// Helper to swap handle if `new_handle` is non-null, releasing the old value of
     /// `ref` in the process.
     pub fn swapIfNew(ref: *Handle, new_handle: OptionalHandle) void {
@@ -595,7 +535,6 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.getHeap().getLocalMetadata(handle.index);
     }
 
-    /// This should not be used for checking if an object is shared, use `isShared` instead.
     pub fn getRefCount(handle: Handle) u32 {
         return handle.getHeap().objects.items(.ref_count)[handle.index];
     }
@@ -620,13 +559,8 @@ pub const Handle = packed struct(HandleBacking) {
 
         return .{
             // References are guaranteed to always have a null representation.
-            .head = .{
-                .str = Object.null_string,
-                .tag = .reference,
-            },
-            .body = .{
-                .reference = handle,
-            },
+            .head = .{ .tag = .reference },
+            .body = .{ .reference = handle },
         };
     }
 
@@ -645,15 +579,22 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn invalidateBody(handle: Handle) void {
-        handle.assert(handle.canShimmer());
+        switch (handle.tag()) {
+            .list => {
+                invalidateCollection(handle);
+            },
+            .dict => {
+                invalidateCollection(handle);
+            },
+            else => handle.peek().deinitBodySingle(handle.getHeap()),
+        }
 
-        invalidateBodyInner(handle);
+        handle.peek().body = undefined;
+        handle.peek().head.tag = .invalid;
     }
 
     pub fn invalidateString(handle: Handle) void {
-        handle.assert(handle.canMutate());
-
-        invalidateStringInner(handle);
+        handle.peek().deinitString(handle.getHeap());
     }
 
     pub fn decrRefCount(handle: Handle) void {
@@ -726,15 +667,6 @@ pub const Handle = packed struct(HandleBacking) {
     }
 };
 
-fn invalidateBothInner(handle: Handle) void {
-    invalidateStringInner(handle);
-    invalidateBodyInner(handle);
-}
-
-fn invalidateStringInner(handle: Handle) void {
-    handle.peek().deinitString(handle.getHeap());
-}
-
 fn invalidateCollection(handle: Handle) void {
     assert(handle.tag() == .dict or handle.tag() == .list);
 
@@ -768,7 +700,7 @@ fn invalidateCollection(handle: Handle) void {
 
         if (!any_elems_referenced) {
             // Case 1: this dictionary owns all items, so we can free all items.
-            invalidateBothInner(elem_handle);
+            elem_handle.invalidateBoth();
         } else {
             // Case 2: there were shared items in the dictionary, so all the items
             // were split into individual items. We need to decrement the dictionary's
@@ -776,23 +708,6 @@ fn invalidateCollection(handle: Handle) void {
             elem_handle.decrRefCount();
         }
     }
-}
-
-fn invalidateBodyInner(handle: Handle) void {
-    std.debug.print("Handle: {any}, ptr: {*}\n", .{ handle, &handle.peek().head });
-
-    switch (handle.tag()) {
-        .list => {
-            invalidateCollection(handle);
-        },
-        .dict => {
-            invalidateCollection(handle);
-        },
-        else => handle.peek().deinitBodySingle(handle.getHeap()),
-    }
-
-    handle.peek().body = undefined;
-    handle.peek().head.tag = .invalid;
 }
 
 const ObjectAndMetadata = struct {
@@ -860,13 +775,6 @@ pub fn emptyObject() Object {
     return .{
         .head = .{ .str = Object.empty_string, .tag = .none },
         .body = undefined,
-    };
-}
-
-pub fn emptyHandle(self: *Heap) Handle {
-    return .{
-        .index = empty_object_idx,
-        .heap = self.heapId(),
     };
 }
 
@@ -973,8 +881,7 @@ pub fn freeObjectBacking(handle: Handle) void {
 }
 
 pub fn freeObject(handle: Handle) void {
-    invalidateBothInner(handle);
-
+    handle.invalidateBoth();
     freeObjectBacking(handle);
 }
 
@@ -1016,15 +923,6 @@ pub fn freeString(self: *Heap, index: u32, len: u32) void {
     const length_with_null = len + 1;
     const order = memutil.getOrder(length_with_null);
     self.string_tracking.free(index, order);
-}
-
-pub fn checkIfEqual(a: Handle, b: Handle) !bool {
-    if (a == b) return true;
-
-    const a_str = try a.getString();
-    const b_str = try b.getString();
-
-    return std.mem.eql(u8, a_str, b_str);
 }
 
 pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
@@ -1075,7 +973,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 error.OutOfMemory => return error.OutOfMemory,
             };
         },
-        .custom_type, .dict_sugar => unreachable,
+        .custom_type => unreachable,
         .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
