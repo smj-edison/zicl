@@ -24,39 +24,10 @@ pub const Error = std.mem.Allocator.Error || error{
     MissingDictKey,
 };
 
-pub const ErrorDetails = struct {
-    message: Handle,
-    index: ?u32 = null,
-};
-
-/// If the object changed locations, `new_handle` will be non-null.
-pub fn shimmerToString(provided_handle: Handle, new_handle: *OptionalHandle) !void {
-    if (provided_handle.tag() == .string) return;
-    errdefer new_handle.swapWithNone();
-
-    try Heap.ensureShimmerableOrDup(provided_handle, new_handle);
-    const handle = new_handle.orElse(provided_handle);
-
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .string;
-    handle.peek().body = .{
-        .string = .{
-            .utf8_length = 0,
-            // Don't know the utf-8 length yet.
-            .length_determined = false,
-        },
-    };
-}
-
 /// Copies provided string.
 pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
-    var handle = try heap.createObject();
-    errdefer handle.decrRefCount();
-
+    const handle = try heap.createObject();
     try Heap.setString(handle, bytes);
-    var new_handle: OptionalHandle = .none;
-    try shimmerToString(handle, &new_handle);
-    assert(new_handle == .none);
 
     return handle;
 }
@@ -67,15 +38,8 @@ pub fn newListWithCapacity(capacity: u32) !Handle {
     const list_head = Heap.local_heap.getLocalObject(list_index);
 
     list_head.* = .{
-        .head = .{
-            .str = Heap.Object.null_string,
-            .tag = .list,
-        },
-        .body = .{
-            .list = .{
-                .len = 0,
-            },
-        },
+        .head = .{ .tag = .list },
+        .body = .{ .list = .{ .len = 0 } },
     };
 
     return Heap.local_heap.getHandle(list_index);
@@ -159,7 +123,7 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
             // split this collection and create a new one.
             const freed_count = current_len - new_len;
             for (0..freed_count) |to_free| {
-                const to_free_handle = listItem(provided_handle, @intCast(current_len - freed_count + to_free));
+                const to_free_handle = listItemNoFollow(provided_handle, @intCast(current_len - freed_count + to_free));
                 if (to_free_handle.getRefCount() > 1) break :new_collection_needed;
             }
 
@@ -278,14 +242,14 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
 }
 
 /// Assumes provided handle is a list.
-pub fn listItem(handle: Handle, index: u32) Handle {
+pub fn listItemNoFollow(handle: Handle, index: u32) Handle {
     assert(handle.tag() == .list);
 
     return collectionItem(handle, index, handle.peek().body.list.len);
 }
 
 /// Assumes provided handle is a list.
-pub fn listItemFollowRefs(handle: Handle, index: u32) Handle {
+pub fn listItem(handle: Handle, index: u32) Handle {
     assert(handle.tag() == .list);
 
     return collectionItemFollowRefs(handle, index, handle.peek().body.list.len);
@@ -307,17 +271,11 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
     list.assert(current_len < memutil.getOrderSize(list.getMetadata().order) - 1); // -1 for list head.
     list.peek().body.list.len += 1;
 
-    listItem(list, current_len).peek().* = object;
+    listItemNoFollow(list, current_len).peek().* = object;
 }
 
 const DictTable = Heap.ExtraDataValue.Dictionary.Table;
-pub fn dictGetTable(dict: Handle) !*DictTable {
-    const metadata = dict.getDictExtraData();
-    if (metadata.table) |*table| return table;
-
-    // FIXME make sure that the dict has a table before sending between threads.
-    dict.assert(!dict.getMetadata().cross_thread);
-
+pub fn dictGetTable(dict: Handle) !DictTable {
     // Table didn't exist, so we need to generate it.
     var new_table: DictTable = .empty;
     errdefer new_table.deinit(Heap.global_gpa);
@@ -330,9 +288,7 @@ pub fn dictGetTable(dict: Handle) !*DictTable {
         try new_table.put(Heap.global_gpa, key, pair + 1);
     }
 
-    metadata.table = new_table;
-    // Make sure to reference its new location after it moves to `metadata.table`.
-    if (metadata.table) |*table| return table else unreachable;
+    return new_table;
 }
 
 pub fn dictMaybeGetTable(dict: Handle) ?*DictTable {
@@ -476,7 +432,7 @@ pub fn dictPut(provided_dict: Handle, key: Handle, value: Heap.Object) !DictAndV
             errdefer new_dict.swapWithNone();
             var dict = new_dict.orElse(provided_dict);
 
-            const table = try dictGetTable(dict);
+            var table = try dictGetTable(dict);
             // Does the key already exist?
             if (table.get(key)) |_| {
                 // Key exists, so replace the value in place.
