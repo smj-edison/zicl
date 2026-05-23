@@ -59,7 +59,6 @@ strings: StringList,
 
 /// If an object can't store all its information in 8 bytes, it can throw extra data on here.
 extra: ExtraDataPool,
-parsed_scripts: ParsedScripts,
 
 pub const HeapId = u16;
 
@@ -85,22 +84,6 @@ const FullHashContext = struct {
     pub fn eql(self: @This(), a: u256, b: u256) bool {
         _ = self;
         return a == b;
-    }
-};
-const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, struct { closure: Closure }, FullHashContext);
-pub const ParsedScript = struct {
-    /// A handle pointing to a Tcl list that has the same length as `tokens`,
-    /// that stores all the string values that the script references.
-    values: Handle,
-    /// Tokens array.
-    tags: std.ArrayList(Token),
-
-    const Token = struct {};
-
-    pub fn deinit(parsed: *ParsedScript) void {
-        parsed.tags.deinit(global_gpa);
-        parsed.values.decrRefCount();
     }
 };
 
@@ -968,9 +951,6 @@ pub fn init(heap: *Heap) !void {
 
     heap.extra = try .initWithCapacity(global_gpa, object_capacity);
     errdefer heap.extra.deinit(global_gpa);
-
-    heap.parsed_scripts = try .initWithCapacity(global_gpa, cfg.cache_size);
-    errdefer heap.parsed_scripts.deinit(global_gpa);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 

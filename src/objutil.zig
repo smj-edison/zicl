@@ -577,8 +577,3 @@ pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !Dic
         },
     };
 }
-
-/// Assumes `handle` is a dict.
-pub fn dictPut(dict: Handle, key: Handle, value: Handle) !DictAndValueResult {
-    return dictPutInner(dict, key, value.dupOrRef());
-}
