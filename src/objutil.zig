@@ -9,21 +9,6 @@ const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 
-pub const Error = std.mem.Allocator.Error || error{
-    BadIndex,
-    NotMutable,
-    BadEnumVariant,
-    BadBoolean,
-    BadDict,
-    BadInteger,
-    IntegerOverflow,
-    DivisionByZero,
-    NegativeDenominator,
-    BadFloat,
-    ParseError,
-    MissingDictKey,
-};
-
 /// Copies provided string.
 pub fn newString(heap: *Heap, bytes: []const u8) !Handle {
     const handle = try heap.createObject();
@@ -43,25 +28,6 @@ pub fn newListWithCapacity(capacity: u32) !Handle {
     };
 
     return Heap.local_heap.getHandle(list_index);
-}
-
-pub fn newList(handles: []const Handle) !Handle {
-    const list = try newListWithCapacity(@intCast(handles.len));
-    errdefer list.decrRefCount();
-    list.peek().body.list.len = @intCast(handles.len);
-
-    const new_items = listItems(list);
-    for (handles, new_items) |handle, *item| {
-        item.* = handle.dupOrRef();
-    }
-
-    return list;
-}
-
-pub fn listLength(list: Handle) u32 {
-    assert(list.tag() == .list);
-
-    return list.peek().body.list.len;
 }
 
 pub fn followIfRef(handle: Handle) Handle {
@@ -247,20 +213,6 @@ pub fn listItemNoFollow(handle: Handle, index: u32) Handle {
     return collectionItem(handle, index, handle.peek().body.list.len);
 }
 
-/// Assumes provided handle is a list.
-pub fn listItem(handle: Handle, index: u32) Handle {
-    assert(handle.tag() == .list);
-
-    return collectionItemFollowRefs(handle, index, handle.peek().body.list.len);
-}
-
-/// Assumes handle is a list.
-pub fn listItems(handle: Handle) []Heap.Object {
-    assert(handle.tag() == .list);
-
-    return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..handle.peek().body.list.len];
-}
-
 /// `list` must be mutable.
 pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
     list.assert(list.tag() == .list);
@@ -275,9 +227,7 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
 
 const DictTable = Heap.ExtraDataValue.Dictionary.Table;
 pub fn dictGetTable(dict: Handle) !DictTable {
-    // Table didn't exist, so we need to generate it.
     var new_table: DictTable = .empty;
-    errdefer new_table.deinit(Heap.global_gpa);
 
     // Populate the new table.
     const dict_len = dict.peek().body.dict.len;
@@ -319,16 +269,6 @@ pub fn dictItemFollowRefs(dict: Handle, index: u32) Handle {
     return collectionItemFollowRefs(dict, index, dict.peek().body.dict.len);
 }
 
-pub fn dictItemLength(handle: Handle) u32 {
-    assert(handle.tag() == .dict);
-    return handle.peek().body.dict.len;
-}
-
-pub fn dictPairLengthRaw(handle: Handle) u32 {
-    assert(handle.tag() == .dict);
-    return handle.peek().body.dict.len / 2;
-}
-
 pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
@@ -343,21 +283,6 @@ pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
     };
 
     return heap.getHandle(dict_index);
-}
-
-/// Caller is responsible that `handles` has handles.len % 2 == 0.
-pub fn newDict(heap: *Heap, handles: []const Handle) !Handle {
-    const dict = try newDictWithCapacity(heap, @intCast(handles.len));
-    errdefer dict.decrRefCount();
-    dict.peek().body.dict.len = @intCast(handles.len);
-
-    const new_items = dictItems(dict);
-
-    for (handles, new_items) |handle, *item| {
-        item.* = heap.dupOrReference(handle);
-    }
-
-    return dict;
 }
 
 pub fn dictLookup(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
@@ -579,7 +504,7 @@ pub fn setVariable(name: Handle, value: Heap.Object) error{ OutOfMemory, BadDict
 
 test "fn command" {
     _ = try Heap.testStart(testing.allocator, testing.io);
-    variables = try newDict(Heap.local_heap, &.{});
+    variables = try newDictWithCapacity(Heap.local_heap, 0);
 
     const foo_str = try newString(Heap.local_heap, "foo");
     try setVariable(foo_str, (try Heap.local_heap.createObject()).reference());

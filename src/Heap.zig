@@ -44,6 +44,7 @@ pub var global_gpa: std.mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var heaps: [cfg.max_heaps]Heap = undefined;
 pub threadlocal var local_heap: *Heap = undefined;
+export var objects_ptr_for_gdb: [*]Object = undefined;
 
 const Heap = @This();
 
@@ -497,8 +498,7 @@ pub const Handle = packed struct(HandleBacking) {
         // Special objects can never be mutated.
         if (handle.index < special_object_count) return false;
 
-        const obj_heap = handle.getHeap();
-        const metadata = obj_heap.getLocalMetadata(handle.index);
+        const metadata = handle.getMetadata();
 
         const mutable = metadata.mutable;
         const cross_thread = metadata.cross_thread;
@@ -532,7 +532,7 @@ pub const Handle = packed struct(HandleBacking) {
     }
 
     pub fn getMetadata(handle: Handle) *ObjectAndMetadata.Metadata {
-        return handle.getHeap().getLocalMetadata(handle.index);
+        return &handle.getHeap().objects.items(.metadata)[handle.index];
     }
 
     pub fn getRefCount(handle: Handle) u32 {
@@ -862,7 +862,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
 pub fn freeObjectBacking(handle: Handle) void {
     const obj_heap = handle.getHeap();
-    const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
+    const metadata = handle.getMetadata().*; // Copy
 
     if (!metadata.in_use) {
         @panic("Double free!");
@@ -1042,10 +1042,11 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
 
             // Duplicate items of dict.
             for (new_items, 0..) |*new_item, i| {
-                new_item.* = dest_heap.duplicateSingle(.{
+                const handle: Handle = .{
                     .index = @intCast(old_start + i),
                     .heap = src_handle.heap,
-                }) catch |e| switch (e) {
+                };
+                new_item.* = dest_heap.duplicateSingle(handle) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     // Dicts can't contain multi item objects.
                     error.MultiItemObject => unreachable,
@@ -1081,25 +1082,9 @@ pub fn objectSlice(self: *Heap, start: u32, end: u32) []Object {
     return self.objects.items(.object)[start..end];
 }
 
-pub fn getLocalMetadata(self: *Heap, index: u32) *ObjectAndMetadata.Metadata {
-    return &self.objects.items(.metadata)[index];
-}
-
 /// Copies provided string.
 pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
     try handle.getHeap().setNormalString(handle.index, bytes);
-}
-
-/// Get the string to modify (must not write any longer than current len).
-/// Not threadsafe.
-pub fn getStringMut(handle: Handle) ![:0]u8 {
-    switch (handle.getStringDetails()) {
-        .normal => {
-            const str = handle.peek().head.str.str;
-            return handle.getHeap().getHeapString(str.index, str.index + str.len);
-        },
-        .null, .empty => return error.NotMutable,
-    }
 }
 
 pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !void {
@@ -1160,12 +1145,7 @@ pub fn initLocalHeap() !void {
     const new_heap = &heaps[slot_index];
     try new_heap.init();
     local_heap = new_heap;
-}
-pub fn deinitAll() void {
-    // Deinit heaps without holding the mutex, as they may lock.
-    for (heaps[0..next_open_heap]) |*heap| {
-        heap.deinit();
-    }
+    objects_ptr_for_gdb = new_heap.objects.items(.object).ptr;
 }
 
 pub fn testStart(gpa: Allocator, io: std.Io) !*Heap {
@@ -1173,8 +1153,4 @@ pub fn testStart(gpa: Allocator, io: std.Io) !*Heap {
     try initLocalHeap();
 
     return local_heap;
-}
-
-pub fn testFinish() void {
-    Heap.deinitAll();
 }
