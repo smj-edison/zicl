@@ -13,6 +13,10 @@ const options = @import("options");
 const memutil = @import("memutil.zig");
 const objutil = @import("objutil.zig");
 
+// Debugging
+var result: std.ArrayList(u8) = .empty;
+export const ptr_to_result: *std.ArrayList(u8) = &result;
+
 // These numbers are final, and can be depended on to be their current values.
 pub const special_string_count = 2;
 pub const null_string = 0;
@@ -46,11 +50,6 @@ const Heap = @This();
 const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
 const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
 const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
-
-/// Used to create and destroy extra data.
-extra_data_mutex: std.Io.Mutex,
-/// Used for locking when adding trace info.
-trace_mutex: std.Io.Mutex,
 
 object_tracking: ObjectTracker,
 objects: ObjectList,
@@ -660,8 +659,7 @@ pub const Handle = packed struct(HandleBacking) {
         handle.assert(handle.getRefCount() > 0);
         handle.assert(handle.tag() != .reference);
 
-        const metadata = handle.getMetadata();
-        incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index], metadata.cross_thread);
+        handle.getHeap().objects.items(.ref_count)[handle.index] += 1;
     }
 
     pub fn referenceTakeOwnership(handle: Handle) Object {
@@ -709,21 +707,9 @@ pub const Handle = packed struct(HandleBacking) {
     pub fn decrRefCount(handle: Handle) void {
         if (handle.index < special_object_count) return;
 
-        const metadata = handle.getMetadata();
-        const obj_heap = handle.getHeap();
-
-        // We should never go below one for an item owned by another object.
-        if (!handle.isAllocHead()) {
-            if (handle.getMetadata().in_use) {
-                handle.assert(handle.getRefCount() > 1);
-            } else {
-                // If it's not in use, we want to fall through to the UAF panic.
-            }
-        }
-
-        if (decrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index], metadata.cross_thread)) {
-            freeObject(handle);
-        }
+        const ref_count = &handle.getHeap().objects.items(.ref_count)[handle.index];
+        ref_count.* -= 1;
+        if (ref_count.* == 0) freeObject(handle);
     }
 
     pub fn isAllocHead(handle: Handle) bool {
@@ -876,159 +862,47 @@ const ObjectAndMetadata = struct {
     object: Object,
     ref_count: u32,
     metadata: Metadata,
-    trace: std.debug.ConfigurableTrace(16, 16, options.trace_mem),
 };
-
-/// Used for the big backing objects, such as Heap.objects or Heap.strings.
-/// These are backed by vmem if possible, or need to be fully pre-allocated
-/// if threading is enabled.
-fn heapBackingAlloc() Allocator {
-    if (options.threading) {
-        return memutil.null_allocator;
-    } else {
-        return global_gpa;
-    }
-}
 
 pub fn init(heap: *Heap) !void {
     heap.* = undefined;
-    // Clean up if we hit an error.
-    errdefer heap.* = undefined;
-
-    heap.trace_mutex = .init;
-    heap.extra_data_mutex = .init;
 
     // Init objects.
     heap.object_tracking = try .init(global_gpa, global_io, cfg.object_heap_order);
-    errdefer if (heap.object_tracking.deinit() == .leaked) {
-        std.debug.print("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
-    };
 
     heap.objects = .empty;
-    if (options.threading) {
-        heap.objects.bytes = (try memutil.vmemMap(object_heap_max_bytes)).ptr;
-        heap.objects.capacity = object_heap_max_count;
-        heap.objects.len = object_heap_max_count;
-    } else if (options.threading) {
-        // if multithreading, we can't have objects moving around. We better allocate
-        // everything up front.
-        try heap.objects.ensureTotalCapacity(global_gpa, object_heap_max_count);
-        heap.objects.len = object_heap_max_count;
-    } else {
-        try heap.objects.ensureTotalCapacity(global_gpa, 32);
-    }
-    errdefer {
-        if (options.threading) {
-            memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
-        } else {
-            heap.objects.deinit(global_gpa);
-        }
-    }
+    heap.objects.bytes = (try memutil.vmemMap(object_heap_max_bytes)).ptr;
+    heap.objects.capacity = object_heap_max_count;
+    heap.objects.len = object_heap_max_count;
 
     // Init strings.
     heap.string_tracking = try .init(global_gpa, global_io, cfg.string_heap_order);
-    errdefer if (heap.string_tracking.deinit() == .leaked) {
-        std.debug.print("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
-    };
-
     heap.strings = .empty;
-    if (options.threading) {
-        const string_vmem = try memutil.vmemMap(string_heap_max_bytes);
-        heap.strings.items = string_vmem.ptr[0..string_vmem.len];
-        heap.strings.capacity = string_vmem.len;
-    } else {
-        try heap.strings.ensureTotalCapacity(global_gpa, 32);
-    }
-    errdefer {
-        if (options.threading) {
-            memutil.vmemUnmap(@alignCast(heap.strings.items.ptr[0..heap.strings.capacity]));
-        } else {
-            heap.strings.deinit(global_gpa);
-        }
-    }
+    heap.strings.items = try memutil.vmemMap(string_heap_max_bytes);
+    heap.strings.capacity = heap.strings.items.len;
 
-    const object_capacity = if (options.threading) object_heap_max_count else 32;
-
-    heap.extra = try .initWithCapacity(global_gpa, object_capacity);
-    errdefer heap.extra.deinit(global_gpa);
+    heap.extra = try .initWithCapacity(global_gpa, object_heap_max_count);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
     // Null string is guaranteed to have index 0.
-    const null_string_idx = try heap.string_tracking.allocFromOwningThread(0);
+    const null_string_idx = try heap.string_tracking.alloc(0);
     assert(null_string_idx == null_string);
-    errdefer heap.string_tracking.freeFromOwningThread(null_string_idx, 0);
     // Empty string is guaranteed to have index 1.
-    const empty_string_idx = try heap.string_tracking.allocFromOwningThread(0);
+    const empty_string_idx = try heap.string_tracking.alloc(0);
     assert(empty_string_idx == empty_string);
-    errdefer heap.string_tracking.freeFromOwningThread(empty_string_idx, 0);
-
-    // This is to remember to update this section whenever the special
-    // objects change.
-    comptime assert(special_object_count == 2);
 
     // Specialty objects.
     // Null object is guaranteed to have index 0.
     const null_object = try heap.createObject();
     assert(null_object.index == null_object_idx);
-    errdefer freeObjectBackingInner(null_object);
     // Empty object is guaranteed to have index 1.
     const empty_object = try heap.createObject();
     assert(empty_object.index == empty_object_idx);
     empty_object.peek().head.str = Object.empty_string;
-    errdefer freeObjectBackingInner(empty_object);
 }
 
-fn clearParsedScripts(self: *Heap) void {
-    var parsed_script_iter = self.parsed_scripts.valueIterator();
-    while (parsed_script_iter.next()) |parsed_script| {
-        parsed_script.script.deinit();
-    }
-    self.parsed_scripts.clearRetainingCapacity();
-}
-
-pub fn deinit(heap: *Heap) void {
-    // Parsed scripts have references to objects, so we'll deinit scripts before objects.
-    heap.clearParsedScripts();
-    heap.parsed_scripts.deinit(global_gpa);
-
-    for ((special_object_count)..heap.objects.len) |i| {
-        const metadata = heap.objects.get(i).metadata;
-        if (metadata.in_use) {
-            // We don't use free object here, as it may cause a double-free when
-            // freeing recursive structures. For example, if there was a list with
-            // two items, we'll free the list (first free of items), then free
-            // the items individually (second free).
-            invalidateBothInner(heap.getHandle(@intCast(i)));
-        }
-    }
-
-    // Be sure to free the specialty objects and strings.
-    assert(special_object_count == 2);
-    heap.object_tracking.freeFromOwningThread(0, 0);
-    heap.object_tracking.freeFromOwningThread(1, 0);
-    assert(special_string_count == 2);
-    heap.string_tracking.freeFromOwningThread(0, 0);
-    heap.string_tracking.freeFromOwningThread(1, 0);
-
-    if (options.threading) {
-        memutil.vmemUnmap(@alignCast(heap.strings.items));
-        memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
-    } else {
-        // Don't use `heapBackingAlloc()` in this case, as that will error
-        // with the null allocator.
-        heap.strings.deinit(global_gpa);
-        heap.objects.deinit(global_gpa);
-    }
-
-    if (heap.object_tracking.deinit() == .leaked) @panic("Heap object leaks when deiniting");
-    if (heap.string_tracking.deinit() == .leaked) @panic("Heap string leaks when deiniting");
-
-    heap.extra.deinit(global_gpa);
-    heap.* = undefined;
-}
-
-pub inline fn heapId(self: *Heap) HeapId {
+pub fn heapId(self: *Heap) HeapId {
     return @intCast(self - &heaps);
 }
 
@@ -1074,20 +948,14 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     const order = memutil.getOrder(count);
     const aligned_count = @as(u32, 1) << order;
 
-    const index: u32 = blk: {
-        if (self == local_heap) {
-            break :blk try self.object_tracking.allocFromOwningThread(order);
-        } else {
-            break :blk try self.object_tracking.allocFromAnyThread(order);
-        }
-    };
+    const index: u32 = try self.object_tracking.alloc(order);
 
     const end = index + aligned_count;
 
     // Make sure object list has space for new objects.
     if (self.objects.len < index + aligned_count) {
         const start_of_new = self.objects.len;
-        if (!options.threading) try self.objects.resize(heapBackingAlloc(), index + aligned_count);
+        if (!options.threading) try self.objects.resize(memutil.null_allocator, index + aligned_count);
         @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
             .order = 31,
             .cross_thread = false,
@@ -1135,10 +1003,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     return index;
 }
 
-var result: std.ArrayList(u8) = .empty;
-export const ptr_to_result: *std.ArrayList(u8) = &result;
-
-fn freeObjectBackingInner(handle: Handle) void {
+pub fn freeObjectBacking(handle: Handle) void {
     const obj_heap = handle.getHeap();
     const metadata = obj_heap.getLocalMetadata(handle.index).*; // Copy
 
@@ -1155,18 +1020,7 @@ fn freeObjectBackingInner(handle: Handle) void {
         .in_use = false,
     });
 
-    if (obj_heap == local_heap) {
-        obj_heap.object_tracking.freeFromOwningThread(handle.index, metadata.order);
-    } else {
-        obj_heap.object_tracking.freeFromAnyThread(handle.index, metadata.order);
-    }
-}
-
-/// Does not run any destructors, frees the object directly.
-pub fn freeObjectBacking(handle: Handle) void {
-    assert(handle.isAllocHead());
-
-    freeObjectBackingInner(handle);
+    obj_heap.object_tracking.free(handle.index, metadata.order);
 }
 
 pub fn freeObject(handle: Handle) void {
@@ -1202,7 +1056,7 @@ pub fn createString(self: *Heap, len: u32) !u32 {
     const length_with_null = len + 1;
     const order = memutil.getOrder(length_with_null);
 
-    const new_string = try self.string_tracking.allocFromAnyThread(order);
+    const new_string = try self.string_tracking.alloc(order);
     self.strings.items[new_string + len] = 0; // Set null byte.
     return new_string;
 }
@@ -1212,7 +1066,7 @@ pub fn freeString(self: *Heap, index: u32, len: u32) void {
 
     const length_with_null = len + 1;
     const order = memutil.getOrder(length_with_null);
-    self.string_tracking.freeFromAnyThread(index, order);
+    self.string_tracking.free(index, order);
 }
 
 pub fn checkIfEqual(a: Handle, b: Handle) !bool {
@@ -1481,12 +1335,7 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
 }
 
 pub fn createExtraData(self: *Heap) !ExtraData {
-    // TODO PERF make a fast case where this uses a heap-local list of
-    // available extra data.
-    self.extra_data_mutex.lockUncancelable(global_io);
-    defer self.extra_data_mutex.unlock(global_io);
-
-    const new_index = try self.extra.create(heapBackingAlloc());
+    const new_index = try self.extra.create(memutil.null_allocator);
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
 
     return @enumFromInt(new_index);
@@ -1517,9 +1366,6 @@ pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
         .none => {},
     }
 
-    self.extra_data_mutex.lockUncancelable(global_io);
-    defer self.extra_data_mutex.unlock(global_io);
-
     self.getExtraData(index).* = undefined;
     self.extra.destroy(@intFromEnum(index));
 }
@@ -1542,43 +1388,6 @@ pub fn deinitAll() void {
     for (heaps[0..next_open_heap]) |*heap| {
         heap.deinit();
     }
-}
-
-/// Atomically adds, if multithreading is enabled. Returns value before adding.
-pub fn atomicIncr(comptime T: type, ptr: *T) T {
-    if (options.threading) {
-        return @atomicRmw(T, ptr, .Add, 1, .monotonic);
-    } else {
-        const before = ptr.*;
-        ptr.* += 1;
-        return before;
-    }
-}
-
-pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) void {
-    if (is_atomic) {
-        _ = @atomicRmw(T, ref, .Add, 1, .monotonic);
-    } else {
-        ref.* += 1;
-    }
-}
-
-/// Returns true if count has reached zero. Multithreaded safe.
-pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) bool {
-    var after_sub: T = undefined;
-    if (is_atomic) {
-        const before_sub = @atomicRmw(T, ref, .Sub, 1, .release);
-        after_sub = before_sub - 1;
-
-        if (after_sub == 0) {
-            _ = @atomicLoad(T, ref, .acquire);
-        }
-    } else {
-        ref.* -= 1;
-        after_sub = ref.*;
-    }
-
-    return after_sub == 0;
 }
 
 pub fn testStart(gpa: Allocator, io: std.Io) !*Heap {

@@ -186,61 +186,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             errdefer self.alloc_count[new_order] -= new_block_count;
         }
 
-        pub fn allocFromAnyThread(self: *Self, requested_order: u5) !u32 {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return self.allocOnMainList(requested_order);
-        }
-
-        pub fn freeFromAnyThread(self: *Self, index: u32, order: u5) void {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return self.freeOnMainList(index, order);
-        }
-        pub fn allocFromOwningThread(self: *Self, requested_order: u5) !u32 {
-            // Try allocating from the pool, if available.
-            if (self.allocOnPool(requested_order)) |pool_alloc| {
-                return pool_alloc;
-            } else |_| {}
-
-            // We still need to lock if another thread is using this allocator right now.
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return self.allocOnMainList(requested_order);
-        }
-
-        pub fn freeFromOwningThread(self: *Self, index: u32, order: u5) void {
-            // Try freeing onto the pool, if there's room left.
-            if (order < cfg.max_pool_order) {
-                if (self.freeOnPool(index, order)) |_| {
-                    return;
-                } else |_| {}
-            }
-
-            // We should transfer the pool over to the main list, since there wasn't any room
-            // left on the pool.
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            self.drainPool();
-            self.freeOnMainList(index, order);
-        }
-
-        /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
-        /// small objects is fast. Not threadsafe.
-        fn allocOnPool(self: *Self, requested_order: u5) !u32 {
-            if (requested_order < cfg.max_pool_order) {
-                if (self.pools_len[requested_order] > 0) {
-                    const open = self.pools[requested_order][self.pools_len[requested_order] - 1];
-                    self.pools_len[requested_order] -= 1;
-                    return open;
-                }
-            }
-
-            return error.PoolEmpty;
-        }
-
-        /// Caller is responsible for locking the allocator.
-        fn allocOnMainList(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
+        pub fn alloc(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
             self.alloc_count[requested_order] += 1; // Allocation stats.
             errdefer self.alloc_count[requested_order] -= 1;
 
@@ -267,20 +213,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             return open_index;
         }
 
-        /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
-        /// small objects is fast. We also don't coalesce on the pool, so this also prevents
-        /// churning where blocks are split and merged constantly. Not threadsafe.
-        fn freeOnPool(self: *Self, index: u32, order: u5) !void {
-            assert(order < cfg.max_pool_order);
-
-            if (self.pools_len[order] >= cfg.pool_size) return error.PoolFull;
-
-            self.pools[order][self.pools_len[order]] = index;
-            self.pools_len[order] += 1;
-        }
-
-        /// Caller is responsible for locking the allocator.
-        fn freeOnMainList(self: *Self, index: u32, order: u5) void {
+        pub fn free(self: *Self, index: u32, order: u5) void {
             self.alloc_count[order] -= 1; // Allocation stats.
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
@@ -328,16 +261,6 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                 }
 
                 // We've found the sibling, so the next iteration will merge.
-            }
-        }
-
-        /// Caller is responsible for locking the allocator.
-        fn drainPool(self: *Self) void {
-            for (&self.pools, &self.pools_len, 0..) |pool, *pool_len, order| {
-                for (pool[0..pool_len.*]) |to_free| {
-                    self.freeOnMainList(to_free, @intCast(order));
-                }
-                pool_len.* = 0;
             }
         }
 
