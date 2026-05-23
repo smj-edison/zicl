@@ -68,6 +68,11 @@ pub fn build(b: *std.Build) void {
         .root_module = root,
         .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .server },
     });
+
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
+
+    const test_asm = tests.getEmittedAsm();
+    const write_asm = b.addInstallFile(test_asm, "main.s");
+    test_step.dependOn(&write_asm.step);
 }

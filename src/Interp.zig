@@ -36,7 +36,7 @@ fn createVariable(name: Handle, value: Heap.Object) !void {
     assert(name.canShimmer());
 
     // Add variable.
-    const put_result = try objutil.dictPutInner(variables, name, value);
+    const put_result = try objutil.dictPut(variables, name, value);
     variables.swapIfNew(put_result.new_dict);
 
     try name.prepareToShimmer();
@@ -48,7 +48,7 @@ fn createVariable(name: Handle, value: Heap.Object) !void {
 }
 
 /// Must be called with a heap-native name. Always takes ownership of `value`, even in error cases.
-pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, BadDict }!void {
+pub fn setVariable(name: Handle, value: Heap.Object) error{ OutOfMemory, BadDict }!void {
     var value_taken = false;
     errdefer if (!value_taken) {
         var value_mut = value;
@@ -61,7 +61,7 @@ pub fn setVariableInner(name: Handle, value: Heap.Object) error{ OutOfMemory, Ba
                 const cached_var = &name.peek().body.cached_local_var;
 
                 value_taken = true;
-                const put_result = try objutil.dictPutInner(variables, name, value);
+                const put_result = try objutil.dictPut(variables, name, value);
                 if (put_result.new_dict.toHandle()) |new_dict| {
                     // Did the dict change locations? If so, all cached lookups are now invalid.
                     variables.swap(new_dict);
@@ -93,7 +93,7 @@ pub fn registerCommand(name: []const u8) !void {
     defer var_name_escaped.decrRefCount();
 
     const var_value = try objutil.newString(Heap.local_heap, name);
-    try setVariableInner(var_name, var_value.referenceTakeOwnership());
+    try setVariable(var_name, var_value.referenceTakeOwnership());
 }
 
 pub fn init() !void {
@@ -126,7 +126,7 @@ pub fn fnCmd(args: []Handle) !void {
     closure_handle.peek().head.tag = .closure;
     closure_handle.peek().body = .{ .closure = .{ .extra_data = extra_data } };
 
-    Interp.setVariableInner(fn_name.*, closure_handle.dupOrRef()) catch unreachable;
+    setVariable(fn_name.*, closure_handle.dupOrRef()) catch unreachable;
 }
 
 test "fn command" {

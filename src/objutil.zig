@@ -432,7 +432,7 @@ pub fn dictLookup(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
 pub const DictAndValueResult = struct { new_dict: OptionalHandle, new_value: Heap.Handle };
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
 /// `value` must be in `Heap.local_heap`.
-pub fn dictPutInner(provided_dict: Handle, key: Handle, value: Heap.Object) !DictAndValueResult {
+pub fn dictPut(provided_dict: Handle, key: Handle, value: Heap.Object) !DictAndValueResult {
     var value_mut = value;
 
     // Because there's so many points at which this function can hit OOM,

@@ -181,7 +181,6 @@ pub const Object = packed struct(u128) {
             .integer,
             .float,
             .bool,
-            .parsed_script_command,
             .marked,
             .invalid,
             .cached_local_var,
@@ -208,7 +207,6 @@ pub const Tag = enum(u5) {
     list,
     dict,
     dict_sugar,
-    parsed_script_command,
     reference,
     cached_local_var,
     cached_lexical_var,
@@ -264,11 +262,6 @@ pub const Body = packed union(u64) {
     dict_sugar: packed struct {
         dict_name_index: HeapIndex,
         path_index: HeapIndex,
-    },
-    /// Information about a parsed command.
-    parsed_script_command: packed struct {
-        line: u32,
-        arg_count: u32,
     },
     reference: Handle,
     cached_local_var: packed struct {
@@ -394,16 +387,6 @@ pub const ListIndex = packed struct(u34) {
             return self.u.index;
         }
     }
-};
-
-pub const VariableValue = union(enum) {
-    local_variable: struct {
-        target: Handle,
-    },
-    /// Variable in a parent scope. Immutable.
-    lexical_variable: struct {
-        target: Handle,
-    },
 };
 
 /// Monotonic counter for parsed script and expression cache keys.
@@ -1113,7 +1096,7 @@ pub fn dupOrReference(dest_heap: *Heap, handle: Handle) Object {
 pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (handle.tag()) {
-        .none, .index, .integer, .float, .string, .bool, .parsed_script_command, .marked => {
+        .none, .index, .integer, .float, .string, .bool, .marked => {
             return .{
                 .head = .{
                     .str = try dest_heap.duplicateObjString(handle),
