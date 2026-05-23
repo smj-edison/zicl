@@ -50,10 +50,10 @@ class TagPtrFn(gdb.Function):
         return gdb.Value(int(addr)).cast(char_ptr)
 
 class ZiclTagCmd(gdb.Command):
-    """zicl-tag <idx>. Print the tag value."""
+    """tag <idx>. Print the tag value."""
 
     def __init__(self):
-        super().__init__("zicl-tag", gdb.COMMAND_DATA)
+        super().__init__("tag", gdb.COMMAND_DATA)
 
     def invoke(self, argument, _from_tty):
         args = gdb.string_to_argv(argument)
