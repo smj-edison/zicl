@@ -316,7 +316,7 @@ pub fn vmemUnmapItems(comptime T: type, items: []align(heap.page_size_min) T) vo
     heap.PageAllocator.unmap(bytes[0..byte_count]);
 }
 
-pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
+pub fn IndexedMemoryPool(comptime Item: type) type {
     // Heavily inspired by std.heap.MemoryPool
 
     return struct {
@@ -336,33 +336,13 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
         count: usize = 0,
 
         /// Capacity must be > 0
-        pub fn initWithCapacity(gpa: Allocator, capacity: usize) !Self {
+        pub fn initWithCapacity(capacity: usize) !Self {
             if (capacity == 0) @panic("Capacity must be larger than 0");
-
-            if (use_vmem) {
-                return .{
-                    .items = try vmemMapItems(Item, capacity),
-                };
-            } else {
-                return .{
-                    .items = try gpa.alloc(Item, capacity),
-                };
-            }
+            return .{ .items = try vmemMapItems(Item, capacity) };
         }
 
-        pub fn create(self: *Self, gpa: Allocator) !usize {
-            // Resize/realloc if needed
-            const new_size = @max(self.items.len, 4) * 2;
-            if (self.len >= self.items.len) {
-                if (use_vmem) {
-                    return error.OutOfMemory;
-                } else if (gpa.resize(self.items, new_size)) {
-                    self.items.len = new_size;
-                } else {
-                    self.items = try gpa.realloc(self.items, new_size);
-                }
-            }
-
+        pub fn create(self: *Self) !usize {
+            if (self.len >= self.items.len) return error.OutOfMemory;
             return self.createAssumeCapacity();
         }
 
@@ -405,12 +385,8 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
             self.next_free = index;
         }
 
-        pub fn deinit(self: *Self, gpa: Allocator) void {
-            if (use_vmem) {
-                vmemUnmapItems(Item, @alignCast(self.items));
-            } else {
-                gpa.free(self.items);
-            }
+        pub fn deinit(self: *Self) void {
+            vmemUnmapItems(Item, @alignCast(self.items));
         }
 
         /// For debugging purposes only. Dumps everything that was leaked.

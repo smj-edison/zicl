@@ -214,7 +214,6 @@ fn setCollectionLength(provided_handle: Handle, new_len: u32) !OptionalHandle {
         // Hence, we have to manually handle freeing the old table.
         if (provided_handle.tag() == .dict) {
             dictInvalidateTable(provided_handle);
-            provided_handle.getHeap().destroyExtraData(provided_handle.peek().body.dict.extra_data);
         }
         provided_handle.invalidateString();
         provided_handle.peek().head.tag = .invalid;
@@ -335,25 +334,12 @@ pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
 
     // `1 +` to make space for the dict's head.
     const dict_index = try heap.createObjects(1 + len);
-    errdefer Heap.freeObjectBacking(heap.getHandle(dict_index));
     const dict_metadata = try heap.createExtraData();
-    errdefer heap.destroyExtraData(dict_metadata);
-
-    heap.getExtraData(dict_metadata).* = .{ .dict = .{
-        .table = null,
-        .parent_link = .none,
-    } };
 
     const dict_head = heap.getLocalObject(dict_index);
     dict_head.* = .{
-        .head = .{
-            .str = Heap.Object.null_string,
-            .tag = .dict,
-        },
-        .body = .{ .dict = .{
-            .extra_data = dict_metadata,
-            .len = 0,
-        } },
+        .head = .{ .tag = .dict },
+        .body = .{ .dict = .{ .extra_data = dict_metadata, .len = 0 } },
     };
 
     return heap.getHandle(dict_index);

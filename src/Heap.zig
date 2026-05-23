@@ -74,7 +74,7 @@ const StringTracker = memutil.BuddyUnmanaged(.{
 });
 const StringList = std.ArrayList(u8);
 
-const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, true);
+const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue);
 const FullHashContext = struct {
     pub fn hash(self: @This(), full_hash: u256) u64 {
         _ = self;
@@ -158,15 +158,9 @@ pub const Object = packed struct(u128) {
                 // How come string is a no-op? Because the string is separate
                 // from its cached length.
             },
-            .source => {
-                heap.destroyExtraData(obj.body.source.extra_data);
-            },
-            .cached_lexical_var => {
-                heap.destroyExtraData(obj.body.cached_lexical_var.extra_data);
-            },
-            .closure => {
-                heap.destroyExtraData(obj.body.closure.extra_data);
-            },
+            .source => {},
+            .cached_lexical_var => {},
+            .closure => {},
             .upvar_link => {
                 const upvar_link = obj.body.upvar_link;
                 heap.getHandle(upvar_link.linked_name).decrRefCount();
@@ -816,8 +810,6 @@ fn invalidateBodyInner(handle: Handle) void {
         },
         .dict => {
             invalidateCollection(handle);
-
-            handle.getHeap().destroyExtraData(handle.peek().body.dict.extra_data);
         },
         else => handle.peek().deinitBodySingle(handle.getHeap()),
     }
@@ -862,7 +854,7 @@ pub fn init(heap: *Heap) !void {
     heap.strings.items = try memutil.vmemMap(string_heap_max_bytes);
     heap.strings.capacity = heap.strings.items.len;
 
-    heap.extra = try .initWithCapacity(global_gpa, object_heap_max_count);
+    heap.extra = try .initWithCapacity(object_heap_max_count);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
@@ -1121,7 +1113,6 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .closure => {
             const closure = handle.getClosureExtraData();
             const new_extra_data = try dest_heap.createExtraData();
-            errdefer dest_heap.destroyExtraData(new_extra_data);
             dest_heap.getExtraData(new_extra_data).* = .{ .closure = closure.borrow() };
 
             return .{
@@ -1161,7 +1152,6 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
                 const new_str = try dest_heap.duplicateObjString(src_handle);
                 errdefer new_str.deinit(dest_heap);
                 const new_extra_data = try dest_heap.createExtraData();
-                errdefer dest_heap.destroyExtraData(new_extra_data);
 
                 new_head.peek().* = .{
                     .head = .{
@@ -1316,7 +1306,7 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
 }
 
 pub fn createExtraData(self: *Heap) !ExtraData {
-    const new_index = try self.extra.create(memutil.null_allocator);
+    const new_index = try self.extra.create();
     if (new_index >= object_heap_max_count) return error.OutOfMemory;
 
     return @enumFromInt(new_index);
@@ -1324,31 +1314,6 @@ pub fn createExtraData(self: *Heap) !ExtraData {
 
 pub fn getExtraData(self: *Heap, index: ExtraData) *ExtraDataValue {
     return &self.extra.items[@intFromEnum(index)];
-}
-
-pub fn destroyExtraData(self: *Heap, index: ExtraData) void {
-    switch (self.getExtraData(index).*) {
-        .lexical_variable => |lexical_var| {
-            lexical_var.ref.decrRefCount();
-        },
-        .dict => |*dict| {
-            dict.parent_link.decrOptional();
-            if (dict.table) |*table| table.deinit(global_gpa);
-        },
-        .source => |*source| {
-            source.file_name.decrOptional();
-        },
-        .custom_type => {
-            @panic("Need to clean up custom type");
-        },
-        .closure => |*closure| {
-            closure.deinit();
-        },
-        .none => {},
-    }
-
-    self.getExtraData(index).* = undefined;
-    self.extra.destroy(@intFromEnum(index));
 }
 
 pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
