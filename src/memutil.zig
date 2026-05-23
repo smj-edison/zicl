@@ -10,58 +10,6 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
-const options = @import("options");
-
-/// Uses blake3 to make a hash that, in theory, should never
-/// overlap with any other byte string.
-pub fn hashBytes(bytes: []const u8) u256 {
-    var out: [32]u8 = @splat(0);
-    std.crypto.hash.Blake3.hash(bytes, &out, .{});
-    return @bitCast(out);
-}
-
-// These functions are all when appending to the free list (it should have
-// already resized itself)
-fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
-    _ = ctx;
-    _ = n;
-    _ = alignment;
-    _ = ra;
-    return null;
-}
-fn null_resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_size: usize, return_address: usize) bool {
-    _ = ctx;
-    _ = buf;
-    _ = alignment;
-    _ = new_size;
-    _ = return_address;
-    return false;
-}
-fn null_remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
-    _ = context;
-    _ = memory;
-    _ = alignment;
-    _ = new_len;
-    _ = return_address;
-    return null;
-}
-fn null_free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_address: usize) void {
-    _ = ctx;
-    _ = buf;
-    _ = alignment;
-    _ = return_address;
-}
-var null_ctx: usize = 0;
-pub const null_allocator: Allocator = .{
-    .ptr = &null_ctx,
-    .vtable = &.{
-        .alloc = null_alloc,
-        .resize = null_resize,
-        .remap = null_remap,
-        .free = null_free,
-    },
-};
-
 pub fn getOrder(count: u32) u5 {
     return @intCast(math.log2_int_ceil(u32, count));
 }
@@ -107,7 +55,6 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
         alloc_count: [cfg.max_order]usize,
         pools: [cfg.max_pool_order][cfg.pool_size]u32,
         pools_len: [cfg.max_pool_order]usize,
-        mutex: std.Io.Mutex = .init,
 
         const Self = @This();
 
@@ -136,39 +83,6 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             return new_alloc;
         }
 
-        // Not threadsafe.
-        pub fn deinit(self: *Self) enum { normal, leaked } {
-            // Synchronize state.
-            self.mutex.lockUncancelable(self.io);
-            self.mutex.unlock(self.io);
-
-            self.drainPool();
-
-            // Leak check.
-            var leaked = false;
-            for (self.alloc_count) |count| {
-                if (count != 0) leaked = true;
-            }
-
-            if (leaked) {
-                std.debug.print("Heap alloc counts: {any}\n", .{self.alloc_count});
-                for (self.free_lists[0..], 0..) |free_list, order| {
-                    if (free_list.count() > 0) {
-                        std.debug.print("Free list for order {}: {any}\n", .{ order, free_list.entries.items(.key) });
-                    }
-                }
-            }
-
-            // Deinit free lists.
-            for (0..cfg.max_order) |i| {
-                self.free_lists[i].deinit(self.gpa);
-            }
-
-            self.* = undefined;
-
-            return if (leaked) .leaked else .normal;
-        }
-
         /// Caller must have the block already allocated. `new_order` must be smaller than
         /// `current_order`.
         pub fn splitBlock(self: *Self, current_order: u5, new_order: u5) void {
@@ -177,21 +91,15 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             // 2 ** (current_order - new_order)
             const new_block_count = @as(u32, 1) << (current_order - new_order);
 
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-
             self.alloc_count[current_order] -= 1;
-            errdefer self.alloc_count[current_order] += 1;
             self.alloc_count[new_order] += new_block_count;
-            errdefer self.alloc_count[new_order] -= new_block_count;
         }
 
-        pub fn alloc(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
+        pub fn alloc(self: *Self, requested_order: u5) u32 {
             self.alloc_count[requested_order] += 1; // Allocation stats.
-            errdefer self.alloc_count[requested_order] -= 1;
 
             // Ensure that the free list has enough space for when the object needs to be freed.
-            try self.ensureSufficientCapacity(requested_order);
+            self.ensureSufficientCapacity(requested_order);
 
             // look for an open block of any size >= requested_order (if the open block is too big, we'll split it).
             var open_index: u32 = undefined;
@@ -201,11 +109,15 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                     open_index = open.key;
                     break;
                 }
-            } else return error.OutOfMemory;
+            } else @panic("OOM");
 
             // split blocks (if needed).
             while (open_order > requested_order) : (open_order -= 1) {
-                try self.free_lists[open_order - 1].putNoClobber(self.gpa, open_index + getOrderSize(open_order - 1), {});
+                self.free_lists[open_order - 1].putNoClobber(
+                    self.gpa,
+                    open_index + getOrderSize(open_order - 1),
+                    {},
+                ) catch @panic("OOM");
                 // Lower half is implicitly passed along `open_index`, since
                 // the lower block index stays the same as it descends.
             }
@@ -264,12 +176,9 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             }
         }
 
-        fn ensureSufficientCapacity(self: *Self, order: u5) !void {
-            const backup = self.alloc_count;
-            errdefer self.alloc_count = backup;
-
+        fn ensureSufficientCapacity(self: *Self, order: u5) void {
             var free_list_size = self.alloc_count[order] / 2 + 1;
-            try self.free_lists[order].ensureTotalCapacity(self.gpa, free_list_size);
+            self.free_lists[order].ensureTotalCapacity(self.gpa, free_list_size) catch @panic("OOM");
 
             var current_order = order;
             while (current_order > 0) {
@@ -278,16 +187,8 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                 // to split this block in the future.
                 const parent_free_list_size = free_list_size;
                 free_list_size = (parent_free_list_size * 2) + self.alloc_count[current_order] / 2 + 1;
-                try self.free_lists[current_order].ensureTotalCapacity(self.gpa, free_list_size);
+                self.free_lists[current_order].ensureTotalCapacity(self.gpa, free_list_size) catch @panic("OOM");
             }
-        }
-
-        fn print_buddy_state(self: Self, beginning: []const u8) void {
-            std.debug.print("{s}", .{beginning});
-            for (0..self.free_lists.len) |order| {
-                std.debug.print("Order: {} ({any}), ", .{ order, self.free_lists[order].items });
-            }
-            std.debug.print("\n", .{});
         }
     };
 }
@@ -387,29 +288,6 @@ pub fn IndexedMemoryPool(comptime Item: type) type {
 
         pub fn deinit(self: *Self) void {
             vmemUnmapItems(Item, @alignCast(self.items));
-        }
-
-        /// For debugging purposes only. Dumps everything that was leaked.
-        pub fn dumpLeaked(self: *Self, scratch: Allocator, comptime fmt: []const u8) !void {
-            // We'll go through the free list, adding each free item to the `not_leaked` set.
-            var not_leaked = std.AutoHashMap(usize, void).init(scratch);
-            defer not_leaked.deinit();
-
-            var next_free = self.next_free;
-            while (next_free != no_next_free) {
-                try not_leaked.put(next_free, undefined);
-
-                const item_ptr: *Item = &self.items[next_free];
-                const int_ptr: *usize = @ptrCast(item_ptr);
-
-                next_free = int_ptr.*;
-            }
-
-            for (0..self.len) |i| {
-                if (!not_leaked.contains(i)) {
-                    std.debug.print(fmt, .{ i, self.items[i] });
-                }
-            }
         }
     };
 }

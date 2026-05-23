@@ -87,40 +87,23 @@ const FullHashContext = struct {
 };
 
 pub const Object = packed struct(u128) {
-    pub const null_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = 0, .len = 0 } },
-        .is_ptr = false,
-    };
-    pub const empty_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = 1, .len = 0 } },
-        .is_ptr = false,
-    };
+    pub const null_string: StrOrPtr = .{ .str = .{ .index = 0, .len = 0 } };
+    pub const empty_string: StrOrPtr = .{ .str = .{ .index = 1, .len = 0 } };
 
     pub const StrOrPtr = packed struct(u59) {
-        u: packed union {
-            str: packed struct {
-                index: u32,
-                len: u26,
-            },
-            /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
-            /// TODO when/if aligned pointers in packed structs become a thing, switch
-            /// over to that system.
-            ptr: u58,
+        str: packed struct {
+            index: u32,
+            len: u26,
         },
-        is_ptr: bool,
+        padding: u1 = 0,
 
         pub fn deinit(str: StrOrPtr, heap: *Heap) void {
             switch (heap.getLocalStringDetails(str)) {
                 .normal => {
-                    heap.freeString(str.u.str.index, str.u.str.len);
+                    heap.freeString(str.str.index, str.str.len);
                 },
                 .null, .empty => {},
             }
-        }
-
-        pub fn format(self: StrOrPtr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            assert(!self.is_ptr);
-            try writer.print("{}", .{self.u.str});
         }
     };
 
@@ -158,7 +141,6 @@ pub const Object = packed struct(u128) {
                 // How come string is a no-op? Because the string is separate
                 // from its cached length.
             },
-            .source => {},
             .cached_lexical_var => {},
             .closure => {},
             .upvar_link => {
@@ -197,7 +179,6 @@ pub const Tag = enum(u5) {
     float,
     bool,
     string,
-    source,
     list,
     dict,
     dict_sugar,
@@ -225,10 +206,6 @@ pub const Body = packed union(u64) {
         utf8_length: u32,
         length_determined: bool,
         padding: u31 = 0,
-    },
-    source: packed struct {
-        extra_data: ExtraData,
-        padding: u32 = 0,
     },
     list: packed struct {
         len: u32,
@@ -579,7 +556,7 @@ pub const Handle = packed struct(HandleBacking) {
 
         const mutable = metadata.mutable;
         const cross_thread = metadata.cross_thread;
-        const multiple_refs = obj_heap.getLocalRefCount(handle.index) > 1;
+        const multiple_refs = handle.getRefCount() > 1;
 
         if (!mutable) return false;
         if (cross_thread) return false;
@@ -859,10 +836,10 @@ pub fn init(heap: *Heap) !void {
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
     // Null string is guaranteed to have index 0.
-    const null_string_idx = try heap.string_tracking.alloc(0);
+    const null_string_idx = heap.string_tracking.alloc(0);
     assert(null_string_idx == null_string);
     // Empty string is guaranteed to have index 1.
-    const empty_string_idx = try heap.string_tracking.alloc(0);
+    const empty_string_idx = heap.string_tracking.alloc(0);
     assert(empty_string_idx == empty_string);
 
     // Specialty objects.
@@ -921,14 +898,13 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     const order = memutil.getOrder(count);
     const aligned_count = @as(u32, 1) << order;
 
-    const index: u32 = try self.object_tracking.alloc(order);
+    const index: u32 = self.object_tracking.alloc(order);
 
     const end = index + aligned_count;
 
     // Make sure object list has space for new objects.
     if (self.objects.len < index + aligned_count) {
         const start_of_new = self.objects.len;
-        if (!options.threading) try self.objects.resize(memutil.null_allocator, index + aligned_count);
         @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
             .order = 31,
             .cross_thread = false,
@@ -1029,7 +1005,7 @@ pub fn createString(self: *Heap, len: u32) !u32 {
     const length_with_null = len + 1;
     const order = memutil.getOrder(length_with_null);
 
-    const new_string = try self.string_tracking.alloc(order);
+    const new_string = self.string_tracking.alloc(order);
     self.strings.items[new_string + len] = 0; // Set null byte.
     return new_string;
 }
@@ -1058,10 +1034,7 @@ pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
             const len: u26 = @intCast(bytes.len);
             @memcpy(dest_heap.getHeapString(new_string, new_string + len), bytes);
 
-            return .{
-                .u = .{ .str = .{ .index = new_string, .len = len } },
-                .is_ptr = false,
-            };
+            return .{ .str = .{ .index = new_string, .len = len } };
         },
         .null, .empty => {
             return handle.peek().head.str;
@@ -1102,7 +1075,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
                 error.OutOfMemory => return error.OutOfMemory,
             };
         },
-        .custom_type, .source, .dict_sugar => unreachable,
+        .custom_type, .dict_sugar => unreachable,
         .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
@@ -1214,20 +1187,9 @@ pub fn getLocalMetadata(self: *Heap, index: u32) *ObjectAndMetadata.Metadata {
     return &self.objects.items(.metadata)[index];
 }
 
-fn getLocalRefCount(self: *Heap, index: u32) u32 {
-    const ptr = &self.objects.items(.ref_count)[index];
-
-    if (self.getLocalMetadata(index).cross_thread) {
-        return @atomicLoad(u32, ptr, .monotonic);
-    } else {
-        return ptr.*;
-    }
-}
-
 /// Copies provided string.
 pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
-    const heap = handle.getHeap();
-    assert(try heap.setNormalString(handle.index, bytes));
+    try handle.getHeap().setNormalString(handle.index, bytes);
 }
 
 /// Get the string to modify (must not write any longer than current len).
@@ -1235,30 +1197,17 @@ pub fn setString(handle: Handle, bytes: []const u8) Allocator.Error!void {
 pub fn getStringMut(handle: Handle) ![:0]u8 {
     switch (handle.getStringDetails()) {
         .normal => {
-            const str = handle.peek().head.str.u.str;
+            const str = handle.peek().head.str.str;
             return handle.getHeap().getHeapString(str.index, str.index + str.len);
         },
         .null, .empty => return error.NotMutable,
     }
 }
 
-/// Low-level function, to exchange one value of an object's string to another.
-/// Returns whether the exchange was successful (if not, caller is responsible
-/// for cleaning up).
-pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set_to: Object.StrOrPtr) bool {
-    _ = expected;
-
-    const obj: *Object = self.getLocalObject(index);
-    obj.head.str = to_set_to;
-
-    return true;
-}
-
-pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
+pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !void {
     if (bytes.len == 0) {
         // No need to check the result of the exchange, as there's nothing to clean up
-        assert(self.exchangeString(index, Object.null_string, Object.empty_string));
-        return true;
+        self.getLocalObject(index).head.str = Object.empty_string;
     } else {
         const string = try self.createString(@intCast(bytes.len));
         const len: u26 = @intCast(bytes.len);
@@ -1267,19 +1216,7 @@ pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
             bytes,
         );
 
-        const string_header: Object.StrOrPtr = .{
-            .u = .{
-                .str = .{ .index = string, .len = len },
-            },
-            .is_ptr = false,
-        };
-
-        const did_win = self.exchangeString(index, Object.null_string, string_header);
-        if (!did_win) {
-            self.freeString(string, len);
-        }
-
-        return true;
+        self.getLocalObject(index).head.str = .{ .str = .{ .index = string, .len = len } };
     }
 }
 
@@ -1290,10 +1227,7 @@ const StringDetails = union(enum) {
 };
 
 fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails {
-    // Normal string or long string?
-    assert(!str_or_ptr.is_ptr);
-
-    const str = str_or_ptr.u.str;
+    const str = str_or_ptr.str;
     if (str.index == null_string) {
         return .null;
     } else if (str.index == empty_string) {
