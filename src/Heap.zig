@@ -265,10 +265,8 @@ pub const Body = packed union(u64) {
     },
     reference: Handle,
     cached_local_var: packed struct {
-        /// Used to invalidate `index`'s cached value, if it doesn't match
-        /// the current call frame's epoch.
-        call_epoch: u32,
         cached_index: HeapIndex,
+        padding: u32 = 0,
     },
     /// Value from lexical scope lookup. In zicl, parent scopes are immutable,
     /// so we can outright borrow this value.
