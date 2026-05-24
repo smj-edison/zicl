@@ -2422,27 +2422,27 @@ pub fn steal(handle: Handle) !Handle {
     return new_obj;
 }
 
-pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !Object.StrOrPtr {
+pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !struct { data: Object.StrOrPtr } {
     switch (handle.getStringDetails()) {
         .long => |long_str| {
             long_str.incrRefCount();
-            return .{
+            return .{ .data = .{
                 .u = .{ .ptr = SpecialString.toInt(long_str) },
                 .is_ptr = true,
-            };
+            } };
         },
         .normal => |normal_str| {
             const new_string = try dest_heap.createHeapString(@intCast(normal_str.bytes.len), normal_str.hash_handles);
             const len: Object.StrOrPtr.NormalLength = @intCast(normal_str.bytes.len);
             @memcpy(dest_heap.getHeapString(new_string, new_string + len), normal_str.bytes);
 
-            return .{
+            return .{ .data = .{
                 .u = .{ .str = .{ .index = new_string, .len = len, .hash_count = @intCast(normal_str.hash_handles.len) } },
                 .is_ptr = false,
-            };
+            } };
         },
         .null, .empty => {
-            return handle.peek().head.str;
+            return .{ .data = handle.peek().head.str };
         },
     }
 }
@@ -2498,7 +2498,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .none, .index, .integer, .float, .string, .bool, .parsed_script_command, .marked => {
             return .{
                 .head = .{
-                    .str = try dest_heap.duplicateObjString(handle),
+                    .str = (try dest_heap.duplicateObjString(handle)).data,
                     .tag = handle.tag(),
                 },
                 .body = src.body,
@@ -2535,7 +2535,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             return .{
                 .head = .{
-                    .str = try dest_heap.duplicateObjString(handle),
+                    .str = (try dest_heap.duplicateObjString(handle)).data,
                     .tag = .source,
                 },
                 .body = .{ .source = .{ .extra_data = extra_data_index } },
@@ -2553,7 +2553,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             var new_object: Object = .{
                 // TODO make sure this doesn't leak
-                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .custom_type },
+                .head = .{ .str = (try dest_heap.duplicateObjString(handle)).data, .tag = .custom_type },
                 .body = .{
                     .custom_type = .{
                         .extra_data = try dest_heap.createExtraData(),
@@ -2568,7 +2568,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .dict_sugar, .cached_local_var, .cached_lexical_var => {
             // Variable lookup is not stable between threads.
             return .{
-                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .none },
+                .head = .{ .str = (try dest_heap.duplicateObjString(handle)).data, .tag = .none },
                 .body = undefined,
             };
         },
@@ -2577,7 +2577,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
             // would cause a double-free when both copies are destroyed. The pattern string
             // is preserved; it will recompile on next use.
             return .{
-                .head = .{ .str = try dest_heap.duplicateObjString(handle), .tag = .none },
+                .head = .{ .str = (try dest_heap.duplicateObjString(handle)).data, .tag = .none },
                 .body = undefined,
             };
         },
@@ -2589,7 +2589,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
 
             return .{
                 .head = .{
-                    .str = try dest_heap.duplicateObjString(handle),
+                    .str = (try dest_heap.duplicateObjString(handle)).data,
                     .tag = .closure,
                 },
                 .body = .{ .closure = .{ .extra_data = new_extra_data } },
@@ -2601,7 +2601,7 @@ pub fn duplicateSingle(dest_heap: *Heap, handle: Handle) error{ OutOfMemory, Mul
         .hash_reference => {
             return .{
                 .head = .{
-                    .str = try dest_heap.duplicateObjString(handle),
+                    .str = (try dest_heap.duplicateObjString(handle)).data,
                     .tag = .hash_reference,
                 },
                 .body = .{ .hash_reference = src.body.hash_reference.borrow() },
@@ -2639,7 +2639,7 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
             // Duplicate head of list.
             new_head.* = .{
                 .head = .{
-                    .str = try dest_heap.duplicateObjString(src_handle),
+                    .str = (try dest_heap.duplicateObjString(src_handle)).data,
                     .tag = .list,
                 },
                 .body = .{
@@ -2673,7 +2673,7 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
 
             // Duplicate head of dict.
             {
-                const new_str = try dest_heap.duplicateObjString(src_handle);
+                const new_str = (try dest_heap.duplicateObjString(src_handle)).data;
                 errdefer new_str.deinit(dest_heap);
                 const new_extra_data = try dest_heap.createExtraData();
                 errdefer dest_heap.destroyExtraData(new_extra_data);
