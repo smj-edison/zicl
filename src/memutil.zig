@@ -98,7 +98,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 }) type {
     const FreeList = std.AutoArrayHashMapUnmanaged(u32, void);
 
-    assert(cfg.max_pool_order <= cfg.max_order);
+    assert(cfg.max_pool_order < cfg.max_order);
 
     return struct {
         gpa: Allocator,
@@ -137,15 +137,12 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             return new_alloc;
         }
 
-        // Not threadsafe.
-        pub fn deinit(self: *Self) enum { normal, leaked } {
-            // Synchronize state.
+        pub fn leakCheck(self: *Self) enum { normal, leaked } {
             self.mutex.lockUncancelable(self.io);
-            self.mutex.unlock(self.io);
+            defer self.mutex.unlock(self.io);
 
             self.drainPool();
 
-            // Leak check.
             var leaked = false;
             for (self.alloc_count) |count| {
                 if (count != 0) leaked = true;
@@ -160,31 +157,49 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                 }
             }
 
+            return if (leaked) .leaked else .normal;
+        }
+
+        /// Caller must handle pool draining and synchronization.
+        pub fn anyAllocationsPresent(self: *Self) bool {
+            var any_present = false;
+            for (self.alloc_count) |count| {
+                if (count != 0) any_present = true;
+            }
+            return any_present;
+        }
+
+        /// Not synchronized.
+        pub fn deinit(self: *Self) void {
+            // Synchronize state.
+            self.mutex.lockUncancelable(self.io);
+            self.mutex.unlock(self.io);
+
             // Deinit free lists.
             for (0..cfg.max_order) |i| {
                 self.free_lists[i].deinit(self.gpa);
             }
 
             self.* = undefined;
-
-            return if (leaked) .leaked else .normal;
         }
 
         /// Caller must have the block already allocated. `new_order` must be smaller than
         /// `current_order`.
         pub fn splitBlock(self: *Self, current_order: u5, new_order: u5) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            self.splitBlockInner(current_order, new_order);
+        }
+
+        fn splitBlockInner(self: *Self, current_order: u5, new_order: u5) void {
             assert(new_order < current_order);
 
             // 2 ** (current_order - new_order)
             const new_block_count = @as(u32, 1) << (current_order - new_order);
 
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-
             self.alloc_count[current_order] -= 1;
-            errdefer self.alloc_count[current_order] += 1;
             self.alloc_count[new_order] += new_block_count;
-            errdefer self.alloc_count[new_order] -= new_block_count;
         }
 
         pub fn allocFromAnyThread(self: *Self, requested_order: u5) !u32 {
@@ -201,20 +216,37 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
         pub fn allocFromOwningThread(self: *Self, requested_order: u5) !u32 {
             // Try allocating from the pool, if available.
-            if (self.allocOnPool(requested_order)) |pool_alloc| {
-                return pool_alloc;
-            } else |_| {}
+            return self.allocOnPool(requested_order) catch |err| switch (err) {
+                error.PoolEmpty => {
+                    // We'll refill the pool next.
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
 
-            // We still need to lock if another thread is using this allocator right now.
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return self.allocOnMainList(requested_order);
+                    const containing_order: u5 = @intCast(requested_order + std.math.log2(cfg.pool_size));
+                    const alloc = try self.allocOnMainList(containing_order);
+                    self.splitBlockInner(containing_order, requested_order);
+                    const added = @as(u32, 1) << (containing_order - requested_order);
+
+                    const step = getOrderSize(requested_order);
+                    for (0..added) |i| {
+                        self.freeOnPool(@intCast(alloc + i * step), requested_order) catch unreachable;
+                    }
+
+                    return self.allocOnPool(requested_order) catch unreachable;
+                },
+                error.TooBigForPool => {
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+
+                    return try self.allocOnMainList(requested_order);
+                },
+            };
         }
 
         pub fn freeFromOwningThread(self: *Self, index: u32, order: u5) void {
             // Try freeing onto the pool, if there's room left.
             if (order < cfg.max_pool_order) {
-                if (self.freeOnPool(index, order)) |_| {
+                if (self.freeOnPool(index, order)) {
                     return;
                 } else |_| {}
             }
@@ -236,13 +268,15 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                     self.pools_len[requested_order] -= 1;
                     return open;
                 }
-            }
 
-            return error.PoolEmpty;
+                return error.PoolEmpty;
+            } else {
+                return error.TooBigForPool;
+            }
         }
 
         /// Caller is responsible for locking the allocator.
-        fn allocOnMainList(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
+        pub fn allocOnMainList(self: *Self, requested_order: u5) error{OutOfMemory}!u32 {
             self.alloc_count[requested_order] += 1; // Allocation stats.
             errdefer self.alloc_count[requested_order] -= 1;
 
@@ -282,11 +316,11 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
         }
 
         /// Caller is responsible for locking the allocator.
-        fn freeOnMainList(self: *Self, index: u32, order: u5) void {
+        pub fn freeOnMainList(self: *Self, index: u32, order: u5) void {
             self.alloc_count[order] -= 1; // Allocation stats.
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
-            const freed_buddy = buddyOf(index, getOrderSize(order));
+            const freed_buddy = buddyOfOrder(index, order);
             var buddy_free_list_index: u32 = blk: {
                 if (self.free_lists[order].getIndex(freed_buddy)) |buddy_index| {
                     break :blk @intCast(buddy_index); // Found buddy.
@@ -333,8 +367,8 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             }
         }
 
-        /// Caller is responsible for locking the allocator.
-        fn drainPool(self: *Self) void {
+        /// Caller is responsible for synchronization.
+        pub fn drainPool(self: *Self) void {
             for (&self.pools, &self.pools_len, 0..) |pool, *pool_len, order| {
                 for (pool[0..pool_len.*]) |to_free| {
                     self.freeOnMainList(to_free, @intCast(order));
@@ -361,7 +395,38 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             }
         }
 
-        fn print_buddy_state(self: Self, beginning: []const u8) void {
+        pub fn forEachAllocated(
+            self: *Self,
+            context: anytype,
+        ) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.drainPool();
+            _ = self.forEachAllocatedInner(cfg.max_order - 1, 0, context);
+        }
+
+        /// Returns true if this subtree contains any free block. This function is not synchronized.
+        fn forEachAllocatedInner(
+            self: *Self,
+            order: u5,
+            index: u32,
+            context: anytype,
+        ) bool {
+            if (self.free_lists[order].getIndex(index) != null) return true;
+
+            const order_allocated_as = context.getOrder(index);
+            if (order == order_allocated_as) {
+                context.onAllocated(index, order);
+                return false;
+            }
+
+            const buddy = index + getOrderSize(order - 1);
+            const left_has_free = self.forEachAllocatedInner(order - 1, index, context);
+            const right_has_free = self.forEachAllocatedInner(order - 1, buddy, context);
+            return left_has_free or right_has_free;
+        }
+
+        fn printBuddyState(self: Self, beginning: []const u8) void {
             ioutil.debug("{s}", .{beginning});
             for (0..self.free_lists.len) |order| {
                 ioutil.debug("Order: {} ({any}), ", .{ order, self.free_lists[order].items });
@@ -385,7 +450,10 @@ test "buddy allocator" {
     const ta = std.testing.allocator;
 
     var alloc = try TestAlloc.init(ta, testing.io, 16);
-    defer if (alloc.deinit() == .leaked) @panic("Found leaks");
+    defer {
+        if (alloc.leakCheck() == .leaked) @panic("Found leaks");
+        alloc.deinit();
+    }
 
     try expectEqual(0, try alloc.allocFromAnyThread(0));
     try expectEqual(1, try alloc.allocFromAnyThread(0));
@@ -422,7 +490,10 @@ const BlockTestAlloc = BuddyUnmanaged(.{
 });
 test "block splitting" {
     var alloc = try BlockTestAlloc.init(testing.allocator, testing.io, 16);
-    defer if (alloc.deinit() == .leaked) @panic("Found leaks");
+    defer {
+        if (alloc.leakCheck() == .leaked) @panic("Found leaks");
+        alloc.deinit();
+    }
 
     // Make sure enough space was allocated on the free list for any split blocks.
     for (0..8) |_| {

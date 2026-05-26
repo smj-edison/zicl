@@ -325,3 +325,27 @@ export fn Zicl_DecrSignalDepth(interp: *Interp) callconv(.c) void {
 export fn Zicl_GetSigmask(interp: *Interp) callconv(.c) u64 {
     return interp.signal;
 }
+
+// Object debugging functions.
+
+export fn Zicl_Tag(handle: Handle) callconv(.c) u8 {
+    return @intFromEnum(handle.tag());
+}
+
+export fn Zicl_Peek(handle: Handle) callconv(.c) *Heap.Object {
+    return handle.peek();
+}
+
+export fn Zicl_RefCount(handle: Handle) callconv(.c) u32 {
+    const heap = handle.getHeap();
+    const ptr = &heap.objects.items(.ref_count)[handle.index];
+    if (heap.getLocalMetadata(handle.index).cross_thread) {
+        return @atomicLoad(u32, ptr, .monotonic);
+    } else {
+        return ptr.*;
+    }
+}
+
+export fn Zicl_RefCountPtr(handle: Handle) callconv(.c) *u32 {
+    return &handle.getHeap().objects.items(.ref_count)[handle.index];
+}

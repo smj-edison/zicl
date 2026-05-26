@@ -28,7 +28,7 @@ pub const empty_object_idx: u32 = 1;
 
 pub const HeapSettings = struct {
     /// Maximum of `1 << heap_order` items.
-    object_heap_order: u6 = 16,
+    object_heap_order: u6 = 24,
     /// Maximum of `1 << heap_order` bytes for all strings.
     string_heap_order: u6 = 28,
     /// Maximum number of custom types.
@@ -43,7 +43,7 @@ pub const HeapSettings = struct {
 const cfg: HeapSettings = .{};
 
 threadlocal var debugging_buffer: [16 * 1024 * 1024]u8 = undefined;
-threadlocal var debugging_gpa: if (builtin.mode == .Debug) memutil.RingBufferAllocator else void = undefined;
+threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 threadlocal var debug_gpa: Allocator = undefined;
 /// Set this right before doing an operation that may cause a panic. The runtime will dump its
@@ -258,6 +258,7 @@ pub const HashRegistry = struct {
 
 const Heap = @This();
 pub threadlocal var local_heap: *Heap = undefined;
+export threadlocal var obj_ptr_for_gdb: [*]Object = undefined;
 
 const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
 const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
@@ -289,13 +290,13 @@ pub const HeapId = u16;
 const ObjectTracker = memutil.BuddyUnmanaged(.{
     .max_order = cfg.object_heap_order,
     .max_pool_order = 6,
-    .pool_size = 64,
+    .pool_size = 256,
 });
 const ObjectList = std.MultiArrayList(ObjectAndMetadata);
 const StringTracker = memutil.BuddyUnmanaged(.{
     .max_order = cfg.string_heap_order,
     .max_pool_order = 10,
-    .pool_size = 64,
+    .pool_size = 256,
 });
 const StringList = std.ArrayList(u8);
 
@@ -1355,24 +1356,10 @@ pub const Handle = packed struct(HandleBacking) {
         return handle.getHeap().getExtraData(handle.peek().body.regexp.extra_data).regexp;
     }
 
-    threadlocal var recursion_depth: usize = 0;
     const empty_string_value = "";
     /// This returns a temporary string. Whenever the object is mutated, it
     /// may become invalid. Guaranteed to be valid, barring OOM.
     pub fn getString(handle: Handle) error{OutOfMemory}![:0]const u8 {
-        recursion_depth += 1;
-        defer recursion_depth -= 1;
-
-        if (recursion_depth > 50) {
-            last_touched = handle;
-            std.debug.panic("Infinite recursion in getString, handle: {any}, type: {}, ref: {any}, body ptr: {*}", .{
-                handle,
-                handle.tag(),
-                handle.peek().body.reference,
-                &handle.peek().body,
-            });
-        }
-
         const obj = handle.peek();
 
         switch (handle.getStringDetails()) {
@@ -1805,7 +1792,7 @@ fn heapBackingAlloc() Allocator {
 }
 
 fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
-    const interned = try heap.createObject();
+    const interned = try heap.createIndividualObject();
     errdefer freeObjectBackingInner(interned);
     const cast_len: Object.StrOrPtr.NormalLength = @intCast(str.len);
     const str_index = try heap.createHeapString(cast_len, &.{});
@@ -1863,9 +1850,12 @@ pub fn init(heap: *Heap) !void {
 
     // Init objects.
     heap.object_tracking = try .init(global_gpa, global_io, cfg.object_heap_order);
-    errdefer if (heap.object_tracking.deinit() == .leaked) {
-        ioutil.debug("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
-    };
+    errdefer {
+        if (heap.object_tracking.leakCheck() == .leaked) {
+            ioutil.debug("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
+        }
+        heap.object_tracking.deinit();
+    }
 
     heap.objects = .empty;
     if (options.threading) {
@@ -1890,9 +1880,12 @@ pub fn init(heap: *Heap) !void {
 
     // Init strings.
     heap.string_tracking = try .init(global_gpa, global_io, cfg.string_heap_order);
-    errdefer if (heap.string_tracking.deinit() == .leaked) {
-        ioutil.debug("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
-    };
+    errdefer {
+        if (heap.string_tracking.leakCheck() == .leaked) {
+            ioutil.debug("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
+        }
+        heap.string_tracking.deinit();
+    }
 
     heap.strings = .empty;
     if (options.threading) {
@@ -1927,13 +1920,13 @@ pub fn init(heap: *Heap) !void {
     // Done initializing heap fields, so now we'll create all the specialty objects.
 
     // Null string is guaranteed to have index 0.
-    const null_string_idx = try heap.string_tracking.allocFromOwningThread(0);
+    const null_string_idx = try heap.string_tracking.allocOnMainList(0);
     assert(null_string_idx == null_string);
-    errdefer heap.string_tracking.freeFromOwningThread(null_string_idx, 0);
+    errdefer heap.string_tracking.freeOnMainList(null_string_idx, 0);
     // Empty string is guaranteed to have index 1.
-    const empty_string_idx = try heap.string_tracking.allocFromOwningThread(0);
+    const empty_string_idx = try heap.string_tracking.allocOnMainList(0);
     assert(empty_string_idx == empty_string);
-    errdefer heap.string_tracking.freeFromOwningThread(empty_string_idx, 0);
+    errdefer heap.string_tracking.freeOnMainList(empty_string_idx, 0);
 
     // This is to remember to update this section whenever the special
     // objects change.
@@ -1941,11 +1934,11 @@ pub fn init(heap: *Heap) !void {
 
     // Specialty objects.
     // Null object is guaranteed to have index 0.
-    const null_object = try heap.createObject();
+    const null_object = try heap.createIndividualObject();
     assert(null_object.index == null_object_idx);
     errdefer freeObjectBackingInner(null_object);
     // Empty object is guaranteed to have index 1.
-    const empty_object = try heap.createObject();
+    const empty_object = try heap.createIndividualObject();
     assert(empty_object.index == empty_object_idx);
     empty_object.peek().head.str = Object.empty_string;
     errdefer freeObjectBackingInner(empty_object);
@@ -2006,23 +1999,44 @@ pub fn deinit(heap: *Heap) void {
     heap.parsed_closures.deinit(global_gpa);
     heap.parsed_substs.deinit(global_gpa);
 
-    for ((special_object_count + interned_string_count)..heap.objects.len) |i| {
-        const metadata = heap.objects.get(i).metadata;
-        if (metadata.in_use) {
-            // We don't use free object here, as it may cause a double-free when
-            // freeing recursive structures. For example, if there was a list with
-            // two items, we'll free the list (first free of items), then free
-            // the items individually (second free).
-            invalidateBothInner(heap.getHandle(@intCast(i)));
-        }
+    const did_leak = heap.didLeak();
+    if (did_leak) {
+        std.debug.panic("Leaked!", .{});
+        // Clean up.
+        const FreeContext = struct {
+            heap: *Heap,
+            pub fn getOrder(self: @This(), index: u32) u5 {
+                return self.heap.getLocalMetadata(index).order;
+            }
+            pub fn onAllocated(context: @This(), index: u32, order: u5) void {
+                if (index < special_object_count + interned_string_count) return;
+                for (index..(index + memutil.getOrderSize(order))) |object_idx| {
+                    // We don't free the object here, instead we opt to directly invalidate it.
+                    // That way we don't tamper with the allocator state while it's iterating.
+                    const object = context.heap.getLocalObject(@intCast(object_idx));
+                    switch (object.head.tag) {
+                        .list, .reference => {
+                            // Don't do anything, so we don't accidentally free
+                            // another object and tamper with the allocator state.
+                        },
+                        .dict => {
+                            // Similar to above.
+                            context.heap.destroyExtraData(object.body.dict.extra_data);
+                        },
+                        else => {
+                            object.deinitBodySingle(context.heap);
+                            invalidateBothInner(context.heap.getHandle(@intCast(object_idx)));
+                        },
+                    }
+                }
+            }
+        };
+        heap.object_tracking.forEachAllocated(FreeContext{ .heap = heap });
     }
 
-    for (special_object_count..(special_object_count + interned_string_count)) |i| {
-        // Need to free these objects directly, since they're not normally allowed
-        // to be mutated.
-        const interned = heap.getHandle(@intCast(i));
-        interned.peek().head.str.deinit(heap);
-        freeObjectBackingInner(interned);
+    // Clean up interned strings.
+    for (special_object_count..(special_object_count + interned_string_count)) |object_idx| {
+        invalidateBothInner(heap.getHandle(@intCast(object_idx)));
     }
 
     // Clean up the OOM error dict.
@@ -2030,11 +2044,11 @@ pub fn deinit(heap: *Heap) void {
 
     // Be sure to free the specialty objects and strings.
     assert(special_object_count == 2);
-    heap.object_tracking.freeFromOwningThread(0, 0);
-    heap.object_tracking.freeFromOwningThread(1, 0);
+    heap.object_tracking.freeOnMainList(0, 0);
+    heap.object_tracking.freeOnMainList(1, 0);
     assert(special_string_count == 2);
-    heap.string_tracking.freeFromOwningThread(0, 0);
-    heap.string_tracking.freeFromOwningThread(1, 0);
+    heap.string_tracking.freeOnMainList(0, 0);
+    heap.string_tracking.freeOnMainList(1, 0);
 
     if (options.threading) {
         memutil.vmemUnmap(@alignCast(heap.strings.items));
@@ -2046,8 +2060,8 @@ pub fn deinit(heap: *Heap) void {
         heap.objects.deinit(global_gpa);
     }
 
-    if (heap.object_tracking.deinit() == .leaked) @panic("Heap object leaks when deiniting");
-    if (heap.string_tracking.deinit() == .leaked) @panic("Heap string leaks when deiniting");
+    heap.object_tracking.deinit();
+    heap.string_tracking.deinit();
 
     heap.extra.deinit(global_gpa);
     heap.* = undefined;
@@ -2088,7 +2102,15 @@ pub fn internedStringRef(heap: *Heap, string: InternedString) Heap.Object {
 }
 
 pub fn createObject(self: *Heap) !Handle {
-    const index = try self.createObjects(1);
+    const index = try self.createObjects(1, false);
+    return .{
+        .index = index,
+        .heap = self.heapId(),
+    };
+}
+
+fn createIndividualObject(self: *Heap) !Handle {
+    const index = try self.createObjects(1, true);
     return .{
         .index = index,
         .heap = self.heapId(),
@@ -2115,10 +2137,10 @@ pub fn splitAlloc(self: *Heap, index: u32, new_order: u5) void {
 }
 
 test "split allocations" {
-    defer Heap.testFinish();
     var heap = try Heap.testStart(testing.allocator, testing.io);
+    defer Heap.testFinish();
 
-    const index = try heap.createObjects(8);
+    const index = try heap.createObjects(8, true);
     heap.splitAlloc(index, 1);
 
     for (index..(index + 8)) |i| {
@@ -2132,12 +2154,16 @@ test "split allocations" {
 
 /// `createObjects` does not initialize objects, but does initialize
 /// reference counts.
-pub fn createObjects(self: *Heap, count: u32) !u32 {
+pub fn createObjects(self: *Heap, count: u32, force_individiual: bool) !u32 {
     const order = memutil.getOrder(count);
     const aligned_count = @as(u32, 1) << order;
 
     const index: u32 = blk: {
-        if (self == local_heap) {
+        if (force_individiual) {
+            self.object_tracking.mutex.lockUncancelable(global_io);
+            defer self.object_tracking.mutex.unlock(global_io);
+            break :blk try self.object_tracking.allocOnMainList(order);
+        } else if (self == local_heap) {
             break :blk try self.object_tracking.allocFromOwningThread(order);
         } else {
             break :blk try self.object_tracking.allocFromAnyThread(order);
@@ -2147,15 +2173,12 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     const end = index + aligned_count;
 
     // Make sure object list has space for new objects.
-    if (self.objects.len < index + aligned_count) {
-        const start_of_new = self.objects.len;
-        if (!options.threading) try self.objects.resize(heapBackingAlloc(), index + aligned_count);
-        @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
-            .order = 31,
-            .cross_thread = false,
-            .in_use = false,
-            .hash_registered = false,
-        });
+    if (self.objects.len < end) {
+        if (options.threading) {
+            return error.OutOfMemory;
+        } else {
+            try self.objects.resize(heapBackingAlloc(), end);
+        }
     }
 
     self.getHandle(index).trace(
@@ -2177,28 +2200,16 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
     // Initialize all as empty objects.
     @memset(self.objectSlice(index, end), .{
-        .head = .{
-            .str = Object.null_string,
-            .tag = .none,
-        },
-        .body = .{
-            .integer = 0,
-        },
+        .head = .{ .tag = .none },
+        .body = undefined,
     });
 
     // Initialize ref counts.
     @memset(self.objects.items(.ref_count)[index..end], 1);
 
     // Initialize metadata.
-    self.objects.items(.metadata)[index] = .{
-        .order = order,
-        .cross_thread = false,
-        .in_use = true,
-        .hash_registered = false,
-    };
-
-    if (aligned_count > 1) @memset(
-        self.objects.items(.metadata)[(index + 1)..end],
+    @memset(
+        self.objects.items(.metadata)[index..end],
         .{
             .order = order,
             .cross_thread = false,
@@ -2620,7 +2631,7 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
             const old_body = src.body.list;
             const old_start = src_handle.index + 1;
 
-            const new_list_idx = try dest_heap.createObjects(1 + old_body.len);
+            const new_list_idx = try dest_heap.createObjects(1 + old_body.len, false);
             errdefer {
                 // Free elements before freeing the head, as the head could
                 // be swapped out if freed too early.
@@ -2665,7 +2676,7 @@ pub fn duplicate(dest_heap: *Heap, src_handle: Handle) error{OutOfMemory}!Handle
             const old_len = src.body.dict.len;
             const old_start = src_handle.index + 1;
 
-            const new_dict_idx = try dest_heap.createObjects(1 + old_len);
+            const new_dict_idx = try dest_heap.createObjects(1 + old_len, false);
             errdefer dest_heap.getHandle(new_dict_idx).decrRefCount();
             const new_head = dest_heap.getHandle(new_dict_idx);
             const new_start = new_dict_idx + 1;
@@ -3268,7 +3279,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
 }
 
 pub fn initLocalHeap() !void {
-    if (builtin.mode == .Debug) {
+    if (options.trace_mem) {
         debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer[0..]);
         debug_gpa = debugging_gpa.allocator();
     }
@@ -3295,6 +3306,7 @@ pub fn initLocalHeap() !void {
         const new_heap = &heaps[slot_index];
         try new_heap.init();
         local_heap = new_heap;
+        obj_ptr_for_gdb = new_heap.objects.items(.object).ptr;
         errdefer new_heap.deinit();
     } else {
         return error.OutOfMemory;
@@ -3542,61 +3554,40 @@ pub fn testFinish() void {
     Heap.deinitAll();
 }
 
-pub fn leakCheck(heap: *Heap) !bool {
-    return leakCheckWithMode(heap, .dot_graph);
+pub fn didLeak(heap: *Heap) bool {
+    // Synchronize the object and string tracking.
+    heap.object_tracking.mutex.lockUncancelable(heap.object_tracking.io);
+    heap.object_tracking.mutex.unlock(heap.object_tracking.io);
+    heap.string_tracking.mutex.lockUncancelable(heap.string_tracking.io);
+    heap.string_tracking.mutex.unlock(heap.string_tracking.io);
+
+    for (heap.object_tracking.alloc_count[1..]) |count| {
+        if (count != 0) return false;
+    }
+    return heap.object_tracking.alloc_count[0] == special_object_count + interned_string_count;
 }
 
-pub fn leakCheckWithMode(heap: *Heap, mode: enum { normal, dot_graph }) !bool {
+pub fn leakCheck(heap: *Heap) !bool {
     // Make sure to free any parsed scripts and system fixtures before scanning,
     // as they're allowed to leak (they have references to heap objects, causing false positives).
     heap.clearParsedScripts();
     heap.deinitOomErrorOptions();
 
-    // Go through once to print the summary, then print each individual trace.
-    const skip_count = special_object_count + interned_string_count;
-    for (heap.objects.items(.metadata)[skip_count..]) |metadata| {
-        if (metadata.in_use) break;
-    } else return false;
+    if (!heap.didLeak()) return false;
 
-    switch (mode) {
-        .normal => leakDumpNormal(heap, skip_count),
-        .dot_graph => {
-            leakDumpNormal(heap, skip_count);
-            try leakDumpDotGraph(heap, skip_count);
-        },
-    }
+    // Go through once to print the summary, then print each individual trace.
+    const start_at = special_object_count + interned_string_count;
+    leakDumpNormal(heap, start_at);
+    try leakDumpDotGraph(heap, start_at);
 
     return true;
 }
 
-fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
-    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
-        if (metadata.in_use) {
-            const handle = heap.getHandle(@intCast(i));
-            const str = handle.getString();
-            if (str) |val| {
-                ioutil.debug("Leaked {}, index {}, order: {}, ref count {}, \"{s}\"\n", .{
-                    handle.tag(),
-                    i,
-                    handle.getMetadata().order,
-                    handle.refCount(),
-                    val,
-                });
-            } else |_| {
-                ioutil.debug("Leaked {}, index {}, order: {}, ref count {}, <oom>\n", .{
-                    handle.tag(),
-                    i,
-                    handle.getMetadata().order,
-                    handle.refCount(),
-                });
-            }
-        }
-    }
-
+fn leakDumpNormal(heap: *Heap, start_at: usize) void {
     if (options.trace_mem) {
         ioutil.debug("\n===== Leak details =====\n\n", .{});
 
-        for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+        for (heap.objects.items(.metadata)[start_at..], start_at..) |metadata, i| {
             if (metadata.in_use) {
                 const handle = heap.getHandle(@intCast(i));
                 if (handle.getString()) |val| {
@@ -3625,7 +3616,7 @@ fn leakDumpNormal(heap: *Heap, skip_count: usize) void {
 }
 
 // Dot rendering is 95% LLM generated.
-fn escapeDotString(str: []const u8) !void {
+fn escapeDotString(str: []const u8) void {
     for (str) |c| switch (c) {
         '"', '\\' => ioutil.debug("\\{c}", .{c}),
         '\n' => ioutil.debug("\\n", .{}),
@@ -3653,15 +3644,15 @@ fn getTagColor(tag: Tag) []const u8 {
     };
 }
 
-fn renderDotNodeLabel(handle: Handle, index: u32, max_str_len: u32) !void {
-    const str = handle.getString() catch "oom";
+fn renderDotNodeLabel(handle: Handle, index: u32, max_str_len: u32) void {
+    const str = handle.getString() catch "<oom>";
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
     ioutil.debug("idx: {} | ", .{index});
     ioutil.debug("{s} | ", .{@tagName(handle.tag())});
     ioutil.debug("rc: {} | ", .{handle.refCount()});
     ioutil.debug("\\\"", .{});
-    try escapeDotString(truncated_str);
+    escapeDotString(truncated_str);
     if (str.len > max_str_len) ioutil.debug("...", .{});
     ioutil.debug("\\\"", .{});
 }
@@ -3679,14 +3670,14 @@ fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
         else => unreachable,
     };
 
-    const str = handle.getString() catch "oom";
+    const str = handle.getString() catch "<oom>";
     const max_str_len = 40;
     const truncated_str = if (str.len > max_str_len) str[0..max_str_len] else str;
 
     // Subgraph header.
     ioutil.debug("  subgraph cluster_{} {{\n", .{index});
     ioutil.debug("    label=\"{s} obj{} (rc:{}, {}/{} used): ", .{ @tagName(handle.tag()), index, handle.refCount(), used_len, allocated_len });
-    try escapeDotString(truncated_str);
+    escapeDotString(truncated_str);
     if (str.len > max_str_len) ioutil.debug("...", .{});
     ioutil.debug("\";\n", .{});
     ioutil.debug("    style=outlined;\n", .{});
@@ -3704,7 +3695,7 @@ fn renderCollectionSubgraph(heap: *Heap, handle: Handle, index: u32) !void {
         const item_handle = heap.getHandle(@intCast(item_idx));
 
         ioutil.debug("    obj{} [label=\"{{", .{item_idx});
-        try renderDotNodeLabel(item_handle, @intCast(item_idx), max_str_len);
+        renderDotNodeLabel(item_handle, @intCast(item_idx), max_str_len);
         ioutil.debug("}}\", fillcolor=\"{s}\"];\n", .{getTagColor(item_handle.tag())});
     }
 
@@ -3763,14 +3754,14 @@ fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
     }
 }
 
-fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
+fn leakDumpDotGraph(heap: *Heap, start_at: usize) !void {
     ioutil.debug("digraph LeakGraph {{\n", .{});
     ioutil.debug("  rankdir=LR;\n", .{});
     ioutil.debug("  node [shape=record];\n", .{});
     ioutil.debug("  compound=true;\n\n", .{});
 
     // First pass: output collections as subgraphs with their items grouped.
-    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+    for (heap.objects.items(.metadata)[start_at..], start_at..) |metadata, i| {
         if (!metadata.in_use) continue;
 
         const handle = heap.getHandle(@intCast(i));
@@ -3781,7 +3772,7 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
     }
 
     // Second pass: output standalone nodes (not part of any collection).
-    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+    for (heap.objects.items(.metadata)[start_at..], start_at..) |metadata, i| {
         if (!metadata.in_use) continue;
 
         const handle = heap.getHandle(@intCast(i));
@@ -3791,14 +3782,14 @@ fn leakDumpDotGraph(heap: *Heap, skip_count: usize) !void {
         if (!handle.isAllocHead()) continue;
 
         ioutil.debug("  obj{} [label=\"{{", .{i});
-        try renderDotNodeLabel(handle, @intCast(i), 60);
+        renderDotNodeLabel(handle, @intCast(i), 60);
         ioutil.debug("}}\", fillcolor=\"{s}\", style=filled];\n", .{getTagColor(handle.tag())});
     }
 
     ioutil.debug("\n", .{});
 
     // Third pass: output all edges.
-    for (heap.objects.items(.metadata)[skip_count..], skip_count..) |metadata, i| {
+    for (heap.objects.items(.metadata)[start_at..], start_at..) |metadata, i| {
         if (!metadata.in_use) continue;
         try renderObjectEdges(heap, heap.getHandle(@intCast(i)), @intCast(i));
     }
@@ -3821,6 +3812,13 @@ fn printLastTouchedTrace(terminal: std.Io.Terminal) !void {
     try terminal.setColor(.reset);
     if (last_touched) |val| {
         try w.writeAll("== Last touched details ==\n\n");
+
+        if (val.heap >= @atomicLoad(usize, &state.next_open_heap, .monotonic) or
+            val.index >= val.getHeap().objects.len)
+        {
+            try w.print("Corrupt last touched: {any}\n\n", .{val});
+            return;
+        }
 
         const trace = val.getHeap().objects.get(val.index).trace;
         const end = @min(trace.index, trace.addrs.len);

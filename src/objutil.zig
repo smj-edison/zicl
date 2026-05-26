@@ -1035,7 +1035,7 @@ pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemor
 
 pub fn newListWithCapacity(capacity: u32) !Handle {
     // `1 +` to make space for the list's head
-    const list_index = try Heap.local_heap.createObjects(1 + capacity);
+    const list_index = try Heap.local_heap.createObjects(1 + capacity, false);
     const list_head = Heap.local_heap.getLocalObject(list_index);
 
     list_head.* = .{
@@ -1290,81 +1290,15 @@ fn setCollectionLengthInner(original: Handle, new_len: u32) !OptionalHandle {
     errdefer new_handle.decrRefCount();
     const new_items = collectionItems(new_handle, new_len);
 
-    if (original.canMutate()) {
-        var found_shared_items = false;
+    // If the collection is shared, we need to duplicate all the items.
+    for (0..current_len, new_items[0..current_len]) |i, *new_item| {
+        new_item.* = collectionItemFollowRefs(original, @intCast(i), new_len).dupOrRef();
+    }
 
-        // If the collection isn't shared, we can move the objects over to the new
-        // collection without any duplication.
-        for (new_items[0..current_len], 0..) |*new_item, i| {
-            const old_item = collectionItemNoFollow(original, @intCast(i), current_len);
-            // However, if an item within the list was shared, we can't move it, we instead have to reference
-            // it. (Why not use `item_handle.reference()`? Because that would create one too many references
-            // as the list already has one ref count for owning the item.)
-            if (old_item.isShared()) {
-                found_shared_items = true;
-                new_item.* = old_item.referenceOwning();
-            } else {
-                new_item.* = old_item.peek().*;
-                // Be sure to "zero" out the old item after we steal it.
-                old_item.peek().* = .{
-                    .head = .{
-                        .str = Heap.Object.null_string,
-                        .tag = .none,
-                    },
-                    .body = undefined,
-                };
-                old_item.trace("Object transferred", .{});
-            }
-        }
-
-        if (found_shared_items) {
-            // Because we found shared items, we can't free the backing directly, as that would
-            // free an item that someone else is currently referencing. Instead, we'll split the
-            // allocation, and free all non-shared objects.
-            original.getHeap().splitAlloc(original.index, 0);
-
-            for (0..current_len) |i| {
-                const item_handle: Handle = collectionItemNoFollow(original, @intCast(i), current_len);
-
-                // Only free the backing of non-shared objects, so we don't release the backing of a shared item.
-                // Why only a backing free? Because the non-shared objectes were moved to the new collection.
-                if (!item_handle.isShared()) {
-                    Heap.freeObjectBacking(item_handle);
-                }
-            }
-        }
-
-        // We don't free the collection here, since that would violate the caller's expectations.
-        // But, we still don't want anyone using this incredibly broken object, so we'll set
-        // it to .invalid.
-
-        // We don't invalidate the old body, as that would double-free the collection items.
-        // Hence, we have to manually handle freeing the old table.
-        if (original.tag() == .dict) {
-            dictInvalidateTable(original);
-            original.getHeap().destroyExtraData(original.peek().body.dict.extra_data);
-        }
-        original.invalidateString();
-        original.trace("Invalidated old dict", .{});
-        original.peek().head.tag = .invalid;
-        original.peek().body = undefined;
-
-        switch (new_handle.tag()) {
-            .dict => new_handle.peek().body.dict.len = new_len,
-            .list => new_handle.peek().body.list.len = new_len,
-            else => unreachable,
-        }
-    } else {
-        // If the collection is shared, we need to duplicate all the items.
-        for (0..current_len, new_items[0..current_len]) |i, *new_item| {
-            new_item.* = collectionItemFollowRefs(original, @intCast(i), new_len).dupOrRef();
-        }
-
-        switch (new_handle.tag()) {
-            .dict => new_handle.peek().body.dict.len = new_len,
-            .list => new_handle.peek().body.list.len = new_len,
-            else => unreachable,
-        }
+    switch (new_handle.tag()) {
+        .dict => new_handle.peek().body.dict.len = new_len,
+        .list => new_handle.peek().body.list.len = new_len,
+        else => unreachable,
     }
 
     return new_handle.toOptional();
@@ -1628,7 +1562,7 @@ pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
     // `1 +` to make space for the dict's head.
-    const dict_index = try heap.createObjects(1 + len);
+    const dict_index = try heap.createObjects(1 + len, false);
     errdefer Heap.freeObjectBacking(heap.getHandle(dict_index));
     const dict_metadata = try heap.createExtraData();
     errdefer heap.destroyExtraData(dict_metadata);

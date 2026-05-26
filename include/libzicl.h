@@ -73,3 +73,38 @@ void Zicl_DecrSignalDepth(Zicl_Interp *interp);
 uint64_t Zicl_GetSigmask(Zicl_Interp *interp);
 Zicl_Handle Zicl_GetScriptBeingEvaluated(Zicl_Interp *interp);
 
+/* Object debugging. */
+typedef enum {
+    ZICL_TAG_NONE = 0,
+    ZICL_TAG_INVALID,
+    ZICL_TAG_MARKED,
+    ZICL_TAG_INDEX,
+    ZICL_TAG_INTEGER,
+    ZICL_TAG_FLOAT,
+    ZICL_TAG_BOOL,
+    ZICL_TAG_STRING,
+    ZICL_TAG_SOURCE,
+    ZICL_TAG_LIST,
+    ZICL_TAG_DICT,
+    ZICL_TAG_DICT_SUGAR,
+    ZICL_TAG_PARSED_SCRIPT_COMMAND,
+    ZICL_TAG_REFERENCE,
+    ZICL_TAG_CACHED_LOCAL_VAR,
+    ZICL_TAG_CACHED_LEXICAL_VAR,
+    ZICL_TAG_UPVAR_LINK,
+    ZICL_TAG_CLOSURE,
+    ZICL_TAG_CUSTOM_TYPE,
+    ZICL_TAG_HASH_REFERENCE,
+    ZICL_TAG_REGEXP,
+} Zicl_Tag_Type;
+
+typedef struct Zicl_Object {
+    uint64_t head;
+    uint64_t body;
+} Zicl_Object;
+
+Zicl_Tag_Type Zicl_Tag(Zicl_Handle handle);
+Zicl_Object *Zicl_Peek(Zicl_Handle handle);
+uint32_t Zicl_RefCount(Zicl_Handle handle);
+uint32_t *Zicl_RefCountPtr(Zicl_Handle handle);
+
