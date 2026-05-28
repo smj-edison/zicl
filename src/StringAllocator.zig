@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const mem = std.mem;
+const memutil = @import("memutil.zig");
 const assert = std.debug.assert;
 
 threadlocal var theap: Heap = undefined;
@@ -337,7 +338,7 @@ pub const Heap = struct {
         var initialized: usize = 0;
         errdefer for (0..initialized) |i| backing_alloc.free(new_pages[i]);
         while (initialized < page_bins) : (initialized += 1) {
-            new_pages[initialized] = try backing_alloc.alloc(Page, max_pages);
+            new_pages[initialized] = try memutil.vmemMapItems(Page, max_pages);
         }
 
         // Shrink slices to len=0; the backing capacity stays at max_pages.
@@ -373,7 +374,7 @@ pub const Heap = struct {
                 heap.backing_alloc.free(heap.pages[i].ptr[j].blocks);
             }
             // Free the page array itself.
-            heap.backing_alloc.free(heap.pages[i].ptr[0..heap.max_pages]);
+            memutil.vmemUnmapItems(Page, @alignCast(heap.pages[i].ptr[0..heap.max_pages]));
         }
     }
 
