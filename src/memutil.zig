@@ -183,15 +183,15 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
             self.* = undefined;
         }
 
-        /// Caller must have the block already allocated. `new_order` must be smaller than
-        /// `current_order`.
-        pub fn splitBlock(self: *Self, current_order: u5, new_order: u5) void {
+        /// Caller must have the block already allocated.
+        pub fn splitBlockIntoIndividual(self: *Self, current_order: u5) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            self.splitBlockInner(current_order, new_order);
+            self.splitBlockInner(current_order, 0);
         }
 
+        /// Caller must make sure there's enough room on the free list for the split objects.
         fn splitBlockInner(self: *Self, current_order: u5, new_order: u5) void {
             assert(new_order < current_order);
 
@@ -229,7 +229,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
 
                     const step = getOrderSize(requested_order);
                     for (0..added) |i| {
-                        self.freeOnPool(@intCast(alloc + i * step), requested_order) catch unreachable;
+                        self.addToPoolFreelist(@intCast(alloc + i * step), requested_order) catch unreachable;
                     }
 
                     return self.allocOnPool(requested_order) catch unreachable;
@@ -246,9 +246,13 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
         pub fn freeFromOwningThread(self: *Self, index: u32, order: u5) void {
             // Try freeing onto the pool, if there's room left.
             if (order < cfg.max_pool_order) {
-                if (self.freeOnPool(index, order)) {
+                if (self.addToPoolFreelist(index, order)) {
                     return;
-                } else |_| {}
+                } else |err| switch (err) {
+                    error.PoolFull => {
+                        // Fall through.
+                    },
+                }
             }
 
             // We should transfer the pool over to the main list, since there wasn't any room
@@ -306,7 +310,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
         /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
         /// small objects is fast. We also don't coalesce on the pool, so this also prevents
         /// churning where blocks are split and merged constantly. Not threadsafe.
-        fn freeOnPool(self: *Self, index: u32, order: u5) !void {
+        fn addToPoolFreelist(self: *Self, index: u32, order: u5) !void {
             assert(order < cfg.max_pool_order);
 
             if (self.pools_len[order] >= cfg.pool_size) return error.PoolFull;
@@ -391,7 +395,7 @@ pub fn BuddyUnmanaged(comptime cfg: struct {
                 // to split this block in the future.
                 const parent_free_list_size = free_list_size;
                 free_list_size = (parent_free_list_size * 2) + self.alloc_count[current_order] / 2 + 1;
-                try self.free_lists[current_order].ensureTotalCapacity(self.gpa, free_list_size);
+                if (current_order == 0) try self.free_lists[current_order].ensureTotalCapacity(self.gpa, free_list_size);
             }
         }
 
@@ -498,7 +502,7 @@ test "block splitting" {
     // Make sure enough space was allocated on the free list for any split blocks.
     for (0..8) |_| {
         _ = try alloc.allocFromAnyThread(4);
-        alloc.splitBlock(4, 0);
+        alloc.splitBlockIntoIndividual(4);
     }
 
     var block_i: u32 = 0;

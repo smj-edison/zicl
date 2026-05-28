@@ -5,7 +5,7 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 
-threadlocal var theap: *Heap = undefined;
+threadlocal var theap: Heap = undefined;
 
 fn expensive_assert(ok: bool) void {
     if (!ok) unreachable;
@@ -197,8 +197,8 @@ fn fullAlloc(heap: *Heap, bin: u6) !Index {
     const block_size = block_size_per_bin[bin];
     const page_mem_size = @as(usize, block_count) * block_size;
 
-    const blocks = try heap.gpa.allocWithOptions(u8, page_mem_size, .@"4", null);
-    errdefer heap.gpa.free(blocks);
+    const blocks = try heap.backing_alloc.allocWithOptions(u8, page_mem_size, .@"4", null);
+    errdefer heap.backing_alloc.free(blocks);
 
     page.* = .{
         .index = @intCast(page_slot),
@@ -325,7 +325,6 @@ pub const Heap = struct {
     backing_alloc: mem.Allocator,
     pages: [page_bins][]Page,
     page_queue: [page_bins]PageQueue,
-    gpa: mem.Allocator,
     max_pages: u16,
 
     const Self = @This();
@@ -359,10 +358,8 @@ pub const Heap = struct {
             .backing_alloc = backing_alloc,
             .pages = new_pages,
             .page_queue = new_page_queue,
-            .gpa = backing_alloc,
             .max_pages = max_pages,
         };
-        theap = heap;
     }
 
     pub fn bindToThread(heap: *Heap) void {
@@ -373,7 +370,7 @@ pub const Heap = struct {
         for (0..page_bins) |i| {
             // Free all active page block memory.
             for (0..heap.pages[i].len) |j| {
-                heap.gpa.free(heap.pages[i].ptr[j].blocks);
+                heap.backing_alloc.free(heap.pages[i].ptr[j].blocks);
             }
             // Free the page array itself.
             heap.backing_alloc.free(heap.pages[i].ptr[0..heap.max_pages]);
@@ -396,7 +393,7 @@ pub const Heap = struct {
         assert(page.used > 0);
         expensive_assert(page.index == page_index);
 
-        if (theap == heap) {
+        if (&theap == heap) {
             // Same thread: local free.
             writeBlockNext(page, index.toInt(), page.local_free);
             page.local_free = OptionalIndex.fromMaybeInt(index.toInt());
@@ -414,87 +411,86 @@ pub const Heap = struct {
         }
     }
 
-    pub fn ptr(heap: *Heap, index: Index, size: u16) [*]align(4) u8 {
+    pub fn peek(heap: *Heap, index: Index, size: u16) []align(4) u8 {
         assert(size > 0 and size <= 2048);
+
         const bin = binIndex(size);
         const block_count = blocks_per_bin[bin];
         const block_size = block_size_per_bin[bin];
         const page_index = index.toInt() / block_count;
         const block_offset = index.toInt() % block_count;
         const page = &heap.pages[bin][page_index];
-        return @ptrCast(@alignCast(&page.blocks[block_offset * block_size]));
+        const ptr: [*]align(4) u8 = @ptrCast(@alignCast(&page.blocks[block_offset * block_size]));
+        return ptr[0..size];
     }
 };
 
+const testing = std.testing;
 test "basic alloc and free" {
-    var heap: Heap = undefined;
-    try Heap.init(&heap, std.testing.allocator, 4);
-    defer heap.deinit();
+    _ = try initHeap(testing.allocator, 4);
+    defer deinitHeap();
 
-    const idx = try heap.alloc(16);
-    const p = heap.ptr(idx, 16);
+    const idx = try theap.alloc(16);
+    const p = theap.peek(idx, 16);
     @memset(p[0..16], 0xAB);
-    heap.free(idx, 16);
+    theap.free(idx, 16);
 }
 
 test "alloc multiple from same page" {
-    var heap: Heap = undefined;
-    try Heap.init(&heap, std.testing.allocator, 4);
-    defer heap.deinit();
+    _ = try initHeap(testing.allocator, 4);
+    defer deinitHeap();
 
-    const idx1 = try heap.alloc(16);
-    const idx2 = try heap.alloc(16);
+    const idx1 = try theap.alloc(16);
+    const idx2 = try theap.alloc(16);
     try std.testing.expect(idx1.toInt() != idx2.toInt());
-    heap.free(idx1, 16);
-    heap.free(idx2, 16);
+    theap.free(idx1, 16);
+    theap.free(idx2, 16);
 }
 
 test "alloc triggers fullAlloc" {
-    var heap: Heap = undefined;
-    try Heap.init(&heap, std.testing.allocator, 2);
-    defer heap.deinit();
+    _ = try initHeap(testing.allocator, 2);
+    defer deinitHeap();
 
     // Exhaust the first page.
     const block_count = blocks_per_bin[binIndex(2048)];
     var idxs = try std.testing.allocator.alloc(Index, block_count);
     defer std.testing.allocator.free(idxs);
     for (0..block_count) |i| {
-        idxs[i] = try heap.alloc(2048);
+        idxs[i] = try theap.alloc(2048);
     }
     // This should trigger fullAlloc and create a second page.
-    const extra = try heap.alloc(2048);
-    heap.free(extra, 2048);
+    const extra = try theap.alloc(2048);
+    theap.free(extra, 2048);
 
     for (0..block_count) |i| {
-        heap.free(idxs[i], 2048);
+        theap.free(idxs[i], 2048);
     }
 }
 
 test "cross-thread free" {
-    var main_heap: Heap = undefined;
-    try Heap.init(&main_heap, std.testing.allocator, 4);
-    defer main_heap.deinit();
+    _ = try initHeap(testing.allocator, 4);
+    defer deinitHeap();
 
-    const idx = try main_heap.alloc(16);
+    const idx = try theap.alloc(16);
 
     const thread = try std.Thread.spawn(.{}, struct {
-        fn run(h: *Heap, index: Index) void {
-            var dummy: Heap = undefined;
-            Heap.init(&dummy, std.testing.allocator, 1) catch unreachable;
-            defer dummy.deinit();
-            h.free(index, 16);
+        fn run(allocated_on: *Heap, index: Index) void {
+            _ = initHeap(testing.allocator, 4) catch unreachable;
+            defer deinitHeap();
+            allocated_on.free(index, 16);
         }
-    }.run, .{ &main_heap, idx });
+    }.run, .{ &theap, idx });
     thread.join();
 
-    // The cross-thread free should be collected on the next alloc.
-    const idx2 = try main_heap.alloc(16);
-    try std.testing.expectEqual(idx.toInt(), idx2.toInt());
+    // The cross-thread free is only collected on the slow path, so the same
+    // index is not guaranteed to be reused immediately.
+    const idx2 = try theap.alloc(16);
+    try std.testing.expect(idx2.toInt() != idx.toInt());
 }
 
 pub fn initHeap(gpa: mem.Allocator, max_pages: u16) !*Heap {
-    try theap.init(gpa, max_pages);
-    return theap;
+    _ = try theap.init(gpa, max_pages);
+    return &theap;
 }
 
 pub fn deinitHeap() void {

@@ -13,6 +13,7 @@ const options = @import("options");
 const ioutil = @import("ioutil.zig");
 const strutil = @import("strutil.zig");
 const memutil = @import("memutil.zig");
+const StringAllocator = @import("StringAllocator.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const expr_parse = @import("expr_parse.zig");
 const regex = @import("regex.zig");
@@ -20,8 +21,6 @@ const pcre2 = @import("pcre2");
 const objutil = @import("objutil.zig");
 
 pub const special_string_count = 2;
-pub const null_string = 0;
-pub const empty_string = 1;
 pub const special_object_count = 2;
 pub const null_object_idx: u32 = 0;
 pub const empty_object_idx: u32 = 1;
@@ -271,8 +270,7 @@ trace_mutex: std.Io.Mutex,
 
 object_tracking: ObjectTracker,
 objects: ObjectList,
-string_tracking: StringTracker,
-strings: StringList,
+small_strings: *StringAllocator.Heap,
 interned_strings: std.EnumArray(InternedString, Heap.Handle),
 /// Preallocated fallback used by `[catch]` when a script OOMs and building
 /// the real opts dict also OOMs. Pinned at init; released via `freeOomOptsDict`.
@@ -289,14 +287,14 @@ pub const HeapId = u16;
 
 const ObjectTracker = memutil.BuddyUnmanaged(.{
     .max_order = cfg.object_heap_order,
-    .max_pool_order = 6,
-    .pool_size = 256,
+    .max_pool_order = 10,
+    .pool_size = 512,
 });
 const ObjectList = std.MultiArrayList(ObjectAndMetadata);
 const StringTracker = memutil.BuddyUnmanaged(.{
     .max_order = cfg.string_heap_order,
-    .max_pool_order = 10,
-    .pool_size = 256,
+    .max_pool_order = 12,
+    .pool_size = 512,
 });
 const StringList = std.ArrayList(u8);
 
@@ -495,26 +493,27 @@ pub const ParsedExpression = struct {
 
 pub const Object = packed struct(u128) {
     pub const null_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = 0, .len = 0, .hash_count = 0 } },
+        .u = .{ .str = .{ .index = .fromInt(0), .len = 0, .hash_count = 0 } },
         .is_ptr = false,
     };
     pub const empty_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = 1, .len = 0, .hash_count = 0 } },
+        .u = .{ .str = .{ .index = .fromInt(1), .len = 0, .hash_count = 0 } },
         .is_ptr = false,
     };
 
     pub const StrOrPtr = packed struct(u59) {
-        pub const NormalLength = u16;
+        pub const SmallLength = u11;
 
         u: packed union {
             /// Normal strings store both the bytes and the hash references inline in the
             /// same allocation. Check `heapStringLayout` for details.
             str: packed struct {
-                index: u32,
-                len: NormalLength,
+                index: StringAllocator.Index,
+                len: SmallLength,
                 /// Number of Handle references stored inline after the null byte (and
                 /// potentially padding).
-                hash_count: u10,
+                hash_count: u6,
+                padding: u9 = 0,
             },
             /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
             ptr: u58,
@@ -1703,7 +1702,7 @@ fn invalidateCollection(handle: Handle) void {
     if (any_elems_referenced) {
         // Since an item was referenced, we'll need to split this allocation
         // into individual objects.
-        handle.getHeap().splitAlloc(handle.index, 0);
+        handle.getHeap().splitAllocIntoIndividual(handle.index);
     }
 
     for (0..len) |i| {
@@ -1794,12 +1793,12 @@ fn heapBackingAlloc() Allocator {
 fn createInternedString(heap: *Heap, expected_index: u32, str: []const u8) !Handle {
     const interned = try heap.createIndividualObject();
     errdefer freeObjectBackingInner(interned);
-    const cast_len: Object.StrOrPtr.NormalLength = @intCast(str.len);
+    const cast_len: Object.StrOrPtr.SmallLength = @intCast(str.len);
     const str_index = try heap.createHeapString(cast_len, &.{});
     errdefer heap.freeHeapString(str_index, cast_len, 0);
     assert(interned.index == (expected_index + special_object_count));
 
-    @memcpy(heap.getHeapString(str_index, str_index + cast_len), str);
+    @memcpy(heap.getHeapString(str_index, cast_len, 0), str);
     assert(heap.exchangeString(interned.index, Object.null_string, .{
         .is_ptr = false,
         .u = .{ .str = .{ .index = str_index, .len = cast_len, .hash_count = 0 } },
@@ -1848,6 +1847,9 @@ pub fn init(heap: *Heap) !void {
     heap.trace_mutex = .init;
     heap.extra_data_mutex = .init;
 
+    heap.small_strings = try StringAllocator.initHeap(global_gpa, 10_000);
+    errdefer StringAllocator.deinitHeap();
+
     // Init objects.
     heap.object_tracking = try .init(global_gpa, global_io, cfg.object_heap_order);
     errdefer {
@@ -1878,31 +1880,6 @@ pub fn init(heap: *Heap) !void {
         }
     }
 
-    // Init strings.
-    heap.string_tracking = try .init(global_gpa, global_io, cfg.string_heap_order);
-    errdefer {
-        if (heap.string_tracking.leakCheck() == .leaked) {
-            ioutil.debug("^^^ Heap strings leaked when cleaning up after partial init\n\n", .{});
-        }
-        heap.string_tracking.deinit();
-    }
-
-    heap.strings = .empty;
-    if (options.threading) {
-        const string_vmem = try memutil.vmemMap(string_heap_max_bytes);
-        heap.strings.items = string_vmem.ptr[0..string_vmem.len];
-        heap.strings.capacity = string_vmem.len;
-    } else {
-        try heap.strings.ensureTotalCapacity(global_gpa, 32);
-    }
-    errdefer {
-        if (options.threading) {
-            memutil.vmemUnmap(@alignCast(heap.strings.items.ptr[0..heap.strings.capacity]));
-        } else {
-            heap.strings.deinit(global_gpa);
-        }
-    }
-
     const object_capacity = if (options.threading) object_heap_max_count else 32;
 
     heap.extra = try .initWithCapacity(global_gpa, object_capacity);
@@ -1918,15 +1895,6 @@ pub fn init(heap: *Heap) !void {
     errdefer heap.parsed_substs.deinit(global_gpa);
 
     // Done initializing heap fields, so now we'll create all the specialty objects.
-
-    // Null string is guaranteed to have index 0.
-    const null_string_idx = try heap.string_tracking.allocOnMainList(0);
-    assert(null_string_idx == null_string);
-    errdefer heap.string_tracking.freeOnMainList(null_string_idx, 0);
-    // Empty string is guaranteed to have index 1.
-    const empty_string_idx = try heap.string_tracking.allocOnMainList(0);
-    assert(empty_string_idx == empty_string);
-    errdefer heap.string_tracking.freeOnMainList(empty_string_idx, 0);
 
     // This is to remember to update this section whenever the special
     // objects change.
@@ -2046,24 +2014,21 @@ pub fn deinit(heap: *Heap) void {
     assert(special_object_count == 2);
     heap.object_tracking.freeOnMainList(0, 0);
     heap.object_tracking.freeOnMainList(1, 0);
-    assert(special_string_count == 2);
-    heap.string_tracking.freeOnMainList(0, 0);
-    heap.string_tracking.freeOnMainList(1, 0);
 
     if (options.threading) {
-        memutil.vmemUnmap(@alignCast(heap.strings.items));
         memutil.vmemUnmap(@alignCast(heap.objects.bytes[0..object_heap_max_bytes]));
     } else {
         // Don't use `heapBackingAlloc()` in this case, as that will error
         // with the null allocator.
-        heap.strings.deinit(global_gpa);
         heap.objects.deinit(global_gpa);
     }
 
     heap.object_tracking.deinit();
-    heap.string_tracking.deinit();
 
     heap.extra.deinit(global_gpa);
+
+    StringAllocator.deinitHeap();
+
     heap.* = undefined;
 }
 
@@ -2118,37 +2083,19 @@ fn createIndividualObject(self: *Heap) !Handle {
 }
 
 /// Splits an existing allocation.
-pub fn splitAlloc(self: *Heap, index: u32, new_order: u5) void {
+pub fn splitAllocIntoIndividual(self: *Heap, index: u32) void {
     const metadata = self.objects.items(.metadata)[index]; // Copy
 
     assert(metadata.in_use);
-    assert(metadata.order > new_order);
-
-    self.object_tracking.splitBlock(metadata.order, new_order);
+    self.object_tracking.splitBlockIntoIndividual(metadata.order);
 
     for (self.objects.items(.metadata)[index..][0..memutil.getOrderSize(metadata.order)], 0..) |*new_metadata, i| {
-        new_metadata.order = new_order;
+        new_metadata.order = 0;
 
         self.getHandle(@intCast(index + i)).trace(
-            "Split from index {} (order {}) to order {}",
-            .{ index, metadata.order, new_order },
+            "Split from index {} (order {}) to order 0",
+            .{ index, metadata.order },
         );
-    }
-}
-
-test "split allocations" {
-    var heap = try Heap.testStart(testing.allocator, testing.io);
-    defer Heap.testFinish();
-
-    const index = try heap.createObjects(8, true);
-    heap.splitAlloc(index, 1);
-
-    for (index..(index + 8)) |i| {
-        try testing.expectEqual(1, heap.objects.get(i).metadata.order);
-    }
-
-    for (0..4) |i| {
-        heap.getHandle(@intCast(index + i * 2)).decrRefCount();
     }
 }
 
@@ -2291,18 +2238,20 @@ pub fn ensureSameHeapOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
 }
 
 /// Get a string slice from heap string storage.
-pub fn getHeapString(self: *Heap, start: u32, end: u32) [:0]u8 {
-    return self.strings.items[start..end :0];
+pub fn getHeapString(self: *Heap, index: StringAllocator.Index, len: u11, hash_count: u6) [:0]u8 {
+    const layout = heapStringLayout(len, hash_count);
+    const base = self.small_strings.peek(index, layout.total_len);
+    return base[0..len :0];
 }
 
 /// Returns the total length of the string, including the null byte and the hash handles.
 /// This will always align the `Handle`s to their alignment, assuming that the first index
 /// of the string is aligned by `Handle`s alignment as well.
-fn heapStringLayout(len: u32, hash_count: u10) struct { total_len: u32, handle_start: u32 } {
+fn heapStringLayout(len: u11, hash_count: u10) struct { total_len: Object.StrOrPtr.SmallLength, handle_start: u11 } {
     const length_with_null = len + 1;
     if (hash_count > 0) {
         // The handles need to be aligned, so we may need some padding.
-        const handle_start: u32 = @intCast(mem.alignForward(usize, length_with_null, @alignOf(Handle)));
+        const handle_start: u11 = @intCast(mem.alignForward(usize, length_with_null, @alignOf(Handle)));
         return .{
             .total_len = handle_start + hash_count * @sizeOf(Handle),
             .handle_start = handle_start,
@@ -2311,68 +2260,43 @@ fn heapStringLayout(len: u32, hash_count: u10) struct { total_len: u32, handle_s
         // No alignment needed.
         return .{
             .total_len = length_with_null,
-            .handle_start = math.maxInt(u32), // No handle start, so use something that will blow up.
+            .handle_start = math.maxInt(u11), // No handle start, so use something that will blow up.
         };
     }
 }
 
 /// Additionally allocates space for the null byte and for the hash handles. Aligns
 /// `Handle`s according to their alignment.
-pub fn createHeapString(heap: *Heap, len: u32, hash_handles: []const OptionalHandle) !u32 {
+pub fn createHeapString(heap: *Heap, len: u11, hash_handles: []align(4) const OptionalHandle) !StringAllocator.Index {
     const layout = heapStringLayout(len, @intCast(hash_handles.len));
-    const order = memutil.getOrder(layout.total_len);
 
-    const new_string = blk: {
-        if (heap == local_heap) {
-            break :blk try heap.string_tracking.allocFromOwningThread(order);
-        } else {
-            break :blk try heap.string_tracking.allocFromAnyThread(order);
-        }
-    };
-    errdefer heap.string_tracking.freeFromAnyThread(new_string, order);
-    // Make sure the returned allocation is aligned to Handle, so that our earlier
-    // aligning relative to the string start is valid. Should always be valid with
-    // the buddy allocator, but this should catch any regressions.
-    if (hash_handles.len > 0) assert(@mod(new_string, @alignOf(Handle)) == 0);
+    const new_string = try heap.small_strings.alloc(@intCast(layout.total_len));
+    errdefer heap.small_strings.free(new_string, @intCast(layout.total_len));
 
-    if (!options.threading) {
-        try heap.strings.ensureTotalCapacity(heapBackingAlloc(), new_string + layout.total_len);
-        heap.strings.items.len = @max(heap.strings.items.len, new_string + layout.total_len);
-    }
-
-    heap.strings.items[new_string + len] = 0; // Set null byte.
+    const bytes = heap.small_strings.peek(new_string, @intCast(layout.total_len));
+    bytes[len] = 0; // Set null byte.
 
     // Copy handles in and borrows them.
     for (hash_handles, 0..) |handle, i| {
-        mem.writeInt(
-            HandleBacking,
-            heap.strings.items[(new_string + layout.handle_start + @sizeOf(Handle) * i)..][0..@sizeOf(Handle)],
-            @bitCast(@intFromEnum(handle)),
-            .native,
-        );
+        const offset = layout.handle_start + @sizeOf(Handle) * i;
+        std.mem.writeInt(HandleBacking, bytes[offset..][0..@sizeOf(Handle)], @bitCast(@intFromEnum(handle)), .native);
         _ = handle.borrowOptional();
     }
 
     return new_string;
 }
 
-pub fn freeHeapString(self: *Heap, index: u32, len: u32, hash_count: u10) void {
-    assert(index >= special_string_count);
-
+pub fn freeHeapString(self: *Heap, index: StringAllocator.Index, len: Object.StrOrPtr.SmallLength, hash_count: u10) void {
     const layout = heapStringLayout(len, hash_count);
-    const order = memutil.getOrder(layout.total_len);
 
     // Release handles.
     if (hash_count > 0) {
-        const handles: [*]const OptionalHandle = @ptrCast(@alignCast(&self.strings.items[index + layout.handle_start]));
+        const bytes = self.small_strings.peek(index, layout.total_len);
+        const handles: []align(4) const OptionalHandle = @ptrCast(@alignCast(bytes[layout.handle_start..]));
         for (handles[0..hash_count]) |handle| handle.decrOptional();
     }
 
-    if (self == local_heap) {
-        self.string_tracking.freeFromOwningThread(index, order);
-    } else {
-        self.string_tracking.freeFromAnyThread(index, order);
-    }
+    self.small_strings.free(index, layout.total_len);
 }
 
 pub fn checkIfEqual(a: Handle, b: Handle) !bool {
@@ -2444,8 +2368,8 @@ pub fn duplicateObjString(dest_heap: *Heap, handle: Handle) !struct { data: Obje
         },
         .normal => |normal_str| {
             const new_string = try dest_heap.createHeapString(@intCast(normal_str.bytes.len), normal_str.hash_handles);
-            const len: Object.StrOrPtr.NormalLength = @intCast(normal_str.bytes.len);
-            @memcpy(dest_heap.getHeapString(new_string, new_string + len), normal_str.bytes);
+            const len: Object.StrOrPtr.SmallLength = @intCast(normal_str.bytes.len);
+            @memcpy(dest_heap.getHeapString(new_string, len, @intCast(normal_str.hash_handles.len)), normal_str.bytes);
 
             return .{ .data = .{
                 .u = .{ .str = .{ .index = new_string, .len = len, .hash_count = @intCast(normal_str.hash_handles.len) } },
@@ -2955,9 +2879,9 @@ pub fn setNormalString(
     if (bytes.len >= SpecialString.split_point) return error.TooBig;
 
     const string = try self.createHeapString(@intCast(bytes.len), hash_handles);
-    const len: Object.StrOrPtr.NormalLength = @intCast(bytes.len);
+    const len: Object.StrOrPtr.SmallLength = @intCast(bytes.len);
     @memcpy(
-        self.getHeapString(string, string + len),
+        self.getHeapString(string, len, @intCast(hash_handles.len)),
         bytes,
     );
 
@@ -3069,7 +2993,7 @@ fn generateDictString(handle: Handle) ![:0]u8 {
 const StringDetails = union(enum) {
     null: void,
     empty: void,
-    normal: struct { bytes: [:0]u8, hash_handles: []const OptionalHandle },
+    normal: struct { bytes: [:0]u8, hash_handles: []align(4) const OptionalHandle },
     long: *align(SpecialString.align_amt) SpecialString,
 };
 
@@ -3082,20 +3006,22 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
         };
     } else {
         const str = str_or_ptr.u.str;
-        if (str.index == null_string) {
+        if (str_or_ptr == Object.null_string) {
             return .null;
-        } else if (str.index == empty_string) {
+        } else if (str_or_ptr == Object.empty_string) {
             return .empty;
         } else {
             const layout = heapStringLayout(str.len, str.hash_count);
-            const hash_handles: []const OptionalHandle = if (str.hash_count > 0) blk: {
-                const raw: [*]const OptionalHandle = @ptrCast(@alignCast(&heap.strings.items[str.index + layout.handle_start]));
+            const allocation = heap.small_strings.peek(str.index, @intCast(layout.total_len));
+            const bytes: [:0]u8 = @ptrCast(allocation[0..str.len :0]);
+            const hash_handles: []align(4) const OptionalHandle = if (str.hash_count > 0) blk: {
+                const raw: [*]align(4) const OptionalHandle = @ptrCast(@alignCast(allocation[layout.handle_start..]));
                 break :blk raw[0..str.hash_count];
             } else &.{};
 
             return .{
                 .normal = .{
-                    .bytes = heap.getHeapString(str.index, str.index + str.len),
+                    .bytes = bytes,
                     .hash_handles = hash_handles,
                 },
             };
@@ -3110,7 +3036,7 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
 pub const SpecialString = struct {
     /// At what point should we switch to using a special string?
     /// Whenever the string length >= `split_point`.
-    pub const split_point = math.maxInt(Object.StrOrPtr.NormalLength);
+    pub const split_point = math.maxInt(Object.StrOrPtr.SmallLength);
     /// This needs to be aligned to 128, due to how pointers are stored in StrOrPtr.
     pub const align_amt = 128;
     pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
@@ -3555,11 +3481,9 @@ pub fn testFinish() void {
 }
 
 pub fn didLeak(heap: *Heap) bool {
-    // Synchronize the object and string tracking.
+    // Synchronize the object tracking.
     heap.object_tracking.mutex.lockUncancelable(heap.object_tracking.io);
     heap.object_tracking.mutex.unlock(heap.object_tracking.io);
-    heap.string_tracking.mutex.lockUncancelable(heap.string_tracking.io);
-    heap.string_tracking.mutex.unlock(heap.string_tracking.io);
 
     for (heap.object_tracking.alloc_count[1..]) |count| {
         if (count != 0) return false;
