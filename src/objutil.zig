@@ -1654,12 +1654,7 @@ pub fn dictLookupFollowLinks(
             shimmerToHashReference(det, parent_link, &maybe_new_parent_link) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.HashLookupFailed => return error.LinkLookupFailed,
-                error.NotHashReference => {
-                    if (det) |details| {
-                        details.message.decrRefCount();
-                        details.* = undefined;
-                    }
-                },
+                error.NotHashReference => return error.LinkLookupFailed,
             };
 
             if (maybe_new_parent_link.toHandle()) |new_parent_link| {
@@ -1881,7 +1876,7 @@ fn dictPutInner(original: Handle, key: Handle, value: Heap.Object) !DictAndValue
                 // We can't fail at this point, so we don't need to worry about
                 // `value` being freed after assignment.
                 errdefer comptime unreachable;
-                value_handle.peek().* = value;
+                value_handle.peek().* = value_mut;
 
                 break :next_state .{ .changed_value = .{
                     .new_dict = new_dict,
@@ -1913,7 +1908,8 @@ fn dictPutInner(original: Handle, key: Handle, value: Heap.Object) !DictAndValue
 
                     // Set the new key and value.
                     new_key_handle.peek().* = key_obj;
-                    new_value_handle.peek().* = value;
+                    new_value_handle.peek().* = value_mut;
+                    value_mut = Heap.emptyObject();
 
                     break :blk .{ new_key_handle, new_value_handle };
                 };
@@ -2168,6 +2164,85 @@ fn dictFlattenInner(det: ?*ErrorDetails, original: Handle) !OptionalHandle {
 pub fn dictFlatten(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
     errdefer new.swapWithNone();
     new.swapIfNew(try dictFlattenInner(det, new.orElse(original)));
+}
+
+pub const DictKeysContext = struct {
+    pub fn hash(_: @This(), key: Handle) u32 {
+        const hash_value = key.getHash() catch unreachable;
+        return @truncate(hash_value);
+    }
+
+    pub fn eql(_: @This(), a: Handle, b: Handle, _: usize) bool {
+        return Heap.checkIfEqual(a, b) catch unreachable;
+    }
+};
+
+const DictKeysResult = std.array_hash_map.Custom(Handle, void, DictKeysContext, true);
+pub fn dictGetKeys(det: ?*ErrorDetails, arena: std.mem.Allocator, original: Handle, new: *OptionalHandle) !DictKeysResult {
+    errdefer new.swapWithNone();
+    try shimmerToDict(det, original, new);
+
+    var result: std.array_hash_map.Custom(Handle, void, DictKeysContext, true) = .empty;
+    errdefer result.deinit(arena);
+
+    errdefer for (result.keys()) |key| key.decrRefCount();
+    try dictGetKeysInner(det, arena, original, new, &result);
+
+    return result;
+}
+
+fn dictGetKeysInner(
+    det: ?*ErrorDetails,
+    arena: std.mem.Allocator,
+    original: Handle,
+    new: *OptionalHandle,
+    result: *DictKeysResult,
+) !void {
+    var handle = new.orElse(original);
+
+    const parent_key = Heap.local_heap.getInternedString(.@"^parent");
+    if ((try dictLookupFollowRefs(handle, parent_key)).toHandle()) |parent_link| {
+        var maybe_new_parent_link: OptionalHandle = .none;
+        defer maybe_new_parent_link.decrOptional();
+        shimmerToHashReference(det, parent_link, &maybe_new_parent_link) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.HashLookupFailed, error.NotHashReference => return error.LinkLookupFailed,
+        };
+
+        if (maybe_new_parent_link.toHandle()) |new_parent_link| {
+            _ = try dictPutObject(original, new, parent_key, new_parent_link.reference());
+            handle = new.orElse(original);
+        }
+
+        const hash_reference = maybe_new_parent_link.orElse(parent_link);
+        const parent = hash_reference.peek().body.hash_reference;
+        var new_parent: OptionalHandle = .none;
+        defer new_parent.decrOptional();
+        shimmerToDict(det, parent, &new_parent) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.LinkLookupFailed,
+        };
+
+        if (new_parent.toHandle()) |val| {
+            _ = try dictPutObject(original, new, parent_key, val.hashReference());
+            handle = new.orElse(original);
+        }
+
+        // Recurse into parent first so parent keys are inserted before child keys.
+        try dictGetKeysInner(det, arena, new_parent.orElse(parent), &new_parent, result);
+    }
+
+    const pair_count = dictPairLengthRaw(handle);
+    var pair_i: u32 = 0;
+    while (pair_i < pair_count) : (pair_i += 1) {
+        const key = dictItemFollowRefs(handle, pair_i * 2);
+        if (try key.equalsString("^parent")) continue;
+
+        const gop = try result.getOrPut(arena, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = key.borrow();
+        }
+    }
 }
 
 fn testDictFlatten(ta: std.mem.Allocator) !void {

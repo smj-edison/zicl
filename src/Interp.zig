@@ -403,11 +403,8 @@ pub fn setVariableInner(
     // return the variable's new handle after setting it. After doing so, be sure to audit all
     // the call sites.
 
-    var value_taken = false;
-    errdefer if (!value_taken) {
-        var value_mut = value;
-        value_mut.deinitSingle(Heap.local_heap);
-    };
+    var value_mut = value;
+    errdefer value_mut.deinitSingle(Heap.local_heap);
 
     if (interp.ensureValidVariableType(null, call_frame_idx, name)) {
         switch (name.tag()) {
@@ -417,20 +414,23 @@ pub fn setVariableInner(
                 if (var_value.tag() == .upvar_link) {
                     const upvar_link = var_value.peek().body.upvar_link;
                     // Set the value through the linked name in the linked frame.
+                    const taken_value = value_mut;
+                    value_mut = Heap.emptyObject();
                     try interp.setVariableInner(
                         det,
                         upvar_link.call_frame,
                         Heap.local_heap.getHandle(upvar_link.linked_name),
-                        value,
+                        taken_value,
                     );
                     return;
                 }
 
                 const var_call_frame = &interp.call_frames.items[call_frame_idx];
 
-                value_taken = true;
+                const taken_value = value_mut;
+                value_mut = Heap.emptyObject();
                 var new_variables: OptionalHandle = .none;
-                const put_result = try objutil.dictPutObject(var_call_frame.variables, &new_variables, name, value);
+                const put_result = try objutil.dictPutObject(var_call_frame.variables, &new_variables, name, taken_value);
                 if (new_variables.toHandle()) |val| {
                     // Did the dict change locations? If so, all cached lookups are now invalid.
                     var_call_frame.variables.swap(val);
@@ -444,16 +444,18 @@ pub fn setVariableInner(
             },
             .cached_lexical_var => {
                 // We can't mutate a lexical var, so we instead shadow it in the local scope.
-                value_taken = true;
-                try createVariable(interp, call_frame_idx, name, value);
+                const taken_value = value_mut;
+                value_mut = Heap.emptyObject();
+                try createVariable(interp, call_frame_idx, name, taken_value);
             },
             else => unreachable,
         }
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.VariableNotFound => {
-            value_taken = true;
-            try createVariable(interp, call_frame_idx, name, value);
+            const taken_value = value_mut;
+            value_mut = Heap.emptyObject();
+            try createVariable(interp, call_frame_idx, name, taken_value);
         },
         error.LinkLookupFailed => return error.LinkLookupFailed,
         error.DictSugar => {
@@ -481,8 +483,9 @@ pub fn setVariableInner(
             defer keys.deinit(Heap.global_gpa);
 
             var maybe_new_dict: OptionalHandle = .none;
-            value_taken = true;
-            _ = objutil.dictPutRecursively(null, resolved_dict, &maybe_new_dict, keys.items, value) catch |put_err| switch (put_err) {
+            const taken_value = value_mut;
+            value_mut = Heap.emptyObject();
+            _ = objutil.dictPutRecursively(null, resolved_dict, &maybe_new_dict, keys.items, taken_value) catch |put_err| switch (put_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };

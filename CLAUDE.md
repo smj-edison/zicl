@@ -71,6 +71,7 @@ zig build -Dtoken-debugging=true
 -   Provides high-level operations for lists, dicts, strings, indices, enums, and source info
 -   Dictionary operations: `dictPut`, `dictPutRecursively`, `dictRemove`, `dictRemoveRecursively`, `dictLookupRecursively`, `dictLookupFollowLinks`
 -   Supports recursive key lookups for nested dictionaries
+-   Dicts support `^parent` links (a `.hash_reference` value stored under the interned key `^parent`) for lexical scope chains. When iterating over dict keys or doing lookups, parent links must be followed recursively, with parent keys taking precedence (insertion order: parent keys first, then child keys not already present).
 -   Uses packed structs for memory efficiency (Object is 16 bytes)
 
 **Tokenizer (src/Tokenizer.zig)**: Tokenizes Tcl scripts supporting:
@@ -312,6 +313,8 @@ const result = try processData(data);  // This might fail
 ## Common Issues
 
 **Double Free**: If you see double-free panics, check the memory trace. With the splitting allocator design, collection items CAN be borrowed and ref-counted individually. However, you should only call `decrRefCount()` on items you explicitly borrowed. Enable `options.trace_mem` to dump the full allocation/deallocation trace.
+
+**Overlapping errdefers after ownership transfer**: When you transfer ownership of a raw `Heap.Object` into a collection slot (e.g. `new_value_handle.peek().* = value;`) inside a nested block with its own `errdefer`, null out the source variable afterward (`value_mut = Heap.emptyObject()`). Otherwise an outer `errdefer value_mut.deinitSingle(...)` and an inner `errdefer new_value_handle.invalidateBoth()` will both try to free the same backing object if an error occurs after the transfer, causing a double-free under OOM.
 
 **Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `Heap.ensureShimmerableOrDup()` to automatically duplicate if the handle cannot shimmer.
 

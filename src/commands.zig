@@ -396,6 +396,30 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             const dict = &args[2];
             try interp.setResultBoolean((try interp.getDictValueRecursively(dict, args[3..])) != .none);
         },
+        .keys => {
+            var new_dict: OptionalHandle = .none;
+            errdefer new_dict.decrOptional();
+            var keys_map = try interp.wrapError(&det, objutil.dictGetKeys(&det, Heap.global_gpa, args[2], &new_dict));
+            args[2].swapIfNew(new_dict);
+            defer {
+                for (keys_map.keys()) |key| key.decrRefCount();
+                keys_map.deinit(Heap.global_gpa);
+            }
+
+            if (args.len == 4) {
+                const pattern = args[3];
+                var filtered = try objutil.newListWithCapacity(@intCast(keys_map.count()));
+                errdefer filtered.decrRefCount();
+                for (keys_map.keys()) |key| {
+                    if (try objutil.globMatch(pattern, key, false)) {
+                        objutil.listAppendAssumeCapacity(filtered, key.dupOrRef());
+                    }
+                }
+                interp.setResultOwning(filtered);
+            } else {
+                interp.setResultOwning(try objutil.newList(keys_map.keys()));
+            }
+        },
         .merge => {
             const dicts = args[2..];
 
@@ -494,10 +518,8 @@ pub fn forCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     interp.setEmptyResult();
 }
 
-/// [foreach] -- iterate over one or more lists, assigning variables.
-///
-/// Syntax: foreach varList list ?varList list ...? body
-pub fn foreachCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+/// Shared implementation of [foreach] and [lmap].
+fn foreachMapHelper(interp: *Interp, args: []Handle, mode: enum { foreach, map }) Interp.Error!void {
     const num_pairs = (args.len - 2) / 2;
     const body = args[args.len - 1];
 
@@ -523,6 +545,9 @@ pub fn foreachCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         try value_counts.append(Heap.global_gpa, try interp.getListLength(&args[2 + i * 2]));
         try value_indices.append(Heap.global_gpa, 0);
     }
+
+    var result_list: Handle = Heap.local_heap.emptyHandle();
+    errdefer result_list.decrRefCount();
 
     while (true) {
         // Continue only if any value list still has unconsumed elements.
@@ -573,11 +598,23 @@ pub fn foreachCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         switch (try propagateLoopControl(interp, interp.evalObject(body))) {
             .@"break" => break,
             .@"continue" => {},
-            .none => {},
+            .none => {
+                if (mode == .map) _ = try interp.listAppend(&result_list, interp.result);
+            },
         }
     }
 
-    interp.setEmptyResult();
+    interp.setResultOwning(result_list);
+}
+
+/// [foreach]
+pub fn foreachCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    return foreachMapHelper(interp, args, .foreach);
+}
+
+/// [lmap]
+pub fn lmapCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    return foreachMapHelper(interp, args, .map);
 }
 
 test "loop commands" {
@@ -658,6 +695,36 @@ test "loop commands" {
     // [foreach] empty varlist error.
     try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
         \\ foreach {} {1 2} { puts hi }
+    );
+
+    // [lmap] basic iteration.
+    try interp.testExpectScriptResult("2 4 6",
+        \\ lmap x {1 2 3} { expr {$x * 2} }
+    );
+
+    // [lmap] with multiple list pairs.
+    try interp.testExpectScriptResult("{1 x} {2 y}",
+        \\ lmap a {1 2} b {x y} { list $a $b }
+    );
+
+    // [lmap] continue skips the result.
+    try interp.testExpectScriptResult("2 6",
+        \\ lmap x {1 2 3} { if {$x == 2} { continue } ; expr {$x * 2} }
+    );
+
+    // [lmap] break stops early.
+    try interp.testExpectScriptResult("2",
+        \\ lmap x {1 2 3} { if {$x == 2} { break } ; expr {$x * 2} }
+    );
+
+    // [lmap] empty input list returns empty list.
+    try interp.testExpectScriptResult("",
+        \\ lmap x {} { expr {$x * 2} }
+    );
+
+    // [lmap] empty varlist error.
+    try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
+        \\ lmap {} {1 2} { puts hi }
     );
 }
 
@@ -2492,6 +2559,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
     try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
     try registerCommand(interp, "foreach", foreachCmd, "varList list ?varList list ...? body", 3, null, 2);
+    try registerCommand(interp, "lmap", lmapCmd, "varList list ?varList list ...? body", 3, null, 2);
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
@@ -2542,4 +2610,16 @@ test "commands" {
     );
     defer script.decrRefCount();
     interp.evalObject(script) catch {};
+}
+
+fn testRegisterCoreCommands(ta: std.mem.Allocator) !void {
+    defer Heap.testFinish();
+    _ = try Heap.testStart(ta, testing.io);
+    var interp = try Interp.init();
+    defer interp.deinit();
+    try registerCoreCommands(&interp);
+}
+
+test "register core commands" {
+    try testing.checkAllAllocationFailures(testing.allocator, testRegisterCoreCommands, .{});
 }

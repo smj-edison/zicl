@@ -7,6 +7,7 @@ const testFinish = commands.testFinish;
 
 const Interp = @import("../Interp.zig");
 const Heap = @import("../Heap.zig");
+const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("../objutil.zig");
 
 const ta = std.testing.allocator;
@@ -69,4 +70,47 @@ test "dict sugar" {
         \\ set x::y 10
         \\ set x
     );
+}
+
+test "dict keys" {
+    var interp = try testStart(testing.allocator);
+    defer testFinish(&interp);
+
+    // Basic dict keys.
+    try interp.testExpectScriptResult("a b", "dict keys {a 1 b 2}");
+
+    // Keys with pattern.
+    try interp.testExpectScriptResult("a", "dict keys {a 1 b 2} a*");
+
+    // Parent links: parent keys first, then child keys not already present.
+    const heap = Heap.local_heap;
+    const parent = try objutil.newDictInner(heap, &.{
+        try objutil.newStringInner(heap, "foo"), try objutil.newStringInner(heap, "1"),
+        try objutil.newStringInner(heap, "bar"), try objutil.newStringInner(heap, "2"),
+    });
+    defer parent.decrRefCount();
+
+    const child = try objutil.newDictInner(heap, &.{
+        try objutil.newStringInner(heap, "foo"), try objutil.newStringInner(heap, "3"),
+        try objutil.newStringInner(heap, "baz"), try objutil.newStringInner(heap, "4"),
+    });
+    defer child.decrRefCount();
+
+    var new: OptionalHandle = .none;
+    errdefer new.decrOptional();
+    const parent_key = heap.getInternedString(.@"^parent");
+    _ = try objutil.dictPutObject(child, &new, parent_key, parent.hashReference());
+    new.swapWithNone();
+
+    {
+        var var_name = try objutil.newString("d");
+        defer var_name.decrRefCount();
+        try interp.setVariableTo(&var_name, child);
+    }
+
+    // foo is in both parent and child; parent foo takes precedence in order.
+    // bar is only in parent.
+    // baz is only in child.
+    // Order: parent keys first (foo, bar), then new child keys (baz).
+    try interp.testExpectScriptResult("foo bar baz", "dict keys $d");
 }
