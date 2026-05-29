@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
     const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse !static_link;
     const trace_mem = b.option(bool, "trace-mem", "Trace object memory operations") orelse (optimize == .Debug);
+    const expensive_checks = b.option(bool, "expensive-checks", "Whether expensive internal state checks are enabled") orelse (optimize == .Debug);
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -26,6 +27,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "token_debugging", token_debugging);
     options.addOption(bool, "threading", threading);
     options.addOption(bool, "trace_mem", trace_mem);
+    options.addOption(bool, "expensive_checks", expensive_checks);
     const options_mod = options.createModule();
 
     // deps
