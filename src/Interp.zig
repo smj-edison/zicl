@@ -1018,11 +1018,9 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
 
     var new_closure_value: OptionalHandle = .none;
     const maybe_name = try objutil.dictLookupFollowLinks(det, closure_value, &new_closure_value, Heap.local_heap.getInternedString(.name));
-    closure_value.swapAndClear(&new_closure_value);
     const maybe_impl = try objutil.dictLookupFollowLinks(det, closure_value, &new_closure_value, Heap.local_heap.getInternedString(.impl));
-    closure_value.swapAndClear(&new_closure_value);
     const maybe_scope = try objutil.dictLookupFollowLinks(det, closure_value, &new_closure_value, Heap.local_heap.getInternedString(.scope));
-    closure_value.swapAndClear(&new_closure_value);
+    closure_value.swapIfNew(new_closure_value);
 
     var args, const body = blk: {
         if (maybe_impl.toHandle()) |impl| {
@@ -1187,9 +1185,11 @@ pub fn parseClosureArgList(det: ?*objutil.ErrorDetails, args: Handle) !ParsedArg
             }
 
             const arg_name = try objutil.listItem(arg, 0).getString();
-            if (std.mem.eql(u8, arg_name, "args")) args_parameter_found = true;
-
-            required_arity += 1;
+            if (std.mem.eql(u8, arg_name, "args")) {
+                args_parameter_found = true;
+            } else {
+                required_arity += 1;
+            }
         }
     }
 
@@ -1264,6 +1264,8 @@ pub fn callClosure(interp: *Interp, closure: Heap.Closure, cache_key: u256, args
     const has_args: bool = closure.has_args_parameter;
     const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
     if (too_few_arguments or too_many_arguments) {
+        ioutil.debug("arg_count: {} required_arity: {}\n", .{ arg_count, closure.required_arity });
+        ioutil.debug("Too few arguments? {} too many arguments? {}\n", .{ too_few_arguments, too_many_arguments });
         // Wrong argument count, error accordingly.
         var sf = std.heap.stackFallback(64, Heap.global_gpa);
         const scratch = sf.get();

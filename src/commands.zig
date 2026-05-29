@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const assert = std.debug.assert;
 
@@ -2130,7 +2131,7 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 };
                 break :blk true;
             };
-            try interp.setResultInteger(if (exists) 1 else 0);
+            try interp.setResultBoolean(exists);
         },
         .dirname => {
             const path = try args[2].getString();
@@ -2186,7 +2187,7 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 };
                 break :blk true;
             };
-            try interp.setResultInteger(if (readable) 1 else 0);
+            try interp.setResultBoolean(readable);
         },
         .isdirectory => {
             const path = try args[2].getString();
@@ -2200,7 +2201,7 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
                 };
                 break :blk stat.kind == .directory;
             };
-            try interp.setResultInteger(if (is_dir) 1 else 0);
+            try interp.setResultBoolean(is_dir);
         },
         .mtime => {
             const path = try args[2].getString();
@@ -2221,7 +2222,82 @@ pub fn fileCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             };
             try interp.setResultString(buf[0..len]);
         },
-        .tempfile => std.debug.panic("tempfile not fully implemented", .{}),
+        .tempfile => {
+            const template = if (args.len > 2) try args[2].getString() else null;
+
+            var path_buf: std.ArrayList(u8) = .empty;
+            defer path_buf.deinit(Heap.global_gpa);
+
+            if (template) |t| {
+                try path_buf.appendSlice(Heap.global_gpa, t);
+            } else {
+                const tmpdir = switch (builtin.os.tag) {
+                    .windows => blk: {
+                        const env_vars = &[_][]const u8{ "TMP", "TEMP", "LOCALAPPDATA", "USERPROFILE" };
+                        for (env_vars) |name| {
+                            if (std.c.getenv(name.ptr)) |val| {
+                                const slice = std.mem.span(val);
+                                if (slice.len > 0) break :blk slice;
+                            }
+                        }
+                        break :blk "C:\\Windows\\Temp";
+                    },
+                    else => blk: {
+                        if (std.c.getenv("TMPDIR")) |val| {
+                            const slice = std.mem.span(val);
+                            if (slice.len > 0) break :blk slice;
+                        }
+                        break :blk "/tmp";
+                    },
+                };
+                try path_buf.appendSlice(Heap.global_gpa, tmpdir);
+                if (!std.mem.endsWith(u8, path_buf.items, std.fs.path.sep_str)) {
+                    try path_buf.append(Heap.global_gpa, std.fs.path.sep);
+                }
+                try path_buf.appendSlice(Heap.global_gpa, "tcl.tmp.");
+            }
+
+            const base_len = path_buf.items.len;
+            const has_template = if (template) |val| std.mem.endsWith(u8, val, "XXXXXX") else false;
+            const suffix_start = if (has_template) base_len - 6 else base_len;
+            const suffix_len: usize = if (has_template) 6 else 8;
+
+            if (!has_template) {
+                try path_buf.resize(Heap.global_gpa, base_len + suffix_len);
+            }
+
+            const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            var random_bytes: [8]u8 = undefined;
+
+            var retries: u32 = 0;
+            const max_retries = 100;
+            while (retries < max_retries) : (retries += 1) {
+                Heap.global_io.random(&random_bytes);
+
+                for (0..suffix_len) |i| {
+                    path_buf.items[suffix_start + i] = alnum[random_bytes[i] % alnum.len];
+                }
+
+                const file = std.Io.Dir.createFileAbsolute(Heap.global_io, path_buf.items, .{
+                    .read = true,
+                    .truncate = false,
+                    .exclusive = true,
+                }) catch |err| switch (err) {
+                    error.PathAlreadyExists => continue,
+                    else => {
+                        try interp.setResultFormatted("could not create temp file: {s}", .{@errorName(err)});
+                        return error.EvalError;
+                    },
+                };
+                defer file.close(Heap.global_io);
+
+                try interp.setResultString(path_buf.items);
+                return;
+            }
+
+            try interp.setResultString("could not create a unique temporary file");
+            return error.EvalError;
+        },
     }
 }
 
