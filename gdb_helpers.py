@@ -9,14 +9,20 @@ TAG_NAMES = [
     "float",
     "bool",
     "string",
+    "source",
     "list",
     "dict",
+    "dict_sugar",
+    "parsed_script_command",
     "reference",
     "cached_local_var",
     "cached_lexical_var",
     "upvar_link",
     "closure",
     "custom_type",
+    "hash_reference",
+    "regexp",
+    "free_list",
 ]
 
 

@@ -1181,7 +1181,7 @@ pub const Body = packed union(u64) {
     /// Information about a parsed command.
     parsed_script_command: packed struct {
         line: u32,
-        arg_count: u32,
+        word_count: u32,
     },
     reference: Handle,
     cached_local_var: packed struct {
@@ -1453,7 +1453,7 @@ pub const OptionalHandle = enum(HandleBacking) {
         } else return null;
     }
 
-    pub fn swapRef(ref: *OptionalHandle, new_handle: Handle) void {
+    pub fn swap(ref: *OptionalHandle, new_handle: Handle) void {
         if (ref.toHandle()) |handle| {
             handle.decrRefCount();
         }
@@ -1938,7 +1938,7 @@ pub const Handle = packed struct(HandleBacking) {
                     break :blk try std.fmt.allocPrintSentinel(
                         global_gpa,
                         "<script command: args: {}, line: {}>",
-                        .{ script_command.arg_count, script_command.line },
+                        .{ script_command.word_count, script_command.line },
                         0,
                     );
                 } else @panic("Script line is an internal object only");
@@ -2687,7 +2687,7 @@ pub fn ensureMutableOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
         // its parent is shared, so if this isn't the head this is
         // probably incorrect.
         assert(handle.isAllocHead());
-        new_handle.swapRef(try Heap.duplicate(local_heap, handle));
+        new_handle.swap(try Heap.duplicate(local_heap, handle));
     }
 }
 
@@ -2695,13 +2695,13 @@ pub fn ensureMutableOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
 pub fn ensureShimmerableOrDup(original: Handle, new: *OptionalHandle) !void {
     const current = new.orElse(original);
     if (!current.canShimmer()) {
-        new.swapRef(try Heap.duplicate(local_heap, current));
+        new.swap(try Heap.duplicate(local_heap, current));
     }
 }
 
 pub fn ensureSameHeapOrDup(handle: Handle, new_handle: *OptionalHandle) !void {
     if (handle.heap != local_heap.heapId()) {
-        new_handle.swapRef(try local_heap.duplicate(handle));
+        new_handle.swap(try local_heap.duplicate(handle));
     }
 }
 
@@ -4199,6 +4199,7 @@ fn printLastTouchedTrace(terminal: std.Io.Terminal) !void {
     if (!options.trace_mem) {
         try terminal.setColor(.yellow);
         try w.print("WARNING: no trace collected as it was disabled in options.\n\n", .{});
+        try terminal.setColor(.reset);
         return;
     }
 

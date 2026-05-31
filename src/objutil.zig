@@ -161,9 +161,10 @@ pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
 }
 
 /// Copies provided string.
-pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: usize) !Handle {
-    const handle = try heap.createObject();
-    Heap.setString(handle, bytes);
+pub fn newStringWithCodepointLen(bytes: []const u8, cp_length: usize) !Handle {
+    const handle = try Heap.local_heap.createObject();
+    errdefer handle.decrRefCount();
+    try Heap.setString(handle, bytes);
 
     handle.peek().head.tag = .string;
 
@@ -173,8 +174,8 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
             handle.peek().body = undefined;
         },
         .normal => {
-            handle.peek().body.string.* = .{
-                .utf8_length = cp_length,
+            handle.peek().body.string = .{
+                .utf8_length = @intCast(cp_length),
                 .length_determined = true,
             };
         },
@@ -342,15 +343,11 @@ pub const Range = struct {
     /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
     pub fn fromIndexes(list_len: u32, start_index: Heap.ListIndex, end_index: Heap.ListIndex) Range {
         var start = start_index.asAbsoluteIndex(list_len);
-        var end = end_index.asAbsoluteIndex(list_len);
-
-        if (start > end) return .{ .start = 0, .end = 0 };
-
-        // End is inclusive, so we'll switch it to exclusive. We had to do it here, however,
-        // otherwise `start > end` wouldn't catch a start of 0 and an end of -1.
-        end += 1;
+        // Convert inclusive to exclusive with `+ 1`.
+        var end = end_index.asAbsoluteIndex(list_len) + 1;
 
         if (start < 0) start = 0;
+        if (end < 0) end = 0;
         if (end > list_len) end = list_len;
 
         return .{
@@ -390,7 +387,7 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandl
         // Does it start with "end"? If so, it might be end+5, or end-2, etc
         if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
             if (bytes.len >= 4) {
-                if (bytes[3] != '+' or bytes[3] != '-') return badIndexError(det, handle);
+                if (bytes[3] != '+' and bytes[3] != '-') return badIndexError(det, handle);
 
                 const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, handle);
                 break :blk .{
@@ -463,6 +460,7 @@ pub fn getRangeInPlace(det: ?*ErrorDetails, list_len: u32, start: *Handle, end: 
 pub fn stringRange(
     det: ?*ErrorDetails,
     str: Handle,
+    new_str: *OptionalHandle,
     orig_start: Handle,
     new_start: *OptionalHandle,
     orig_end: Handle,
@@ -471,17 +469,17 @@ pub fn stringRange(
     errdefer new_start.swapWithNone();
     errdefer new_end.swapWithNone();
 
-    const codepoint_len = try getCodepointLength(str);
-    const bytes = str.getString();
+    const codepoint_len = try getCodepointLength(str, new_str);
+    const bytes = try str.getString();
 
     const start_index = try getIndex(det, orig_start, new_start);
     const end_index = try getIndex(det, orig_end, new_end);
 
-    const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
+    const range = Range.fromIndexes(@intCast(codepoint_len), start_index, end_index);
 
     // cpIndex is generic across ASCII and UTF-8.
-    const byte_start = strutil.cpIndex(bytes, range.start);
-    const byte_end = strutil.cpIndex(bytes, range.end);
+    const byte_start = strutil.cpIndex(bytes, range.start) orelse return Heap.local_heap.emptyHandle();
+    const byte_end = strutil.cpIndex(bytes, range.end) orelse bytes.len;
 
     return try newStringWithCodepointLen(
         bytes[byte_start..byte_end],
@@ -1115,7 +1113,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
             line_no = info.line_no;
             file_name = info.file_name.borrowOptional();
         }
-        file_name.swapWithNone();
+        defer file_name.swapWithNone();
 
         const str = try handle.getString();
         var parser = Tokenizer.init(str, line_no);
@@ -1144,7 +1142,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
         // TODO PERF reuse the object backing if it was allocated with more than one object.
         const new_list = try newListWithCapacity(@intCast(tokens.items.len));
         new_list.peek().body.list.len = @intCast(tokens.items.len);
-        new.swapRef(new_list);
+        new.swap(new_list);
         handle = new.orElse(original);
 
         for (tokens.items, 0..) |token, i| {
@@ -1164,7 +1162,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
                 };
             }
 
-            try setSourceInfo(item, .{ .file_name = file_name, .line_no = token.loc.line_no });
+            try setSourceInfo(item, .{ .file_name = file_name.borrowOptional(), .line_no = token.loc.line_no });
         }
     }
 }
@@ -1374,8 +1372,7 @@ pub fn listAppendObject(det: ?*ErrorDetails, original: Handle, new: *OptionalHan
 pub fn listAppend(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, item: Handle) !Handle {
     errdefer new.swapWithNone();
 
-    const item_obj = original.getHeap().dupOrReference(item);
-    const index = try listAppendObject(det, original, new, item_obj);
+    const index = try listAppendObject(det, original, new, item.dupOrRef());
     return listItemNoFollow(new.orElse(original), index);
 }
 
@@ -1718,7 +1715,7 @@ fn dictRemoveDuplicates(original: Handle, new: *OptionalHandle, to_track: ?u32) 
         if (dictItem(handle, @intCast(i)).isShared()) {
             // Need to duplicate.
             const duplicated = try handle.duplicate();
-            new.swapRef(duplicated);
+            new.swap(duplicated);
             handle = duplicated;
             metadata = handle.getDictExtraData(); // Need to reload metadata.
             break;
@@ -1865,7 +1862,7 @@ fn dictPutInner(original: Handle, key: Handle, value: Heap.Object) !DictAndValue
                     // Looks like this dictionary value is shared, so we can't replace the value in place
                     // (else we'd smash up a value someone else is using). Instead, we'll use a new dict
                     // which, due to duplication, must have non-shared elements.
-                    new_dict.swapRef(try dict.duplicate());
+                    new_dict.swap(try dict.duplicate());
                     dict = new_dict.orElse(original);
                     value_handle = dictItem(dict, existing_value_index);
                 }
@@ -2177,26 +2174,26 @@ pub const DictKeysContext = struct {
     }
 };
 
-const DictKeysResult = std.array_hash_map.Custom(Handle, void, DictKeysContext, true);
-pub fn dictGetKeys(det: ?*ErrorDetails, arena: std.mem.Allocator, original: Handle, new: *OptionalHandle) !DictKeysResult {
+pub const DictKvResult = std.array_hash_map.Custom(Handle, Handle, DictKeysContext, true);
+pub fn dictGetKvPairs(det: ?*ErrorDetails, arena: std.mem.Allocator, original: Handle, new: *OptionalHandle) !DictKvResult {
     errdefer new.swapWithNone();
     try shimmerToDict(det, original, new);
 
-    var result: std.array_hash_map.Custom(Handle, void, DictKeysContext, true) = .empty;
+    var result: DictKvResult = .empty;
     errdefer result.deinit(arena);
 
     errdefer for (result.keys()) |key| key.decrRefCount();
-    try dictGetKeysInner(det, arena, original, new, &result);
+    try dictGetKvPairsInner(det, arena, original, new, &result);
 
     return result;
 }
 
-fn dictGetKeysInner(
+fn dictGetKvPairsInner(
     det: ?*ErrorDetails,
     arena: std.mem.Allocator,
     original: Handle,
     new: *OptionalHandle,
-    result: *DictKeysResult,
+    result: *DictKvResult,
 ) !void {
     var handle = new.orElse(original);
 
@@ -2229,18 +2226,20 @@ fn dictGetKeysInner(
         }
 
         // Recurse into parent first so parent keys are inserted before child keys.
-        try dictGetKeysInner(det, arena, new_parent.orElse(parent), &new_parent, result);
+        try dictGetKvPairsInner(det, arena, new_parent.orElse(parent), &new_parent, result);
     }
 
     const pair_count = dictPairLengthRaw(handle);
     var pair_i: u32 = 0;
     while (pair_i < pair_count) : (pair_i += 1) {
         const key = dictItemFollowRefs(handle, pair_i * 2);
+        const value = dictItemFollowRefs(handle, pair_i * 2 + 1);
         if (try key.equalsString("^parent")) continue;
 
         const gop = try result.getOrPut(arena, key);
         if (!gop.found_existing) {
             gop.key_ptr.* = key.borrow();
+            gop.value_ptr.* = value.borrow();
         }
     }
 }
@@ -2348,7 +2347,7 @@ pub fn dictRemove(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, k
         // Looks like this dictionary item is shared, so we can't replace the value in place
         // (else we'd smash up an item someone else is using). Instead, we'll start this whole
         // process over with a new dictionary.
-        new.swapRef(try handle.duplicate());
+        new.swap(try handle.duplicate());
         handle = new.orElse(original);
     }
 
@@ -2687,7 +2686,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             if (tokens.items[i].tag == .end_of_file) {
                 if (command_arg_count > 0) {
                     const script_command = listItemNoFollow(new_token_values, script_command_idx).peek();
-                    script_command.body.parsed_script_command.arg_count = command_arg_count;
+                    script_command.body.parsed_script_command.word_count = command_arg_count;
                 }
                 break; // Don't append a .script_command for EOF
             }
@@ -2696,7 +2695,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
             if (command_arg_count > 0) {
                 const script_command = listItemNoFollow(new_token_values, script_command_idx).peek();
-                script_command.body.parsed_script_command.arg_count = command_arg_count;
+                script_command.body.parsed_script_command.word_count = command_arg_count;
                 command_arg_count = 0;
             }
 
@@ -2711,7 +2710,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                 .body = .{
                     .parsed_script_command = .{
                         .line = tokens.items[i].loc.line_no,
-                        .arg_count = 0,
+                        .word_count = 0,
                     },
                 },
             });
@@ -2782,7 +2781,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 
     if (command_arg_count > 0) {
         const script_command = listItemNoFollow(new_token_values, script_command_idx).peek();
-        script_command.body.parsed_script_command.arg_count = command_arg_count;
+        script_command.body.parsed_script_command.word_count = command_arg_count;
     }
 
     const parsed_script: Heap.ParsedScript = .{
@@ -2815,14 +2814,14 @@ fn testScriptParsing(ta: std.mem.Allocator) !void {
     // set x 5
     try testing.expectEqual(.start_of_command, tokens[0]);
     try testing.expectEqual(0, values[0].body.parsed_script_command.line);
-    try testing.expectEqual(3, values[0].body.parsed_script_command.arg_count);
+    try testing.expectEqual(3, values[0].body.parsed_script_command.word_count);
     try expectEqualToken(&parsed, 1, .simple_string, "set");
     try expectEqualToken(&parsed, 2, .simple_string, "x");
     try expectEqualToken(&parsed, 3, .simple_string, "5");
 
     try testing.expectEqual(.start_of_command, tokens[4]);
     try testing.expectEqual(1, values[4].body.parsed_script_command.line);
-    try testing.expectEqual(3, values[4].body.parsed_script_command.arg_count);
+    try testing.expectEqual(3, values[4].body.parsed_script_command.word_count);
     try expectEqualToken(&parsed, 5, .simple_string, "set");
     try expectEqualToken(&parsed, 6, .simple_string, "y");
     try testing.expectEqual(.start_of_word, tokens[7]);
@@ -3026,6 +3025,7 @@ pub fn parseSubstitution(det: ?*ErrorDetails, handle: Handle, flags: Tokenizer.S
     }
 
     if (options.token_debugging) {
+        ioutil.debug("Substitution tokens:\n", .{});
         for (tokens.items, 0..) |token, i| {
             ioutil.debug("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"\n", .{
                 i,

@@ -396,28 +396,33 @@ pub fn dictCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             const dict = &args[2];
             try interp.setResultBoolean((try interp.getDictValueRecursively(dict, args[3..])) != .none);
         },
-        .keys => {
+        .keys, .values => {
             var new_dict: OptionalHandle = .none;
             errdefer new_dict.decrOptional();
-            var keys_map = try interp.wrapError(&det, objutil.dictGetKeys(&det, Heap.global_gpa, args[2], &new_dict));
+            var kv_map: objutil.DictKvResult = try interp.wrapError(&det, objutil.dictGetKvPairs(&det, Heap.global_gpa, args[2], &new_dict));
             args[2].swapIfNew(new_dict);
             defer {
-                for (keys_map.keys()) |key| key.decrRefCount();
-                keys_map.deinit(Heap.global_gpa);
+                var iter = kv_map.iterator();
+                while (iter.next()) |val| {
+                    val.key_ptr.decrRefCount();
+                    val.value_ptr.decrRefCount();
+                }
+                kv_map.deinit(Heap.global_gpa);
             }
 
             if (args.len == 4) {
                 const pattern = args[3];
-                var filtered = try objutil.newListWithCapacity(@intCast(keys_map.count()));
+                var filtered = try objutil.newListWithCapacity(@intCast(kv_map.count()));
                 errdefer filtered.decrRefCount();
-                for (keys_map.keys()) |key| {
-                    if (try objutil.globMatch(pattern, key, false)) {
-                        objutil.listAppendAssumeCapacity(filtered, key.dupOrRef());
+                for (kv_map.keys(), kv_map.values()) |key, value| {
+                    const used = if (subcommand == .keys) key else value;
+                    if (try objutil.globMatch(pattern, used, false)) {
+                        objutil.listAppendAssumeCapacity(filtered, used.dupOrRef());
                     }
                 }
                 interp.setResultOwning(filtered);
             } else {
-                interp.setResultOwning(try objutil.newList(keys_map.keys()));
+                interp.setResultOwning(try objutil.newList(if (subcommand == .keys) kv_map.keys() else kv_map.values()));
             }
         },
         .merge => {
@@ -1017,6 +1022,25 @@ pub fn stringCmd(interp: *Interp, args: []Handle) !void {
             .length => {
                 try interp.setResultInteger(@intCast(try interp.getCodepointLength(&sub_args[0])));
             },
+            .range => {
+                var new_str: OptionalHandle = .none;
+                var new_start: OptionalHandle = .none;
+                var new_end: OptionalHandle = .none;
+                const ranged_str = try interp.wrapError(&det, objutil.stringRange(
+                    &det,
+                    sub_args[0],
+                    &new_str,
+                    sub_args[1],
+                    &new_start,
+                    sub_args[2],
+                    &new_end,
+                ));
+                sub_args[0].swapIfNew(new_str);
+                sub_args[1].swapIfNew(new_start);
+                sub_args[2].swapIfNew(new_end);
+
+                interp.setResultOwning(ranged_str);
+            },
             .map => {
                 var opt_case_insensitive = false;
                 if (sub_args.len == 3) {
@@ -1578,9 +1602,15 @@ pub fn uplevelCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     return interp.evalObjectInner(target_frame, script, cache_key);
 }
 
-/// [apply] - invoke a closure value directly without binding it to a name.
-/// Unlike Tcl's [apply], the lambda must be a Zicl closure object or its
-/// serialized string form, a raw {argList body} list is not supported.
+pub fn evalCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+    if (args.len == 2) {
+        try interp.evalObject(args[1]);
+    } else {
+        try interp.evalObject(try objutil.newList(args[1..]));
+    }
+}
+
+/// [apply]
 pub fn applyCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     var det: objutil.ErrorDetails = undefined;
     const closure_and_key = try interp.wrapError(&det, interp.getClosure(&det, args[1], false));
@@ -2025,8 +2055,8 @@ fn catchTryHelper(
                 options_dict = options.toOptional();
             }
 
-            interp.pending_error_during.swapRef(options_dict.toHandle().?.borrow());
-            options_dict.swapRef(buildErrorOptionsBestEffort(
+            interp.pending_error_during.swap(options_dict.toHandle().?.borrow());
+            options_dict.swap(buildErrorOptionsBestEffort(
                 interp,
                 Interp.ReturnCode.fromErrorUnion(err),
                 interp.stack_trace,
@@ -2052,7 +2082,7 @@ fn catchTryHelper(
                 options_dict = options.toOptional();
             }
 
-            interp.pending_error_during.swapRef(options_dict.toHandle().?.borrow());
+            interp.pending_error_during.swap(options_dict.toHandle().?.borrow());
         }
     }
 
@@ -2077,6 +2107,10 @@ pub fn tryCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     return catchTryHelper(interp, .@"try", args);
 }
 
+pub fn breakpointCmd(_: *Interp, _: []Handle) Interp.Error!void {
+    @breakpoint();
+}
+
 /// [error message ?errorCode?]
 pub fn errorCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     interp.setResult(args[1]);
@@ -2084,7 +2118,7 @@ pub fn errorCmd(interp: *Interp, args: []Handle) Interp.Error!void {
     if (args.len >= 3) {
         // Store the error code so [catch]/[try] can pick it up.
         try interp.shimmerToList(&args[2]);
-        interp.pending_error_code.swapRef(args[2].borrow());
+        interp.pending_error_code.swap(args[2].borrow());
     }
 
     return error.EvalError;
@@ -2375,12 +2409,14 @@ pub fn infoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
         source,
         frame,
         hostname,
+        type,
     };
     const Parser = objutil.SubcommandParser(Subcommands, &.{
         .{ .variant = .exists, .usage = "varName", .min_args = 1, .max_args = 1 },
         .{ .variant = .source, .usage = "script ?fileName lineNo?", .min_args = 1, .max_args = 3 },
         .{ .variant = .frame, .usage = "?level?", .min_args = 0, .max_args = 1 },
         .{ .variant = .hostname, .usage = "", .min_args = 0, .max_args = 0 },
+        .{ .variant = .type, .usage = "object", .min_args = 1, .max_args = 1 },
     });
 
     var det: objutil.ErrorDetails = undefined;
@@ -2498,6 +2534,9 @@ pub fn infoCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             };
             try interp.setResultString(name);
         },
+        .type => {
+            try interp.setResultString(@tagName(args[1].tag()));
+        },
     }
 }
 
@@ -2545,12 +2584,14 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null, null);
     try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null, null);
     try registerCommand(interp, "break", breakCmd, "?level?", 0, 1, null);
+    try registerCommand(interp, "breakpoint", breakpointCmd, "", 0, 0, null);
     try registerCommand(interp, "catch", catchCmd, "script ?resultVar? ?optsVar?", 1, 3, null);
     try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null, null);
     try registerCommand(interp, "continue", continueCmd, "?level?", 0, 1, null);
     try registerCommand(interp, "dict", dictCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2, null);
     try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
+    try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null, null);
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3, null);
