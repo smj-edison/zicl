@@ -183,7 +183,6 @@ pub const Parse = struct {
     const Tokens = std.MultiArrayList(Tokenizer.Token).Slice;
 
     gpa: std.mem.Allocator,
-    heap: *Heap,
     source: []const u8,
     source_file_name: OptionalHandle,
     tokens: Tokens,
@@ -361,7 +360,7 @@ pub const Parse = struct {
             },
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try objutil.newStringInner(p.heap, p.source[loc.start..loc.end]);
+                const handle = try objutil.newString(p.source[loc.start..loc.end]);
                 errdefer handle.decrRefCount();
 
                 return try p.addNode(.{
@@ -371,7 +370,7 @@ pub const Parse = struct {
             },
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try p.heap.createObject();
+                const handle = try Heap.createObject();
                 errdefer handle.decrRefCount();
                 objutil.setStringFromEscaped(handle, p.source[loc.start..loc.end]) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -385,7 +384,7 @@ pub const Parse = struct {
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                const command_handle = try objutil.newStringInner(p.heap, p.source[loc.start..loc.end]);
+                const command_handle = try objutil.newString(p.source[loc.start..loc.end]);
                 errdefer command_handle.decrRefCount();
 
                 // Be sure to save the source info.
@@ -404,7 +403,7 @@ pub const Parse = struct {
             .keyword_true,
             => {
                 const loc = p.tokenLoc(p.nextToken());
-                var string_handle = try objutil.newStringInner(p.heap, p.source[loc.start..loc.end]);
+                var string_handle = try objutil.newString(p.source[loc.start..loc.end]);
                 errdefer string_handle.decrRefCount();
 
                 return try p.addNode(.{
@@ -548,10 +547,9 @@ pub const Parse = struct {
     }
 
     /// Does not borrow source_file_name.
-    pub fn init(heap: *Heap, source_file_name: OptionalHandle, source: []const u8, tokens: Tokens) Parse {
+    pub fn init(source_file_name: OptionalHandle, source: []const u8, tokens: Tokens) Parse {
         return .{
             .gpa = Heap.global_gpa,
-            .heap = heap,
             .source = source,
             .source_file_name = source_file_name,
             .tokens = tokens,
@@ -796,74 +794,73 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
 
 test "expr parsing" {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator, testing.io);
+    try Heap.testStart(testing.allocator, testing.io);
 
     // Left associativity.
-    try testExprParse(heap, "1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");
+    try testExprParse("1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");
     // Right associativity.
-    try testExprParse(heap, "1 ** 2 ** 3 ** 4", "(1 .pow (2 .pow (3 .pow 4)))");
+    try testExprParse("1 ** 2 ** 3 ** 4", "(1 .pow (2 .pow (3 .pow 4)))");
     // No associativity.
-    try testExprParseError(heap, "1 < 2 < 3", .chained_comparison_operators, null);
+    try testExprParseError("1 < 2 < 3", .chained_comparison_operators, null);
 
     // Various stress tests.
-    try testExprParse(heap, "1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");
-    try testExprParse(heap, "1 ? 10 : 5", "(.ternary_conditional 1 10 5)");
+    try testExprParse("1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");
+    try testExprParse("1 ? 10 : 5", "(.ternary_conditional 1 10 5)");
     try testExprParse(
-        heap,
         "atan2(1 ? 10 : 5, int(0 ? 5 : 2))",
         "(.atan2 (.ternary_conditional 1 10 5) (.to_int (.ternary_conditional 0 5 2)))",
     );
 
     // Test error messages.
-    try testExprParseError(heap, "1 + ", .missing_operand,
+    try testExprParseError("1 + ", .missing_operand,
         \\error: missing operand
         \\  |
         \\1 | 1 + 
         \\  |     ^
     );
-    try testExprParseError(heap, ": 5", .colon_without_question_mark,
+    try testExprParseError(": 5", .colon_without_question_mark,
         \\error: ":" without "?" in expression
         \\  |
         \\1 | : 5
         \\  | ^
     );
-    try testExprParseError(heap, "1 ? 5", .missing_colon,
+    try testExprParseError("1 ? 5", .missing_colon,
         \\error: missing operator ":"
         \\  |
         \\1 | 1 ? 5
         \\  |      ^
     );
-    try testExprParseError(heap, "atan2(1)", .too_few_arguments,
+    try testExprParseError("atan2(1)", .too_few_arguments,
         \\error: not enough arguments for function
         \\  |
         \\1 | atan2(1)
         \\  |        ^
     );
-    try testExprParseError(heap, "atan2(1, 2, 3)", .too_many_arguments,
+    try testExprParseError("atan2(1, 2, 3)", .too_many_arguments,
         \\error: too many arguments for function
         \\  |
         \\1 | atan2(1, 2, 3)
         \\  |             ^
     );
-    try testExprParseError(heap, "(5))", .too_many_r_parens,
+    try testExprParseError("(5))", .too_many_r_parens,
         \\error: unexpected closing parenthesis
         \\  |
         \\1 | (5))
         \\  |    ^
     );
-    try testExprParseError(heap, "5 < 10 > 15", .chained_comparison_operators,
+    try testExprParseError("5 < 10 > 15", .chained_comparison_operators,
         \\error: unexpected chained comparison operator
         \\  |
         \\1 | 5 < 10 > 15
         \\  |        ^
     );
-    try testExprParseError(heap, "atan2((1, 5)", .comma_outside_function,
+    try testExprParseError("atan2((1, 5)", .comma_outside_function,
         \\error: unexpected ","
         \\  |
         \\1 | atan2((1, 5)
         \\  |         ^
     );
-    try testExprParseError(heap, "10 20", .missing_operator,
+    try testExprParseError("10 20", .missing_operator,
         \\error: missing operator
         \\  |
         \\1 | 10 20
@@ -871,10 +868,10 @@ test "expr parsing" {
     );
 }
 
-fn testExprParse(heap: *Heap, expr: []const u8, comptime expected_tree: []const u8) !void {
+fn testExprParse(expr: []const u8, comptime expected_tree: []const u8) !void {
     var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
     defer tokens.deinit(testing.allocator);
-    var parser = Parse.init(heap, .none, expr, tokens.slice());
+    var parser = Parse.init(.none, expr, tokens.slice());
     defer parser.deinit();
     const root_node = (parser.parseExpr() catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
 
@@ -885,10 +882,10 @@ fn testExprParse(heap: *Heap, expr: []const u8, comptime expected_tree: []const 
     try testing.expectEqualStrings(expected_tree, result);
 }
 
-fn testExprParseError(heap: *Heap, expr: []const u8, expected_error: Parse.Error.Tag, message: ?[]const u8) !void {
+fn testExprParseError(expr: []const u8, expected_error: Parse.Error.Tag, message: ?[]const u8) !void {
     var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
     defer tokens.deinit(testing.allocator);
-    var parser = Parse.init(heap, .none, expr, tokens.slice());
+    var parser = Parse.init(.none, expr, tokens.slice());
     defer parser.deinit();
 
     try testing.expectError(error.ParseError, parser.parseExpr());

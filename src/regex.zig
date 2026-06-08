@@ -6,6 +6,7 @@ const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
+const Shimmerable = objutil.Shimmerable;
 const Interp = @import("Interp.zig");
 
 fn pcreMalloc(size: usize, userdata: ?*anyopaque) callconv(.c) ?*anyopaque {
@@ -112,7 +113,7 @@ pub fn doesStringMatch(det: ?*objutil.ErrorDetails, re: *pcre2.struct_pcre2_real
     return true;
 }
 
-pub fn regexpCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var opt_nocase = false;
     var opt_all = false;
     var opt_inline = false;
@@ -237,7 +238,7 @@ pub fn regexpCmd(interp: *Interp, args: []Handle) Interp.Error!void {
             if (opt_all) {
                 const match_list = try matchToList(subject, ovector, opt_indices);
                 defer match_list.decrRefCount();
-                const match_len = objutil.listLengthRaw(match_list);
+                const match_len = objutil.listLength(match_list);
                 var result_list_handle = result_list.?;
                 for (0..match_len) |j| {
                     const item = objutil.listItemNoFollow(match_list, @intCast(j));
@@ -284,7 +285,7 @@ fn setRegexpCaptureVars(
     interp: *Interp,
     subject: []const u8,
     match_data: *pcre2.pcre2_match_data_8,
-    match_vars: []Handle,
+    match_vars: []Shimmerable,
     opt_indices: bool,
 ) Interp.Error!void {
     if (match_vars.len == 0) return;
@@ -328,7 +329,7 @@ fn setRegexpCaptureVars(
     }
 }
 
-pub fn regsubCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var opt_nocase = false;
     var opt_all = false;
     var opt_expanded = false;

@@ -69,14 +69,16 @@ anything that might already exist.
 - `listAppend(det, provided_list, new_list, item)` -- Append a handle, duplicating/referencing as needed.
 - `listAppendAssumeCapacity(list, item)` -- Infallible append; caller pre-allocated capacity and did ref-counting.
 - `listToHandles(gpa, list)` -- Collect all item handles from a list into a newly allocated `ArrayList` (caller owns the list).
+- `listLengthShimmering(det, wb)` -- Shimmer to `.list` and return the item count.
+- `listSetInner(wb, index, value)` -- Set a list slot taking ownership of a raw `Heap.Object` (lower-level than `listSetObject`).
 
 ### Dicts
 - `newDictWithCapacity(heap, len)` -- Allocate a dict with pre-reserved key/value pair slots (`len` must be even).
 - `newDict(heap, handles)` -- Allocate a dict from a slice of alternating key/value handles.
 - `shimmerToDict(det, provided_handle, new_dict)` -- Shimmer to `.dict`; `new_dict` set if object moved.
 - `dictItems(handle)` -- Slice over all key/value objects in a dict.
-- `dictItem(dict, index)` -- Get a raw slot handle by flat index.
-- `dictItemFollowRefs(dict, index)` -- Same as `dictItem` but dereferences `.reference` objects.
+- `dictItemNoFollow(dict, index)` -- Get a raw slot handle by flat index.
+- `dictItem(dict, index)` -- Same as `dictItem` but dereferences `.reference` objects.
 - `dictItemLength(handle)` -- Total number of slots (keys + values).
 - `dictPairLengthRaw(handle)` -- Number of key/value pairs (total/2) without shimmering.
 - `dictPairLength(det, provided_handle, new_dict)` -- Shimmer + return the pair count.
@@ -87,7 +89,7 @@ anything that might already exist.
 - `dictLookupFollowRefs(dict, key)` -- Look up a key and follow `.reference` objects.
 - `dictLookupFollowLinks(dict, key)` -- Look up a key and follow upvar links.
 - `dictPut(dict, key, value)` -- Insert/update a key-value pair; returns `DictAndValueResult`.
-- `dictPutInner(provided_dict, key, value)` -- Like `dictPut` but takes ownership of a raw `Heap.Object`.
+- `dictPutObject(provided_dict, key, value)` -- Like `dictPut` but takes ownership of a raw `Heap.Object`.
 - `dictPutRecursively(det, provided_dict, keys, value)` -- Nested dict insert/update along a key path.
 - `dictRemove(provided_dict, key)` -- Remove a key; returns `DictAndRemovedResult`.
 - `dictRemoveRecursively(det, provided_dict, keys)` -- Nested dict remove along a key path.
@@ -97,6 +99,10 @@ anything that might already exist.
 - `dictFlatten(provided_dict)` -- Recursively merge a linked-dict chain into a single flat dict; returns `.none` if nothing changed.
 - `newDictInner(heap, handles)` -- Like `newDict` but takes an explicit heap.
 - `dictPutObject(original, new, key, value)` -- Insert/update a key-value pair in a dict, taking ownership of the value object.
+- `dictLookupNoFollow(dict, key)` -- Look up a key returning the raw slot handle (no ref-follow).
+- `dictLookup(dict, key)` -- Look up a key and follow `.reference` objects.
+- `dictPutAssumeCapacity(dict, key, value)` -- Infallible dict put; caller pre-allocated capacity and did ref-counting.
+- `dictGetKvPairs(det, arena, wb)` -- Recursively flatten a linked-dict chain (including `^parent` links) into an `ArrayHashMap` for iteration.
 
 ### References & misc
 - `integerObject(value)` -- Build a raw `Heap.Object` for an integer without allocating (no Handle, no heap needed).
@@ -120,6 +126,8 @@ anything that might already exist.
 - `getScript(det, handle, cache_key)` -- Parse (or retrieve from LRU cache) a Tcl script.
 - `parseExpression(det, handle)` -- Parse an expression from a string handle (not cached).
 - `getExpression(det, handle, cache_key)` -- Parse (or retrieve from LRU cache) an expression.
+- `parseSubstitution(det, handle, flags)` -- Parse a Tcl substitution string into tokens (used by `[subst]`).
+- `getSubstitution(det, handle, cache_key, flags)` -- Parse (or retrieve from cache) a substitution with the given flags.
 
 ---
 
@@ -166,6 +174,8 @@ anything that might already exist.
 - `handle.referenceOwning()` -- Create a `.reference` object without incrementing ref count (returns raw `Object`).
 - `handle.getHashNoRegister()` -- Return a `u256` content hash without registering in the hash registry.
 - `handle.getRegexpExtraData()` -- Access the `.regexp` extra data pointer.
+- `handle.getRefCount()` -- Return the current reference count.
+- `handle.hashReference()` -- Create a `.hash_reference` object (returns raw `Object`).
 
 ### OptionalHandle operations
 - `optional.toHandle()` -- Convert to `?Handle`.
@@ -186,6 +196,7 @@ anything that might already exist.
 - `Object.deinitSingle(obj, heap)` -- Free a single object and its backing storage.
 - `Object.deinitString(obj, heap)` -- Free only the string representation of an object.
 - `Object.deinitBodySingle(obj, heap)` -- Free only the body/backing storage of an object.
+- `Object.take(obj)` -- Take ownership of the object (returns raw `Object` and zeroes the source).
 
 ### Heap-level operations
 - `Heap.ensureMutableOrDup(handle, new_handle)` -- Duplicate if the handle cannot be mutated in-place.
@@ -233,6 +244,7 @@ anything that might already exist.
 - `Heap.setStringOwning(handle, bytes, hash_handles)` -- Set a string, taking ownership of the bytes if they are too big for a normal string; returns whether ownership was taken.
 - `heap.setNormalString(obj_index, bytes, hash_handles)` -- Low-level function that copies a string into the object heap.
 - `heap.setSpecialString(obj_index, string, hash_handles)` -- Low-level function that sets an object's string to a special string representation.
+- `heap.splitAllocIntoIndividual(self, index)` -- Split a multi-object buddy block into individual order-0 objects.
 
 ### Lifecycle
 - `Heap.init(heap)` -- Initialize a heap (called by `initLocalHeap`).
@@ -266,6 +278,7 @@ anything that might already exist.
 - `Heap.leakCheck(heap)` -- Return true if any objects are still live.
 - `Heap.leakCheckWithMode(heap, mode)` -- Leak check with optional dot-graph output.
 - `Heap.leakCheckAll()` -- Leak-check all heaps.
+- `Heap.didLeak(heap)` -- Return true if the given heap has live objects remaining.
 
 ---
 
@@ -373,6 +386,7 @@ anything that might already exist.
 - `evalExpressionInPlace(interp, handle)` -- Evaluate an expression, shimmering `handle` in-place; returns `ExprResult`.
 - `getBoolFromExpression(interp, handle)` -- Evaluate an expression and return its boolean value; updates `handle` if shimmered.
 - `evalFile(interp, filename)` -- Read a file and evaluate its contents as a script, attaching source info for error reporting.
+- `evalSubstitution(interp, handle, flags)` -- Evaluate a substitution string, interpolating variables and commands.
 
 ### Setting the result
 - `setResult(interp, handle)` -- Set `interp.result`, borrowing the handle (caller still owns original).
@@ -404,6 +418,7 @@ anything that might already exist.
 - `setVariableUpvarInner(interp, det, call_frame_idx, name, target_call_frame_idx, target_name)` -- Create an upvar link, checking for circular references.
 - `unsetVariableInner(interp, det, call_frame_idx, name)` -- Unset a variable in the given call frame.
 - `getVariableInner(interp, det, call_frame_idx, name)` -- Resolve a variable's value; must be called with a heap-native name.
+- `getVariableOrErrorInner(interp, det, call_frame_idx, name)` -- Resolve a variable's value; errors via `det` if unset.
 
 ### Dict helpers (interp-aware wrappers)
 - `getDictValue(interp, dict, key)` -- Look up `key` in `dict`; returns struct with value and shimmer handle.
@@ -433,6 +448,15 @@ anything that might already exist.
 - `getIndex(interp, handle)` -- Shimmer `*handle` to index and return the `Heap.ListIndex` value.
 - `resolveHash(interp, handle)` -- Shimmer `*handle` to hash reference and return the resolved handle.
 - `getCodepointLength(interp, handle)` -- Shimmer `*handle` to string and return its UTF-8 codepoint length.
+- `wrapShimmerInPlaceFn(interp, ref, to_call)` -- Comptime: adapt a shimmer function for a `*Handle` reference (in-place). Prefer writeback variants; in-place can accidentally free objects.
+- `wrapMutableFn(interp, wb, to_call)` -- Comptime: adapt a mutable function to use `interp` error context.
+- `getIntegerInPlace(interp, ref)` -- Shimmer a `*Handle` reference to integer and return the value. Prefer `getInteger` with a writeback buffer.
+- `getBooleanInPlace(interp, ref)` -- Shimmer a `*Handle` reference to boolean and return the value. Prefer `getBoolean` with a writeback buffer.
+- `shimmerToDict(interp, wb)` -- Shimmer a writeback buffer to a dict.
+- `shimmerToListInPlace(interp, ref)` -- Shimmer a `*Handle` reference to a list. Prefer `shimmerToList` with a writeback buffer.
+- `getListLengthInPlace(interp, ref)` -- Shimmer a `*Handle` reference to list and return the item count. Prefer `getListLength` with a writeback buffer.
+- `getIntegerOrFloat(interp, wb)` -- Shimmer a writeback buffer and return an `IntegerOrFloat` union (tries integer first, then float).
+- `getIntegerOrFloatInPlace(interp, ref)` -- Like `getIntegerOrFloat` but updates a `*Handle` reference in place. Prefer the writeback variant.
 
 ### Closures
 - `parseClosure(det, bytes)` -- Parse a closure definition from raw bytes; returns `Heap.Closure`.

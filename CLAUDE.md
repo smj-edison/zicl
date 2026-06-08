@@ -8,11 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Design Constraints
 -   **Out of memory is considered recoverable.** Zig has strong support for OOM scenarios, and so we follow this idiom and make sure our OOM paths recover correctly.
--   **Fail fast and loud.** This has come up so so many times, please stop writing defensive code and either crash loudly or report the error clearly to the user.Also, don't _ever_ leave a piece of code unimplemented without panicking or raising an appropriate error. The last thing we need in an interpreter is silent correctness issues. 
+-   **Fail fast and loud.** This has come up so so many times, please stop writing defensive code and either crash loudly or report the error clearly to the user.Also, don't _ever_ leave a piece of code unimplemented without panicking or raising an appropriate error. The last thing we need in an interpreter is silent correctness issues.
 -   **Cross-thread sharing is a primary goal.** The multi-heap architecture exists specifically to support this. Design decisions should treat cross-thread object sharing as a first-class use case, not an afterthought.
 -   **Interpreters can block indefinitely.** Blocking in C FFI (or otherwise) is considered normal operation. Nothing in the system may require an interpreter's owning thread to be active in order to make progress. In particular, foreign threads must be able to free objects belonging to a blocked heap without any cooperation from the owning thread.
--   **Allocation is thread-local; deallocation is cross-thread safe.** The buddy allocator uses a mutex-protected main list for operations from any thread, and a lock-free pool as a fast path for the owning thread only. Cross-thread frees go directly through the mutex to the main list — no deferred queue is used, precisely because a deferred queue would require the owning thread to drain it.
--   **Every object must be transparently treated as a string.** All design decisions revolve around this ­— at the end of the day everything in Zicl is a string. This means handle.tag() can't be relied on for the object to have a permanent type, since the tag is ephemeral. This also means that Zicl data structures can't depend on the current tag outside of optimization, since that would break the contract that all objects are transparently strings.
+-   **Allocation is thread-local; deallocation is cross-thread safe.** The buddy allocator uses a mutex-protected main list for operations from any thread, and a lock-free pool as a fast path for the owning thread only. Cross-thread frees go directly through the mutex to the main list -- no deferred queue is used, precisely because a deferred queue would require the owning thread to drain it.
+-   **Every object must be transparently treated as a string.** All design decisions revolve around this -- at the end of the day everything in Zicl is a string. This means handle.tag() can't be relied on for the object to have a permanent type, since the tag is ephemeral. This also means that Zicl data structures can't depend on the current tag outside of optimization, since that would break the contract that all objects are transparently strings.
 -   **We don't use standard malloc/free.** When doing C FFI, make sure that we've registered our custom allocators, and called the functions accordingly.
 
 ## Build Commands
@@ -127,11 +127,17 @@ Objects automatically "shimmer" between types, maintaining cached representation
 
 1. **Handles vs Objects**: Handles are lightweight references (64 bits) to objects in a heap. Objects live in the heap's object storage.
 
-2. **OptionalHandle**: A special enum type that can be `.none` or contain a `Handle`. Used as an output parameter in shimmer functions to indicate whether duplication occurred.
+2. **Shimmerable and Mutable**: Two wrapper structs that track in-place modifications.
+   - `Shimmerable = { original: Handle, shimmered: OptionalHandle }` -- for transparent type changes (the string representation is preserved or will be generated the same way).
+   - `Mutable = { original: Handle, mutated: OptionalHandle }` -- for visible mutations (the string representation may change).
+   - Both provide `.current()` to get the effective handle, `.consume()` to take ownership, and `.discardChanges()` to roll back.
+   - `Mutable` can be cast to `Shimmerable` via `.asShimmerable()`.
 
-3. **Reference Counting**: All heap objects are ref-counted (including list items). Only interned strings and special objects bypass ref counting.
+3. **OptionalHandle**: A special enum type that can be `.none` or contain a `Handle`. Still used for optional values and inside `Shimmerable`/`Mutable`.
 
-4. **Ownership Patterns**:
+4. **Reference Counting**: All heap objects are ref-counted (including list items). Only interned strings and special objects bypass ref counting.
+
+5. **Ownership Patterns**:
 
     - Functions that allocate return owned handles (caller must release)
     - `borrow()` increases ref count and returns the handle
@@ -156,8 +162,8 @@ Tests use `testing.checkAllAllocationFailures()` to ensure proper error handling
 
 ```zig
 fn testFoo(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta, std.io.getStdOut());
     defer Heap.testFinish();
+    try Heap.testStart(ta, testing.io);
     // ... test code ...
 }
 
@@ -187,73 +193,86 @@ Helper functions available:
 **Creating Objects**:
 
 ```zig
-const str = try object.newString("hello");
+const str = try objutil.newString("hello");
 defer str.decrRefCount();
 ```
 
 **Working with Lists**:
 
 ```zig
-const list = try object.newList(&.{item1, item2});
+const list = try objutil.newList(&.{item1, item2});
 defer list.decrRefCount();
-const item = object.listItem(list, 0); // Non-owning handle
+const item = objutil.listItem(list, 0); // Non-owning handle
 ```
 
-**Type Shimmering** (output parameter API):
+**Type Shimmering** (`Shimmerable` / `Mutable` API):
 
-The out parameter `new` is an accumulating scratch space that tracks the current handle through a chain of operations. It starts as `.none`, gets populated if the object is duplicated or replaced, and subsequent operations in the same scope read `new.orElse(original)` to see the latest handle.
+Shimmer and mutation functions take a `*Shimmerable` or `*Mutable` working buffer. The wrapper tracks whether the object had to be duplicated. Callers use `.current()` to get the effective handle and `.discardChanges()` on cleanup paths.
 
 ```zig
-// Shimmer functions take Handle by value and *OptionalHandle output parameter.
-var det: object.ErrorDetails = undefined;
-var new: OptionalHandle = .none;
-try object.shimmerToList(&det, handle, &new);
-handle.swapIfNew(new);  // Update if shimmer created a duplicate
-// handle is now a list type
+// Shimmer functions take a *Shimmerable working buffer.
+var det: objutil.ErrorDetails = undefined;
+var wb: objutil.Shimmerable = .{ .original = handle };
+defer wb.discardChanges();
+try objutil.shimmerToList(&det, &wb);
+// wb.current() is now a list. If wb.shimmered is non-null, the object moved.
 
 // Pattern inside shimmer functions:
-pub fn shimmerToInteger(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    var handle = new.orElse(original);
-    if (handle.tag() == .integer) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToInteger(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .integer) return;
+    errdefer wb.discardChanges();
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    handle = new.orElse(original);
+    const value = try integerGetNoShimmer(det, wb.current());
 
-    // ... shimmer logic ...
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .integer;
+    wb.peek().body.integer = value;
 }
 ```
 
-**In-place Shimmering** (for wrapped types like enums):
+**Mutation functions** use `Mutable` instead of `Shimmerable`:
 
 ```zig
-// When a shimmer function is called on a *Handle, use a local working variable.
-pub fn getInPlace(det: ?*ErrorDetails, handle: *Handle) !T {
-    var working: OptionalHandle = .none;
-    errdefer working.swapWithNone();
-    const result = try get(det, handle.*, &working);
-    handle.swapIfNew(working);
-    return result;
-}
+var wb: Mutable = .{ .original = dict };
+defer wb.discardChanges();
+_ = try objutil.dictPutObject(&det, &wb, key_handle, value_object);
+// wb.current() now holds the mutated dict.
+```
+
+**In-place Shimmering** (for single `Handle` references):
+
+```zig
+// Interp provides helpers that wrap a *Handle into a local Shimmerable.
+const value = try interp.getInteger(&args[1]);
+// args[1] is shimmered in place if needed.
+```
+
+Or manually:
+
+```zig
+var wb: Shimmerable = .{ .original = my_handle };
+defer wb.discardChanges();
+const value = try objutil.integerGet(&det, &wb);
+my_handle = wb.consume();
 ```
 
 **Get Functions** (shimmer + extract value):
 
 ```zig
-// Get functions shimmer and return a value, leaving the handle updated.
-var new: OptionalHandle = .none;
-const value = try object.integerGet(&det, my_handle, &new);
-my_handle.swapIfNew(new);
-// my_handle is now an integer type, value contains the i64
+var wb: Shimmerable = .{ .original = my_handle };
+defer wb.discardChanges();
+const value = try objutil.integerGet(&det, &wb);
+my_handle = wb.consume();
+// my_handle is now an integer type, value contains the i64.
 ```
 
-**Shimmerability guards**: Before mutating or shimmering an object, always check (or ensure) that it is safe to do so. `handle.canShimmer()` returns false for shared or cross-thread objects. `handle.canMutate()` returns false when ref count is greater than 1. Use `Heap.ensureShimmerableOrDup()` or `Heap.ensureMutableOrDup()` to duplicate the object automatically when needed. Always call `handle.prepareToShimmer()` before changing an object's tag or body.
+**Shimmerability guards**: Before mutating or shimmering an object, always check (or ensure) that it is safe to do so. `handle.canShimmer()` returns false for shared or cross-thread objects. `handle.canMutate()` returns false when ref count is greater than 1 or the object is cross-thread. `Shimmerable` provides `.ensureShimmerable()` and `.prepareToShimmer()`; `Mutable` provides `.prepareToMutate()`. Always call `prepareToShimmer()` before changing an object's tag or body.
 
 **Error Handling with Details**:
 
 ```zig
-var det: object.ErrorDetails = undefined;
-const result = try someFn(heap, &det, arg);
+var det: objutil.ErrorDetails = undefined;
+const result = try someFn(&det, arg);
 // On error, det.message contains user-facing error string. Pass in `null` to `someFn` to avoid the error being allocated on the heap.
 ```
 
@@ -285,7 +304,7 @@ Build options (in build.zig):
 
 Heap settings (in Heap.zig cfg):
 
--   `object_heap_order`: Max 2^16 objects (default: 16)
+-   `object_heap_order`: Max 2^24 objects (default: 24)
 -   `string_heap_order`: Max 2^28 bytes for strings (default: 28)
 -   `max_heaps`: Maximum concurrent heaps (default: 128)
 -   `max_custom_types`: Maximum registered custom types (default: 65536)
@@ -316,7 +335,7 @@ const result = try processData(data);  // This might fail
 
 **Overlapping errdefers after ownership transfer**: When you transfer ownership of a raw `Heap.Object` into a collection slot (e.g. `new_value_handle.peek().* = value;`) inside a nested block with its own `errdefer`, null out the source variable afterward (`value_mut = Heap.emptyObject()`). Otherwise an outer `errdefer value_mut.deinitSingle(...)` and an inner `errdefer new_value_handle.invalidateBoth()` will both try to free the same backing object if an error occurs after the transfer, causing a double-free under OOM.
 
-**Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `Heap.ensureShimmerableOrDup()` to automatically duplicate if the handle cannot shimmer.
+**Shimmer Errors**: If shimmering fails, ensure the handle is not shared between threads. Use `Shimmerable.ensureShimmerable()` or `Mutable.prepareToMutate()` to automatically duplicate if the handle cannot shimmer in place.
 
 **OOM in Tests**: Use `testing.checkAllAllocationFailures()` wrapper to test all OOM code paths. All tests should pass without leaks even when allocations fail at any point.
 
@@ -326,7 +345,7 @@ const result = try processData(data);  // This might fail
 
 ## Debugging
 
-This project has comprehensive tracing for all memory operations. _Always_ read the complete trace before jumping into the code—the trace often holds the answer.
+This project has comprehensive tracing for all memory operations. _Always_ read the complete trace before jumping into the code--the trace often holds the answer.
 
 ## Recent Development
 
@@ -339,17 +358,19 @@ Recent fixes and improvements:
 -   **Exception system**: Implemented `[catch]`, `[try]`, `[return]`, and `[errorinfo]` with proper `-code`/`-level`/`-errorstack` propagation.
 -   **Closures via `[fn]`**: Implemented first-class closures with lexical scope capture. `[fn]` replaces both `[proc]` and `[apply]`. Closures capture their defining scope and support required args, optional args with defaults, and varargs. `[method]` provides the same for methods.
 -   **LRU cache**: Parsed scripts, expressions, and closures are now cached per-heap using an LRU cache (in `memutil.zig`), replacing the old ScriptId system.
--   **Handle Refactoring (complete)**: Refactored Handle management API from pointer-based mutation (`shimmerToX(&det, &handle)`) to an output parameter pattern that eliminates use-after-free issues.
-    -   New signature: `shimmerToX(det, original, new: *OptionalHandle) !void`
-    -   The out parameter `new` is an accumulating scratch space; functions read `new.orElse(original)` to see the current handle, which may have been set by an earlier step in the same scope
-    -   Get functions (e.g., `integerGet`) take the same parameters and return the value directly
-    -   Standard pattern: `errdefer new.swapWithNone()` at function start; `var handle = new.orElse(original)` to resolve the current object
-    -   Caller pattern: `handle.swapIfNew(new)` to update handle references after the call
-    -   In-place helpers (e.g., `getInPlace`, `wrapShimmerFn`) use a local `working: OptionalHandle = .none` with `errdefer working.swapWithNone()`, then `handle.swapIfNew(working)` on success
--   Dictionary operations: Added `dictRemove`, `dictRemoveRecursively`, fixed duplicate handling, added dict parent-link flattening.
--   Command architecture: Standardized function naming conventions.
--   Loop control: Fixed break/continue propagation with level support.
--   Memory safety: Fixed double-free on initialization failure and interned string leaks.
+-   **Shimmerable/Mutable Refactoring (complete)**: Refactored the entire object mutation API from pointer-based mutation and `OptionalHandle` out-parameters to `Shimmerable` and `Mutable` wrapper structs.
+    -   `Shimmerable = { original: Handle, shimmered: OptionalHandle }` tracks transparent type conversions.
+    -   `Mutable = { original: Handle, mutated: OptionalHandle }` tracks visible mutations.
+    -   Shimmer functions: `shimmerToX(det, wb: *Shimmerable) !void`
+    -   Mutation functions: `dictPut(wb: *Mutable, key, value) !Handle`, `listAppend(wb: *Mutable, item) !Handle`, etc.
+    -   Interp wrappers: `getInteger(wb: *Shimmerable) !i64`, `shimmerToDict(wb: *Shimmerable) !void`, etc.
+    -   Command signatures now take `[]Shimmerable` instead of `[]Handle`, allowing in-place shimmering of arguments.
+-   **Variable caching**: Reworked variable resolution with `resolveVariable`, `reshimmerToVariable`, and `ensureValidVariableType`. Local variables cache their dict slot index; lexical variables cache the resolved value via extra data.
+-   **Dict iteration**: Added `dictGetKvPairs` which recursively flattens parent links into an `ArrayHashMap` for iteration.
+-   **Dictionary operations**: Added `dictRemove`, `dictRemoveRecursively`, fixed duplicate handling, added dict parent-link flattening.
+-   **Command architecture**: Standardized function naming conventions.
+-   **Loop control**: Fixed break/continue propagation with level support.
+-   **Memory safety**: Fixed double-free on initialization failure and interned string leaks.
 
 ## Development Status
 
@@ -377,7 +398,7 @@ Currently implemented:
     -   Control flow: [if], [for], [while], [break], [continue], [catch], [try], [return], [tailcall]
     -   Variables: [set], [unset], [upvar], [uplevel], [append]
     -   Closures: [fn], [method], [apply], [applymethod]
-    -   Data structures: [dict] (get, getdef, set, remove, exists, size, keys, values, merge, create), [list], [llength], [lappend], [lassign], [concat]
+    -   Data structures: [dict] (get, getdef, set, remove, exists, size, keys, values, merge, create, link), [list], [llength], [lappend], [lassign], [concat]
     -   String: [string] (length, index, range, match, map, cat, compare, equal, trim, tolower, toupper, totitle, repeat, replace, reverse, first, last)
     -   File I/O: [file] (exists, dirname, tail, rootname, join, mkdir, size, readable, isdirectory, mtime, readlink, tempfile), [source], [puts]
     -   Introspection: [info], [errorinfo], [pid]

@@ -35,16 +35,145 @@ pub const ErrorDetails = struct {
     index: ?u32 = null,
 };
 
-pub fn shimmerToString(original: Handle, new: *OptionalHandle) !void {
-    if (new.orElse(original).tag() == .string) return;
-    errdefer new.swapWithNone();
+/// Note that this is often cast to `Mutable`, so you can't depend on `original`
+/// and `shimmered` as having the same value. Always use `.current()`. This is
+/// because `Shimmerable` and `Mutable` are more conventions to keep straight
+/// what's allowed to mutate, and what's just allowed to shimmer (a mutation is
+/// considered a shimmer if it has/will generate the same string rep).
+pub const Shimmerable = extern struct {
+    original: Handle,
+    shimmered: OptionalHandle = .none,
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    const handle = new.orElse(original);
+    pub fn deinit(self: *Shimmerable) void {
+        self.original.decrRefCount();
+        self.shimmered.decrOptional();
+        self.* = undefined;
+    }
 
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .string;
-    handle.peek().body = .{
+    pub fn current(self: *const Shimmerable) Handle {
+        return self.shimmered.orElse(self.original);
+    }
+
+    pub fn consume(self: *Shimmerable) Handle {
+        if (self.shimmered.toHandle()) |shimmered| {
+            self.original.decrRefCount();
+            self.* = undefined;
+            return shimmered;
+        } else {
+            self.* = undefined;
+            return self.original;
+        }
+    }
+
+    pub fn discardChanges(self: *Shimmerable) void {
+        self.shimmered.swapWithNone();
+    }
+
+    pub fn peek(self: *const Shimmerable) *Heap.Object {
+        return self.current().peek();
+    }
+
+    pub fn tag(self: *const Shimmerable) Heap.Tag {
+        return self.current().tag();
+    }
+
+    pub fn getString(self: *const Shimmerable) ![:0]const u8 {
+        return try self.getString();
+    }
+
+    /// Be very careful when using `asMutable`, since mutation functions often invalidate
+    /// the original string. Even if the mutation you do is transparent with the object
+    /// model, it may free the original string, thus not being transparent.
+    pub fn asMutable(self: *Shimmerable) *Mutable {
+        return @ptrCast(self);
+    }
+
+    pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
+        if (!self.current().canShimmer()) {
+            self.shimmered.swap(try Heap.duplicate(self.current()));
+        }
+    }
+
+    pub fn prepareToShimmer(self: *Shimmerable) !void {
+        try self.ensureShimmerable();
+        try self.current().prepareToShimmer();
+    }
+
+    pub fn duplicateForMutable(self: *const Shimmerable) !Handle {
+        // Even if `original` or `replacement` can mutate due to ref count = 1,
+        // we've been tasked with making sure this object doesn't mutate, since
+        // the purpose of Shimmer is to ensure that we only ever write back
+        // something that has the same string (or will have the same string
+        // when generated).
+        return try self.current().duplicate();
+    }
+};
+
+pub const Mutable = extern struct {
+    original: Handle,
+    mutated: OptionalHandle = .none,
+
+    pub fn deinit(self: *Mutable) void {
+        self.original.decrRefCount();
+        self.mutated.decrOptional();
+        self.* = undefined;
+    }
+
+    pub fn current(self: *const Mutable) Handle {
+        return self.mutated.orElse(self.original);
+    }
+
+    pub fn consume(self: *Mutable) Handle {
+        if (self.mutated.toHandle()) |mutated| {
+            self.original.decrRefCount();
+            return mutated;
+        } else {
+            return self.original;
+        }
+    }
+
+    pub fn discardChanges(self: *Mutable) void {
+        self.mutated.swapWithNone();
+    }
+
+    pub fn peek(self: *const Mutable) *Heap.Object {
+        return self.current().peek();
+    }
+
+    pub fn tag(self: *const Mutable) Heap.Tag {
+        return self.current().tag();
+    }
+
+    pub fn getString(self: *const Shimmerable) ![:0]const u8 {
+        return try self.getString();
+    }
+
+    pub fn asShimmerable(self: *Mutable) *Shimmerable {
+        return @ptrCast(self);
+    }
+
+    pub fn prepareToShimmer(self: *Mutable) !void {
+        if (!self.current().canShimmer()) {
+            self.mutated.swap(try Heap.duplicate(self.current()));
+        }
+
+        try self.current().prepareToShimmer();
+    }
+
+    pub fn prepareToMutate(self: *Mutable) !void {
+        if (!self.current().canMutate()) {
+            self.mutated.swap(try Heap.duplicate(self.current()));
+        }
+    }
+};
+
+pub fn shimmerToString(wb: *Shimmerable) !void {
+    if (wb.tag() == .string) return;
+    errdefer wb.discardChanges();
+
+    try wb.prepareToShimmer();
+    wb.current().peek().head.tag = .string;
+    wb.current().peek().body = .{
         .string = .{
             .utf8_length = 0,
             // Don't know the utf-8 length yet.
@@ -54,54 +183,48 @@ pub fn shimmerToString(original: Handle, new: *OptionalHandle) !void {
 }
 
 pub fn createHashReference(referent: Handle) !Handle {
-    const handle = try Heap.local_heap.createObject();
+    const handle = try Heap.createObject();
     handle.peek().head.tag = .hash_reference;
     handle.peek().body.hash_reference = referent.borrow();
     return handle;
 }
 
-pub const hash_lookup_failed_fmt_string = "Could not find value for hash reference {f}";
-pub fn shimmerToHashReference(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    if (new.orElse(original).tag() == .hash_reference) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToHashReference(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.current().tag() == .hash_reference) return;
+    errdefer wb.discardChanges();
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    const handle = new.orElse(original);
+    try wb.prepareToShimmer();
 
-    const str = try handle.getString();
+    const str = try wb.current().getString();
     const hash = Heap.parseHashReference(str) orelse {
         if (det) |details| details.* = .{
-            .message = try newStringFmtInner(
-                Heap.local_heap,
-                "Expected a hash reference like \"blake3^...\" in \"{f}\".",
-                .{handle},
+            .message = try newStringFmt(
+                "Expected a hash reference like \"blake3^...\" in \"{s}\".",
+                .{str},
             ),
         };
         return error.NotHashReference;
     };
     const target = Heap.registered_hashes.get(hash) orelse {
         if (det) |details| details.* = .{
-            .message = try newStringFmtInner(
-                Heap.local_heap,
-                hash_lookup_failed_fmt_string,
-                .{handle},
+            .message = try newStringFmt(
+                "Could not find value for hash reference {s}",
+                .{str},
             ),
         };
         return error.HashLookupFailed;
     };
 
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .hash_reference;
-    handle.peek().body = .{ .hash_reference = target.borrow() };
+    wb.peek().head.tag = .hash_reference;
+    wb.peek().body = .{ .hash_reference = target.borrow() };
 }
 
-pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
-    errdefer new.swapWithNone();
-    try shimmerToString(original, new);
-    const handle = new.orElse(original);
+pub fn getCodepointLength(wb: *Shimmerable) !usize {
+    errdefer wb.discardChanges();
+    try shimmerToString(wb);
 
     // See if we already calculated the utf8 length.
-    switch (handle.getStringDetails()) {
+    switch (wb.current().getStringDetails()) {
         .long => |long_str| {
             const current_len = long_str.getUtf8Length();
             if (current_len) |val| return val;
@@ -112,15 +235,18 @@ pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
             return utf8_length;
         },
         .normal => {
-            if (handle.peek().body.string.length_determined) {
-                return handle.peek().body.string.utf8_length;
+            const body_ptr: *@FieldType(Heap.Body, "string") = @alignCast(&wb.peek().body.string);
+            const current_body = @atomicLoad(@TypeOf(body_ptr), body_ptr, .monotonic);
+            if (current_body.length_determined) {
+                return current_body.utf8_length;
             } else {
-                const bytes = try handle.getString();
+                const bytes = try wb.current().getString();
                 const utf8_length = strutil.codepointLength(bytes);
-                handle.peek().body.string = .{
+                @atomicStore(@TypeOf(body_ptr), body_ptr, .{
                     .utf8_length = @intCast(utf8_length), // Cache utf8 length.
                     .length_determined = true,
-                };
+                }, .monotonic);
+
                 return utf8_length;
             }
         },
@@ -130,39 +256,31 @@ pub fn getCodepointLength(original: Handle, new: *OptionalHandle) !usize {
 }
 
 /// Copies provided string.
-pub fn newStringInner(heap: *Heap, bytes: []const u8) !Handle {
-    var handle = try heap.createObject();
+pub fn newString(bytes: []const u8) !Handle {
+    var handle = try Heap.createObject();
     errdefer handle.decrRefCount();
 
     Heap.setString(handle, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OtherThreadSet => unreachable, // Brand new string, so impossible.
     };
-    var new_handle: OptionalHandle = .none;
-    try shimmerToString(handle, &new_handle);
-    assert(new_handle == .none);
+    var handle_wb: Shimmerable = .{ .original = handle };
+    try shimmerToString(&handle_wb);
+    assert(handle_wb.shimmered == .none);
 
     return handle;
 }
 
-pub fn newString(bytes: []const u8) !Handle {
-    return newStringInner(Heap.local_heap, bytes);
-}
-
-pub fn newStringFmtInner(heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
+pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
     const str = try std.fmt.allocPrint(Heap.global_gpa, fmt, args);
     defer Heap.global_gpa.free(str);
 
-    return try newStringInner(heap, str);
-}
-
-pub fn newStringFmt(comptime fmt: []const u8, args: anytype) !Handle {
-    return newStringFmtInner(Heap.local_heap, fmt, args);
+    return try newString(str);
 }
 
 /// Copies provided string.
 pub fn newStringWithCodepointLen(bytes: []const u8, cp_length: usize) !Handle {
-    const handle = try Heap.local_heap.createObject();
+    const handle = try Heap.createObject();
     errdefer handle.decrRefCount();
     try Heap.setString(handle, bytes);
 
@@ -215,8 +333,8 @@ pub fn compare(a: Handle, b: Handle, up_to_cp: ?usize, case_insensitive: bool) !
 }
 
 // Integer related functions
-pub fn newInteger(heap: *Heap, value: i64) !Handle {
-    const handle = try heap.createObject();
+pub fn newInteger(value: i64) !Handle {
+    const handle = try Heap.createObject();
     handle.peek().head.tag = .integer;
     handle.peek().body.integer = value;
     return handle;
@@ -269,28 +387,25 @@ pub fn integerGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !i64 {
     }
 }
 
-pub fn shimmerToInteger(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    if (new.orElse(original).tag() == .integer) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToInteger(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .integer) return;
+    errdefer wb.discardChanges();
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    const handle = new.orElse(original);
+    const value: i64 = try integerGetNoShimmer(det, wb.current());
 
-    const value: i64 = try integerGetNoShimmer(det, handle);
-
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .integer;
-    handle.peek().body.integer = value;
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .integer;
+    wb.peek().body.integer = value;
 }
 
-pub fn integerGet(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !i64 {
-    try shimmerToInteger(det, original, new);
-    return new.orElse(original).peek().body.integer;
+pub fn integerGet(det: ?*ErrorDetails, wb: *Shimmerable) !i64 {
+    shimmerToInteger(det, wb);
+    return wb.peek().body.integer;
 }
 
 // Float related functions.
 pub fn newFloat(value: f64) !Handle {
-    const handle = try Heap.local_heap.createObject();
+    const handle = try Heap.createObject();
     handle.peek().head.tag = .float;
     handle.peek().body.float = value;
     return handle;
@@ -312,22 +427,20 @@ pub fn floatGetNoShimmer(det: ?*ErrorDetails, handle: Handle) !f64 {
     }
 }
 
-pub fn shimmerToFloat(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    if (new.orElse(original).tag() == .float) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToFloat(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .float) return;
+    errdefer wb.discardChanges();
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    const handle = new.orElse(original);
+    const value = try floatGetNoShimmer(det, wb.current());
 
-    const value = try floatGetNoShimmer(det, handle);
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .float;
-    handle.peek().body.float = value;
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .float;
+    wb.peek().body.float = value;
 }
 
-pub fn floatGet(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !i64 {
-    try shimmerToFloat(det, original, new);
-    return new.orElse(original).peek().body.float;
+pub fn floatGet(det: ?*ErrorDetails, wb: *Shimmerable) !i64 {
+    try shimmerToFloat(det, wb);
+    return wb.peek().body.float;
 }
 
 ///////////////////////////////
@@ -374,22 +487,19 @@ fn badIndexError(det: ?*ErrorDetails, handle: Handle) error{ OutOfMemory, BadInd
 }
 
 /// Shimmers to an index representation.
-pub fn shimmerToIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    if (new.orElse(original).tag() == .index) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToIndex(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .index) return;
+    errdefer wb.discardChanges();
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    const handle = new.orElse(original);
-
-    const bytes = try handle.getString();
+    const bytes = try wb.current().getString();
 
     const index: Heap.ListIndex = blk: {
         // Does it start with "end"? If so, it might be end+5, or end-2, etc
         if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
             if (bytes.len >= 4) {
-                if (bytes[3] != '+' and bytes[3] != '-') return badIndexError(det, handle);
+                if (bytes[3] != '+' and bytes[3] != '-') return badIndexError(det, wb.current());
 
-                const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, handle);
+                const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return badIndexError(det, wb.current());
                 break :blk .{
                     .u = .{ .end_offset = index_offset },
                     .is_relative = true,
@@ -399,81 +509,56 @@ pub fn shimmerToIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandl
             break :blk Heap.ListIndex.end;
         } else {
             break :blk .{ .u = .{ .index = .{
-                .data = std.fmt.parseInt(u32, bytes, 10) catch return badIndexError(det, handle),
+                .data = std.fmt.parseInt(u32, bytes, 10) catch return badIndexError(det, wb.current()),
             } }, .is_relative = false };
         }
     };
 
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .index;
-    handle.peek().body = .{ .index = .{ .data = index } };
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .index;
+    wb.peek().body = .{ .index = .{ .data = index } };
 }
 
-pub fn getIndex(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !Heap.ListIndex {
-    const handle = new.orElse(original);
-    errdefer new.swapWithNone();
+pub fn getIndex(det: ?*ErrorDetails, wb: *Shimmerable) !Heap.ListIndex {
+    errdefer wb.discardChanges();
     // Fast case: if it's an integer or float, we can quickly cast it (don't
     // shimmer though, as it'll probably still be used for its original purpose)
-    if (handle.tag() == .integer) {
-        const integer = handle.peek().body.integer;
-        if (integer < 0) return badIndexError(det, handle);
-        if (integer > std.math.maxInt(u32)) return badIndexError(det, handle);
+    if (wb.tag() == .integer) {
+        const integer = wb.peek().body.integer;
+        if (integer < 0) return badIndexError(det, wb.current());
+        if (integer > std.math.maxInt(u32)) return badIndexError(det, wb.current());
 
         return .{ .u = .{ .index = .{ .data = @intCast(integer) } }, .is_relative = false };
-    } else if (handle.tag() == .float) {
-        const float = handle.peek().body.float;
+    } else if (wb.tag() == .float) {
+        const float = wb.peek().body.float;
 
-        if (std.math.isNan(float)) return badIndexError(det, handle);
-        if (float < 0) return badIndexError(det, handle);
-        if (float > std.math.maxInt(u32)) return badIndexError(det, handle);
+        if (std.math.isNan(float)) return badIndexError(det, wb.current());
+        if (float < 0) return badIndexError(det, wb.current());
+        if (float > std.math.maxInt(u32)) return badIndexError(det, wb.current());
 
         return .{ .u = .{ .index = .{ .data = @intFromFloat(float) } }, .is_relative = false };
     }
 
-    try shimmerToIndex(det, original, new);
-    return new.orElse(original).peek().body.index.data;
+    try shimmerToIndex(det, wb);
+    return wb.peek().body.index.data;
 }
 
-pub fn getRange(
-    det: ?*ErrorDetails,
-    list_len: u32,
-    orig_start: Handle,
-    new_start: *OptionalHandle,
-    orig_end: Handle,
-    new_end: *OptionalHandle,
-) !Range {
-    const start = try getIndex(det, orig_start, new_start);
-    const end = try getIndex(det, orig_end, new_end);
-    return Range.fromIndexes(list_len, start, end);
-}
-
-pub fn getRangeInPlace(det: ?*ErrorDetails, list_len: u32, start: *Handle, end: *Handle) !Range {
-    var new_start: OptionalHandle = .none;
-    var new_end: OptionalHandle = .none;
-    const range = try getRange(det, list_len, start.*, &new_start, end.*, &new_end);
-    start.swapIfNew(new_start);
-    end.swapIfNew(new_end);
-    return range;
+pub fn getRange(det: ?*ErrorDetails, list_len: u32, start: *Shimmerable, end: *Shimmerable) !Range {
+    const start_index = try getIndex(det, start);
+    const end_index = try getIndex(end);
+    return Range.fromIndexes(list_len, start_index, end_index);
 }
 
 /// Creates a substring of the passed in string. Used in `[string range]`.
-pub fn stringRange(
-    det: ?*ErrorDetails,
-    str: Handle,
-    new_str: *OptionalHandle,
-    orig_start: Handle,
-    new_start: *OptionalHandle,
-    orig_end: Handle,
-    new_end: *OptionalHandle,
-) !Handle {
-    errdefer new_start.swapWithNone();
-    errdefer new_end.swapWithNone();
+pub fn stringRange(det: ?*ErrorDetails, str: *Shimmerable, start: *Shimmerable, end: *Shimmerable) !Handle {
+    errdefer start.discardChanges();
+    errdefer end.discardChanges();
 
-    const codepoint_len = try getCodepointLength(str, new_str);
-    const bytes = try str.getString();
+    const codepoint_len = try getCodepointLength(str);
+    const bytes = try str.current().getString();
 
-    const start_index = try getIndex(det, orig_start, new_start);
-    const end_index = try getIndex(det, orig_end, new_end);
+    const start_index = try getIndex(det, start);
+    const end_index = try getIndex(det, end);
 
     const range = Range.fromIndexes(@intCast(codepoint_len), start_index, end_index);
 
@@ -481,30 +566,22 @@ pub fn stringRange(
     const byte_start = strutil.cpIndex(bytes, range.start) orelse return Heap.local_heap.emptyHandle();
     const byte_end = strutil.cpIndex(bytes, range.end) orelse bytes.len;
 
-    return try newStringWithCodepointLen(
-        bytes[byte_start..byte_end],
-        range.end - range.start,
-    );
+    return try newStringWithCodepointLen(bytes[byte_start..byte_end], range.end - range.start);
 }
 
 /// Removes from `start` to `end`, optionally inserting `to_insert`.
 pub fn stringReplace(
     det: ?*ErrorDetails,
-    str: Handle,
-    orig_start: Handle,
-    new_start: *OptionalHandle,
-    orig_end: Handle,
-    new_end: *OptionalHandle,
+    str: *Shimmerable,
+    start: *Shimmerable,
+    end: *Shimmerable,
     to_insert: OptionalHandle,
 ) Handle {
-    errdefer new_start.swapWithNone();
-    errdefer new_end.swapWithNone();
-
     const codepoint_len = try getCodepointLength(str);
-    const bytes = str.getString();
+    const bytes = str.current().getString();
 
-    const start_index = try getIndex(det, orig_start, new_start);
-    const end_index = try getIndex(det, orig_end, new_end);
+    const start_index = try getIndex(det, start);
+    const end_index = try getIndex(det, end);
 
     const range = try Range.fromIndexes(det, codepoint_len, start_index, end_index);
 
@@ -543,11 +620,7 @@ pub fn stringReplace(
     };
     defer Heap.global_gpa.free(replaced);
 
-    return .{
-        .new_start = new_start,
-        .new_end = new_end,
-        .replaced = try newString(replaced),
-    };
+    return try newString(replaced);
 }
 
 /// Upper/lower/title case conversion.
@@ -631,7 +704,7 @@ pub fn stringTrimLeft(str: Handle, trim_chars: Handle) !Handle {
     if (start == 0) {
         return str;
     } else {
-        return try newStringInner(bytes[start..]);
+        return try newString(bytes[start..]);
     }
 }
 
@@ -645,7 +718,7 @@ pub fn stringTrimRight(str: Handle, trim_chars: Handle) !Handle {
     if (end == bytes.len) {
         return str;
     } else {
-        return try newStringInner(bytes[0..end]);
+        return try newString(bytes[0..end]);
     }
 }
 
@@ -660,7 +733,7 @@ pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     if (start == 0 and end == bytes.len) {
         return str;
     } else {
-        return try newStringInner(bytes[start..end]);
+        return try newString(bytes[start..end]);
     }
 }
 
@@ -719,33 +792,24 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8, include_numbers: bool) t
         pub const map = (EnumMapping(T, include_numbers){}).map;
         pub const names = enumNames(T, ", ");
 
-        pub fn get(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !T {
-            errdefer new.swapWithNone();
-            try Heap.ensureShimmerableOrDup(original, new);
-            const handle = new.orElse(original);
+        pub fn get(det: ?*ErrorDetails, wb: *Shimmerable) !T {
+            errdefer wb.discardChanges();
+            try wb.prepareToShimmer();
 
             // TODO PERF we can optimize this by shimmering the value to an "enum" type,
             // where the enum type has a u48 storing the hash of enum_name and a u16 for
             // which variant it is, by index.
-            const bytes = try handle.getString();
+            const bytes = try wb.current().getString();
             const variant = map.get(bytes);
             if (variant) |val| {
                 return val;
             } else {
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt("bad {s} \"{f}\": must be {s}", .{ enum_name, handle, names }),
+                    .message = try newStringFmt("bad {s} \"{s}\": must be {s}", .{ enum_name, bytes, names }),
                 };
 
                 return error.BadEnumVariant;
             }
-        }
-
-        pub fn getInPlace(det: ?*ErrorDetails, handle: *Handle) !T {
-            var working: OptionalHandle = .none;
-            errdefer working.swapWithNone();
-            const result = try get(det, handle.*, &working);
-            handle.swapIfNew(working);
-            return result;
         }
     };
 }
@@ -760,30 +824,31 @@ test "enum mapping" {
 
 test "tcl enum" {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator, testing.io);
+    try Heap.testStart(testing.allocator, testing.io);
 
     const MyEnum = enum { foo, bar, baz };
     const MyTclEnum = TclEnum(MyEnum, "myenum", true);
 
-    var foo_str = try newStringInner(heap, "foo");
+    var foo_str = try newString("foo");
     defer foo_str.decrRefCount();
-    var one_str = try newStringInner(heap, "1");
+    var one_str = try newString("1");
     defer one_str.decrRefCount();
-    var bad_str = try newStringInner(heap, "bad");
+    var bad_str = try newString("bad");
     defer bad_str.decrRefCount();
 
-    var working: OptionalHandle = .none;
-    try testing.expectEqual(MyEnum.foo, MyTclEnum.get(null, foo_str, &working));
-    foo_str.swapAndClear(&working);
-    try testing.expectEqual(MyEnum.bar, MyTclEnum.get(null, one_str, &working));
-    foo_str.swapAndClear(&working);
-    try testing.expectError(error.BadEnumVariant, MyTclEnum.get(null, bad_str, &working));
-    foo_str.swapAndClear(&working);
+    var working: Shimmerable = .{ .original = foo_str, .shimmered = .none };
+    try testing.expectEqual(MyEnum.foo, MyTclEnum.get(null, &working));
+    working.discardChanges();
+    working = .{ .original = one_str };
+    try testing.expectEqual(MyEnum.bar, MyTclEnum.get(null, &working));
+    working.discardChanges();
+    working = .{ .original = bad_str };
+    try testing.expectError(error.BadEnumVariant, MyTclEnum.get(null, &working));
+    working.discardChanges();
 }
 
 fn generateSubcommandUsage(comptime Enum: type, args: []Handle) !Handle {
-    return try newStringFmtInner(
-        Heap.local_heap,
+    return try newStringFmt(
         "Usage: \"{f} command ... \", where command is one of: {s}",
         .{ args[0], enumNames(Enum, ", ") },
     );
@@ -824,20 +889,20 @@ pub fn SubcommandParser(
         const comma_joined_names = enumNames(Enum, ",");
 
         /// `args` should include the original command name.
-        pub fn parse(det: ?*ErrorDetails, args: []Handle) !Enum {
+        pub fn parse(det: ?*ErrorDetails, args: []Shimmerable) !Enum {
             if (args.len < 2) {
                 if (det) |details| details.* = .{
                     .message = try newStringFmt(
                         \\wrong # args: should be "{f} command ..."
                         \\Use "{f} -help ?command?" for help
-                    , .{ args[0], args[0] }),
+                    , .{ args[0].current(), args[0].current() }),
                 };
                 return error.WrongUsage;
             }
 
             // TODO PERF cache the subcommand lookup.
 
-            if (try args[1].equalsString("-help")) {
+            if (try args[1].current().equalsString("-help")) {
                 if (args.len >= 3) {
                     const subcommand_queried = try args[2].getString();
 
@@ -847,7 +912,7 @@ pub fn SubcommandParser(
                         if (det) |details| details.* = .{
                             .message = try newStringFmt(
                                 \\Usage: "{f} {s} {s}"
-                            , .{ args[0], subcommand_queried, subcommand.usage }),
+                            , .{ args[0].current(), subcommand_queried, subcommand.usage }),
                         };
                         return error.UsageHelp;
                     }
@@ -858,7 +923,7 @@ pub fn SubcommandParser(
                 return error.UsageHelp;
             }
 
-            if (try args[1].equalsString("-commands")) {
+            if (try args[1].current().equalsString("-commands")) {
                 if (det) |details| details.* = .{ .message = try newString(space_joined_names) };
                 return error.UsageHelp;
             }
@@ -902,17 +967,17 @@ test "subcommand parser" {
     });
 
     defer Heap.testFinish();
-    const heap = try Heap.testStart(testing.allocator, testing.io);
+    try Heap.testStart(testing.allocator, testing.io);
 
-    var base_str = try newStringInner(heap, "base");
+    var base_str = try newString("base");
     defer base_str.decrRefCount();
-    var foo_str = try newStringInner(heap, "foo");
+    var foo_str = try newString("foo");
     defer foo_str.decrRefCount();
-    var arg1_str = try newStringInner(heap, "arg1");
+    var arg1_str = try newString("arg1");
     defer arg1_str.decrRefCount();
-    var arg2_str = try newStringInner(heap, "arg2");
+    var arg2_str = try newString("arg2");
     defer arg2_str.decrRefCount();
-    var arg3_str = try newStringInner(heap, "arg3");
+    var arg3_str = try newString("arg3");
     defer arg3_str.decrRefCount();
 
     var args = [_]Handle{ base_str, foo_str, arg1_str, arg2_str };
@@ -923,13 +988,7 @@ test "subcommand parser" {
 }
 
 /// Runs a string check based on requested class. `class_to_check` must be shimmerable.
-pub fn stringIs(
-    det: ?*ErrorDetails,
-    str: Handle,
-    orig_class_to_check: Handle,
-    new_class_to_check: *OptionalHandle,
-    strict: bool,
-) !bool {
+pub fn stringIs(det: ?*ErrorDetails, str: Handle, class_to_check: *Shimmerable, strict: bool) !bool {
     const Class = TclEnum(enum {
         integer,
         alpha,
@@ -948,8 +1007,8 @@ pub fn stringIs(
         boolean,
     }, "class", false);
 
-    errdefer new_class_to_check.swapWithNone();
-    const class = try Class.get(det, orig_class_to_check, new_class_to_check);
+    errdefer class_to_check.discardChanges();
+    const class = try Class.get(det, class_to_check);
 
     const bytes = try str.getString();
     if (bytes.len == 0) return !strict;
@@ -964,7 +1023,9 @@ pub fn stringIs(
             break :blk true;
         },
         .boolean => blk: {
-            _ = getBoolean(null, str, new_class_to_check) catch break :blk false;
+            var str_wb: Shimmerable = .{ .original = str };
+            defer str_wb.discardChanges();
+            _ = getBoolean(null, &str_wb) catch break :blk false;
             break :blk true;
         },
         .alpha => strutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
@@ -984,23 +1045,25 @@ pub fn stringIs(
 
 fn testStringIs(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
 
-    var str = try newStringInner(heap, "abcdefg");
+    var str = try newString("abcdefg");
     defer str.decrRefCount();
-    var str2 = try newStringInner(heap, "abcdefg123");
+    var str2 = try newString("abcdefg123");
     defer str2.decrRefCount();
-    var class = try newStringInner(heap, "alpha");
+    var class = try newString("alpha");
     defer class.decrRefCount();
-    var bad_class = try newStringInner(heap, "bad_class");
+    var bad_class = try newString("bad_class");
     defer bad_class.decrRefCount();
     var det: ErrorDetails = undefined;
 
-    var new_class: Heap.OptionalHandle = .none;
-    defer if (new_class.toHandle()) |val| val.decrRefCount();
-    try testing.expectEqual(true, try stringIs(null, str, class, &new_class, false));
-    try testing.expectEqual(false, try stringIs(null, str2, class, &new_class, false));
-    const err = stringIs(&det, str, bad_class, &new_class, false);
+    var wb: Shimmerable = .{ .original = class };
+    errdefer wb.discardChanges();
+    try testing.expectEqual(true, try stringIs(null, str, &wb, false));
+    try testing.expectEqual(false, try stringIs(null, str2, &wb, false));
+    wb.discardChanges();
+    wb = .{ .original = bad_class };
+    const err = stringIs(&det, str, &wb, false);
     if (err == error.OutOfMemory) return error.OutOfMemory;
     try testing.expectError(error.BadEnumVariant, err);
     try testing.expectEqualStrings(
@@ -1009,22 +1072,23 @@ fn testStringIs(ta: std.mem.Allocator) !void {
         try det.message.getString(),
     );
     det.message.decrRefCount();
+    wb.discardChanges();
 }
 
 test "string is" {
     try testing.checkAllAllocationFailures(testing.allocator, testStringIs, .{});
 }
 
-pub fn convertTokenizerError(heap: *Heap, err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
+pub fn convertTokenizerError(err: Tokenizer.Error) error{OutOfMemory}!ErrorDetails {
     const message = switch (err) {
-        error.CharactersAfterCloseBrace => try newStringInner(heap, "extra characters after close-brace"),
-        error.MissingCloseBrace => try newStringInner(heap, "missing close-brace"),
-        error.MissingCloseBracket => try newStringInner(heap, "unmatched \"[\""),
-        error.MissingCloseQuote => try newStringInner(heap, "missing quote"),
-        error.TrailingBackslash => try newStringInner(heap, "no character after \\"),
-        error.FunctionMissingParentheses => try newStringInner(heap, "function missing parentheses"),
-        error.NotOperator => try newStringInner(heap, "not operator"),
-        error.NotNumber => try newStringInner(heap, "not number"),
+        error.CharactersAfterCloseBrace => try newString("extra characters after close-brace"),
+        error.MissingCloseBrace => try newString("missing close-brace"),
+        error.MissingCloseBracket => try newString("unmatched \"[\""),
+        error.MissingCloseQuote => try newString("missing quote"),
+        error.TrailingBackslash => try newString("no character after \\"),
+        error.FunctionMissingParentheses => try newString("function missing parentheses"),
+        error.NotOperator => try newString("not operator"),
+        error.NotNumber => try newString("not number"),
         error.NotVariable => unreachable,
     };
 
@@ -1065,40 +1129,30 @@ pub fn newList(handles: []const Handle) !Handle {
 }
 
 /// `handle` must be shimmerable. Returns a new object if the list had to move.
-pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    var handle = new.orElse(original);
-    if (handle.tag() == .list) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToList(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .list) return;
+    errdefer wb.discardChanges();
 
     // Optimise dict -> list.
-    if (handle.tag() == .dict) {
+    if (wb.tag() == .dict) {
         // Only need to ensure it's shimmerable in this case, since
         // in the other case we duplicate it anyways.
-        const len = handle.peek().body.dict.len;
+        const len = wb.peek().body.dict.len;
 
-        try Heap.ensureMutableOrDup(original, new);
-        handle = new.orElse(original);
-
-        var pair_index: u32 = 0;
-        while (pair_index < len) : (pair_index += 2) {
-            const key = collectionItemFollowRefs(handle, pair_index, len);
-            // Make sure the key never mutates by pinning it. This ensures that the hash map
-            // never gets out of sync with the keys' value.
-            key.incrRefCount();
-        }
+        try Heap.ensureMutableOrDup(wb.current(), &wb.shimmered);
 
         // Because both lists and dicts store their values directly after,
         // we can just swap out the head to convert to a list. Don't call
         // `prepareToShimmer` because that would invalidate the dict items,
         // but we want to reuse them as list items.
-        _ = try handle.getString();
+        _ = try wb.current().getString();
 
         // Clean up dict-specific resources (table and extra_data).
-        const heap = handle.getHeap();
-        heap.destroyExtraData(handle.peek().body.dict.extra_data);
+        const heap = wb.current().getHeap();
+        heap.destroyExtraData(wb.peek().body.dict.extra_data);
 
-        handle.peek().head.tag = .list;
-        handle.peek().body = .{ .list = .{ .len = len } };
+        wb.peek().head.tag = .list;
+        wb.peek().body = .{ .list = .{ .len = len } };
 
         return;
     } else {
@@ -1106,7 +1160,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
         // a new object anyways.
 
         // Try to preserve information about filename / line number.
-        const source_info: ?SourceInfo = getSourceInfo(handle);
+        const source_info: ?SourceInfo = getSourceInfo(wb.current());
         var file_name: OptionalHandle = .none;
         var line_no: u32 = 1;
         if (source_info) |info| {
@@ -1115,7 +1169,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
         }
         defer file_name.swapWithNone();
 
-        const str = try handle.getString();
+        const str = try wb.current().getString();
         var parser = Tokenizer.init(str, line_no);
 
         // Figure out how many tokens there are, so we can create the correct list size
@@ -1125,7 +1179,7 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
 
         while (true) {
             const next_token = parser.nextListToken() catch |err| {
-                if (det) |details| details.* = try convertTokenizerError(Heap.local_heap, err);
+                if (det) |details| details.* = try convertTokenizerError(err);
                 return err;
             };
             switch (next_token.tag) {
@@ -1142,21 +1196,20 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
         // TODO PERF reuse the object backing if it was allocated with more than one object.
         const new_list = try newListWithCapacity(@intCast(tokens.items.len));
         new_list.peek().body.list.len = @intCast(tokens.items.len);
-        new.swap(new_list);
-        handle = new.orElse(original);
+        wb.shimmered.swap(new_list);
 
         for (tokens.items, 0..) |token, i| {
             const item = listItemNoFollow(new_list, @intCast(i));
 
-            if (token.tag == .simple_string) {
-                // Normal string, so no escaping needed.
-                Heap.setString(item, str[token.loc.start..token.loc.end]) catch |err| switch (err) {
+            if (token.tag == .escaped_string) {
+                // Needs escaping. We'll create another string to copy the escaped string into.
+                setStringFromEscaped(item, str[token.loc.start..token.loc.end]) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.OtherThreadSet => unreachable,
                 };
             } else {
-                // Needs escaping. We'll create another string to copy the escaped string into.
-                setStringFromEscaped(item, str[token.loc.start..token.loc.end]) catch |err| switch (err) {
+                // Normal string, so no escaping needed.
+                Heap.setString(item, str[token.loc.start..token.loc.end]) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.OtherThreadSet => unreachable,
                 };
@@ -1167,17 +1220,18 @@ pub fn shimmerToList(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
     }
 }
 
-pub fn listLengthRaw(list: Handle) u32 {
+/// Caller is responsible to ensure `list` is of type .list.
+pub fn listLength(list: Handle) u32 {
     assert(list.tag() == .list);
 
     return list.peek().body.list.len;
 }
 
-pub fn listLength(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !u32 {
-    errdefer new.swapWithNone();
+pub fn listLengthShimmering(det: ?*ErrorDetails, wb: *Shimmerable) !u32 {
+    errdefer wb.discardChanges();
 
-    try shimmerToList(det, original, new);
-    return new.orElse(original).peek().body.list.len;
+    try shimmerToList(det, wb);
+    return wb.peek().body.list.len;
 }
 
 pub fn followIfRef(handle: Handle) Handle {
@@ -1205,7 +1259,7 @@ fn collectionItemFollowRefs(handle: Handle, index: u32, len: u32) Heap.Handle {
         };
 
         return followIfRef(elem);
-    } else @panic("Element out of bounds");
+    } else unreachable;
 }
 
 pub fn collectionItems(handle: Handle, len: u32) []Heap.Object {
@@ -1282,7 +1336,7 @@ fn setCollectionLengthInner(original: Handle, new_len: u32) !OptionalHandle {
     // We've exhausted all other options, so we'll need to make a new collection.
     const new_handle = switch (original.tag()) {
         .list => try newListWithCapacity(new_len),
-        .dict => try newDictWithCapacity(Heap.local_heap, new_len),
+        .dict => try newDictWithCapacity(new_len),
         else => unreachable,
     };
     errdefer new_handle.decrRefCount();
@@ -1302,8 +1356,8 @@ fn setCollectionLengthInner(original: Handle, new_len: u32) !OptionalHandle {
     return new_handle.toOptional();
 }
 
-fn setCollectionLength(original: Handle, new: *OptionalHandle, new_len: u32) !void {
-    new.swapIfNew(try setCollectionLengthInner(new.orElse(original), new_len));
+fn setCollectionLength(wb: *Mutable, new_len: u32) !void {
+    wb.mutated.swapIfNew(try setCollectionLengthInner(wb.current(), new_len));
 }
 
 /// Assumes provided handle is a list.
@@ -1327,53 +1381,49 @@ pub fn listItems(handle: Handle) []Heap.Object {
     return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..handle.peek().body.list.len];
 }
 
-/// Returns a new list if the list had to move. Takes ownership of `value` in all cases, including errors.
-pub fn listSetObject(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, index: u32, value: Heap.Object) !void {
-    errdefer {
-        var value_mut = value;
-        value_mut.deinitSingle(Heap.local_heap);
+/// Takes ownership of `value` in all cases, including errors. Does not invalidate the string.
+/// Must already be a list.
+pub fn listSetInner(wb: *Mutable, index: u32, value: Heap.Object) error{OutOfMemory}!void {
+    wb.current().assert(wb.tag() == .list);
+
+    var value_mut = value;
+    errdefer value_mut.deinitSingle(Heap.local_heap);
+    errdefer wb.discardChanges();
+
+    // Make sure this item can mutate, as well as this list.
+    if (!wb.current().canMutate() or !listItemNoFollow(wb.current(), index).canMutate()) {
+        wb.mutated.swap(try wb.current().duplicate());
     }
-    errdefer new.swapWithNone();
 
-    const len = try listLength(det, original, new);
-    var handle = new.orElse(original);
-    if (index > len) return error.OutOfBounds;
-
-    const mutable_list: OptionalHandle = blk: {
-        if (!handle.canMutate() or !listItemNoFollow(handle, index).canMutate()) {
-            break :blk (try handle.duplicate()).toOptional();
-        }
-        break :blk .none;
-    };
-    new.swapIfNew(mutable_list);
-    handle = new.orElse(original);
-
-    // We know that this index is now safe to modify.
-    const item = listItemNoFollow(handle, index);
+    // We know that this item is now safe to modify.
+    const item = listItemNoFollow(wb.current(), index);
     item.assert(item.canMutate());
 
     item.invalidateBoth(); // Clear the last value.
-    item.peek().* = value;
+    item.peek().* = value_mut.take();
 }
 
-pub fn listAppendObject(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, item: Heap.Object) !u32 {
-    errdefer new.swapWithNone();
+/// Must already be a list.
+pub fn listSetObject(det: ?*ErrorDetails, wb: *Mutable, index: u32, value: Heap.Object) !void {
+    try listSetInner(det, wb, index, value);
+    wb.current().invalidateString();
+}
 
-    const len = try listLength(det, original, new);
-    try setCollectionLength(original, new, len + 1);
-    const handle = new.orElse(original);
+pub fn listAppendObject(det: ?*ErrorDetails, wb: *Mutable, item: Heap.Object) !u32 {
+    errdefer wb.mutated.swapWithNone();
 
-    const index = handle.peek().body.list.len - 1;
-    listItems(handle)[index] = item;
+    const len = try listLengthShimmering(det, wb.asShimmerable());
+    try setCollectionLength(wb, len + 1);
+
+    const index = wb.peek().body.list.len - 1;
+    listItems(wb.current())[index] = item;
 
     return index;
 }
 
-pub fn listAppend(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, item: Handle) !Handle {
-    errdefer new.swapWithNone();
-
-    const index = try listAppendObject(det, original, new, item.dupOrRef());
-    return listItemNoFollow(new.orElse(original), index);
+pub fn listAppend(det: ?*ErrorDetails, wb: *Mutable, item: Handle) !Handle {
+    const index = try listAppendObject(det, wb, item.dupOrRef());
+    return listItemNoFollow(wb.current(), index);
 }
 
 /// `list` must be mutable.
@@ -1392,7 +1442,7 @@ pub fn listAppendAssumeCapacity(list: Handle, object: Heap.Object) void {
 pub fn listToHandles(gpa: std.mem.Allocator, list: Handle) !std.ArrayList(Handle) {
     // TODO PERF this shouldn't have to exist. Maybe instead of functions taking
     // in []Handle, they take in []Object?
-    const list_len = listLengthRaw(list);
+    const list_len = listLength(list);
     var handles = try std.ArrayList(Handle).initCapacity(gpa, list_len);
     for (0..list_len) |i| {
         handles.appendAssumeCapacity(listItemNoFollow(list, @intCast(i)));
@@ -1402,14 +1452,14 @@ pub fn listToHandles(gpa: std.mem.Allocator, list: Handle) !std.ArrayList(Handle
 
 fn testLists(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
 
     var det: ErrorDetails = undefined;
 
     // Simple case: two objects in a list
-    const obj1 = try newStringInner(heap, "object 1");
+    const obj1 = try newString("object 1");
     defer obj1.decrRefCount();
-    const obj2 = try newStringInner(heap, "object 2");
+    const obj2 = try newString("object 2");
     defer obj2.decrRefCount();
     var list1 = try newList(&.{ obj1, obj2 });
     defer list1.decrRefCount();
@@ -1421,23 +1471,23 @@ fn testLists(ta: std.mem.Allocator) !void {
     // But it should have an identical string
     try testing.expectEqualStrings("object 1", try listItemNoFollow(list1, 0).getString());
 
-    const to_append = try newStringInner(heap, "appended item");
+    const to_append = try newString("appended item");
     defer to_append.decrRefCount();
 
-    var new_list: OptionalHandle = .none;
-    errdefer new_list.swapWithNone();
-    _ = try listAppend(&det, list1, &new_list, to_append);
-    list1.swapAndClear(&new_list);
-    try testing.expectEqualStrings("appended item", try listItemNoFollow(list1, 2).getString());
+    var list1_wb: Mutable = .{ .original = list1 };
+    defer list1_wb.discardChanges();
+    _ = try listAppend(&det, &list1_wb, to_append);
+    try testing.expectEqualStrings("appended item", try listItemNoFollow(list1_wb.current(), 2).getString());
 
-    var string_list = try newStringInner(heap,
+    var string_list = try newString(
         \\item1 {item 2} item\ 3
     );
     defer string_list.decrRefCount();
 
-    try shimmerToList(&det, string_list, &new_list);
-    try testing.expect(string_list != new_list.toHandle());
-    string_list.swapAndClear(&new_list);
+    var string_list_wb: Shimmerable = .{ .original = string_list };
+    defer string_list_wb.discardChanges();
+    try shimmerToList(&det, &string_list_wb);
+    try testing.expect(string_list != string_list_wb.shimmered.toHandle());
     try testing.expectEqualStrings("item1", try listItemNoFollow(string_list, 0).getString());
     try testing.expectEqualStrings("item 2", try listItemNoFollow(string_list, 1).getString());
     try testing.expectEqualStrings("item 3", try listItemNoFollow(string_list, 2).getString());
@@ -1485,23 +1535,20 @@ pub fn dictInvalidateTable(dict: Handle) void {
     }
 }
 
-pub fn shimmerToDict(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    var handle = new.orElse(original);
-    if (handle.tag() == .dict) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToDict(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .dict) return;
+    errdefer wb.discardChanges();
 
     // Get length, potentially shimmering.
-    const len = try listLength(det, original, new);
-    handle = new.orElse(original);
-    const handle_heap = handle.getHeap();
+    const len = try listLengthShimmering(det, wb);
+    const handle_heap = wb.current().getHeap();
 
     if (@mod(len, 2) == 1) {
         // Unmatched key.
         if (det) |details| details.* = .{
-            .message = try newStringFmtInner(
-                Heap.local_heap,
+            .message = try newStringFmt(
                 "Missing value to go with key when converting \"{f}\" to a dictionary.",
-                .{handle},
+                .{wb.current()},
             ),
         };
         return error.BadDict;
@@ -1516,8 +1563,8 @@ pub fn shimmerToDict(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle
 
     // Because both lists and dicts store their values directly after,
     // we can just swap out the head to convert to a dict.
-    handle.peek().head.tag = .dict;
-    handle.peek().body.dict = .{
+    wb.peek().head.tag = .dict;
+    wb.peek().body.dict = .{
         .extra_data = metadata_index,
         .len = len,
     };
@@ -1529,12 +1576,12 @@ pub fn dictItems(handle: Handle) []Heap.Object {
     return handle.getHeap().objectSlice(handle.index + 1, handle.index + 1 + dict_len);
 }
 
-pub fn dictItem(dict: Handle, index: u32) Handle {
+pub fn dictItemNoFollow(dict: Handle, index: u32) Handle {
     dict.assert(dict.tag() == .dict);
     return collectionItemNoFollow(dict, index, dict.peek().body.dict.len);
 }
 
-pub fn dictItemFollowRefs(dict: Handle, index: u32) Handle {
+pub fn dictItem(dict: Handle, index: u32) Handle {
     dict.assert(dict.tag() == .dict);
     return collectionItemFollowRefs(dict, index, dict.peek().body.dict.len);
 }
@@ -1544,31 +1591,25 @@ pub fn dictItemLength(dict: Handle) u32 {
     return dict.peek().body.dict.len;
 }
 
-pub fn dictPairLengthRaw(dict: Handle) u32 {
+pub fn dictPairLength(dict: Handle) u32 {
     dict.assert(dict.tag() == .dict);
     return dict.peek().body.dict.len / 2;
 }
 
-/// Length in pairs (total length / 2).
-pub fn dictPairLength(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !u32 {
-    try shimmerToDict(det, original, new);
-    return dictPairLengthRaw(new.orElse(original));
-}
-
-pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
+pub fn newDictWithCapacity(len: u32) !Handle {
     assert(@mod(len, 2) == 0);
 
     // `1 +` to make space for the dict's head.
-    const dict_index = try heap.createObjects(1 + len, false);
-    errdefer Heap.freeObjectBacking(heap.getHandle(dict_index));
-    const dict_metadata = try heap.createExtraData();
-    errdefer heap.destroyExtraData(dict_metadata);
+    const dict_index = try Heap.local_heap.createObjects(1 + len, false);
+    errdefer Heap.freeObjectBacking(Heap.local_heap.getHandle(dict_index));
+    const dict_metadata = try Heap.local_heap.createExtraData();
+    errdefer Heap.local_heap.destroyExtraData(dict_metadata);
 
-    heap.getExtraData(dict_metadata).* = .{ .dict = .{
+    Heap.local_heap.getExtraData(dict_metadata).* = .{ .dict = .{
         .table = null,
     } };
 
-    const dict_head = heap.getLocalObject(dict_index);
+    const dict_head = Heap.local_heap.getLocalObject(dict_index);
     dict_head.* = .{
         .head = .{
             .str = Heap.Object.null_string,
@@ -1580,34 +1621,54 @@ pub fn newDictWithCapacity(heap: *Heap, len: u32) !Handle {
         } },
     };
 
-    return heap.getHandle(dict_index);
+    return Heap.local_heap.getHandle(dict_index);
+}
+
+/// `dict` must be mutable. Be careful that you append an even number of elements.
+pub fn dictPutAssumeCapacity(dict: Handle, key: Handle, value: Heap.Object) void {
+    dict.assert(dict.tag() == .dict);
+    dict.assert(dict.canMutate());
+    dict.assert(dict.getDictExtraData().table == null);
+
+    const current_len = dict.peek().body.dict.len;
+    // `- 3` for dict head, new key, and value.
+    dict.assert(current_len <= memutil.getOrderSize(dict.getMetadata().order) - 3);
+
+    dictItemNoFollow(dict, current_len).peek().* = key.dupOrRef();
+    dict.peek().body.dict.len += 1;
+    dictItemNoFollow(dict, current_len).peek().* = value;
+    dict.peek().body.dict.len += 1;
 }
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.
-pub fn newDictInner(heap: *Heap, handles: []const Handle) !Handle {
-    const dict = try newDictWithCapacity(heap, @intCast(handles.len));
+pub fn newDict(handles: []const Handle) !Handle {
+    const dict = try newDictWithCapacity(@intCast(handles.len));
     errdefer dict.decrRefCount();
     dict.peek().body.dict.len = @intCast(handles.len);
 
     const new_items = dictItems(dict);
-
     for (handles, new_items) |handle, *item| {
-        item.* = heap.dupOrReference(handle);
+        item.* = handle.dupOrRef();
     }
 
     return dict;
 }
 
-/// Caller is responsible that `handles` has handles.len % 2 == 0.
-pub fn newDict(handles: []const Handle) !Handle {
-    return newDictInner(Heap.local_heap, handles);
+/// Asserts `dict` is a .dict. Like `dictLookup`, but returns the raw dict slot handle
+/// without following references.
+pub fn dictLookupNoFollow(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
+    dict.assert(dict.tag() == .dict);
+    _ = try key.getString();
+
+    const table = try dictGetTable(dict);
+    if (table.get(key)) |value_offset| {
+        return dictItemNoFollow(dict, value_offset).toOptional();
+    } else return .none;
 }
 
-/// Asserts `dict` is a .dict.
-/// Like `dictLookupFollowRefs`, but returns the raw dict slot handle
-/// without following references.
-pub fn dictLookupInner(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
+pub fn dictLookup(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
     dict.assert(dict.tag() == .dict);
+    // Make sure key has a string representation, as table.get isn't allowed to fail.
     _ = try key.getString();
 
     const table = try dictGetTable(dict);
@@ -1616,63 +1677,46 @@ pub fn dictLookupInner(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHan
     } else return .none;
 }
 
-pub fn dictLookupFollowRefs(dict: Handle, key: Handle) error{OutOfMemory}!OptionalHandle {
-    dict.assert(dict.tag() == .dict);
-    // Make sure key has a string representation, as table.get isn't allowed to fail.
-    _ = try key.getString();
-
-    const table = try dictGetTable(dict);
-    if (table.get(key)) |value_offset| {
-        return dictItemFollowRefs(dict, value_offset).toOptional();
-    } else return .none;
-}
-
-pub fn dictLookupFollowLinks(
-    det: ?*ErrorDetails,
-    original: Handle,
-    new: *OptionalHandle,
-    key: Handle,
-) error{ OutOfMemory, LinkLookupFailed }!OptionalHandle {
-    var handle = new.orElse(original);
-    handle.assert(handle.tag() == .dict);
-    errdefer new.swapWithNone();
+pub fn dictLookupFollowLinks(det: ?*ErrorDetails, wb: *Shimmerable, key: Handle) error{ OutOfMemory, LinkLookupFailed }!OptionalHandle {
+    wb.current().assert(wb.tag() == .dict);
+    errdefer wb.discardChanges();
 
     // Make sure key has a string representation, as table.get isn't allowed to fail.
     _ = try key.getString();
 
-    const table = try dictGetTable(handle);
+    const table = try dictGetTable(wb.current());
     if (table.get(key)) |value_offset| {
-        return dictItemFollowRefs(handle, value_offset).toOptional();
+        return dictItem(wb.current(), value_offset).toOptional();
     } else {
         const parent_key = Heap.local_heap.getInternedString(.@"^parent");
-        if ((try dictLookupFollowRefs(handle, parent_key)).toHandle()) |parent_link| {
-            var maybe_new_parent_link: OptionalHandle = .none;
-            defer maybe_new_parent_link.decrOptional();
-            shimmerToHashReference(det, parent_link, &maybe_new_parent_link) catch |err| switch (err) {
+        if ((try dictLookup(wb.current(), parent_key)).toHandle()) |parent_link| {
+            var parent_link_wb: Shimmerable = .{ .original = parent_link, .shimmered = .none };
+            defer parent_link_wb.discardChanges();
+            shimmerToHashReference(det, &parent_link_wb) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.HashLookupFailed => return error.LinkLookupFailed,
                 error.NotHashReference => return error.LinkLookupFailed,
             };
 
-            if (maybe_new_parent_link.toHandle()) |new_parent_link| {
-                _ = try dictPutObject(original, new, parent_key, new_parent_link.reference());
-                handle = new.orElse(original);
+            if (parent_link_wb.shimmered.toHandle()) |new_parent_link| {
+                // This is delicate, but it's not mutation, since we're switching out the reference
+                // for its shimmered representation, so it is transparent to the caller. Note that
+                // `dictPutInner` does not invalidate the string representation, so even if the
+                // underlying dictionary mutates, we preserve the original string.
+                _ = try dictPutInner(wb.asMutable(), parent_key, new_parent_link.reference());
             }
 
-            const hash_reference = maybe_new_parent_link.orElse(parent_link);
-            const parent = hash_reference.peek().body.hash_reference;
-            var new_parent: OptionalHandle = .none;
-            defer new_parent.decrOptional();
-            shimmerToDict(det, parent, &new_parent) catch |err| switch (err) {
+            const parent = parent_link_wb.peek().body.hash_reference;
+            var parent_wb: Shimmerable = .{ .original = parent, .shimmered = .none };
+            defer parent_wb.discardChanges();
+            shimmerToDict(det, &parent_wb) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.LinkLookupFailed,
             };
 
-            const looked_up = try dictLookupFollowLinks(det, new_parent.orElse(parent), &new_parent, key);
-
-            if (new_parent.toHandle()) |val| {
-                _ = try dictPutObject(original, new, parent_key, val.hashReference());
-                handle = new.orElse(original);
+            const looked_up = try dictLookupFollowLinks(det, &parent_wb, key);
+            if (parent_wb.shimmered.toHandle()) |val| {
+                _ = try dictPutInner(wb.asMutable(), parent_key, val.hashReference());
             }
 
             return looked_up;
@@ -1694,48 +1738,49 @@ fn dictHasDuplicatesRaw(dict: Handle) !bool {
 /// Removes duplicate entries. Assumes handle is a dict. If the caller needs to track
 /// a key/value as it gets rearranged, set `to_track`. The result will be its new index,
 /// unless it was removed.
-fn dictRemoveDuplicates(original: Handle, new: *OptionalHandle, to_track: ?u32) !?u32 {
-    var handle = new.orElse(original);
-    handle.assert(handle.tag() == .dict);
-    errdefer new.swapWithNone();
+fn dictRemoveDuplicates(wb: *Mutable, to_track: ?u32) !?u32 {
+    wb.current().assert(wb.tag() == .dict);
+    errdefer wb.discardChanges();
 
     // If the length of the table is the length of the dict, it means we have
     // no duplicates.
-    const original_len = handle.peek().body.dict.len;
-    if (dictMaybeGetTable(handle)) |table| {
+    const original_len = wb.peek().body.dict.len;
+    if (dictMaybeGetTable(wb.current())) |table| {
         if (table.size * 2 == original_len) return to_track;
     }
 
-    try Heap.ensureMutableOrDup(original, new);
-    handle = new.orElse(original);
-    var metadata = handle.getDictExtraData();
+    try wb.prepareToMutate();
+    var metadata = wb.current().getDictExtraData();
 
     // Check if any items are shared.
     for (0..original_len) |i| {
-        if (dictItem(handle, @intCast(i)).isShared()) {
+        if (dictItemNoFollow(wb.current(), @intCast(i)).isShared()) {
             // Need to duplicate.
-            const duplicated = try handle.duplicate();
-            new.swap(duplicated);
-            handle = duplicated;
-            metadata = handle.getDictExtraData(); // Need to reload metadata.
+            const duplicated = try wb.current().duplicate();
+            wb.mutated.swap(duplicated);
+            metadata = wb.current().getDictExtraData(); // Need to reload metadata.
             break;
         }
     }
 
     var to_track_new_location: ?u32 = null;
 
-    const table = try dictGetTable(handle);
+    const table = try dictGetTable(wb.current());
     if (table.size * 2 == original_len) {
         // No duplicate entries.
         return to_track;
     }
 
+    // From here on out, the dictionary will reach a very unstable intermediate
+    // state, so this ensures that no error is returned partway through.
+    errdefer comptime unreachable;
+
     var pair_index: u32 = 0;
     while (pair_index < original_len) : (pair_index += 2) {
         const key_index = pair_index;
         const value_index = pair_index + 1;
-        const key_handle = dictItem(handle, key_index);
-        const value_handle = dictItem(handle, value_index);
+        const key_handle = dictItemNoFollow(wb.current(), key_index);
+        const value_handle = dictItemNoFollow(wb.current(), value_index);
 
         // Because keys are immutable, we know that they'll never lose their string rep.
         if (table.get(key_handle).? != value_index) {
@@ -1748,15 +1793,15 @@ fn dictRemoveDuplicates(original: Handle, new: *OptionalHandle, to_track: ?u32) 
     // Why mark all the handles before later removing them? Because the hash map
     // requires all the keys and values to not move, and we use the hash map
     // to see what pairs need to be removed.
-    const items = dictItems(handle);
+    const items = dictItems(wb.current());
     // How many pairs we've removed so far. Increments by 1.
     var removed: u32 = 0;
     pair_index = 0;
     while (pair_index < original_len) : (pair_index += 2) {
         const key_index = pair_index;
         const value_index = pair_index + 1;
-        const key_handle = dictItem(handle, key_index);
-        const value_handle = dictItem(handle, value_index);
+        const key_handle = dictItemNoFollow(wb.current(), key_index);
+        const value_handle = dictItemNoFollow(wb.current(), value_index);
 
         if (key_handle.tag() == .marked) {
             removed += 1;
@@ -1785,7 +1830,7 @@ fn dictRemoveDuplicates(original: Handle, new: *OptionalHandle, to_track: ?u32) 
 
     // "zero" out the removed items.
     for ((original_len - removed * 2)..original_len) |to_zero| {
-        const item_handle = collectionItemNoFollow(handle, @intCast(to_zero), original_len);
+        const item_handle = collectionItemNoFollow(wb.current(), @intCast(to_zero), original_len);
         item_handle.peek().* = .{
             .head = .{
                 .str = Heap.Object.null_string,
@@ -1796,298 +1841,207 @@ fn dictRemoveDuplicates(original: Handle, new: *OptionalHandle, to_track: ?u32) 
         item_handle.trace("Zero out removed", .{});
     }
 
-    handle.peek().body.dict.len -= removed * 2;
+    wb.peek().body.dict.len -= removed * 2;
 
     // The table is pretty broken at this point, as all its references have shifted around.
     // TODO PERF For now, it's better just to free it altogether, though this has the
     // potential to slow things down.
-    dictInvalidateTable(handle);
+    dictInvalidateTable(wb.current());
 
     return to_track_new_location;
 }
 
-pub const DictAndValueResult = struct { new_dict: OptionalHandle, new_value: Heap.Handle };
 /// Takes ownership of `value`, including error cases. Returns a handle to the new value's location.
-/// `value` must be in `Heap.local_heap`.
-fn dictPutInner(original: Handle, key: Handle, value: Heap.Object) !DictAndValueResult {
+/// `value` must be in `Heap.local_heap`. Does not invalidate the string rep.
+fn dictPutInner(dict: *Mutable, key: Handle, value: Heap.Object) !Handle {
+    dict.current().assert(dict.tag() == .dict);
+
     var value_mut = value;
+    errdefer value_mut.deinitSingle(Heap.local_heap);
+    errdefer dict.discardChanges();
 
-    // Because there's so many points at which this function can hit OOM,
-    // we model this as a FSM, in order to handle error cases correctly.
-    const State = union(enum) {
-        start,
-        ensured_mutable: struct {
-            new_dict: OptionalHandle,
-        },
-        changed_value: struct {
-            new_dict: OptionalHandle,
-            old_value: Heap.Object,
-            /// Index relative to the dict.
-            value_index: u32,
-        },
-        appended_pair: struct {
-            new_dict: OptionalHandle,
-            /// Index relative to the dict.
-            new_key_index: u32,
-        },
-    };
+    // Make sure the key has a string representation.
+    _ = try dict.current().getString();
+    // Also make sure we can mutate the dict.
+    try dict.prepareToMutate();
 
-    var current_state: State = .start;
-    while (true) current_state = next_state: switch (current_state) {
-        .start => {
-            errdefer value_mut.deinitSingle(Heap.local_heap);
+    const table = try dictGetTable(dict.current());
+    // Does the key already exist?
+    if (table.get(key)) |existing_value_index| {
+        // Key exists, so replace the value in place.
+        var value_handle = dictItemNoFollow(dict.current(), existing_value_index);
+        if (value_handle.isShared()) {
+            // Looks like this dictionary value is shared, so we can't replace the value in place
+            // (else we'd smash up a value someone else is using). Instead, we'll use a new dict,
+            // which due to duplication, must have non-shared elements.
+            dict.mutated.swap(try dict.current().duplicate());
+            value_handle = dictItemNoFollow(dict.current(), existing_value_index);
+        }
 
-            // Make sure the key has a string representation.
-            _ = try key.getString();
-            // Also make sure we can mutate the dict.
-            var new_dict: OptionalHandle = .none;
-            try Heap.ensureMutableOrDup(original, &new_dict);
+        var old_value = value_handle.peek().*; // Copy old value.
+        defer old_value.deinitSingle(Heap.local_heap);
+        value_handle.peek().* = value_mut.take(); // Set new value.
+        errdefer {
+            // On error, we need to restore the old value we saved.
+            value_handle.invalidateBoth(); // Invalidate new value.
+            value_handle.peek().* = old_value.take(); // Restore old value.
+        }
 
-            break :next_state .{ .ensured_mutable = .{
-                .new_dict = new_dict,
-            } };
-        },
-        .ensured_mutable => |state| {
-            errdefer value_mut.deinitSingle(Heap.local_heap);
-            var new_dict = state.new_dict;
-            errdefer new_dict.swapWithNone();
-            var dict = new_dict.orElse(original);
-
-            const table = try dictGetTable(dict);
-            // Does the key already exist?
-            if (table.get(key)) |existing_value_index| {
-                // Key exists, so replace the value in place.
-                var value_handle = dictItem(dict, existing_value_index);
-                if (value_handle.isShared()) {
-                    // Looks like this dictionary value is shared, so we can't replace the value in place
-                    // (else we'd smash up a value someone else is using). Instead, we'll use a new dict
-                    // which, due to duplication, must have non-shared elements.
-                    new_dict.swap(try dict.duplicate());
-                    dict = new_dict.orElse(original);
-                    value_handle = dictItem(dict, existing_value_index);
-                }
-
-                value_handle.assert(value_handle.getHeap() == Heap.local_heap);
-                const old_value = value_handle.peek().*; // Copy.
-
-                // We can't fail at this point, so we don't need to worry about
-                // `value` being freed after assignment.
-                errdefer comptime unreachable;
-                value_handle.peek().* = value_mut;
-
-                break :next_state .{ .changed_value = .{
-                    .new_dict = new_dict,
-                    .old_value = old_value,
-                    .value_index = existing_value_index,
-                } };
+        // Because we mutated the dictionary, we need to remove any duplicates, if applicable.
+        const new_index = new_index: {
+            if (try dictHasDuplicatesRaw(dict.current())) {
+                const tracked_index = try dictRemoveDuplicates(dict, existing_value_index);
+                break :new_index tracked_index.?;
             } else {
-                const original_len = dict.peek().body.dict.len;
-                const new_length = original_len + 2;
-
-                // Key doesn't exist, so append both key and value.
-                const len_before_resize = dict.peek().body.dict.len;
-                const new_key_index = len_before_resize;
-                const new_value_index = len_before_resize + 1;
-
-                // Duplicate/reference the key _before_ resizing, so we can't fail
-                // after the resize is successful.
-                const new_key_handle, const new_value_handle = blk: {
-                    var key_obj: Heap.Object = Heap.dupOrReference(Heap.local_heap, key);
-                    errdefer key_obj.deinitSingle(Heap.local_heap);
-
-                    try setCollectionLength(original, &new_dict, new_length);
-                    dict = new_dict.orElse(original);
-
-                    const new_key_handle = dictItem(dict, new_key_index);
-                    const new_value_handle = dictItem(dict, new_value_index);
-
-                    new_key_handle.trace("Setting as new key to {f}", .{key_obj});
-
-                    // Set the new key and value.
-                    new_key_handle.peek().* = key_obj;
-                    new_value_handle.peek().* = value_mut;
-                    value_mut = Heap.emptyObject();
-
-                    break :blk .{ new_key_handle, new_value_handle };
-                };
-                errdefer {
-                    new_key_handle.invalidateBoth();
-                    new_value_handle.invalidateBoth();
-                    dict.peek().body.dict.len = original_len;
-                }
-
-                // Make sure the key has a string rep.
-                _ = try new_key_handle.getString();
-
-                // Only put the key in the table if the table exists. It'll be discovered
-                // when the table is generated if not.
-                if (dictMaybeGetTable(dict)) |new_table| {
-                    try new_table.put(Heap.global_gpa, new_key_handle, new_value_index);
-                }
-
-                // Need to add a new pair.
-                break :next_state .{ .appended_pair = .{
-                    .new_dict = new_dict,
-                    .new_key_index = new_key_index,
-                } };
+                break :new_index existing_value_index;
             }
-        },
-        .changed_value => |state| {
-            var old_value = state.old_value;
-            var new_dict = state.new_dict;
-            errdefer new_dict.swapWithNone();
-            var dict = new_dict.orElse(original);
-            errdefer {
-                const value_handle = dictItem(dict, state.value_index);
-                // Invalidate new value.
-                value_handle.invalidateBoth();
-                // Restore old value.
-                value_handle.peek().* = old_value;
+        };
+
+        return dictItemNoFollow(dict.current(), new_index);
+    } else {
+        const original_len = dict.peek().body.dict.len;
+        const new_length = original_len + 2;
+
+        // Key doesn't exist, so append both key and value.
+        const len_before_resize = dict.peek().body.dict.len;
+        const new_key_index = len_before_resize;
+        const new_value_index = len_before_resize + 1;
+
+        // Duplicate/reference the key _before_ resizing, so we can't fail
+        // after the resize is successful.
+        const new_key_handle, const new_value_handle = blk: {
+            var key_obj: Heap.Object = key.dupOrRef();
+            errdefer key_obj.deinitSingle(Heap.local_heap);
+
+            const maybe_new_dict = try setCollectionLengthInner(dict.current(), new_length);
+            dict.mutated.swapIfNew(maybe_new_dict);
+
+            const new_key_handle = dictItemNoFollow(dict.current(), new_key_index);
+            const new_value_handle = dictItemNoFollow(dict.current(), new_value_index);
+
+            new_key_handle.trace("Setting as new key to {f}", .{key_obj});
+
+            // Set the new key and value.
+            new_key_handle.peek().* = key_obj.take();
+            new_value_handle.peek().* = value_mut.take();
+
+            break :blk .{ new_key_handle, new_value_handle };
+        };
+        errdefer {
+            // Because these are new values, we don't need to restore old
+            // values, since there's nothing to restore. Instead, we'll just
+            // free the last two new values, and shrink the length.
+            new_key_handle.invalidateBoth();
+            new_value_handle.invalidateBoth();
+            dict.peek().body.dict.len = original_len;
+        }
+
+        // Make sure the key has a string rep.
+        _ = try new_key_handle.getString();
+
+        // Only put the key in the table if the table exists. It'll be discovered
+        // when the table is generated if not.
+        if (dictMaybeGetTable(dict.current())) |new_table| {
+            try new_table.put(Heap.global_gpa, new_key_handle, new_value_index);
+        }
+
+        // Need to add a new pair.
+
+        // Because we mutated the dictionary, we need to remove any duplicates, if applicable.
+        const new_index = new_index: {
+            if (try dictHasDuplicatesRaw(dict.current())) {
+                const tracked_value = try dictRemoveDuplicates(dict, new_key_index + 1);
+                break :new_index tracked_value.?;
+            } else {
+                break :new_index new_key_index + 1;
             }
+        };
 
-            // Because we mutated the dictionary, we need to remove any duplicates, if applicable.
-            const new_index = new_index: {
-                if (try dictHasDuplicatesRaw(dict)) {
-                    const tracked_index = try dictRemoveDuplicates(dict, &new_dict, state.value_index);
-                    dict = new_dict.orElse(dict);
-                    break :new_index tracked_index.?;
-                } else {
-                    break :new_index state.value_index;
-                }
-            };
-
-            // Success! We can now safely deinit the old value, since there's no need
-            // to restore it anymore.
-            old_value.deinitSingle(Heap.local_heap);
-
-            new_dict.orElse(original).invalidateString();
-            return .{ .new_dict = new_dict, .new_value = dictItem(dict, new_index) };
-        },
-        .appended_pair => |state| {
-            var new_dict = state.new_dict;
-            errdefer new_dict.swapWithNone();
-            var dict = new_dict.orElse(original);
-            errdefer {
-                // Because these are new values, we don't need to restore old values--
-                // there's nothing to restore. Instead, we'll just free the last two
-                // new values, and shrink the length.
-                const len = dict.peek().body.dict.len;
-                assert(state.new_key_index == len - 2);
-
-                dictItem(dict, len - 2).invalidateBoth();
-                dictItem(dict, len - 1).invalidateBoth();
-                dict.peek().body.dict.len -= 2;
-            }
-
-            // Because we mutated the dictionary, we need to remove any duplicates, if applicable.
-            const new_index = new_index: {
-                if (try dictHasDuplicatesRaw(dict)) {
-                    const tracked_value = try dictRemoveDuplicates(dict, &new_dict, state.new_key_index + 1);
-                    dict = new_dict.orElse(dict);
-                    break :new_index tracked_value.?;
-                } else {
-                    break :new_index state.new_key_index + 1;
-                }
-            };
-
-            new_dict.orElse(original).invalidateString();
-            return .{ .new_dict = new_dict, .new_value = dictItem(dict, new_index) };
-        },
-    };
+        return dictItemNoFollow(dict.current(), new_index);
+    }
 }
 
-pub fn dictPutObject(original: Handle, new: *OptionalHandle, key: Handle, value: Heap.Object) !Handle {
-    errdefer new.swapWithNone();
-    const result = try dictPutInner(new.orElse(original), key, value);
-    new.swapIfNew(result.new_dict);
-    return result.new_value;
+pub fn dictPutObject(dict: *Mutable, key: Handle, value: Heap.Object) !Handle {
+    const new_value_handle = try dictPutInner(dict, key, value);
+    dict.current().invalidateString();
+    return new_value_handle;
 }
 
 /// Takes ownership of `value`, including in error cases. `value` must be in the local heap.
-pub fn dictPutRecursively(
-    det: ?*ErrorDetails,
-    original: Handle,
-    new: *OptionalHandle,
-    keys: []const Handle,
-    value: Heap.Object,
-) !Handle {
-    var value_taken = false;
-    errdefer if (!value_taken) {
-        var value_mut = value;
-        value_mut.deinitSingle(Heap.local_heap);
-    };
-    errdefer new.swapWithNone();
+pub fn dictPutRecursively(det: ?*ErrorDetails, wb: *Mutable, context: anytype, value: Heap.Object) !Handle {
+    var value_mut = value;
+    errdefer value_mut.deinitSingle(Heap.local_heap);
+    errdefer wb.discardChanges();
 
-    try shimmerToDict(det, original, new);
-    var handle = new.orElse(original);
+    try shimmerToDict(det, wb.asShimmerable());
 
-    assert(keys.len > 0);
+    assert(context.len() > 0);
 
-    if (keys.len == 1) {
-        value_taken = true; // `dictPutObject` always takes ownership, even in error cases.
-        return try dictPutObject(original, new, keys[0], value);
+    if (context.len() == 1) {
+        // `dictPutObject` always takes ownership, even in error cases.
+        return try dictPutObject(wb, context.get(0), value_mut.take());
     }
 
     // Find/create the child dict.
     const child_dict = blk: {
-        if ((try dictLookupFollowRefs(handle, keys[0])).toHandle()) |existing_dict| {
+        if ((try dictLookup(wb.current(), context.get(0))).toHandle()) |existing_dict| {
             // Make sure the parent dict is mutable before the recursive call. If we wait until
             // after the child is modified, the parent may contain a stale .reference to an
             // invalidated child, and duplicating the parent would then panic.
-            try Heap.ensureMutableOrDup(original, new);
-            handle = new.orElse(original);
+            wb.prepareToMutate();
             break :blk existing_dict;
         } else {
             // Create a new child dictionary.
-            const new_child_dict = try newDictWithCapacity(Heap.local_heap, 2);
+            const new_child_dict = try newDictWithCapacity(2);
 
-            const element = try dictPutObject(original, new, keys[0], new_child_dict.referenceOwning());
-            handle = new.orElse(original);
+            const element = try dictPutObject(wb, context.get(0), new_child_dict.referenceOwning());
             break :blk element;
         }
     };
 
-    value_taken = true;
     var new_child_dict: OptionalHandle = .none;
-    const child_put_result = try dictPutRecursively(det, child_dict, &new_child_dict, keys[1..], value);
+    const child_put_result = try dictPutRecursively(
+        det,
+        child_dict,
+        &new_child_dict,
+        @as(@TypeOf(context), context.sliceAfter(1)),
+        value_mut.take(),
+    );
     if (new_child_dict.toHandle()) |new_child| {
         errdefer new_child.decrRefCount();
 
         // The child dict changed, so we need to update ours.
-        _ = try dictPutObject(original, new, keys[0], new_child.referenceOwning());
-        handle = new.orElse(original);
+        _ = try dictPutObject(wb, context.get(0), new_child.referenceOwning());
     }
 
-    handle.invalidateString();
+    wb.current().invalidateString();
 
     return child_put_result;
 }
 
-pub fn dictRemoveRecursively(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, keys: []const Handle) !bool {
-    errdefer new.swapWithNone();
-    try shimmerToDict(det, original, new);
-    var handle = new.orElse(original);
+pub fn dictRemoveRecursively(det: ?*ErrorDetails, wb: *Mutable, context: anytype) !bool {
+    errdefer wb.discardChanges();
+    try shimmerToDict(det, wb.asShimmerable());
 
-    assert(keys.len > 0);
+    assert(context.len() > 0);
 
-    if (keys.len == 1) {
-        return try dictRemove(det, original, new, keys[0]);
+    if (context.len() == 1) {
+        return try dictRemove(det, wb, context.get(0));
     }
 
     // Find the child dict.
-    if ((try dictLookupFollowRefs(handle, keys[0])).toHandle()) |child_dict| {
+    if ((try dictLookup(wb.current(), context.get(0))).toHandle()) |child_dict| {
         var maybe_new_child: OptionalHandle = .none;
         errdefer maybe_new_child.swapWithNone();
-        const did_remove = try dictRemoveRecursively(det, child_dict, &maybe_new_child, keys[1..]);
+        const did_remove = try dictRemoveRecursively(det, child_dict, &maybe_new_child, context.sliceAfter(1));
         // If the child dict was modified (either in place or by duplication), we need to
         // update our dict to point to the modified version.
         if (maybe_new_child.toHandle()) |new_child| {
             // The child dict was duplicated, so we need to replace the old reference with the new one.
-            _ = try dictPutObject(original, new, keys[0], new_child.referenceOwning());
-            handle = new.orElse(original);
+            _ = try dictPutObject(wb, context.get(0), new_child.referenceOwning());
         }
 
-        handle.invalidateString();
+        wb.current().invalidateString();
 
         return did_remove;
     } else {
@@ -2095,29 +2049,22 @@ pub fn dictRemoveRecursively(det: ?*ErrorDetails, original: Handle, new: *Option
     }
 }
 
-pub fn dictLookupRecursively(
-    det: ?*ErrorDetails,
-    original: Handle,
-    new: *OptionalHandle,
-    keys: []const Handle,
-) !OptionalHandle {
-    errdefer new.swapWithNone();
-    try shimmerToDict(det, original, new);
-    var handle = new.orElse(original);
+pub fn dictLookupRecursively(det: ?*ErrorDetails, wb: *Shimmerable, context: anytype) !OptionalHandle {
+    errdefer wb.discardChanges();
+    try shimmerToDict(det, wb);
 
-    if (keys.len == 0) return handle.toOptional();
-    if (keys.len == 1) {
-        return try dictLookupFollowLinks(det, original, new, keys[0]);
+    if (context.len() == 0) return wb.current().toOptional();
+    if (context.len() == 1) {
+        return try dictLookupFollowLinks(det, wb, context.get(0));
     }
 
-    if ((try dictLookupFollowLinks(det, original, new, keys[0])).toHandle()) |child_dict| {
+    if ((try dictLookupFollowLinks(det, wb, context.get(0))).toHandle()) |child_dict| {
         var maybe_new_child: OptionalHandle = .none;
         errdefer maybe_new_child.swapWithNone();
-        const child_result = try dictLookupRecursively(det, child_dict, &maybe_new_child, keys[1..]);
+        const child_result = try dictLookupRecursively(det, child_dict, &maybe_new_child, context.sliceAfter(1));
         if (maybe_new_child.toHandle()) |new_child| {
             // The child dict changed, propagate back up.
-            _ = try dictPutObject(original, new, keys[0], new_child.referenceOwning());
-            handle = new.orElse(original);
+            _ = try dictPutInner(wb.asMutable(), context.get(0), new_child.referenceOwning());
         }
         return child_result;
     } else {
@@ -2125,29 +2072,29 @@ pub fn dictLookupRecursively(
     }
 }
 
-/// Assumes `handle` is a dict.
-pub fn dictPut(original: Handle, new: *OptionalHandle, key: Handle, value: Handle) !Handle {
-    return dictPutObject(original, new, key, value.dupOrRef());
+/// Asserts `handle` is a dict.
+pub fn dictPut(wb: *Mutable, key: Handle, value: Handle) !Handle {
+    return dictPutObject(wb, key, value.dupOrRef());
 }
 
 fn dictFlattenInner(det: ?*ErrorDetails, original: Handle) !OptionalHandle {
-    if ((try dictLookupFollowRefs(original, Heap.local_heap.getInternedString(.@"^parent"))).toHandle()) |parent_link| {
-        var new_parent_link: OptionalHandle = .none;
-        defer new_parent_link.decrOptional();
-        try shimmerToHashReference(det, parent_link, &new_parent_link);
+    if ((try dictLookup(original, Heap.local_heap.getInternedString(.@"^parent"))).toHandle()) |parent_link| {
+        var parent_link_wb: Shimmerable = .{ .original = parent_link };
+        defer parent_link_wb.discardChanges();
+        try shimmerToHashReference(det, &parent_link_wb);
 
-        const parent = new_parent_link.orElse(parent_link).peek().body.hash_reference;
+        const parent = parent_link_wb.peek().body.hash_reference;
 
         var new_dict = try dictFlattenInner(det, parent);
-        var to_add_to = if (new_dict.toHandle()) |handle| handle else try Heap.local_heap.duplicate(parent);
+        var to_add_to = if (new_dict.toHandle()) |handle| handle else try parent.duplicate();
         errdefer to_add_to.decrRefCount();
 
         var pair_i: u32 = 0;
         while (pair_i < original.peek().body.dict.len / 2) : (pair_i += 1) {
             const put_result = try dictPutInner(
                 to_add_to,
-                dictItemFollowRefs(original, pair_i * 2),
-                dictItemFollowRefs(original, pair_i * 2 + 1).reference(),
+                dictItem(original, pair_i * 2),
+                dictItem(original, pair_i * 2 + 1).reference(),
             );
             to_add_to.swapIfNew(put_result.new_dict);
         }
@@ -2158,9 +2105,9 @@ fn dictFlattenInner(det: ?*ErrorDetails, original: Handle) !OptionalHandle {
     }
 }
 
-pub fn dictFlatten(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    errdefer new.swapWithNone();
-    new.swapIfNew(try dictFlattenInner(det, new.orElse(original)));
+pub fn dictFlatten(det: ?*ErrorDetails, wb: *Mutable) !void {
+    errdefer wb.discardChanges();
+    wb.mutated.swapIfNew(try dictFlattenInner(det, wb.current()));
 }
 
 pub const DictKeysContext = struct {
@@ -2175,65 +2122,57 @@ pub const DictKeysContext = struct {
 };
 
 pub const DictKvResult = std.array_hash_map.Custom(Handle, Handle, DictKeysContext, true);
-pub fn dictGetKvPairs(det: ?*ErrorDetails, arena: std.mem.Allocator, original: Handle, new: *OptionalHandle) !DictKvResult {
-    errdefer new.swapWithNone();
-    try shimmerToDict(det, original, new);
+pub fn dictGetKvPairs(det: ?*ErrorDetails, arena: std.mem.Allocator, wb: *Shimmerable) !DictKvResult {
+    errdefer wb.discardChanges();
+    try shimmerToDict(det, wb);
 
     var result: DictKvResult = .empty;
     errdefer result.deinit(arena);
 
     errdefer for (result.keys()) |key| key.decrRefCount();
-    try dictGetKvPairsInner(det, arena, original, new, &result);
+    errdefer for (result.values()) |value| value.decrRefCount();
+    try dictGetKvPairsInner(det, arena, wb, &result);
 
     return result;
 }
 
-fn dictGetKvPairsInner(
-    det: ?*ErrorDetails,
-    arena: std.mem.Allocator,
-    original: Handle,
-    new: *OptionalHandle,
-    result: *DictKvResult,
-) !void {
-    var handle = new.orElse(original);
-
+fn dictGetKvPairsInner(det: ?*ErrorDetails, arena: std.mem.Allocator, wb: *Shimmerable, result: *DictKvResult) !void {
     const parent_key = Heap.local_heap.getInternedString(.@"^parent");
-    if ((try dictLookupFollowRefs(handle, parent_key)).toHandle()) |parent_link| {
-        var maybe_new_parent_link: OptionalHandle = .none;
-        defer maybe_new_parent_link.decrOptional();
-        shimmerToHashReference(det, parent_link, &maybe_new_parent_link) catch |err| switch (err) {
+    if ((try dictLookup(wb.current(), parent_key)).toHandle()) |parent_link| {
+        var parent_link_wb: Shimmerable = .{ .original = parent_link, .shimmered = .none };
+        defer parent_link_wb.discardChanges();
+        shimmerToHashReference(det, &parent_link_wb) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.HashLookupFailed, error.NotHashReference => return error.LinkLookupFailed,
         };
 
-        if (maybe_new_parent_link.toHandle()) |new_parent_link| {
-            _ = try dictPutObject(original, new, parent_key, new_parent_link.reference());
-            handle = new.orElse(original);
+        if (parent_link_wb.shimmered.toHandle()) |new_parent_link| {
+            // This is very delicate, but it technically isn't a visible mutation, since
+            // we're swapping one hash reference with another reference with identical content.
+            _ = try dictPutObject(wb.original, &wb.shimmered, parent_key, new_parent_link.reference());
         }
 
-        const hash_reference = maybe_new_parent_link.orElse(parent_link);
-        const parent = hash_reference.peek().body.hash_reference;
-        var new_parent: OptionalHandle = .none;
-        defer new_parent.decrOptional();
-        shimmerToDict(det, parent, &new_parent) catch |err| switch (err) {
+        const parent = parent_link_wb.peek().body.hash_reference;
+        var parent_wb: Shimmerable = .{ .original = parent, .shimmered = .none };
+        defer parent_wb.discardChanges();
+        shimmerToDict(det, &parent_wb) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.LinkLookupFailed,
         };
 
-        if (new_parent.toHandle()) |val| {
-            _ = try dictPutObject(original, new, parent_key, val.hashReference());
-            handle = new.orElse(original);
+        if (parent_wb.shimmered.toHandle()) |val| {
+            _ = try dictPutObject(wb.original, &wb.shimmered, parent_key, val.hashReference());
         }
 
         // Recurse into parent first so parent keys are inserted before child keys.
-        try dictGetKvPairsInner(det, arena, new_parent.orElse(parent), &new_parent, result);
+        try dictGetKvPairsInner(det, arena, &parent_wb, result);
     }
 
-    const pair_count = dictPairLengthRaw(handle);
+    const pair_count = dictPairLength(wb.current());
     var pair_i: u32 = 0;
     while (pair_i < pair_count) : (pair_i += 1) {
-        const key = dictItemFollowRefs(handle, pair_i * 2);
-        const value = dictItemFollowRefs(handle, pair_i * 2 + 1);
+        const key = dictItem(wb.current(), pair_i * 2);
+        const value = dictItem(wb.current(), pair_i * 2 + 1);
         if (try key.equalsString("^parent")) continue;
 
         const gop = try result.getOrPut(arena, key);
@@ -2246,35 +2185,33 @@ fn dictGetKvPairsInner(
 
 fn testDictFlatten(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
 
-    const key_foo = try newStringInner(heap, "foo");
+    const key_foo = try newString("foo");
     defer key_foo.decrRefCount();
-    const value1 = try newStringInner(heap, "1");
+    const value1 = try newString("1");
     defer value1.decrRefCount();
-    const key_bar = try newStringInner(heap, "bar");
+    const key_bar = try newString("bar");
     defer key_bar.decrRefCount();
-    const value2 = try newStringInner(heap, "2");
+    const value2 = try newString("2");
     defer value2.decrRefCount();
-    const key_baz = try newStringInner(heap, "baz");
+    const key_baz = try newString("baz");
     defer key_baz.decrRefCount();
-    const value3 = try newStringInner(heap, "3");
+    const value3 = try newString("3");
     defer value3.decrRefCount();
 
-    const dict1 = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
+    const dict1 = try newDict(&.{ key_foo, value1, key_bar, value2 });
     defer dict1.decrRefCount();
 
-    const dict2 = try newDictInner(heap, &.{ key_foo, value2, key_baz, value3 });
+    const dict2 = try newDict(&.{ key_foo, value2, key_baz, value3 });
     defer dict2.decrRefCount();
 
-    var new: OptionalHandle = .none;
-    errdefer new.decrOptional();
-    const parent_key = heap.getInternedString(.@"^parent");
-    _ = try dictPutObject(dict2, &new, parent_key, dict1.hashReference());
-    new.swapWithNone();
+    var dict2_wb: Shimmerable = .{ .original = dict2, .shimmered = .none };
+    defer dict2_wb.discardChanges();
 
-    try dictFlatten(null, dict2, &new);
-    new.swapWithNone();
+    const parent_key = Heap.local_heap.getInternedString(.@"^parent");
+    _ = try dictPutObject(&dict2_wb, parent_key, dict1.hashReference());
+    try dictFlatten(null, &dict2_wb);
 }
 test "dict flatten" {
     try testing.checkAllAllocationFailures(testing.allocator, testDictFlatten, .{});
@@ -2282,51 +2219,46 @@ test "dict flatten" {
 
 /// Returns true if the value was removed, or false if the value doesn't exist.
 /// May merge parent links.
-pub fn dictRemove(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, key: Handle) !bool {
-    var handle = new.orElse(original);
-    assert(handle.tag() == .dict);
-    errdefer new.swapWithNone();
+pub fn dictRemove(det: ?*ErrorDetails, wb: *Mutable, key: Handle) !bool {
+    assert(wb.tag() == .dict);
+    errdefer wb.discardChanges();
 
     const key_bytes = try key.getString();
 
-    try Heap.ensureMutableOrDup(original, new);
-    handle = new.orElse(original);
+    wb.prepareToMutate();
 
     const parent_key = Heap.local_heap.getInternedString(.@"^parent");
-    if ((try dictLookupFollowRefs(handle, parent_key)).toHandle()) |parent_link| {
+    if ((try dictLookup(wb.current(), parent_key)).toHandle()) |parent_link| {
         // If the parent chain contains the key we're removing, we must flatten first,
         // otherwise removing locally would leave the parent value still visible.
         var maybe_new_parent_link: OptionalHandle = .none;
         defer maybe_new_parent_link.decrOptional();
         try shimmerToHashReference(det, parent_link, &maybe_new_parent_link);
         if (maybe_new_parent_link.toHandle()) |new_parent_link| {
-            _ = try dictPutObject(original, new, parent_key, new_parent_link.reference());
-            handle = new.orElse(original);
+            _ = try dictPutObject(wb, parent_key, new_parent_link.reference());
         }
 
         const parent = maybe_new_parent_link.orElse(parent_link).peek().body.hash_reference;
         var maybe_new_parent: OptionalHandle = .none;
         const key_in_parent = (try dictLookupFollowLinks(det, parent, &maybe_new_parent, key)) != .none;
         if (maybe_new_parent.toHandle()) |new_parent| {
-            _ = try dictPutObject(original, new, parent_key, new_parent.hashReference());
-            handle = new.orElse(original);
+            _ = try dictPutObject(wb, parent_key, new_parent.hashReference());
         }
 
         if (key_in_parent) {
             // Key was found in the parent, so we do need to flatten.
-            try dictFlatten(det, original, new);
-            handle = new.orElse(original);
+            try dictFlatten(det, wb);
         }
     }
 
-    handle.assert(handle.canShimmer());
-    const dict_len = dictItemLength(handle);
+    wb.current().assert(wb.current().canShimmer());
+    const dict_len = dictItemLength(wb.current());
 
     // Locate the first key (note, we can't use `metadata.table.get`, because Tcl removes all
     // key(s), while `metadata.table.get` only returns the last key).
     var first_key_index: u32 = 0;
     while (first_key_index < dict_len) : (first_key_index += 2) {
-        const key_checking = try dictItem(handle, first_key_index).getString();
+        const key_checking = try dictItem(wb.current(), first_key_index).getString();
         if (std.mem.eql(u8, key_bytes, key_checking)) {
             break; // Found our key.
         }
@@ -2339,7 +2271,7 @@ pub fn dictRemove(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, k
     // following the key and value.
     var shared_values_found = false;
     for (first_key_index..dict_len) |item_index| {
-        const item_handle = dictItem(handle, @intCast(item_index));
+        const item_handle = dictItem(wb.current(), @intCast(item_index));
         if (item_handle.isShared()) shared_values_found = true;
     }
 
@@ -2347,8 +2279,7 @@ pub fn dictRemove(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, k
         // Looks like this dictionary item is shared, so we can't replace the value in place
         // (else we'd smash up an item someone else is using). Instead, we'll start this whole
         // process over with a new dictionary.
-        new.swap(try handle.duplicate());
-        handle = new.orElse(original);
+        wb.mutated.swap(try wb.current().duplicate());
     }
 
     // Make sure all the keys have string reps. If we OOM halfway through removal
@@ -2356,32 +2287,32 @@ pub fn dictRemove(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, k
     // string rep to start with. If not, we'll safely propagate the OOM.
     var item_index: u32 = 0;
     while (item_index < dict_len) : (item_index += 2) {
-        _ = try dictItem(handle, item_index).getString();
+        _ = try dictItem(wb.current(), item_index).getString();
     }
 
     // This is the start of mutation. From here on there's no going back.
     errdefer comptime unreachable;
-    dictInvalidateTable(handle);
+    dictInvalidateTable(wb.current());
 
     // Remove all matching keys and their values, moving the following pair
     // backwards to fill the gap(s).
     item_index = first_key_index;
     var pairs_removed: u32 = 0;
     while (item_index < dict_len) : (item_index += 2) {
-        const key_handle = dictItem(handle, item_index);
-        const value_handle = dictItem(handle, item_index + 1);
+        const key_handle = dictItem(wb.current(), item_index);
+        const value_handle = dictItem(wb.current(), item_index + 1);
         key_handle.assert(!key_handle.isShared());
         value_handle.assert(!value_handle.isShared());
         // We checked that all our keys have strings earlier.
-        const key_checking = dictItem(handle, item_index).getString() catch unreachable;
+        const key_checking = dictItem(wb.current(), item_index).getString() catch unreachable;
         if (std.mem.eql(u8, key_bytes, key_checking)) {
             key_handle.invalidateBoth();
             value_handle.invalidateBoth();
             pairs_removed += 1;
         } else if (pairs_removed > 0) {
             // Move this pair backwards.
-            const new_key_handle = dictItem(handle, item_index - pairs_removed * 2);
-            const new_value_handle = dictItem(handle, item_index - pairs_removed * 2 + 1);
+            const new_key_handle = dictItem(wb.current(), item_index - pairs_removed * 2);
+            const new_value_handle = dictItem(wb.current(), item_index - pairs_removed * 2 + 1);
             new_key_handle.peek().* = key_handle.peek().*;
             new_value_handle.peek().* = value_handle.peek().*;
         }
@@ -2390,106 +2321,105 @@ pub fn dictRemove(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, k
     // Be sure to "zero" out all the moved items that weren't replaced with something else.
     const start_of_removed = dict_len - pairs_removed * 2;
     for (start_of_removed..dict_len) |removed| {
-        const item_handle = dictItem(handle, @intCast(removed));
+        const item_handle = dictItem(wb.current(), @intCast(removed));
         item_handle.peek().* = .{ .head = .{ .str = Heap.Object.null_string, .tag = .none }, .body = undefined };
     }
 
-    handle.peek().body.dict.len -= pairs_removed * 2;
+    wb.peek().body.dict.len -= pairs_removed * 2;
 
-    handle.invalidateString();
+    wb.current().invalidateString();
 
     return true;
 }
 
 fn testDicts(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
 
-    const key_foo = try newStringInner(heap, "foo");
+    const key_foo = try newString("foo");
     defer key_foo.decrRefCount();
-    const value1 = try newStringInner(heap, "1");
+    const value1 = try newString("1");
     defer value1.decrRefCount();
-    const key_bar = try newStringInner(heap, "bar");
+    const key_bar = try newString("bar");
     defer key_bar.decrRefCount();
-    const value2 = try newStringInner(heap, "2");
+    const value2 = try newString("2");
     defer value2.decrRefCount();
 
-    const dict1 = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
+    const dict1 = try newDict(&.{ key_foo, value1, key_bar, value2 });
     defer dict1.decrRefCount();
 
-    const good_key = try newStringInner(heap, "foo");
+    const good_key = try newString("foo");
     defer good_key.decrRefCount();
-    const bad_key = try newStringInner(heap, "bogus");
+    const bad_key = try newString("bogus");
     defer bad_key.decrRefCount();
 
-    try testing.expectEqualStrings("1", try (try dictLookupFollowRefs(dict1, good_key)).toHandle().?.getString());
-    try testing.expectEqual(.none, try dictLookupFollowRefs(dict1, bad_key));
+    try testing.expectEqualStrings("1", try (try dictLookup(dict1, good_key)).toHandle().?.getString());
+    try testing.expectEqual(.none, try dictLookup(dict1, bad_key));
 
     // Dict with duplicate entries testing.
     var new_dict: OptionalHandle = .none;
     defer new_dict.swapWithNone();
 
-    var dict_with_duplicates = try newStringInner(heap, "foo 5 bar 10 foo 15");
+    const dict_with_duplicates = try newString("foo 5 bar 10 foo 15");
     defer dict_with_duplicates.decrRefCount();
-    const dup_len = try dictPairLength(null, dict_with_duplicates, &new_dict);
-    dict_with_duplicates.swapAndClear(&new_dict);
+    var dict_with_duplicates_wb: Mutable = .{ .original = dict_with_duplicates };
+    defer dict_with_duplicates_wb.discardChanges();
+    try shimmerToDict(null, dict_with_duplicates_wb.asShimmerable());
+    const dup_len = try dictPairLength(null, &dict_with_duplicates_wb);
 
     try testing.expectEqual(3, dup_len);
     // When a duplicate key is queried, it should point to the last corrisponding value.
-    try testing.expectEqualStrings("15", try (try dictLookupFollowRefs(dict_with_duplicates, key_foo)).toHandle().?.getString());
+    try testing.expectEqualStrings("15", try (try dictLookup(dict_with_duplicates_wb.current(), key_foo)).toHandle().?.getString());
 
-    _ = try dictRemoveDuplicates(dict_with_duplicates, &new_dict, null);
+    _ = try dictRemoveDuplicates(&dict_with_duplicates_wb, null);
     dict_with_duplicates.swapAndClear(&new_dict);
-    try testing.expectEqual(2, dictPairLengthRaw(dict_with_duplicates));
+    try testing.expectEqual(2, dictPairLength(dict_with_duplicates));
 
     // Dict put testing.
-    var dict_for_put = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
+    const dict_for_put = try newDict(&.{ key_foo, value1, key_bar, value2 });
     defer dict_for_put.decrRefCount();
-    const key3 = try newStringInner(heap, "baz");
+    const key3 = try newString("baz");
     defer key3.decrRefCount();
-    const value3 = try newStringInner(heap, "3");
+    const value3 = try newString("3");
     defer value3.decrRefCount();
 
-    try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
-    var new: OptionalHandle = .none;
-    defer new.swapWithNone();
-    _ = try dictPut(dict_for_put, &new, key_bar, value3);
-    dict_for_put.swapAndClear(&new);
-    try testing.expectEqual(2, dictPairLengthRaw(dict_for_put));
+    var dict_for_put_wb: Mutable = .{ .original = dict_for_put };
+    defer dict_for_put_wb.discardChanges();
+    try testing.expectEqual(2, dictPairLength(dict_for_put_wb.current()));
+    _ = try dictPut(&dict_for_put_wb, key_bar, value3);
+    try testing.expectEqual(2, dictPairLength(dict_for_put_wb.current()));
 
-    _ = try dictPut(dict_for_put, &new, key3, value3);
-    dict_for_put.swapAndClear(&new);
-    try testing.expectEqual(3, dictPairLengthRaw(dict_for_put));
-    try testing.expectEqualStrings("3", try (try dictLookupFollowRefs(dict_for_put, key3)).toHandle().?.getString());
+    _ = try dictPut(&dict_for_put_wb, key3, value3);
+    try testing.expectEqual(3, dictPairLength(dict_for_put_wb.current()));
+    try testing.expectEqualStrings("3", try (try dictLookup(dict_for_put_wb.current(), key3)).toHandle().?.getString());
 
     // Dict remove testing.
-    var dict_for_remove = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2, key_foo, value3 });
+    var dict_for_remove = try newDict(&.{ key_foo, value1, key_bar, value2, key_foo, value3 });
     defer dict_for_remove.decrRefCount();
-    const did_remove = try dictRemove(null, dict_for_remove, &new, key_foo);
-    dict_for_remove.swapAndClear(&new);
+    var dict_for_remove_wb: Mutable = .{ .original = dict_for_remove };
+    const did_remove = try dictRemove(null, &dict_for_remove_wb, key_foo);
     try testing.expectEqual(true, did_remove);
     try testing.expectEqualStrings("bar 2", try dict_for_remove.getString());
 
     // Test dict edge cases.
-    var dict_edge_cases = try newDictInner(heap, &.{ key_foo, value1, key_bar, value2 });
+    var dict_edge_cases = try newDict(&.{ key_foo, value1, key_bar, value2 });
     defer dict_edge_cases.decrRefCount();
+    var dict_edge_cases_wb: Mutable = .{ .original = dict_edge_cases };
+    defer dict_edge_cases_wb.discardChanges();
 
     // Try using a value as a key, and a key as the value while not shared (this is to check
     // that this handles using internal objects correctly).
     assert(dict_edge_cases.canMutate());
-    _ = try dictPut(dict_edge_cases, &new, dictItemFollowRefs(dict_edge_cases, 1), dictItemFollowRefs(dict_edge_cases, 2));
-    dict_edge_cases.swapAndClear(&new);
-    try testing.expectEqualStrings("bar", try (try dictLookupFollowRefs(dict_edge_cases, value1)).toHandle().?.getString());
+    _ = try dictPut(&dict_edge_cases_wb, dictItem(dict_edge_cases, 1), dictItem(dict_edge_cases, 2));
+    try testing.expectEqualStrings("bar", try (try dictLookup(dict_edge_cases, value1)).toHandle().?.getString());
 
     // Try aliasing a key by using it as key and value.
-    _ = try dictPut(dict_edge_cases, &new, dictItemFollowRefs(dict_edge_cases, 0), dictItemFollowRefs(dict_edge_cases, 0));
-    dict_edge_cases.swapAndClear(&new);
-    try testing.expectEqualStrings("foo", try (try dictLookupFollowRefs(dict_edge_cases, key_foo)).toHandle().?.getString());
+    _ = try dictPut(&dict_edge_cases_wb, dictItem(dict_edge_cases, 0), dictItem(dict_edge_cases, 0));
+    try testing.expectEqualStrings("foo", try (try dictLookup(dict_edge_cases, key_foo)).toHandle().?.getString());
 
     // Try aliasing a value by using it as key and value.
-    _ = try dictPut(dict_edge_cases, &new, dictItemFollowRefs(dict_edge_cases, 3), dictItemFollowRefs(dict_edge_cases, 3));
-    dict_edge_cases.swapAndClear(&new);
-    try testing.expectEqualStrings("2", try (try dictLookupFollowRefs(dict_edge_cases, value2)).toHandle().?.getString());
+    _ = try dictPut(&dict_edge_cases_wb, dictItem(dict_edge_cases, 3), dictItem(dict_edge_cases, 3));
+    try testing.expectEqualStrings("2", try (try dictLookup(dict_edge_cases, value2)).toHandle().?.getString());
 }
 
 test "dicts" {
@@ -2545,12 +2475,12 @@ pub fn setSourceInfo(handle: Handle, source_info: SourceInfo) !void {
 
 fn testSourceInfo(ta: std.mem.Allocator) !void {
     defer Heap.testFinish();
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
 
-    var obj = try heap.createObject();
+    var obj = try Heap.createObject();
     defer obj.decrRefCount();
 
-    const file_name = try newStringInner(heap, "test_file.tcl");
+    const file_name = try newString("test_file.tcl");
     defer file_name.decrRefCount();
 
     try setSourceInfo(obj, .{ .file_name = file_name.toOptional(), .line_no = 42 });
@@ -2563,7 +2493,7 @@ fn testSourceInfo(ta: std.mem.Allocator) !void {
     try testing.expectEqualSlices(u8, "test_file.tcl", try obj.getSourceExtraData().file_name.toHandle().?.getString());
     try testing.expectEqual(@as(u32, 42), info.?.line_no);
 
-    const obj2 = try newStringInner(heap, "hello");
+    const obj2 = try newString("hello");
     defer obj2.decrRefCount();
 
     const empty_info = getSourceInfo(obj2);
@@ -2626,7 +2556,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
             }
         } else |err| {
             if (det) |details| {
-                details.* = try convertTokenizerError(Heap.local_heap, err);
+                details.* = try convertTokenizerError(err);
                 if (parser.error_details) |parser_details| {
                     details.index = parser_details.index;
                 }
@@ -2714,7 +2644,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                     },
                 },
             });
-            script_command_idx = listLengthRaw(new_token_values) - 1;
+            script_command_idx = listLength(new_token_values) - 1;
         }
 
         // Append the start of the word (only if necessary).
@@ -2745,7 +2675,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                     .escaped_string => {
                         new_token_tags.appendAssumeCapacity(.simple_string);
                         listAppendAssumeCapacity(new_token_values, .{ .head = .{ .tag = .none }, .body = undefined });
-                        const item = listItemNoFollow(new_token_values, listLengthRaw(new_token_values) - 1);
+                        const item = listItemNoFollow(new_token_values, listLength(new_token_values) - 1);
                         setStringFromEscaped(item, bytes[token.loc.start..token.loc.end]) catch |err| switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
                             error.OtherThreadSet => unreachable,
@@ -2756,7 +2686,7 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
                     else => {
                         new_token_tags.appendAssumeCapacity(token.tag);
                         listAppendAssumeCapacity(new_token_values, .{ .head = .{ .tag = .none }, .body = undefined });
-                        const item = listItemNoFollow(new_token_values, listLengthRaw(new_token_values) - 1);
+                        const item = listItemNoFollow(new_token_values, listLength(new_token_values) - 1);
                         Heap.setString(item, bytes[token.loc.start..token.loc.end]) catch |err| switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
                             error.OtherThreadSet => unreachable,
@@ -2797,10 +2727,10 @@ pub fn parseScript(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedScript {
 }
 
 fn testScriptParsing(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
-    const script1 = try newStringInner(heap,
+    const script1 = try newString(
         \\ set x 5
         \\ set y $x[set x]
     );
@@ -2848,10 +2778,10 @@ pub fn getScript(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap.Par
 }
 
 fn testScriptShimmering(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
-    var script = try newStringInner(heap,
+    var script = try newString(
         \\ set foo 5
         \\ set y $foo[set foo]
     );
@@ -2879,7 +2809,7 @@ fn testScriptShimmering(ta: std.mem.Allocator) !void {
     try testing.expectEqual(parsed1.tags.items.ptr, parsed2.tags.items.ptr);
 
     // A different script gets its own cache entry.
-    var script2 = try newStringInner(heap, "set x 5");
+    var script2 = try newString("set x 5");
     defer script2.decrRefCount();
 
     const cache_key2 = try script2.getHash();
@@ -2913,7 +2843,7 @@ pub fn parseExpression(det: ?*ErrorDetails, handle: Handle) !Heap.ParsedExpressi
             try tokens.append(Heap.global_gpa, token);
             if (token.tag == .end_of_file) break;
         } else |err| if (det) |details| {
-            details.* = try convertTokenizerError(Heap.local_heap, err);
+            details.* = try convertTokenizerError(err);
             if (tokenizer.error_details) |parser_details| {
                 details.index = parser_details.index;
             }
@@ -2977,10 +2907,10 @@ pub fn getExpression(det: ?*ErrorDetails, handle: Handle, cache_key: u256) !Heap
 }
 
 fn testExpressions(ta: std.mem.Allocator) !void {
-    const heap = try Heap.testStart(ta, testing.io);
+    try Heap.testStart(ta, testing.io);
     defer Heap.testFinish();
 
-    var expr1 = try newStringInner(heap, "1 + 2 * 3 + 4");
+    var expr1 = try newString("1 + 2 * 3 + 4");
     defer expr1.decrRefCount();
 
     const parsed = try getExpression(null, expr1, try expr1.getHash());
@@ -3015,7 +2945,7 @@ pub fn parseSubstitution(det: ?*ErrorDetails, handle: Handle, flags: Tokenizer.S
             try tokens.append(Heap.global_gpa, token);
         } else |err| {
             if (det) |details| {
-                details.* = try convertTokenizerError(Heap.local_heap, err);
+                details.* = try convertTokenizerError(err);
                 if (parser.error_details) |parser_details| {
                     details.index = parser_details.index;
                 }
@@ -3102,35 +3032,31 @@ pub fn getSubstitution(det: ?*ErrorDetails, handle: Handle, cache_key: u256, fla
     }
 }
 
-pub fn shimmerToBoolean(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle) !void {
-    var handle = new.orElse(original);
-    if (handle.tag() == .bool) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToBoolean(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .bool) return;
+    errdefer wb.discardChanges();
 
     // Fast case: if it's an int, we can get the value directly.
-    if (handle.tag() == .integer) {
-        const new_value = handle.peek().body.integer != 0;
+    if (wb.tag() == .integer) {
+        const new_value = wb.peek().body.integer != 0;
 
-        try Heap.ensureShimmerableOrDup(original, new);
-        handle = new.orElse(original);
-
-        try handle.prepareToShimmer();
-        handle.peek().head.tag = .bool;
-        handle.peek().body.bool = .{ .data = new_value };
+        try wb.prepareToShimmer();
+        wb.peek().head.tag = .bool;
+        wb.peek().body.bool = .{ .data = new_value };
         return;
     }
 
     const Mapping = std.StaticStringMap(bool).initComptime(Tokenizer.boolean_mapping);
 
-    const bytes = try handle.getString();
+    const bytes = try wb.current().getString();
     const new_value = Mapping.get(bytes) orelse blk: {
         // It might be an integer, so be sure to try parsing it as an int before giving up.
-        const as_int = integerGetNoShimmer(null, handle) catch |err| switch (err) {
+        const as_int = integerGetNoShimmer(null, wb.current()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 // Finally, give up.
                 if (det) |details| details.* = .{
-                    .message = try newStringFmt("expected boolean but got \"{f}\"", .{handle}),
+                    .message = try newStringFmt("expected boolean but got \"{f}\"", .{wb.current()}),
                 };
                 return error.BadBoolean;
             },
@@ -3138,35 +3064,28 @@ pub fn shimmerToBoolean(det: ?*ErrorDetails, original: Handle, new: *OptionalHan
         break :blk as_int != 0;
     };
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    handle = new.orElse(original);
-
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .bool;
-    handle.peek().body.bool = .{ .data = new_value };
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .bool;
+    wb.peek().body.bool = .{ .data = new_value };
 }
 
-pub fn getBoolean(det: ?*ErrorDetails, provided_handle: Handle, new_handle: *OptionalHandle) !bool {
-    try shimmerToBoolean(det, provided_handle, new_handle);
-    return new_handle.orElse(provided_handle).peek().body.bool.data;
+pub fn getBoolean(det: ?*ErrorDetails, wb: *Shimmerable) !bool {
+    try shimmerToBoolean(det, wb);
+    return wb.peek().body.bool.data;
 }
 
 pub fn newBoolean(value: bool) !Handle {
-    const handle = try Heap.local_heap.createObject();
+    const handle = try Heap.createObject();
     handle.peek().head.tag = .bool;
     handle.peek().body.bool = .{ .data = value };
     return handle;
 }
 
-pub fn shimmerToRegexp(det: ?*ErrorDetails, original: Handle, new: *OptionalHandle, compile_opts: u32) !void {
-    var handle = new.orElse(original);
-    if (handle.tag() == .regexp and handle.peek().body.regexp.options == compile_opts) return;
-    errdefer new.swapWithNone();
+pub fn shimmerToRegexp(det: ?*ErrorDetails, wb: *Shimmerable, compile_opts: u32) !void {
+    if (wb.tag() == .regexp and wb.peek().body.regexp.options == compile_opts) return;
+    errdefer wb.discardChanges();
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    handle = new.orElse(original);
-
-    const pattern = try handle.getString();
+    const pattern = try wb.current().getString();
 
     var err_code: c_int = 0;
     var err_offset: usize = 0;
@@ -3191,13 +3110,13 @@ pub fn shimmerToRegexp(det: ?*ErrorDetails, original: Handle, new: *OptionalHand
         return error.BadRegexp;
     };
 
-    const heap = handle.getHeap();
+    const heap = wb.current().getHeap();
     const extra = try heap.createExtraData();
     errdefer heap.destroyExtraData(extra);
 
     heap.getExtraData(extra).* = .{ .regexp = re };
 
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .regexp;
-    handle.peek().body.regexp = .{ .options = compile_opts, .extra_data = extra };
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .regexp;
+    wb.peek().body.regexp = .{ .options = compile_opts, .extra_data = extra };
 }

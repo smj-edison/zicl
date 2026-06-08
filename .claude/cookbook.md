@@ -8,7 +8,7 @@ objutil.listAppendAssumeCapacity(handle, some_other_handle.dupOrRef());
 ```
 
 ### Implementing a new `[command]`.
-Commands are functions with the signature `fn (interp: *Interp, args: []Handle) Error!void`, where `args[0]` is the command name and `args[1..]` are the arguments. Register them in `Interp.init` with `registerCommand`.
+Commands are functions with the signature `fn (interp: *Interp, args: []Shimmerable) Error!void`, where `args[0]` is the command name and `args[1..]` are the arguments. Register them in `Interp.init` with `registerCommand`.
 
 Argument handles are non-const and may be shimmered in place by helpers like `interp.getInteger(&args[1])`. Do **not** copy an argument into a local `var` and then pass `&var` to a shimmer function -- the original `args` slot will not be updated.
 
@@ -27,7 +27,7 @@ const value = try interp.getInteger(foo);
 
 ```zig
 /// [pid] -- returns the process id.
-pub fn pidCmd(interp: *Interp, args: []Handle) !void {
+pub fn pidCmd(interp: *Interp, args: []Shimmerable) !void {
     try interp.setResultInteger(@intCast(std.os.linux.getpid()));
 }
 
@@ -43,7 +43,7 @@ try interp.registerCommand("pid", .{
 `min_arity` and `max_arity` are checked by the dispatcher, so the command body does not need to validate argument count manually. For commands with complex or conditional parsing, return `error.WrongUsage` and the interpreter will format a "wrong # args: should be..." message from the `.usage` field.
 
 ```zig
-pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var remaining_args = args[1..];
     while (true) {
         if (remaining_args.len < 2) return error.WrongUsage;
@@ -55,7 +55,7 @@ pub fn ifCmd(interp: *Interp, args: []Handle) Interp.Error!void {
 For subcommands, use `objutil.SubcommandParser` to dispatch and validate arity automatically.
 
 ```zig
-pub fn stringCmd(interp: *Interp, args: []Handle) !void {
+pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
     const Subcommands = enum { length, index, range, /* ... */ };
     const Parser = objutil.SubcommandParser(Subcommands, &.{
         .{ .variant = .length, .usage = "string", .min_args = 1, .max_args = 1 },
@@ -74,45 +74,98 @@ pub fn stringCmd(interp: *Interp, args: []Handle) !void {
 }
 ```
 
-### Shimmering with the out-parameter pattern.
-Shimmer functions take the original handle and a `*OptionalHandle` scratch parameter. On success, `new` is set if the object moved; on error, it is cleared.
+### Shimmering with writeback buffers (`Shimmerable` / `Mutable`).
+Shimmer and mutation functions take a `*Shimmerable` or `*Mutable` working buffer. The wrapper tracks whether the object had to be duplicated. Callers use `.current()` to get the effective handle, `.consume()` to take ownership, and `.discardChanges()` to roll back.
 
 ```zig
-// Caller pattern.
-var new: OptionalHandle = .none;
-try objutil.shimmerToInteger(&det, handle, &new);
-handle.swapIfNew(new);  // Update handle only if a new object was created.
-// `handle` is now an integer.
+// Caller pattern for shimmering.
+var det: objutil.ErrorDetails = undefined;
+var wb: objutil.Shimmerable = .{ .original = handle };
+defer wb.discardChanges();
+try objutil.shimmerToInteger(&det, &wb);
+// wb.current() is now an integer. If wb.shimmered is non-null, the object moved.
+handle = wb.consume();
 ```
 
-Inside a shimmer function, start with `errdefer new.swapWithNone()` and resolve the current handle with `new.orElse(original)`.
+Always prefer calling `.consume()` to write the result back into the original slot. If the slot is borrowed or otherwise cannot be updated (for example, when the handle is just a temporary inside a larger expression), call `.discardChanges()` instead. The `defer wb.discardChanges()` ensures that any duplicated object is freed if an error occurs before `.consume()` is reached.
+
+For mutations, use `Mutable` instead. It can be cast to `Shimmerable` via `.asShimmerable()`.
 
 ```zig
-pub fn shimmerToString(original: Handle, new: *OptionalHandle) !void {
-    if (new.orElse(original).tag() == .string) return;
-    errdefer new.swapWithNone();
+// Caller pattern for mutation.
+var wb: objutil.Mutable = .{ .original = dict };
+defer wb.discardChanges();
+_ = try objutil.dictPut(&wb, key_handle, value_handle);
+// wb.current() now holds the mutated dict.
+dict = wb.consume();
+```
 
-    try Heap.ensureShimmerableOrDup(original, new);
-    const handle = new.orElse(original);
+Inside a shimmer function, start with `errdefer wb.discardChanges()` and call `wb.prepareToShimmer()` before modifying the tag or body.
 
-    try handle.prepareToShimmer();
-    handle.peek().head.tag = .string;
-    handle.peek().body = .{ .string = .{ .utf8_length = 0, .length_determined = false } };
+```zig
+pub fn shimmerToInteger(det: ?*ErrorDetails, wb: *Shimmerable) !void {
+    if (wb.tag() == .integer) return;
+    errdefer wb.discardChanges();
+
+    const value = try integerGetNoShimmer(det, wb.current());
+
+    try wb.prepareToShimmer();
+    wb.peek().head.tag = .integer;
+    wb.peek().body.integer = value;
 }
 ```
 
-For in-place mutation, many functions have a `get*InPlace` postfix, which wraps the pattern above.
+For in-place shimmering on a single `Handle` reference, the interpreter provides helpers that wrap a `*Handle` into a local `Shimmerable`. Prefer these over manual in-place updates, because raw `*Handle` shimmering can accidentally free objects.
 
 ```zig
-pub fn getRangeInPlace(det: ?*ErrorDetails, list_len: u32, start: *Handle, end: *Handle) !Range {
-    var new_start: OptionalHandle = .none;
-    var new_end: OptionalHandle = .none;
-    const range = try getRange(det, list_len, start.*, &new_start, end.*, &new_end);
-    start.swapIfNew(new_start);
-    end.swapIfNew(new_end);
-    return range;
+const value = try interp.getInteger(&args[1]);
+// args[1] is shimmered in place if needed.
+```
+
+When a function needs to shimmer two handles at once (e.g. `[string range]`), use the writeback buffer pattern for both.
+
+```zig
+var det: objutil.ErrorDetails = undefined;
+var start_wb: objutil.Shimmerable = .{ .original = start_handle };
+var end_wb: objutil.Shimmerable = .{ .original = end_handle };
+defer start_wb.discardChanges();
+defer end_wb.discardChanges();
+const range = try objutil.getRange(&det, list_len, &start_wb, &end_wb);
+start_handle = start_wb.consume();
+end_handle = end_wb.consume();
+```
+
+### Propagating writeback buffers up the call stack.
+When you write a helper that might shimmer or mutate its argument, take a `*Shimmerable` or `*Mutable` parameter and let the caller consume it. Do **not** consume the buffer inside the helper. This keeps the ownership boundary clean and avoids accidentally dropping a handle that the caller still needs.
+
+```zig
+/// Ensure `wb` is a list and append `item` to it.
+/// The caller owns `wb` and must call `.consume()` or `.discardChanges()`.
+fn ensureListAndAppend(det: ?*ErrorDetails, wb: *Mutable, item: Handle) !void {
+    try objutil.shimmerToList(det, wb.asShimmerable());
+    _ = try objutil.listAppend(det, wb, item);
+}
+
+/// Build a list by appending multiple items.
+/// Propagates the same `wb` up through every helper call.
+fn buildList(det: ?*ErrorDetails, wb: *Mutable, items: []const Handle) !void {
+    for (items) |item| {
+        try ensureListAndAppend(det, wb, item);
+    }
+}
+
+// Top-level caller creates the buffer, propagates it down, then consumes it.
+pub fn myCmd(interp: *Interp, args: []Shimmerable) !void {
+    var wb: objutil.Mutable = .{ .original = args[1].current() };
+    defer wb.discardChanges();
+    try buildList(null, &wb, args[2..]);
+    // Write the result back so the caller sees the updated handle.
+    args[1] = .{ .original = wb.consume() };
+    interp.setResult(args[1].current());
 }
 ```
+
+This pattern applies to roughly 90% of shimmer and mutation operations. The only time you should consume internally is when the helper is the final owner of the value (for example, a function that sets `interp.result` directly and then drops the working buffer).
 
 ### Testing with `checkAllAllocationFailures`.
 Every allocation path must be leak-free, even when OOM strikes. Wrap tests that allocate in a helper and invoke `checkAllAllocationFailures`.
@@ -145,14 +198,15 @@ Object-level functions take an optional `det: ?*ErrorDetails` to report user-fac
 
 ```zig
 var det: objutil.ErrorDetails = undefined;
-const result = try interp.wrapError(&det, objutil.integerGet(&det, handle, &new));
+const result = try interp.wrapError(&det, objutil.integerGet(&det, &wb));
 ```
 
 When you only care the error code and not the message, use `null` for `det`.
 
 ```zig
-var new_handle: OptionalHandle = .none;
-objutil.shimmerToDict(null, closure_value, &new_handle) catch |err| switch (err) {
+var wb: objutil.Shimmerable = .{ .original = closure_value };
+defer wb.discardChanges();
+objutil.shimmerToDict(null, &wb) catch |err| switch (err) {
     error.OutOfMemory => return error.OutOfMemory,
     else => return error.BadClosure,
 };
@@ -167,37 +221,40 @@ Create a dict from alternating keys and values.
 interp.setResultOwning(try objutil.newDict(args[2..]));
 ```
 
-Insert or update a key, handling the out-parameter.
+Insert or update a key, using a `Mutable` writeback buffer.
 
 ```zig
-var new_dict: OptionalHandle = .none;
-_ = try objutil.dictPut(dict, &new_dict, key_handle, value_handle);
-dict.swapIfNew(new_dict);
+var wb: objutil.Mutable = .{ .original = dict };
+defer wb.discardChanges();
+_ = try objutil.dictPut(&wb, key_handle, value_handle);
+dict = wb.consume();
 ```
 
 Nested dict operations follow a key path.
 
 ```zig
 // dict set varName key ?key ...? value
-var new_dict: OptionalHandle = .none;
-_ = try objutil.dictPutRecursively(&det, dict, &new_dict, keys, new_value);
-if (new_dict.toHandle()) |new| {
-    defer new.decrRefCount();
-    try interp.setVariableTo(var_name, new);
-}
+var wb: objutil.Mutable = .{ .original = dict };
+defer wb.discardChanges();
+_ = try objutil.dictPutRecursively(&det, &wb, keys, new_value_object);
+dict = wb.consume();
 ```
 
 Remove recursively works similarly.
 
 ```zig
-var new_dict: OptionalHandle = .none;
-_ = try objutil.dictRemoveRecursively(&det, dict, &new_dict, args[3..args.len]);
+var wb: objutil.Mutable = .{ .original = dict };
+defer wb.discardChanges();
+_ = try objutil.dictRemoveRecursively(&det, &wb, args[3..args.len]);
+dict = wb.consume();
 ```
 
 Look up a value and follow `.reference` objects.
 
 ```zig
-const val = try interp.getDictValueRecursivelyOrError(&dict_handle, key_path);
+var wb: objutil.Shimmerable = .{ .original = dict_handle };
+defer wb.discardChanges();
+const val = try interp.getDictValueRecursivelyOrError(&wb, key_path);
 interp.setResult(val);
 ```
 
@@ -208,14 +265,16 @@ Build a list from existing handles.
 interp.setResultOwning(try objutil.newList(args[1..]));
 ```
 
-Append handles, duplicating or referencing as needed.
+Append handles, duplicating or referencing as needed. `listAppend` takes a `*Mutable`.
 
 ```zig
 var list = try objutil.newListWithCapacity(4);
 errdefer list.decrRefCount();
+var wb: objutil.Mutable = .{ .original = list };
 for (items) |item| {
-    _ = try interp.listAppend(&list, item);
+    _ = try interp.listAppend(&wb, item);
 }
+list = wb.consume();
 interp.setResultOwning(list);
 ```
 
@@ -247,7 +306,7 @@ defer handles.deinit(gpa);
 Parse and evaluate a Tcl expression. `evalExpressionInPlace` shimmers the handle in place and returns an `ExprResult`.
 
 ```zig
-pub fn exprCmd(interp: *Interp, args: []Handle) Interp.Error!void {
+pub fn exprCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const result = try (try interp.evalExpressionInPlace(&args[1])).toObject();
     defer result.decrRefCount();
     interp.setResult(result);
@@ -286,12 +345,12 @@ defer ref.deinitBodySingle(Heap.local_heap);
 const ref = handle.referenceTakeOwnership();  // does not increment ref count
 ```
 
-When shimmering, use `errdefer` on the out-parameter to avoid leaks on error.
+When shimmering, use `errdefer` on the writeback buffer to avoid leaks on error.
 
 ```zig
-var new: OptionalHandle = .none;
-errdefer new.swapWithNone();
-try objutil.shimmerToList(&det, handle, &new);
+var wb: objutil.Shimmerable = .{ .original = handle };
+errdefer wb.discardChanges();
+try objutil.shimmerToList(&det, &wb);
 ```
 
 When swapping handles, use `swapIfNew` to only update when necessary, and `swapIntermediate` when the old and provided handles might alias.
