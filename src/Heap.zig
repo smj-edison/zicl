@@ -227,21 +227,17 @@ pub const HashRegistry = struct {
 
                     registry.rw_lock.unlockShared(global_io);
                     registry.rw_lock.lockUncancelable(global_io);
-                    defer registry.rw_lock.unlock(global_io);
 
                     // The entry should still exist here, as we were the ones who set instances
                     // to 0. It could have moved locations though, when upgrading to an exclusive
                     // lock.
-                    const entry_second_check = registry.entries.getPtr(key).?;
-                    // Note that we don't need to worry about this `decrRefCount` calling `unregister`
-                    // recursively, since the only way recursion could happen is if
-                    // 1. There were circular references (in which case a global invariant has been
-                    //    violated and we're screwed anyways)
-                    // 2. `representative == value`, but we've just set `value.hash_registered`
-                    //    as false, so it won't call `unregister`.
-                    entry_second_check.representative.decrRefCount();
-
+                    const entry_second_check = registry.entries.getPtr(key).?.*;
                     assert(registry.entries.remove(key));
+                    registry.rw_lock.unlock(global_io);
+
+                    // Make sure to `decrRefCount` only after unlocking the mutex, to avoid
+                    // recursive locking.
+                    entry_second_check.representative.decrRefCount();
                 } else {
                     registry.rw_lock.unlockShared(global_io);
                 }
@@ -348,6 +344,7 @@ const ObjectAllocator = struct {
             .cross_thread = false,
             .hash_registered = false,
         };
+        allocator.alloc_count[0] = 1;
 
         return allocator;
     }
@@ -356,19 +353,6 @@ const ObjectAllocator = struct {
         // Synchronize state.
         self.mutex.lockUncancelable(global_io);
         self.mutex.unlock(global_io);
-    }
-
-    pub fn leakCheck(self: *ObjectAllocator, heap: *Heap) enum { normal, leaked } {
-        self.mutex.lockUncancelable(global_io);
-        defer self.mutex.unlock(global_io);
-        self.drainPool(heap);
-
-        var leaked = false;
-        for (self.alloc_count) |count| {
-            if (count != 0) leaked = true;
-        }
-
-        return if (leaked) .leaked else .normal;
     }
 
     /// Caller must handle pool draining and synchronization.
@@ -1722,7 +1706,7 @@ pub const Handle = packed struct(HandleBacking) {
         return local_heap.dupOrReference(handle);
     }
 
-    pub fn duplicate(handle: Handle) !Handle {
+    pub fn duplicate(handle: Handle) error{OutOfMemory}!Handle {
         return Heap.duplicate(handle);
     }
 
@@ -1858,10 +1842,6 @@ pub const Handle = packed struct(HandleBacking) {
             .null => {
                 // Keep going in code.
             },
-        }
-
-        if (handle.tag() == .none) {
-            ioutil.debug("Base: {*}\nHead ptr: {*}\n", .{ obj_ptr_for_gdb, &obj.head });
         }
 
         // No representation, so we better generate it.
@@ -2366,7 +2346,7 @@ pub fn init(heap: *Heap) !void {
     // and index 0 can never be allocated again.
     heap.object_tracking = ObjectAllocator.init(heap);
     errdefer {
-        if (heap.object_tracking.leakCheck(heap) == .leaked) {
+        if (heap.leakCheck(true) catch false) {
             ioutil.debug("^^^ Heap objects leaked when cleaning up after partial init\n\n", .{});
         }
         heap.object_tracking.deinit();
@@ -2461,7 +2441,6 @@ pub fn deinit(heap: *Heap) void {
 
     const did_leak = heap.didLeak();
     if (did_leak) {
-        std.debug.panic("Leaked!", .{});
         // Clean up.
         const FreeContext = struct {
             heap: *Heap,
@@ -3974,7 +3953,7 @@ pub fn leakCheckAll() void {
 
     var leaked = false;
     for (heaps[0..heap_count]) |*heap| {
-        if (heap.leakCheck() catch false) {
+        if (heap.leakCheck(false) catch false) {
             leaked = true;
         }
     }
@@ -3988,19 +3967,21 @@ pub fn testFinish() void {
 pub fn didLeak(heap: *Heap) bool {
     // Synchronize the object tracking.
     heap.object_tracking.mutex.lockUncancelable(global_io);
+    heap.object_tracking.drainPool(heap);
     heap.object_tracking.mutex.unlock(global_io);
 
     for (heap.object_tracking.alloc_count[1..]) |count| {
-        if (count != 0) return false;
+        if (count != 0) return true;
     }
-    return heap.object_tracking.alloc_count[0] == special_object_count + interned_string_count;
+
+    return heap.object_tracking.alloc_count[0] > special_object_count + interned_string_count;
 }
 
-pub fn leakCheck(heap: *Heap) !bool {
+pub fn leakCheck(heap: *Heap, during_init: bool) !bool {
     // Make sure to free any parsed scripts and system fixtures before scanning,
     // as they're allowed to leak (they have references to heap objects, causing false positives).
-    heap.clearParsedScripts();
-    heap.deinitOomErrorOptions();
+    if (!during_init) heap.clearParsedScripts();
+    if (!during_init) heap.deinitOomErrorOptions();
 
     if (!heap.didLeak()) return false;
 
@@ -4138,15 +4119,16 @@ fn renderObjectEdges(heap: *Heap, handle: Handle, index: u32) !void {
         .list => {
             const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             for (0..len_including_nones) |item_idx| {
-                const item_handle = objutil.listItemNoFollow(handle, @intCast(item_idx));
+                const item_handle = objutil.collectionItemNoFollow(handle, @intCast(item_idx), len_including_nones);
                 ioutil.debug("  obj{} -> obj{} [label=\"[{}]\"];\n", .{ index, item_handle.index, item_idx });
             }
         },
         .dict => {
+            const len_including_nones = memutil.getOrderSize(handle.getMetadata().order) - 1;
             var item_idx: u32 = 0;
-            while (item_idx < obj.body.dict.len) : (item_idx += 2) {
-                const key_handle = objutil.dictItemNoFollow(handle, item_idx);
-                const val_handle = objutil.dictItemNoFollow(handle, item_idx + 1);
+            while (item_idx < len_including_nones) : (item_idx += 2) {
+                const key_handle = objutil.collectionItemNoFollow(handle, item_idx, len_including_nones);
+                const val_handle = objutil.collectionItemNoFollow(handle, item_idx + 1, len_including_nones);
 
                 ioutil.debug("  obj{} -> obj{} [label=\"key\", color=blue];\n", .{ index, key_handle.index });
                 ioutil.debug("  obj{} -> obj{} [label=\"val\", color=green];\n", .{ index, val_handle.index });

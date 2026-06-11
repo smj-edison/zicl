@@ -4,6 +4,8 @@ const Heap = @import("Heap.zig");
 const Handle = Heap.Handle;
 const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("objutil.zig");
+const Shimmerable = objutil.Shimmerable;
+const Mutable = objutil.Mutable;
 const Interp = @import("Interp.zig");
 const narrowError = Interp.narrowError;
 const ReturnCode = Interp.ReturnCode;
@@ -116,12 +118,14 @@ export fn Zicl_ListGetItem(list: Handle, index: u32) callconv(.c) Handle {
 }
 
 export fn Zicl_ListLength(interp: *Interp, list: *Handle) callconv(.c) c_int {
-    const len = interp.getListLength(list) catch return -1;
+    const len = interp.getListLengthInPlace(list) catch return -1;
     return @intCast(len);
 }
 
 export fn Zicl_ListAppend(interp: *Interp, list: *Handle, item: Handle) callconv(.c) ReturnCode {
+    var wb: Shimmerable = .{ .original = list.* };
     _ = interp.listAppend(list, item) catch |err| return ReturnCode.fromError(err);
+    list.* = wb.consume();
     return .ok;
 }
 
@@ -142,17 +146,19 @@ export fn Zicl_DictPut(interp: *Interp, dict: *Handle, key: Handle, value: Handl
 
 // Number functions.
 export fn Zicl_GetLong(interp: *Interp, handle: *Handle, out: *c_long) callconv(.c) ReturnCode {
-    out.* = interp.getInteger(handle) catch |err| return ReturnCode.fromError(err);
+    out.* = interp.getIntegerInPlace(handle) catch |err| return ReturnCode.fromError(err);
     return .ok;
 }
 
 export fn Zicl_GetDouble(interp: *Interp, handle: *Handle, out: *f64) callconv(.c) ReturnCode {
+    var wb: Shimmerable = .{ .original = handle.* };
     out.* = interp.getFloat(handle) catch |err| return ReturnCode.fromError(err);
+    handle.* = wb.consume();
     return .ok;
 }
 
 export fn Zicl_GetBoolean(interp: *Interp, handle: *Handle, out: *c_int) callconv(.c) ReturnCode {
-    const result = interp.getBoolean(handle) catch |err| return ReturnCode.fromError(err);
+    const result = interp.getBooleanInPlace(handle) catch |err| return ReturnCode.fromError(err);
     out.* = if (result) 1 else 0;
     return .ok;
 }

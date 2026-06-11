@@ -109,15 +109,14 @@ pub fn ConfigurableTrace(comptime size: usize, comptime stack_frame_count: usize
                 terminal.writer.print("{s}:\n", .{t.notes[i]}) catch return;
                 var frames_array_mutable = frames_array;
                 const frames = std.mem.sliceTo(frames_array_mutable[0..], 0);
-                const len = @min(t.index, frames.len);
                 const stack_trace: std.debug.StackTrace = .{
-                    .return_addresses = frames[0..len],
-                    .skipped = if (len < frames.len) .none else .unknown,
+                    .return_addresses = frames,
+                    .skipped = if (frames.len < frames_array.len) .none else .unknown,
                 };
                 std.debug.writeStackTrace(&stack_trace, terminal) catch return;
             }
             if (t.index > end) {
-                terminal.writer.print("{d} traces dropped; consider increasing trace size\n", .{
+                terminal.writer.print("{d} traces shifted out; consider increasing trace size\n", .{
                     t.index - end,
                 }) catch return;
             }

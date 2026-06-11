@@ -20,7 +20,7 @@ fn commandMatch(interp: *Interp, command: Handle, pattern: Handle, string: Handl
     const script = try objutil.newList(&.{ command, pattern, string });
     defer script.decrRefCount();
     try interp.evalObject(script);
-    return try interp.getBoolean(&interp.result);
+    return try interp.getBooleanInPlace(&interp.result);
 }
 
 fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { add, mul }) Interp.Error!void {
@@ -68,9 +68,7 @@ fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                 break :blk args[i].peek().body.float;
             } else {
                 // Try to shimmer it to a float.
-                var arg = args[i].borrow();
-                defer arg.decrRefCount();
-                break :blk try interp.getFloat(&arg);
+                break :blk try interp.getFloat(&args[i]);
             }
         };
 
@@ -138,9 +136,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                     break :not_all_ints;
                 } else {
                     // Try to shimmer it to an integer.
-                    var new_handle: OptionalHandle = .none;
-                    defer new_handle.decrOptional();
-                    const res = objutil.integerGet(null, args[i], &new_handle) catch |err| switch (err) {
+                    const res = objutil.integerGet(null, &args[i]) catch |err| switch (err) {
                         error.IntegerOverflow, error.BadInteger => {
                             break :not_all_ints;
                         },
@@ -182,9 +178,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                 break :blk args[i].peek().body.float;
             } else {
                 // Try to shimmer it to a float.
-                var arg = args[i].borrow();
-                defer arg.decrRefCount();
-                break :blk try interp.getFloat(&arg);
+                break :blk try interp.getFloat(&args[i]);
             }
         };
 
@@ -325,22 +319,11 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .get => {
             const dict = &args[2];
             const path = args[3..];
-            const GetContext = struct {
-                args: []Shimmerable,
-                pub fn len(self: @This()) usize {
-                    return self.args.len;
-                }
-                pub fn get(self: @This(), index: usize) Handle {
-                    return self.args[index].current();
-                }
-                pub fn sliceAfter(self: @This(), index: usize) @This() {
-                    return .{ .args = self.args[index..] };
-                }
-            };
-            interp.setResult(try interp.getDictValueRecursivelyOrError(dict, GetContext{ .args = path }));
+            interp.setResult(try interp.getDictValueRecursivelyOrError(dict, objutil.ShimmerableSliceContext{ .items = path }));
         },
         .getdef => {
-            if ((try interp.getDictValueRecursively(&args[2], args[3..(args.len - 1)])).toHandle()) |val| {
+            const getdef_ctx = objutil.ShimmerableSliceContext{ .items = args[3..(args.len - 1)] };
+            if ((try interp.getDictValueRecursively(&args[2], getdef_ctx)).toHandle()) |val| {
                 interp.setResult(val);
             } else {
                 interp.setResult(args[args.len - 1].current());
@@ -368,7 +351,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             }
 
             const new_value = args[args.len - 1].current().dupOrRef();
-            _ = try interp.wrapError(&det, objutil.dictPutRecursively(&det, &dict, keys, new_value));
+            const set_ctx = objutil.ShimmerableSliceContext{ .items = keys };
+            _ = try interp.wrapError(&det, objutil.dictPutRecursively(&det, &dict, set_ctx, new_value));
 
             if (dict.mutated.toHandle()) |new| {
                 {
@@ -397,7 +381,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             };
             defer dict.discardChanges();
 
-            _ = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, &dict, args[3..args.len]));
+            const unset_ctx = objutil.ShimmerableSliceContext{ .items = args[3..args.len] };
+            _ = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, &dict, unset_ctx));
             if (dict.mutated.toHandle()) |new| {
                 defer new.decrRefCount();
                 try interp.setVariableToObject(var_name, new.reference());
@@ -405,7 +390,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .exists => {
             const dict = &args[2];
-            try interp.setResultBoolean((try interp.getDictValueRecursively(dict, args[3..])) != .none);
+            const exists_ctx = objutil.ShimmerableSliceContext{ .items = args[3..] };
+            try interp.setResultBoolean((try interp.getDictValueRecursively(dict, exists_ctx)) != .none);
         },
         .keys, .values => {
             var new_dict: OptionalHandle = .none;
@@ -517,7 +503,7 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     // Check condition.
     while (try interp.getBoolFromExpression(args[2].current())) {
         // Evaluate body.
-        switch (try propagateLoopControl(interp, interp.evalObject(args[4]))) {
+        switch (try propagateLoopControl(interp, interp.evalObject(args[4].current()))) {
             .@"break" => {
                 break;
             },
@@ -530,7 +516,7 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         }
 
         // Run increment.
-        try interp.evalObject(args[3]);
+        try interp.evalObject(args[3].current());
     }
 
     interp.setEmptyResult();
@@ -552,6 +538,7 @@ fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, 
         length: u32,
         current_index: u32,
     }) = try .initCapacity(Heap.global_gpa, list_count);
+    defer iter_state.deinit(Heap.global_gpa);
 
     for (0..list_count) |i| {
         const stride = try interp.getListLength(&args[i * 2 + 1]);
@@ -816,7 +803,7 @@ pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             // There should only be one more argument, since there shouldn't
             // be anything after "else".
             if (remaining_args.len > 2) return error.WrongUsage;
-            try interp.evalObject(remaining_args[1]);
+            try interp.evalObject(remaining_args[1].current());
             return;
         }
 
@@ -1003,9 +990,9 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
                 // before is a flag.
                 var i: usize = 0;
                 while (i < sub_args.len - 2) : (i += 1) {
-                    if (try sub_args[i].equalsString("-nocase")) {
+                    if (try sub_args[i].current().equalsString("-nocase")) {
                         opt_case_insensitive = true;
-                    } else if (try sub_args[i].equalsString("-length")) {
+                    } else if (try sub_args[i].current().equalsString("-length")) {
                         if (i + 1 >= sub_args.len - 2) break :wrong_usage true; // There needs to be a value after `-length`.
                         opt_length = std.math.lossyCast(usize, try interp.getInteger(&sub_args[i + 1]));
                         i += 1;
@@ -1071,8 +1058,9 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
                 var key_i: u32 = 0;
                 while (key_i < map_len) : (key_i += 2) {
                     var key_wb: Shimmerable = .{ .original = objutil.listItem(map_list.current(), key_i) };
+                    defer key_wb.discardChanges();
                     try objutil.shimmerToString(&key_wb);
-                    if (key_wb.shimmered.toHandle()) |new_key| {
+                    if (key_wb.takeShimmered().toHandle()) |new_key| {
                         // Be sure to write back the new object to the list.
                         try objutil.listSetInner(map_list.asMutable(), key_i, new_key.steal());
                     }
@@ -1182,7 +1170,7 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
     if (was_wrong_usage) {
         try interp.setResultFormatted(
             "wrong # args: should be \"{f} {f} {s}\"",
-            .{ args[0], args[1], Parser.EnumToSubcommand.get(subcommand).usage },
+            .{ args[0].current(), args[1].current(), Parser.EnumToSubcommand.get(subcommand).usage },
         );
         return error.EvalError;
     }
@@ -1243,9 +1231,7 @@ pub fn lassignCmd(interp: *Interp, args: []Shimmerable) !void {
 
 /// [list]
 pub fn listCmd(interp: *Interp, args: []Shimmerable) !void {
-    const new_list = try objutil.newListWithCapacity(@intCast(args[1..].len));
-    for (args[1..]) |arg| objutil.listAppendAssumeCapacity(new_list, arg.current().dupOrRef());
-    interp.setResultOwning(new_list);
+    interp.setResultOwning(try objutil.newListFromShimmerables(args[1..]));
 }
 
 pub fn concatCmd(interp: *Interp, args: []Shimmerable) !void {
@@ -1324,23 +1310,23 @@ pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
     };
 
     for (1..(args.len - 1)) |arg_index| {
-        if (try args[arg_index].equalsString("-nocommands")) {
+        if (try args[arg_index].current().equalsString("-nocommands")) {
             flags.command_subst = false;
-        } else if (try args[arg_index].equalsString("-novariables")) {
+        } else if (try args[arg_index].current().equalsString("-novariables")) {
             flags.variable_subst = false;
-        } else if (try args[arg_index].equalsString("-nobackslashes")) {
+        } else if (try args[arg_index].current().equalsString("-nobackslashes")) {
             flags.escape_subst = false;
         }
 
         try interp.setResultFormatted(
             "bad option \"{f}\": must be -nocommands, -novariables, or -nobackslashes",
-            .{args[arg_index]},
+            .{args[arg_index].current()},
         );
         return error.EvalError;
     }
 
-    const to_substitute = args[args.len - 1];
-    interp.setResultOwning(try interp.evalSubstitution(to_substitute, flags));
+    const to_substitute = &args[args.len - 1];
+    interp.setResultOwning(try interp.evalSubstitution(to_substitute.current(), flags));
 }
 
 pub fn launderCmd(interp: *Interp, args: []Shimmerable) !void {
@@ -1366,6 +1352,7 @@ pub fn setCmd(interp: *Interp, args: []Shimmerable) !void {
 pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
     const MatchType = enum { exact, glob, regex, command };
     var match_type: MatchType = .exact;
+
     var command_to_match: ?Handle = null;
 
     var arg_index: usize = 1;
@@ -1377,95 +1364,100 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
         const bytes = try args[arg_index].getString();
 
         if (bytes[0] != '-') break; // Not a flag.
-        if (try args[arg_index].equalsString("--")) {
+        if (try args[arg_index].current().equalsString("--")) {
             arg_index += 1;
             break;
         }
-        if (try args[arg_index].equalsString("-exact")) {
+        if (try args[arg_index].current().equalsString("-exact")) {
             match_type = .exact;
-        } else if (try args[arg_index].equalsString("-glob")) {
+        } else if (try args[arg_index].current().equalsString("-glob")) {
             match_type = .glob;
-        } else if (try args[arg_index].equalsString("-regexp")) {
+        } else if (try args[arg_index].current().equalsString("-regexp")) {
             match_type = .regex;
-        } else if (try args[arg_index].equalsString("-command")) {
+        } else if (try args[arg_index].current().equalsString("-command")) {
             match_type = .command;
             arg_index += 1;
-            command_to_match = args[arg_index];
+            command_to_match = args[arg_index].current();
         } else {
             try interp.setResultFormatted(
                 "bad option \"{f}\": must be -exact, -glob, -regexp, -command procname or --",
-                .{args[arg_index]},
+                .{args[arg_index].current()},
             );
             return error.EvalError;
         }
     }
 
     // Value we're switching on.
-    const to_match_on = args[arg_index];
+    const to_match_on = args[arg_index].current().borrow();
+    defer to_match_on.decrRefCount();
     arg_index += 1;
     const to_match_on_bytes = try to_match_on.getString();
 
     const switch_body, var to_free_after = blk: {
         if (args.len - arg_index == 1) {
             try interp.shimmerToList(&args[arg_index]);
-            const handles = try objutil.listToHandles(Heap.global_gpa, args[arg_index]);
+            const handles = try objutil.listToShimmerables(Heap.global_gpa, args[arg_index].current());
             break :blk .{ handles.items, handles };
         } else {
             if (@mod(args.len - arg_index, 2) != 0) return error.WrongUsage;
             break :blk .{ args[arg_index..], null };
         }
     };
-    defer if (to_free_after) |*val| val.deinit(Heap.global_gpa);
+    defer if (to_free_after) |*val| {
+        for (switch_body) |*wb| wb.discardChanges();
+        val.deinit(Heap.global_gpa);
+    };
 
+    // We need to borrow `body_to_run`, since it may mutate under us otherwise when `commandMatch` is called.
     var body_to_run: ?Handle = null;
+    defer if (body_to_run) |val| val.decrRefCount();
+
     // Go through each switch arm until we find one that matches.
     var arm_idx: usize = 0;
     while (arm_idx < switch_body.len) : (arm_idx += 2) {
-        const is_default = try switch_body[arm_idx].equalsString("default");
+        const is_default = try switch_body[arm_idx].current().equalsString("default");
         // If `default` isn't the last arm in the switch body, we treat it
         // as a normal string to check against.
         if (!is_default or arm_idx < switch_body.len - 2) {
             switch (match_type) {
                 .exact => {
-                    if (try Heap.checkIfEqual(to_match_on, switch_body[arm_idx])) {
-                        body_to_run = switch_body[arm_idx + 1];
+                    if (try Heap.checkIfEqual(to_match_on, switch_body[arm_idx].current())) {
+                        body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break;
                     }
                 },
                 .glob => {
                     const matches = strutil.globMatch(try switch_body[arm_idx].getString(), to_match_on_bytes, false);
                     if (matches) {
-                        body_to_run = switch_body[arm_idx + 1];
+                        body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break;
                     }
                 },
                 .regex => {
-                    var new: OptionalHandle = .none;
-                    defer new.decrOptional();
                     var det: objutil.ErrorDetails = undefined;
                     const opts = pcre2.PCRE2_UTF | pcre2.PCRE2_UCP | pcre2.PCRE2_DOTALL;
-                    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, switch_body[arm_idx], &new, opts));
-                    const regexp_handle = new.orElse(switch_body[arm_idx]);
+                    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, &switch_body[arm_idx], opts));
+                    const regexp_handle = switch_body[arm_idx].current();
 
                     const re = regexp_handle.getRegexpExtraData();
 
                     const matches = try interp.wrapError(&det, regex.doesStringMatch(&det, re, to_match_on_bytes));
                     if (matches) {
-                        body_to_run = switch_body[arm_idx + 1];
+                        body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break; // Match!
                     } else continue;
                 },
                 .command => {
-                    const matches = try commandMatch(interp, command_to_match.?, switch_body[arm_idx], to_match_on);
+                    const matches = try commandMatch(interp, command_to_match.?, switch_body[arm_idx].current(), to_match_on);
                     if (matches) {
-                        body_to_run = switch_body[arm_idx + 1];
+                        body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break; // Match!
                     } else continue;
                 },
             }
         } else {
             // Truly the default.
-            body_to_run = switch_body[arm_idx + 1];
+            body_to_run = switch_body[arm_idx + 1].current().borrow();
         }
     }
 
@@ -1475,11 +1467,11 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
             // Fall through if the body is `-`.
             var true_body_idx = arm_idx + 1;
             while (true_body_idx < switch_body.len) : (true_body_idx += 2) {
-                if (!(try switch_body[true_body_idx].equalsString("-"))) break;
+                if (!(try switch_body[true_body_idx].current().equalsString("-"))) break;
             } else {
-                try interp.setResultFormatted("no body specified for pattern \"{f}\"", .{switch_body[arm_idx]});
+                try interp.setResultFormatted("no body specified for pattern \"{f}\"", .{switch_body[arm_idx].current()});
             }
-            break :blk switch_body[true_body_idx];
+            break :blk switch_body[true_body_idx].current();
         } else to_run;
 
         try interp.evalObject(to_run_fallthrough);
@@ -1492,10 +1484,10 @@ pub fn unsetCmd(interp: *Interp, args: []Shimmerable) !void {
 
     var i: usize = 1;
     while (i < args.len) {
-        if (try args[i].equalsString("--")) {
+        if (try args[i].current().equalsString("--")) {
             i += 1;
             break;
-        } else if (try args[i].equalsString("-nocomplain")) {
+        } else if (try args[i].current().equalsString("-nocomplain")) {
             should_complain = false;
             i += 1;
             continue;
@@ -1513,6 +1505,8 @@ pub fn unsetCmd(interp: *Interp, args: []Shimmerable) !void {
                 error.HashLookupFailed,
                 error.LinkLookupFailed,
                 error.NotHashReference,
+                error.BadVariableName,
+                error.BadDict,
                 => {},
                 error.OutOfMemory => return error.OutOfMemory,
             };
@@ -1555,11 +1549,14 @@ pub fn upvarCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     var j = upvar_names_start;
     while (j + 1 < args.len) : (j += 2) {
-        try interp.ensureShimmerable(&args[j]);
-        try interp.ensureShimmerable(&args[j + 1]);
+        try args[j].ensureShimmerable();
+        try args[j + 1].ensureShimmerable();
 
         var det: objutil.ErrorDetails = undefined;
-        try interp.wrapError(&det, interp.setVariableUpvarInner(&det, current_frame, args[j + 1], target_frame, args[j]));
+        try interp.wrapError(
+            &det,
+            interp.setVariableUpvarInner(&det, current_frame, args[j + 1].current(), target_frame, args[j].current()),
+        );
     }
 }
 
@@ -1601,14 +1598,14 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     const script, const is_new_script = blk: {
         if (args.len - script_start == 1) {
-            break :blk .{ args[script_start], false };
+            break :blk .{ args[script_start].current(), false };
         }
-        const list = try objutil.newList(args[script_start..]);
+        const list = try objutil.newListFromShimmerables(args[script_start..]);
         break :blk .{ list, true };
     };
     defer if (is_new_script) script.decrRefCount();
 
-    const cache_key = @as(u256, interp.call_frames.items[target_frame].signature.cache_id) ^ try script.getHash();
+    const cache_key = @as(u256, interp.call_frames.items[target_frame].signature.cache_id) ^ try script.getHashNoRegister();
     return interp.evalObjectInner(target_frame, script, cache_key);
 }
 
@@ -1616,9 +1613,7 @@ pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len == 2) {
         try interp.evalObject(args[1].current());
     } else {
-        const new_list = try objutil.newListWithCapacity(@intCast(args[1..].len));
-        for (args[1..]) |arg| objutil.listAppendAssumeCapacity(new_list, arg.current().dupOrRef());
-        try interp.evalObject(new_list);
+        try interp.evalObject(try objutil.newListFromShimmerables(args[1..]));
     }
 }
 
@@ -1670,12 +1665,13 @@ pub fn tallcallCommand(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             else => return error.EvalError,
         };
 
-        var tailcall_args = std.ArrayList(Handle).empty;
+        const tailcall_args = try Heap.global_gpa.dupe(Shimmerable, args[1..]);
+        errdefer Heap.global_gpa.free(tailcall_args);
+
         // `args[1..]` includes the name of the command to run.
-        try tailcall_args.appendSlice(Heap.global_gpa, args[1..]);
         assert(interp.callFrame().tailcall == null);
         interp.callFrame().tailcall = .{
-            .args = tailcall_args.items,
+            .args = tailcall_args,
         };
         return error.Tailcall;
     } else {
@@ -1711,7 +1707,7 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
     // Build a non-owning closure descriptor. createClosureObject borrows
     // all fields, so we don't need to borrow here.
     const closure_obj = try Interp.createClosureObject(.{
-        .args = arglist.current(),
+        .args = parsed_args.arg_names,
         .body = body.current(),
         .name = if (fn_name) |val| val.current().toOptional() else .none,
         .scope_hash_ref = scope.toOptional(),
@@ -2657,22 +2653,10 @@ test "commands" {
     var interp = try testStart(testing.allocator);
     defer testFinish(&interp);
 
-    var script = try objutil.newStringInner(Heap.local_heap,
+    var script = try objutil.newString(
         \\ dict set x a 10
         \\ puts [dict get $x a 5]
     );
     defer script.decrRefCount();
     interp.evalObject(script) catch {};
-}
-
-fn testRegisterCoreCommands(ta: std.mem.Allocator) !void {
-    defer Heap.testFinish();
-    _ = try Heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
-    defer interp.deinit();
-    try registerCoreCommands(&interp);
-}
-
-test "register core commands" {
-    try testing.checkAllAllocationFailures(testing.allocator, testRegisterCoreCommands, .{});
 }

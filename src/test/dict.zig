@@ -9,6 +9,8 @@ const Interp = @import("../Interp.zig");
 const Heap = @import("../Heap.zig");
 const OptionalHandle = Heap.OptionalHandle;
 const objutil = @import("../objutil.zig");
+const Mutable = objutil.Mutable;
+const Shimmerable = objutil.Shimmerable;
 
 const ta = std.testing.allocator;
 
@@ -82,30 +84,38 @@ test "dict keys" {
     // Keys with pattern.
     try interp.testExpectScriptResult("a", "dict keys {a 1 b 2} a*");
 
+    const foo_str = try objutil.newString("foo");
+    defer foo_str.decrRefCount();
+    const bar_str = try objutil.newString("bar");
+    defer bar_str.decrRefCount();
+    const baz_str = try objutil.newString("baz");
+    defer baz_str.decrRefCount();
+    const one_str = try objutil.newString("1");
+    defer one_str.decrRefCount();
+    const two_str = try objutil.newString("2");
+    defer two_str.decrRefCount();
+    const three_str = try objutil.newString("3");
+    defer three_str.decrRefCount();
+    const four_str = try objutil.newString("4");
+    defer four_str.decrRefCount();
+
     // Parent links: parent keys first, then child keys not already present.
-    const heap = Heap.local_heap;
-    const parent = try objutil.newDictInner(heap, &.{
-        try objutil.newStringInner(heap, "foo"), try objutil.newStringInner(heap, "1"),
-        try objutil.newStringInner(heap, "bar"), try objutil.newStringInner(heap, "2"),
-    });
+    const parent = try objutil.newDict(&.{ foo_str, one_str, bar_str, two_str });
     defer parent.decrRefCount();
 
-    const child = try objutil.newDictInner(heap, &.{
-        try objutil.newStringInner(heap, "foo"), try objutil.newStringInner(heap, "3"),
-        try objutil.newStringInner(heap, "baz"), try objutil.newStringInner(heap, "4"),
-    });
-    defer child.decrRefCount();
+    var child: Mutable = .{ .original = try objutil.newDict(&.{
+        foo_str, three_str,
+        baz_str, four_str,
+    }) };
+    defer child.deinit();
 
-    var new: OptionalHandle = .none;
-    errdefer new.decrOptional();
-    const parent_key = heap.getInternedString(.@"^parent");
-    _ = try objutil.dictPutObject(child, &new, parent_key, parent.hashReference());
-    new.swapWithNone();
+    const parent_key = Heap.local_heap.getInternedString(.@"^parent");
+    _ = try objutil.dictPutObject(&child, parent_key, parent.hashReference());
 
     {
-        var var_name = try objutil.newString("d");
-        defer var_name.decrRefCount();
-        try interp.setVariableTo(&var_name, child);
+        var var_name: Shimmerable = .{ .original = try objutil.newString("d") };
+        defer var_name.deinit();
+        try interp.setVariableTo(&var_name, child.current());
     }
 
     // foo is in both parent and child; parent foo takes precedence in order.

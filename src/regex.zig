@@ -48,9 +48,9 @@ pub fn buildIndexPair(start: i64, end: i64) !Handle {
     // PCRE2 gives us half-open ranges [start, end). Tcl uses inclusive
     // indices [start, end].
     const inclusive_end = if (start == -1) -1 else end - 1;
-    const start_handle = try objutil.newInteger(Heap.local_heap, start);
+    const start_handle = try objutil.newInteger(start);
     errdefer start_handle.decrRefCount();
-    const end_handle = try objutil.newInteger(Heap.local_heap, inclusive_end);
+    const end_handle = try objutil.newInteger(inclusive_end);
     errdefer end_handle.decrRefCount();
     const list = try objutil.newList(&.{ start_handle, end_handle });
     start_handle.decrRefCount();
@@ -126,27 +126,27 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (try args[i].equalsString("-nocase")) {
+        if (try args[i].current().equalsString("-nocase")) {
             opt_nocase = true;
-        } else if (try args[i].equalsString("-all")) {
+        } else if (try args[i].current().equalsString("-all")) {
             opt_all = true;
-        } else if (try args[i].equalsString("-inline")) {
+        } else if (try args[i].current().equalsString("-inline")) {
             opt_inline = true;
-        } else if (try args[i].equalsString("-indices")) {
+        } else if (try args[i].current().equalsString("-indices")) {
             opt_indices = true;
-        } else if (try args[i].equalsString("-expanded")) {
+        } else if (try args[i].current().equalsString("-expanded")) {
             opt_expanded = true;
-        } else if (try args[i].equalsString("-line")) {
+        } else if (try args[i].current().equalsString("-line")) {
             opt_line = true;
-        } else if (try args[i].equalsString("-linestop")) {
+        } else if (try args[i].current().equalsString("-linestop")) {
             opt_linestop = true;
-        } else if (try args[i].equalsString("-lineanchor")) {
+        } else if (try args[i].current().equalsString("-lineanchor")) {
             opt_lineanchor = true;
-        } else if (try args[i].equalsString("-start")) {
+        } else if (try args[i].current().equalsString("-start")) {
             i += 1;
             if (i >= args.len) return error.WrongUsage;
             opt_start = try interp.getInteger(&args[i]);
-        } else if (try args[i].equalsString("--")) {
+        } else if (try args[i].current().equalsString("--")) {
             i += 1;
             break;
         } else {
@@ -164,14 +164,10 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (opt_line or opt_lineanchor) compile_opts |= pcre2.PCRE2_MULTILINE;
     if (opt_line or opt_linestop) compile_opts &= ~@as(u32, pcre2.PCRE2_DOTALL);
 
-    var new: OptionalHandle = .none;
-    errdefer new.swapWithNone();
-
     var det: objutil.ErrorDetails = undefined;
-    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, remaining[0], &new, compile_opts));
-    remaining[0].swapIfNew(new);
+    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, &remaining[0], compile_opts));
 
-    const re = remaining[0].getRegexpExtraData();
+    const re = remaining[0].current().getRegexpExtraData();
 
     const subject = try remaining[1].getString();
     const match_vars = remaining[2..];
@@ -242,7 +238,7 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 var result_list_handle = result_list.?;
                 for (0..match_len) |j| {
                     const item = objutil.listItemNoFollow(match_list, @intCast(j));
-                    _ = try interp.listAppend(&result_list_handle, item);
+                    _ = try interp.listAppendInPlace(&result_list_handle, item);
                 }
                 result_list = result_list_handle;
             } else {
@@ -340,23 +336,23 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (try args[i].equalsString("-nocase")) {
+        if (try args[i].current().equalsString("-nocase")) {
             opt_nocase = true;
-        } else if (try args[i].equalsString("-all")) {
+        } else if (try args[i].current().equalsString("-all")) {
             opt_all = true;
-        } else if (try args[i].equalsString("-expanded")) {
+        } else if (try args[i].current().equalsString("-expanded")) {
             opt_expanded = true;
-        } else if (try args[i].equalsString("-line")) {
+        } else if (try args[i].current().equalsString("-line")) {
             opt_line = true;
-        } else if (try args[i].equalsString("-linestop")) {
+        } else if (try args[i].current().equalsString("-linestop")) {
             opt_linestop = true;
-        } else if (try args[i].equalsString("-lineanchor")) {
+        } else if (try args[i].current().equalsString("-lineanchor")) {
             opt_lineanchor = true;
-        } else if (try args[i].equalsString("-start")) {
+        } else if (try args[i].current().equalsString("-start")) {
             i += 1;
             if (i >= args.len) return error.WrongUsage;
             opt_start = try interp.getInteger(&args[i]);
-        } else if (try args[i].equalsString("--")) {
+        } else if (try args[i].current().equalsString("--")) {
             i += 1;
             break;
         } else {
@@ -377,10 +373,9 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     errdefer new.swapWithNone();
 
     var det: objutil.ErrorDetails = undefined;
-    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, remaining[0], &new, compile_opts));
-    remaining[0].swapIfNew(new);
+    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, &remaining[0], compile_opts));
 
-    const re = remaining[0].getRegexpExtraData();
+    const re = remaining[0].current().getRegexpExtraData();
     const pattern_str = try remaining[0].getString();
 
     const subject = try remaining[1].getString();
