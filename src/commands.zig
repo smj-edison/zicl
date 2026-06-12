@@ -355,10 +355,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             _ = try interp.wrapError(&det, objutil.dictPutRecursively(&det, &dict, set_ctx, new_value));
 
             if (dict.takeMutated().toHandle()) |new| {
-                {
-                    defer new.decrRefCount();
-                    try interp.setVariableTo(var_name, new);
-                }
+                defer new.decrRefCount();
+                try interp.setVariableTo(var_name, new);
                 // TODO probably can do this faster than looking back up every time.
                 interp.setResult((try interp.getVariable(var_name)).toHandle().?);
             } else {
