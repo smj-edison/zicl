@@ -1091,14 +1091,6 @@ pub const Object = packed struct(u128) {
         }
         try writer.writeAll(" } }");
     }
-
-    /// Get a correctly-offset pointer to a byte-aligned field in a packed Object.
-    /// Required because `&obj.field` on a packed struct returns the object start address.
-    pub fn fieldPtr(obj: *Object, comptime field_name: []const u8) *@FieldType(Object, field_name) {
-        const bit_offset = @bitOffsetOf(Object, field_name);
-        std.debug.assert(bit_offset % 8 == 0);
-        return @ptrFromInt(@intFromPtr(obj) + @offsetOf(Object, field_name));
-    }
 };
 
 pub const Tag = enum(u5) {
@@ -1801,7 +1793,7 @@ pub const Handle = packed struct(HandleBacking) {
             // TODO PERF I should probably benchmark whether it's faster
             // to check the metadata, or just to do an acquire load.
             if (options.threading and handle.getMetadata().cross_thread) {
-                const head = @atomicLoad(Object.Head, @as(*Object.Head, @ptrCast(&handle.peek().head)), .acquire);
+                const head = @atomicLoad(Object.Head, memutil.packedFieldPtr(Object, handle.peek(), "head"), .acquire);
                 break :blk head.str;
             } else {
                 break :blk handle.peek().head.str;
@@ -3286,7 +3278,7 @@ pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set
     const success = blk: {
         const obj: *Object = self.getLocalObject(index);
         if (options.threading and self.objects.get(index).metadata.cross_thread) {
-            const object_head: *align(8) Object.Head = @ptrCast(&obj.head);
+            const object_head = memutil.packedFieldPtr(Object, obj, "head");
             var current_head = @atomicLoad(Object.Head, object_head, .acquire);
             while (true) {
                 // Is the string pointer what we expected?

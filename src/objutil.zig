@@ -243,16 +243,16 @@ pub fn getCodepointLength(wb: *Shimmerable) !usize {
             return utf8_length;
         },
         .normal => {
-            // Zig doesn't allow for atomically loading or storing packed enums, so we cast
+            // Zig doesn't allow for atomically loading or storing packed unions, so we cast
             // it as a pointer to its underlying u64.
-            const body_u64_ptr: *u64 = @ptrCast(Heap.Object.fieldPtr(wb.peek(), "body"));
-            const body = @as(Heap.Body, @bitCast(@atomicLoad(u64, body_u64_ptr, .monotonic)));
+            const body_ptr: *u64 = @ptrCast(memutil.packedFieldPtr(Heap.Object, wb.peek(), "body"));
+            const body = @as(Heap.Body, @bitCast(@atomicLoad(u64, body_ptr, .monotonic)));
             if (body.string.length_determined) {
                 return body.string.utf8_length;
             } else {
                 const bytes = try wb.current().getString();
                 const utf8_length = strutil.codepointLength(bytes);
-                @atomicStore(u64, body_u64_ptr, @bitCast(Heap.Body{
+                @atomicStore(u64, body_ptr, @bitCast(Heap.Body{
                     .string = .{
                         .utf8_length = @intCast(utf8_length), // Cache utf8 length.
                         .length_determined = true,
