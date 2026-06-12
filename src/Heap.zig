@@ -1091,6 +1091,14 @@ pub const Object = packed struct(u128) {
         }
         try writer.writeAll(" } }");
     }
+
+    /// Get a correctly-offset pointer to a byte-aligned field in a packed Object.
+    /// Required because `&obj.field` on a packed struct returns the object start address.
+    pub fn fieldPtr(obj: *Object, comptime field_name: []const u8) *@FieldType(Object, field_name) {
+        const bit_offset = @bitOffsetOf(Object, field_name);
+        std.debug.assert(bit_offset % 8 == 0);
+        return @ptrFromInt(@intFromPtr(obj) + @offsetOf(Object, field_name));
+    }
 };
 
 pub const Tag = enum(u5) {

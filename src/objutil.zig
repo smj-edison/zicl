@@ -203,8 +203,6 @@ pub fn createHashReference(referent: Handle) !Handle {
 pub fn shimmerToHashReference(det: ?*ErrorDetails, wb: *Shimmerable) !void {
     if (wb.current().tag() == .hash_reference) return;
 
-    try wb.prepareToShimmer();
-
     const str = try wb.current().getString();
     const hash = Heap.parseHashReference(str) orelse {
         if (det) |details| details.* = .{
@@ -225,6 +223,7 @@ pub fn shimmerToHashReference(det: ?*ErrorDetails, wb: *Shimmerable) !void {
         return error.HashLookupFailed;
     };
 
+    try wb.prepareToShimmer();
     wb.peek().head.tag = .hash_reference;
     wb.peek().body = .{ .hash_reference = target.borrow() };
 }
@@ -244,17 +243,21 @@ pub fn getCodepointLength(wb: *Shimmerable) !usize {
             return utf8_length;
         },
         .normal => {
-            const body_ptr: *@FieldType(Heap.Body, "string") = @ptrCast(&wb.peek().body.string);
-            const current_body = @atomicLoad(@FieldType(Heap.Body, "string"), body_ptr, .monotonic);
-            if (current_body.length_determined) {
-                return current_body.utf8_length;
+            // Zig doesn't allow for atomically loading or storing packed enums, so we cast
+            // it as a pointer to its underlying u64.
+            const body_u64_ptr: *u64 = @ptrCast(Heap.Object.fieldPtr(wb.peek(), "body"));
+            const body = @as(Heap.Body, @bitCast(@atomicLoad(u64, body_u64_ptr, .monotonic)));
+            if (body.string.length_determined) {
+                return body.string.utf8_length;
             } else {
                 const bytes = try wb.current().getString();
                 const utf8_length = strutil.codepointLength(bytes);
-                @atomicStore(@FieldType(Heap.Body, "string"), body_ptr, .{
-                    .utf8_length = @intCast(utf8_length), // Cache utf8 length.
-                    .length_determined = true,
-                }, .monotonic);
+                @atomicStore(u64, body_u64_ptr, @bitCast(Heap.Body{
+                    .string = .{
+                        .utf8_length = @intCast(utf8_length), // Cache utf8 length.
+                        .length_determined = true,
+                    },
+                }), .monotonic);
 
                 return utf8_length;
             }
@@ -1649,10 +1652,9 @@ pub fn dictPutAssumeCapacity(dict: Handle, key: Handle, value: Heap.Object) void
     // `- 3` for dict head, new key, and value.
     dict.assert(current_len <= memutil.getOrderSize(dict.getMetadata().order) - 3);
 
+    dict.peek().body.dict.len += 2;
     dictItemNoFollow(dict, current_len).peek().* = key.dupOrRef();
-    dict.peek().body.dict.len += 1;
-    dictItemNoFollow(dict, current_len).peek().* = value;
-    dict.peek().body.dict.len += 1;
+    dictItemNoFollow(dict, current_len + 1).peek().* = value;
 }
 
 /// Caller is responsible that `handles` has handles.len % 2 == 0.

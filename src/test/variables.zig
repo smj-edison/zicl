@@ -16,6 +16,6 @@ test "variable unset" {
     defer testFinish(&interp);
 
     try interp.testExpectScriptResult("", "set x 5; unset x");
-    try interp.testExpectScriptError(error.EvalError, "can't read \"x\": no such variable", "set x 5; unset x; unset x");
+    try interp.testExpectScriptError(error.EvalError, "can't unset \"x\": no such variable", "set x 5; unset x; unset x");
     try interp.testExpectScriptResult("", "set x 5; unset x; unset -nocomplain x");
 }

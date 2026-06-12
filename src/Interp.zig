@@ -623,7 +623,12 @@ pub fn unsetVariableInner(
 ) !void {
     interp.ensureValidVariableType(det, call_frame_idx, name) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.VariableNotFound => return error.VariableNotFound,
+        error.VariableNotFound => {
+            if (det) |details| details.* = .{
+                .message = try objutil.newStringFmt("can't unset \"{f}\": no such variable", .{name}),
+            };
+            return error.VariableNotFound;
+        },
         error.LinkLookupFailed => return error.LinkLookupFailed,
         error.BadVariableName => return error.BadVariableName,
         error.DictSugar => {
@@ -1033,6 +1038,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     var args, const body = blk: {
         if (maybe_impl.toHandle()) |impl| {
             var impl_wb: Shimmerable = .{ .original = impl };
+            defer impl_wb.discardChanges();
             objutil.shimmerToList(null, &impl_wb) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
@@ -1062,7 +1068,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
         }
     };
     defer args.decrRefCount();
-    defer body.decrRefCount();
+    errdefer body.decrRefCount();
 
     // Make sure args is a list.
     var args_wb: Shimmerable = .{ .original = args };
@@ -1077,10 +1083,17 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     };
     args = args_wb.consume();
 
+    // Both `name` and `scope` point into the temporary dict, so they must be
+    // borrowed before we return. Otherwise the dict freeing would invalidate them.
+    const borrowed_name = maybe_name.borrowOptional();
+    errdefer borrowed_name.decrOptional();
+
     // Scope must always be a hash reference.
     var scope_hash_ref: OptionalHandle = .none;
     if (maybe_scope.toHandle()) |scope| {
-        var scope_wb: Shimmerable = .{ .original = scope };
+        const borrowed_scope = scope.borrow();
+        errdefer borrowed_scope.decrRefCount();
+        var scope_wb: Shimmerable = .{ .original = borrowed_scope };
         try objutil.shimmerToHashReference(det, &scope_wb);
         scope_hash_ref = scope_wb.consume().toOptional();
     }
@@ -1090,7 +1103,7 @@ pub fn parseClosure(det: ?*objutil.ErrorDetails, bytes: []const u8) !Heap.Closur
     return .{
         .args = parsed_args.arg_names,
         .body = body,
-        .name = maybe_name,
+        .name = borrowed_name,
         .scope_hash_ref = scope_hash_ref,
         .required_arity = parsed_args.required_arity,
         .optional_arity = parsed_args.optional_arity,

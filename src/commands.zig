@@ -354,7 +354,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const set_ctx = objutil.ShimmerableSliceContext{ .items = keys };
             _ = try interp.wrapError(&det, objutil.dictPutRecursively(&det, &dict, set_ctx, new_value));
 
-            if (dict.mutated.toHandle()) |new| {
+            if (dict.takeMutated().toHandle()) |new| {
                 {
                     defer new.decrRefCount();
                     try interp.setVariableTo(var_name, new);
@@ -383,7 +383,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             const unset_ctx = objutil.ShimmerableSliceContext{ .items = args[3..args.len] };
             _ = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, &dict, unset_ctx));
-            if (dict.mutated.toHandle()) |new| {
+            if (dict.takeMutated().toHandle()) |new| {
                 defer new.decrRefCount();
                 try interp.setVariableToObject(var_name, new.reference());
             }
@@ -1648,6 +1648,7 @@ pub fn applymethodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     const new_self = args[2].shimmered.toHandle().?;
     args[2].shimmered = .none; // It's bad practice to leave a `Shimmerable` as mutated.
+    defer new_self.decrRefCount();
     const method_result = interp.result;
 
     interp.setResultOwning(try objutil.newList(&.{ new_self, method_result }));
@@ -1884,13 +1885,13 @@ fn catchTryHelper(
     // branch but haven't found its script yet.
     var branch_matched = false;
     var handler_script: ?Handle = null;
-    errdefer if (handler_script) |val| val.decrRefCount();
+    defer if (handler_script) |val| val.decrRefCount();
     var finally_script: ?Handle = null;
-    errdefer if (finally_script) |val| val.decrRefCount();
+    defer if (finally_script) |val| val.decrRefCount();
     var message_var_name: ?Handle = null;
-    errdefer if (message_var_name) |val| val.decrRefCount();
+    defer if (message_var_name) |val| val.decrRefCount();
     var options_var_name: ?Handle = null;
-    errdefer if (options_var_name) |val| val.decrRefCount();
+    defer if (options_var_name) |val| val.decrRefCount();
 
     if (mode == .@"try") {
         // For [try], we need to find either a matching `on` or a matching `trap`.
