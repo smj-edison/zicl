@@ -275,467 +275,21 @@ extra_data_mutex: std.Io.Mutex,
 /// Used for locking when adding trace info.
 trace_mutex: std.Io.Mutex,
 
-object_tracking: ObjectAllocator,
-objects: ObjectList,
-small_strings: *StringAllocator.Heap,
-interned_strings: std.EnumArray(InternedString, Heap.Handle),
+interned_strings: std.EnumArray(InternedString, *Object),
 /// Preallocated fallback used by `[catch]` when a script OOMs and building
 /// the real opts dict also OOMs. Pinned at init; released via `freeOomOptsDict`.
-oom_error_options_dict: ?Handle,
+oom_error_options_dict: ?*Object,
 
-/// If an object can't store all its information in 8 bytes, it can throw extra data on here.
-extra: ExtraDataPool,
 parsed_scripts: ParsedScripts,
 parsed_exprs: ParsedExpressions,
 parsed_closures: ParsedClosures,
 parsed_substs: ParsedSubstitutions,
 
-pub const HeapId = u16;
-
-const ObjectList = std.MultiArrayList(ObjectAndMetadata);
-const StringList = std.ArrayList(u8);
-
-/// Intrusive buddy allocator that stores the free list inside the object heap.
-/// Free blocks are tagged `.free_list` and linked per order via `next`/`prev`.
-/// Metadata on every slot records the block's order, so coalescing can find a
-/// buddy in O(1) without any external hash maps.
-const ObjectAllocator = struct {
-    const max_order = cfg.object_heap_order;
-    const max_pool_order = 10;
-    const pool_size = 512;
-
-    alloc_count: [max_order]usize,
-    pools: [max_pool_order][pool_size]u32,
-    pools_len: [max_pool_order]usize,
-    mutex: std.Io.Mutex = .init,
-
-    // Per-order intrusive doubly-linked list heads/tails.
-    free_heads: [max_order]OptionalIndex,
-    free_tails: [max_order]OptionalIndex,
-
-    pub fn init(heap: *Heap) ObjectAllocator {
-        var allocator: ObjectAllocator = .{
-            .alloc_count = @splat(0),
-            .pools = @splat(@splat(0)),
-            .pools_len = @splat(0),
-            .free_heads = @splat(.none),
-            .free_tails = @splat(.none),
-        };
-
-        // The entire heap starts as one free block at the top order.
-        // We manually split it down so that index 0 becomes order 0 (allocated),
-        // becoming the null object. This way index 0 is never used.
-        var current_order: u5 = max_order - 1;
-        while (current_order > 0) : (current_order -= 1) {
-            const upper = memutil.getOrderSize(current_order - 1);
-            heap.objects.items(.metadata)[upper] = .{
-                .order = current_order - 1,
-                .in_use = false,
-                .cross_thread = false,
-                .hash_registered = false,
-            };
-            allocator.pushToFreeList(heap, upper, current_order - 1);
-        }
-
-        // Index 0 is now order 0 and permanently allocated (the null object).
-        heap.objects.items(.metadata)[0] = .{
-            .order = 0,
-            .in_use = true,
-            .cross_thread = false,
-            .hash_registered = false,
-        };
-        allocator.alloc_count[0] = 1;
-
-        return allocator;
-    }
-
-    pub fn deinit(self: *ObjectAllocator) void {
-        // Synchronize state.
-        self.mutex.lockUncancelable(global_io);
-        self.mutex.unlock(global_io);
-    }
-
-    /// Caller must handle pool draining and synchronization.
-    pub fn anyAllocationsPresent(self: *ObjectAllocator) bool {
-        var any_present = false;
-        for (self.alloc_count) |count| {
-            if (count != 0) any_present = true;
-        }
-        return any_present;
-    }
-
-    /// Splits an existing allocation into smaller blocks for accounting.
-    /// Every slot in the range gets the new order so that any slot can find
-    /// its allocation head.
-    /// Caller must hold the allocator mutex.
-    pub fn splitBlock(self: *ObjectAllocator, heap: *Heap, index: u32, current_order: u5, new_order: u5) void {
-        assert(new_order < current_order);
-
-        const new_block_count = @as(u32, 1) << (current_order - new_order);
-        self.alloc_count[current_order] -= 1;
-        self.alloc_count[new_order] += new_block_count;
-
-        // We only need to change the metadata of every `stride`th object, because
-        // that's all that's needed for heap usages. Callers should do a full
-        // initialization.
-        const stride = memutil.getOrderSize(new_order);
-        for (0..new_block_count) |i| {
-            const block_index = @as(u32, @intCast(index + i * stride));
-            heap.objects.items(.metadata)[block_index].order = new_order;
-            heap.objects.items(.metadata)[block_index].in_use = true;
-        }
-    }
-
-    pub fn freeFromAnyThread(self: *ObjectAllocator, heap: *Heap, index: u32, order: u5) void {
-        self.mutex.lockUncancelable(global_io);
-        defer self.mutex.unlock(global_io);
-
-        self.freeOnMainList(heap, index, order);
-
-        const start_of_clearing = if (heap.getLocalObject(index).head.tag == .free_list) index + 1 else index;
-        zeroObjects(heap, start_of_clearing, index + memutil.getOrderSize(order));
-    }
-
-    pub fn allocFromOwningThread(self: *ObjectAllocator, heap: *Heap, requested_order: u5) !u32 {
-        // Try allocating from the pool, if available.
-        return self.allocOnPool(requested_order) catch |err| switch (err) {
-            error.PoolEmpty => {
-                // We'll refill the pool next.
-                self.mutex.lockUncancelable(global_io);
-                defer self.mutex.unlock(global_io);
-
-                const containing_order: u5 = @intCast(requested_order + std.math.log2(pool_size));
-                const alloc = try self.allocOnMainList(heap, containing_order);
-
-                // The containing block is logically split into `added` smaller blocks.
-                const added = @as(u32, 1) << (containing_order - requested_order);
-                self.splitBlock(heap, alloc, containing_order, requested_order);
-
-                // Push each split piece onto the pool.
-                const stride = memutil.getOrderSize(requested_order);
-                for (0..added) |i| {
-                    const block_index = @as(u32, @intCast(alloc + i * stride));
-                    self.addToPoolFreelist(block_index, requested_order) catch unreachable;
-                }
-
-                return self.allocOnPool(requested_order) catch unreachable;
-            },
-            error.TooBigForPool => {
-                self.mutex.lockUncancelable(global_io);
-                defer self.mutex.unlock(global_io);
-
-                return try self.allocOnMainList(heap, requested_order);
-            },
-        };
-    }
-
-    pub fn freeFromOwningThread(self: *ObjectAllocator, heap: *Heap, index: u32, order: u5) void {
-        // Try freeing onto the pool, if there's room left.
-        if (order < max_pool_order) {
-            if (self.addToPoolFreelist(index, order)) {
-                heap.getLocalMetadata(index).* = .{
-                    .order = order,
-                    // You might ask, didn't we just free it, so shouldn't `in_use` be false?
-                    // Well, it's not in use, but it is still allocated from the perspective of
-                    // the main list. If the main list sees `in_use` as false, it will try to
-                    // coalesce with this, even though this is still in an allocated state.
-                    .in_use = true,
-                    .cross_thread = false,
-                    .hash_registered = false,
-                };
-                zeroObjects(heap, index + 1, index + memutil.getOrderSize(order));
-                return;
-            } else |err| switch (err) {
-                error.PoolFull => {
-                    // Fall through to the main list.
-                },
-            }
-        }
-
-        // We should transfer the pool over to the main list, since there wasn't any room
-        // left on the pool.
-        self.mutex.lockUncancelable(global_io);
-        defer self.mutex.unlock(global_io);
-        self.drainPool(heap);
-        self.freeOnMainList(heap, index, order);
-
-        const start_of_clearing = if (heap.getLocalObject(index).head.tag == .free_list) index + 1 else index;
-        zeroObjects(heap, start_of_clearing, index + memutil.getOrderSize(order));
-    }
-
-    /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
-    /// small objects is fast. Not threadsafe.
-    fn allocOnPool(self: *ObjectAllocator, requested_order: u5) !u32 {
-        if (requested_order < max_pool_order) {
-            if (self.pools_len[requested_order] > 0) {
-                const open = self.pools[requested_order][self.pools_len[requested_order] - 1];
-                self.pools_len[requested_order] -= 1;
-                return open;
-            }
-            return error.PoolEmpty;
-        }
-        return error.TooBigForPool;
-    }
-
-    /// Caller is responsible for locking the allocator.
-    pub fn allocOnMainList(self: *ObjectAllocator, heap: *Heap, requested_order: u5) error{OutOfMemory}!u32 {
-        self.alloc_count[requested_order] += 1; // Allocation stats.
-        errdefer self.alloc_count[requested_order] -= 1;
-
-        // Look for an open block of any size >= requested_order (if the open block is too big, we'll split it).
-        var open_index: u32 = undefined;
-        var open_order = requested_order;
-        while (open_order < max_order) : (open_order += 1) {
-            if (self.popFreeList(heap, open_order).toIndex()) |open| {
-                open_index = open;
-                break;
-            }
-        } else return error.OutOfMemory;
-
-        // Split blocks (if needed).
-        while (open_order > requested_order) : (open_order -= 1) {
-            const upper = open_index + memutil.getOrderSize(open_order - 1);
-
-            // Only the head needs metadata; the rest will be set when the block
-            // is allocated via createObjects or freed via freeOnMainList.
-            // `in_use = false` because this upper half is going onto the free list.
-            heap.objects.items(.metadata)[upper] = .{
-                .order = open_order - 1,
-                .in_use = false,
-                .cross_thread = false,
-                .hash_registered = false,
-            };
-            self.pushToFreeList(heap, upper, open_order - 1);
-            // Lower half is implicitly passed along `open_index`, since
-            // the lower block index stays the same as it descends.
-        }
-
-        // Mark the returned block as in use.
-        heap.objects.items(.metadata)[open_index] = .{
-            .order = requested_order,
-            .in_use = true,
-            .cross_thread = false,
-            .hash_registered = false,
-        };
-
-        return open_index;
-    }
-
-    /// We keep a non-threadsafe pool of recently used addresses, so allocation/free of
-    /// small objects is fast. We also don't coalesce on the pool, so this also prevents
-    /// churning where blocks are split and merged constantly. Not threadsafe.
-    fn addToPoolFreelist(self: *ObjectAllocator, index: u32, order: u5) !void {
-        assert(order < max_pool_order);
-
-        if (self.pools_len[order] >= pool_size) return error.PoolFull;
-
-        self.pools[order][self.pools_len[order]] = index;
-        self.pools_len[order] += 1;
-    }
-
-    /// Caller is responsible for locking the allocator.
-    pub fn freeOnMainList(self: *ObjectAllocator, heap: *Heap, index: u32, order: u5) void {
-        self.alloc_count[order] -= 1; // Allocation stats.
-
-        // If this block has a buddy, merge. If not, add this block to the appropriate free list.
-        const freed_buddy = memutil.buddyOfOrder(index, order);
-        const buddy_meta = heap.objects.items(.metadata)[freed_buddy];
-
-        if (!buddy_meta.in_use and buddy_meta.order == order) {
-            // Buddy is free and same order. Remove it from its list and merge.
-            self.removeFromFreeList(heap, freed_buddy, order);
-
-            // This block has a buddy, so do recursive merging.
-            var order_being_merged = order;
-            var block_being_merged = index;
-            var buddy_being_merged = freed_buddy;
-
-            // Why < max_order - 1? Because the top order has no sibling to merge with.
-            while (order_being_merged < max_order - 1) {
-                // Remove buddy from its free list (no longer free since it's being merged).
-                // No need to remove the block, since we never added it in the first place.
-
-                // We've effectively merged the two blocks now, but we're not going to put
-                // the merged result on the higher free list, because it'll be passed up
-                // through block_being_merged anyways. We do however need to update the index,
-                // because the higher order is aligned differently.
-                order_being_merged += 1;
-                block_being_merged = @min(block_being_merged, buddy_being_merged);
-
-                // Now check if the higher order block also needs to be merged, by checking
-                // for the presence of its buddy in the free list.
-                const new_buddy = memutil.buddyOfOrder(block_being_merged, order_being_merged);
-                const new_buddy_meta = heap.objects.items(.metadata)[new_buddy];
-
-                if (!new_buddy_meta.in_use and new_buddy_meta.order == order_being_merged) {
-                    // We've found the sibling, so the next iteration will merge.
-                    self.removeFromFreeList(heap, new_buddy, order_being_merged);
-                    buddy_being_merged = new_buddy;
-                } else {
-                    // In this case, we actually _do_ need to append the merged block,
-                    // since we're no longer implicitly passing it up block_being_merged.
-                    // Only the head needs metadata for coalescing.
-                    heap.objects.items(.metadata)[block_being_merged] = .{
-                        .order = order_being_merged,
-                        .in_use = false,
-                        .cross_thread = false,
-                        .hash_registered = false,
-                    };
-                    self.pushToFreeList(heap, block_being_merged, order_being_merged);
-                    return;
-                }
-            }
-
-            // If we reach max_order - 1, push the merged block onto the top list.
-            heap.objects.items(.metadata)[block_being_merged] = .{
-                .order = order_being_merged,
-                .in_use = false,
-                .cross_thread = false,
-                .hash_registered = false,
-            };
-            self.pushToFreeList(heap, block_being_merged, order_being_merged);
-        } else {
-            // No buddy, so add this block to the free list.
-            heap.objects.items(.metadata)[index] = .{
-                .order = order,
-                .in_use = false,
-                .cross_thread = false,
-                .hash_registered = false,
-            };
-            self.pushToFreeList(heap, index, order);
-        }
-    }
-
-    /// Caller is responsible for synchronization.
-    pub fn drainPool(self: *ObjectAllocator, heap: *Heap) void {
-        for (&self.pools, &self.pools_len, 0..) |pool, *pool_len, order| {
-            for (pool[0..pool_len.*]) |to_free| {
-                self.freeOnMainList(heap, to_free, @intCast(order));
-
-                const start_of_clearing = if (heap.getLocalObject(to_free).head.tag == .free_list) to_free + 1 else to_free;
-                zeroObjects(heap, start_of_clearing, to_free + memutil.getOrderSize(@intCast(order)));
-            }
-            pool_len.* = 0;
-        }
-    }
-
-    // Intrusive doubly-linked list helpers.
-
-    fn pushToFreeList(self: *ObjectAllocator, heap: *Heap, index: u32, order: u5) void {
-        const head = self.free_heads[order];
-        const obj = heap.getLocalObject(index);
-
-        assert(!heap.getLocalMetadata(index).in_use);
-        obj.head.tag = .free_list;
-        obj.body = .{ .free_list = .{ .next = .none, .prev = .none } };
-
-        if (head == .none) {
-            self.free_heads[order] = OptionalIndex.from(index);
-            self.free_tails[order] = OptionalIndex.from(index);
-        } else {
-            // `tail` is non-null because `head` was non-null, and the list
-            // always maintains both head and tail together.
-            const tail = self.free_tails[order];
-            const tail_obj = heap.getLocalObject(tail.toIndex().?);
-            assert(tail_obj.head.tag == .free_list);
-            tail_obj.body.free_list.next = OptionalIndex.from(index);
-            obj.body.free_list.prev = tail;
-            self.free_tails[order] = OptionalIndex.from(index);
-        }
-    }
-
-    fn removeFromFreeList(self: *ObjectAllocator, heap: *Heap, index: u32, order: u5) void {
-        const obj = heap.getLocalObject(index);
-        if (obj.head.tag != .free_list) {
-            std.debug.print("removeFromFreeList assert: index={}, order={}, tag={}\n", .{ index, order, obj.head.tag });
-        }
-        assert(obj.head.tag == .free_list);
-
-        const maybe_prev = obj.body.free_list.prev;
-        const maybe_next = obj.body.free_list.next;
-
-        if (maybe_prev.toIndex()) |prev| {
-            const prev_obj = heap.getLocalObject(prev);
-            assert(prev_obj.head.tag == .free_list);
-            prev_obj.body.free_list.next = maybe_next;
-        } else {
-            self.free_heads[order] = maybe_next;
-        }
-
-        if (maybe_next.toIndex()) |next| {
-            // `next` is a valid link in the list, so it must be non-null.
-            const next_obj = heap.getLocalObject(next);
-            assert(next_obj.head.tag == .free_list);
-            next_obj.body.free_list.prev = maybe_prev;
-        } else {
-            self.free_tails[order] = maybe_prev;
-        }
-    }
-
-    fn zeroObjects(heap: *Heap, start: usize, end: usize) void {
-        @memset(
-            heap.objects.items(.metadata)[start..end],
-            .{
-                .order = 31,
-                .in_use = false,
-                .cross_thread = false,
-                .hash_registered = false,
-            },
-        );
-
-        if (options.expensive_checks) @memset(
-            heap.objects.items(.object)[start..end],
-            .{
-                .head = .{ .tag = .invalid },
-                .body = undefined,
-            },
-        );
-    }
-
-    fn popFreeList(self: *ObjectAllocator, heap: *Heap, order: u5) OptionalIndex {
-        if (self.free_heads[order].toIndex()) |head| {
-            self.removeFromFreeList(heap, head, order);
-            return OptionalIndex.from(head);
-        } else return .none;
-    }
-
-    pub fn forEachAllocated(self: *ObjectAllocator, heap: *Heap, context: anytype) void {
-        self.mutex.lockUncancelable(global_io);
-        defer self.mutex.unlock(global_io);
-        self.drainPool(heap);
-        _ = self.forEachAllocatedInner(heap, max_order - 1, 0, context);
-    }
-
-    /// Returns true if this subtree contains any free block. This function is not synchronized.
-    fn forEachAllocatedInner(self: *ObjectAllocator, heap: *Heap, order: u5, index: u32, context: anytype) bool {
-        const meta = heap.objects.items(.metadata)[index];
-        if (!meta.in_use and meta.order == order) {
-            // This is a free head of this order.
-            assert(heap.getLocalObject(index).head.tag == .free_list);
-            return true;
-        }
-
-        const order_allocated_as = context.getOrder(index);
-        if (order == order_allocated_as) {
-            context.onAllocated(index, order);
-            return false;
-        }
-
-        const buddy = index + memutil.getOrderSize(order - 1);
-        const left_has_free = self.forEachAllocatedInner(heap, order - 1, index, context);
-        const right_has_free = self.forEachAllocatedInner(heap, order - 1, buddy, context);
-        return left_has_free or right_has_free;
-    }
-};
-
-const ExtraDataPool = memutil.IndexedMemoryPool(ExtraDataValue, options.threading);
 const FullHashContext = struct {
-    pub fn hash(self: @This(), full_hash: u256) u64 {
-        _ = self;
+    pub fn hash(_: @This(), full_hash: u256) u64 {
         return @truncate(full_hash);
     }
-    pub fn eql(self: @This(), a: u256, b: u256) bool {
-        _ = self;
+    pub fn eql(_: @This(), a: u256, b: u256) bool {
         return a == b;
     }
 };
@@ -879,11 +433,10 @@ const interned_string_count = std.enums.values(InternedString).len;
 /// two times.
 ///
 pub const ParsedScript = struct {
-    /// A handle pointing to a Tcl list that has the same length as `tokens`,
-    /// that stores all the string values that the script references.
-    values: Handle,
     /// Tokens array.
     tags: std.ArrayList(Tokenizer.Token.Tag),
+    /// The associated values for their corresponding tokens.
+    values: []*Object,
 
     pub fn printTokens(script: *const ParsedScript) void {
         const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
@@ -907,7 +460,7 @@ pub const ParsedScript = struct {
 
     pub fn deinit(parsed: *ParsedScript) void {
         parsed.tags.deinit(global_gpa);
-        parsed.values.decrRefCount();
+        for (parsed.values) |value| value.decrRefCount();
     }
 };
 
@@ -921,73 +474,22 @@ pub const ParsedExpression = struct {
     }
 };
 
-pub const Object = packed struct(u128) {
-    pub const null_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = .fromInt(0), .len = 0, .hash_count = 0 } },
-        .is_ptr = false,
-    };
-    pub const empty_string: StrOrPtr = .{
-        .u = .{ .str = .{ .index = .fromInt(1), .len = 0, .hash_count = 0 } },
-        .is_ptr = false,
-    };
-
-    pub const StrOrPtr = packed struct(u59) {
-        pub const SmallLength = u11;
-
-        u: packed union {
-            /// Normal strings store both the bytes and the hash references inline in the
-            /// same allocation. Check `heapStringLayout` for details.
-            str: packed struct {
-                index: StringAllocator.Index,
-                len: SmallLength,
-                /// Number of Handle references stored inline after the null byte (and
-                /// potentially padding).
-                hash_count: u6,
-                padding: u9 = 0,
-            },
-            /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
-            ptr: u58,
-        },
-        is_ptr: bool,
-
-        pub fn deinit(str: StrOrPtr, heap: *Heap) void {
-            switch (heap.getLocalStringDetails(str)) {
-                .long => |long_str| {
-                    long_str.decrRefCount();
-                },
-                .normal => {
-                    heap.freeHeapString(str.u.str.index, str.u.str.len, str.u.str.hash_count);
-                },
-                .null, .empty => {},
-            }
-        }
-
-        pub fn format(self: StrOrPtr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            if (self.is_ptr) {
-                try writer.print(".{{ .ptr = {*} }}", .{SpecialString.fromInt(self.u.ptr)});
-            } else {
-                try writer.print("{}", .{self.u.str});
-            }
-        }
-    };
-
-    pub const Head = packed struct(u64) {
-        str: StrOrPtr = Object.null_string,
-        tag: Tag,
-    };
-
-    head: Head,
+pub const Object = struct {
+    string: ?[]u8,
+    hashes: ?*[]struct {
+        str_index: usize,
+        value: *?Object,
+    },
+    ref_count: u32,
+    flags: packed struct(u8) {
+        crossthread: bool,
+        hash_registered: bool,
+    },
     body: Body,
 
-    pub fn take(obj: *Object) Object {
-        const taken = obj.*;
-        obj.* = emptyObject();
-        return taken;
-    }
-
-    pub fn deinitSingle(obj: *Object, heap: *Heap) void {
-        obj.deinitBodySingle(heap);
-        obj.deinitString(heap);
+    pub fn deinit(obj: *Object) void {
+        obj.deinitBody();
+        obj.deinitString();
     }
 
     pub fn deinitString(obj: *Object, heap: *Heap) void {
@@ -1120,40 +622,41 @@ pub const Tag = enum(u5) {
     free_list,
 };
 
-pub const Body = packed union(u64) {
-    const Empty = packed struct { padding: u64 = 0 };
-
-    none: Empty,
-    invalid: Empty,
+pub const Body = union {
+    none: void,
+    invalid: void,
     /// Used internally in places where a value needs to be temporarily marked.
-    marked: Empty,
+    marked: void,
     /// List index.
-    index: packed struct { data: ListIndex, padding: u30 = 0 },
+    index: ListIndex,
     integer: i64,
     float: f64,
-    bool: packed struct { data: bool, padding: u63 = 0 },
-    string: packed struct(u64) {
-        utf8_length: u32,
+    bool: bool,
+    string: struct {
+        utf8_length: u64,
         length_determined: bool,
-        padding: u31 = 0,
     },
-    source: packed struct {
-        extra_data: ExtraData,
-        padding: u32 = 0,
+    source: struct {
+        file_name: ?*Object,
+        line_no: u32,
+        hash: std.atomic.Value(?*u256),
     },
-    list: packed struct {
-        len: u32,
-        padding: u32 = 0,
+    list: struct {
+        items: []*Object,
     },
-    /// Items of the dictionary are stored directly after, similar to a list.
-    /// Keys and values alternate. Allows for duplicate keys when shimmering
-    /// from a list, but duplicates will be removed when any writing operation
-    /// happens.
-    dict: packed struct {
-        /// Length of dictionaries' backing list, including potential duplicated
-        /// keys when shimmering from list.
-        len: u32,
-        extra_data: ExtraData,
+    dict: struct {
+        pub const Table = std.HashMapUnmanaged(*Object, u32, struct {
+            pub fn hash(_: @This(), key: *Object) u64 {
+                const str = key.getString() catch unreachable;
+                return std.hash_map.hashString(str);
+            }
+            pub fn eql(_: @This(), a: *Object, b: *Object) bool {
+                return checkIfEqual(a, b) catch unreachable;
+            }
+        }, 80);
+
+        items: []*Object,
+        table: Table,
     },
     /// Both objects must be in the parent object's heap. `dict_name_index` points
     /// to an object that contains the name of the dictionary (and most likely
@@ -1164,21 +667,20 @@ pub const Body = packed union(u64) {
     /// dict_name_index: "foo"
     /// path_index: ["bar", "baz"]
     /// ```
-    dict_sugar: packed struct {
-        dict_name_index: HeapIndex,
-        path_index: HeapIndex,
+    dict_sugar: struct {
+        dict_name_index: *Object,
+        path_index: *Object,
     },
     /// Information about a parsed command.
-    parsed_script_command: packed struct {
+    parsed_script_command: struct {
         line: u32,
         word_count: u32,
     },
-    reference: Handle,
-    cached_local_var: packed struct {
+    cached_local_var: struct {
         /// Used to invalidate `index`'s cached value, if it doesn't match
         /// the current call frame's epoch.
-        call_epoch: u32,
-        cached_index: HeapIndex,
+        call_epoch: u64,
+        cached_index: *Object,
     },
     /// Value from lexical scope lookup. In zicl, parent scopes are immutable,
     /// so we can outright borrow this value.
@@ -1187,7 +689,7 @@ pub const Body = packed union(u64) {
         /// the current call frame's epoch. The only thing that can
         /// invalidate a lexical lookup is shadowing it with a local
         /// variable.
-        call_epoch: u32,
+        call_epoch: u64,
         extra_data: ExtraData,
     },
     upvar_link: packed struct {
@@ -1288,15 +790,11 @@ pub const ExtraDataValue = union(enum) {
 pub const IndexError = error{BadIndex};
 /// Tcl list index. Indexes are inclusive both for start and end in Tcl. Additionally,
 /// an index may be relative, such as "end" or "end-1".
-pub const ListIndex = packed struct(u34) {
-    u: packed union {
-        index: packed struct { data: u32, padding: u1 = 0 },
-        end_offset: i33,
-    },
-    /// Whether this is a relative index, such as "end", "end-1", "end+5", etc.
-    is_relative: bool,
+pub const ListIndex = union(enum) {
+    index: packed struct { data: usize },
+    end_offset: i64,
 
-    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
+    pub const end: ListIndex = .{ .end_offset = 0 };
 
     pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) i33 {
         if (self.is_relative) {
