@@ -74,7 +74,7 @@ prng: std.Random.DefaultPrng,
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 pub const CommandFn = fn (interp: *Interp, args: []Shimmerable) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Shimmerable) callconv(.c) ReturnCode;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Handle) callconv(.c) ReturnCode;
 
 pub const EvalError = error{
     OutOfMemory,
@@ -1395,7 +1395,21 @@ fn callNative(interp: *Interp, command: *NativeCommand, args: []Shimmerable) !vo
         switch (command.call_info) {
             .zig => |to_call| try to_call(interp, args),
             .c => |to_call| {
-                try ReturnCode.toError(to_call(interp, @intCast(args.len), args.ptr));
+                const args_as_handles = try Heap.global_gpa.alloc(Handle, args.len);
+                defer Heap.global_gpa.free(args_as_handles);
+                for (args, args_as_handles) |arg, *native_arg| native_arg.* = arg.current().borrow();
+
+                const retcode = ReturnCode.toError(to_call(interp, @intCast(args_as_handles.len), args_as_handles.ptr));
+
+                for (args, args_as_handles) |*arg, native_arg| {
+                    if (native_arg != arg.current()) {
+                        arg.shimmered.swap(native_arg);
+                    } else {
+                        native_arg.decrRefCount();
+                    }
+                }
+
+                return retcode;
             },
         }
 

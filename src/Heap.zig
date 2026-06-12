@@ -2718,13 +2718,13 @@ pub fn getHeapString(self: *Heap, index: StringAllocator.Index, len: u11, hash_c
 /// Returns the total length of the string, including the null byte and the hash handles.
 /// This will always align the `Handle`s to their alignment, assuming that the first index
 /// of the string is aligned by `Handle`s alignment as well.
-fn heapStringLayout(len: u11, hash_count: u10) struct { total_len: Object.StrOrPtr.SmallLength, handle_start: u11 } {
+fn heapStringLayout(len: u11, hash_count: u6) struct { total_len: Object.StrOrPtr.SmallLength, handle_start: u11 } {
     const length_with_null = len + 1;
     if (hash_count > 0) {
-        // The handles need to be aligned, so we may need some padding.
-        const handle_start: u11 = @intCast(mem.alignForward(usize, length_with_null, @alignOf(Handle)));
+        // The handles need to be aligned to 4 bytes, so we may need some padding.
+        const handle_start: u11 = @intCast(mem.alignForward(usize, length_with_null, 4));
         return .{
-            .total_len = handle_start + hash_count * @sizeOf(Handle),
+            .total_len = handle_start + @as(u11, hash_count) * @sizeOf(Handle),
             .handle_start = handle_start,
         };
     } else {
@@ -2757,7 +2757,7 @@ pub fn createHeapString(heap: *Heap, len: u11, hash_handles: []align(4) const Op
     return new_string;
 }
 
-pub fn freeHeapString(self: *Heap, index: StringAllocator.Index, len: Object.StrOrPtr.SmallLength, hash_count: u10) void {
+pub fn freeHeapString(self: *Heap, index: StringAllocator.Index, len: Object.StrOrPtr.SmallLength, hash_count: u6) void {
     const layout = heapStringLayout(len, hash_count);
 
     // Release handles.
@@ -3342,7 +3342,17 @@ fn createNormalString(
         return .{ .data = Object.empty_string };
     }
 
-    if (bytes.len >= SpecialString.split_point) return error.TooBig;
+    // Keep in sync with `heapStringLayout`.
+    const total_size: usize = blk: {
+        if (hash_handles.len > 0) {
+            const len_with_null = bytes.len + 1;
+            const handle_start = mem.alignForward(usize, len_with_null, 4);
+            break :blk handle_start + hash_handles.len * @sizeOf(Handle);
+        } else {
+            break :blk bytes.len + 1;
+        }
+    };
+    if (total_size >= SpecialString.split_point) return error.TooBig;
 
     const string = try self.createHeapString(@intCast(bytes.len), hash_handles);
     const len: Object.StrOrPtr.SmallLength = @intCast(bytes.len);

@@ -123,9 +123,7 @@ export fn Zicl_ListLength(interp: *Interp, list: *Handle) callconv(.c) c_int {
 }
 
 export fn Zicl_ListAppend(interp: *Interp, list: *Handle, item: Handle) callconv(.c) ReturnCode {
-    var wb: Shimmerable = .{ .original = list.* };
-    _ = interp.listAppend(list, item) catch |err| return ReturnCode.fromError(err);
-    list.* = wb.consume();
+    _ = interp.listAppendInPlace(list, item) catch |err| return ReturnCode.fromError(err);
     return .ok;
 }
 
@@ -152,7 +150,7 @@ export fn Zicl_GetLong(interp: *Interp, handle: *Handle, out: *c_long) callconv(
 
 export fn Zicl_GetDouble(interp: *Interp, handle: *Handle, out: *f64) callconv(.c) ReturnCode {
     var wb: Shimmerable = .{ .original = handle.* };
-    out.* = interp.getFloat(handle) catch |err| return ReturnCode.fromError(err);
+    out.* = interp.getFloat(&wb) catch |err| return ReturnCode.fromError(err);
     handle.* = wb.consume();
     return .ok;
 }
@@ -282,7 +280,9 @@ export fn Zicl_SetResultOwning(interp: *Interp, handle: Handle) callconv(.c) voi
 }
 
 export fn Zicl_SetVariable(interp: *Interp, name: *Handle, handle: Handle) callconv(.c) ReturnCode {
-    interp.setVariableTo(name, handle) catch |err| return ReturnCode.fromError(err);
+    var name_wb: Shimmerable = .{ .original = name.* };
+    interp.setVariableTo(&name_wb, handle) catch |err| return ReturnCode.fromError(err);
+    name.* = name_wb.consume();
     return .ok;
 }
 
