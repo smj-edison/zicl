@@ -3165,6 +3165,8 @@ fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(u25
     var found_hashes: std.ArrayList(u256) = .empty;
     errdefer found_hashes.deinit(arena);
 
+    if (bytes.len < hash_and_prepend_len) return found_hashes;
+
     var current_index: usize = 0;
     while (true) {
         if (std.mem.findPos(u8, bytes, current_index, hash_prepend)) |next| {
