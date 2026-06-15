@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const debug = std.debug;
 const testing = std.testing;
 const builtin = @import("builtin");
 const math = std.math;
@@ -20,28 +21,7 @@ const regex = @import("regex.zig");
 const pcre2 = @import("pcre2");
 const objutil = @import("objutil.zig");
 
-pub const special_string_count = 2;
-pub const special_object_count = 2;
-pub const null_object_idx: u32 = 0;
-pub const empty_object_idx: u32 = 1;
-
-pub const HeapSettings = struct {
-    /// Maximum of `1 << heap_order` items.
-    object_heap_order: u6 = 24,
-    /// Maximum of `1 << heap_order` bytes for all strings.
-    string_heap_order: u6 = 28,
-    /// Maximum number of custom types.
-    max_custom_types: usize = 65536,
-    /// Maximum number of evaluating scripts.
-    max_scripts: usize = 65536,
-    /// Maximum number of heaps (not necessarily initialized).
-    max_heaps: usize = 128,
-    /// Parsed script cache size.
-    cache_size: usize = 512,
-};
-const cfg: HeapSettings = .{};
-
-threadlocal var debugging_buffer: [16 * 1024 * 1024]u8 = undefined;
+threadlocal var debugging_buffer: if (options.trace_mem) [16 * 1024 * 1024]u8 else void = undefined;
 threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 threadlocal var debug_gpa: Allocator = undefined;
@@ -54,18 +34,159 @@ pub const GlobalHeapState = struct {
     /// Use to lock `custom_types` or `script_metadata` when adding or removing
     /// (no need to lock when using).
     mutex: std.Io.Mutex = .init,
-    next_open_heap: usize = 0,
     /// Used to turn some panics into useful messages.
     running_leak_check: bool = false,
 };
 
 pub var state: GlobalHeapState = .{};
-pub var global_gpa: std.mem.Allocator = undefined;
+pub var global_gpa: mem.Allocator = undefined;
+pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
-pub var heaps: [cfg.max_heaps]Heap = undefined;
-pub var custom_types: memutil.IndexedMemoryPool(CustomType, options.threading) = undefined;
 pub var nativefn_registry: NativeFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
+
+const ObjectType = struct {
+    duplicate: *const fn (src: Value) error{OutOfMemory}!Value,
+};
+
+fn duplicateNone(src: Value) !Value {
+    const obj = src.asPtr().?;
+
+    comptime assert(@sizeOf(ObjectHead) <= 64);
+    const new = (try global_gpa.alignedAlloc(u8, .of(ObjectHead), 64)).ptr;
+    const as_head: *ObjectHead = @ptrCast(new);
+    as_head.alloc_len = 64;
+
+    try obj.duplicateHead(as_head);
+
+    return Value.fromObject(obj);
+}
+pub const NoneObjectType: ObjectType = .{
+    .duplicate = duplicateNone,
+};
+
+/// Note that this is often cast to `Mutable`, so you can't depend on `original`
+/// and `shimmered` as having the same value. Always use `.current()`. This is
+/// because `Shimmerable` and `Mutable` are more conventions to keep straight
+/// what's allowed to mutate, and what's just allowed to shimmer (a mutation is
+/// considered a shimmer if it has/will generate the same string rep).
+pub const Shimmerable = extern struct {
+    original: Value,
+    shimmered: OptionalValue = .none,
+
+    pub fn deinit(self: *Shimmerable) void {
+        self.original.release();
+        self.shimmered.release();
+        self.* = undefined;
+    }
+
+    pub fn current(self: Shimmerable) Value {
+        return self.shimmered.orElse(self.original);
+    }
+
+    pub fn consume(self: *Shimmerable) Handle {
+        defer self.* = undefined;
+        if (self.shimmered.asValue()) |shimmered| {
+            self.original.release();
+            return shimmered;
+        } else {
+            return self.original;
+        }
+    }
+
+    pub fn discardChanges(self: *Shimmerable) void {
+        self.shimmered.swapWithNone();
+    }
+
+    pub fn takeShimmered(self: *Shimmerable) OptionalHandle {
+        const result = self.shimmered;
+        self.shimmered = .none;
+        return result;
+    }
+
+    /// Be very careful when using `asMutable`, since mutation functions often invalidate
+    /// the original string. Even if the mutation you do is transparent with the object
+    /// model, it may free the original string, thus not being transparent.
+    pub fn asMutable(self: *Shimmerable) *Mutable {
+        return @ptrCast(self);
+    }
+
+    pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
+        if (!self.current().canShimmer()) {
+            self.shimmered.swap(self.current().duplicate());
+        }
+    }
+
+    pub fn prepareToShimmer(self: *Shimmerable) !void {
+        try self.ensureShimmerable();
+        try self.current().prepareToShimmer();
+    }
+
+    pub fn duplicateForMutable(self: *const Shimmerable) !Handle {
+        // Even if `original` or `replacement` can mutate due to ref count = 1,
+        // we've been tasked with making sure this object doesn't mutate, since
+        // the purpose of Shimmer is to ensure that we only ever write back
+        // something that has the same string (or will have the same string
+        // when generated).
+        return try self.current().duplicate();
+    }
+};
+
+pub const Mutable = extern struct {
+    original: Handle,
+    mutated: OptionalHandle = .none,
+
+    pub fn deinit(self: *Mutable) void {
+        self.original.decrRefCount();
+        self.mutated.decrOptional();
+        self.* = undefined;
+    }
+
+    pub fn current(self: *const Mutable) Handle {
+        return self.mutated.orElse(self.original);
+    }
+
+    pub fn consume(self: *Mutable) Handle {
+        if (self.mutated.toHandle()) |mutated| {
+            self.original.decrRefCount();
+            return mutated;
+        } else {
+            return self.original;
+        }
+    }
+
+    pub fn discardChanges(self: *Mutable) void {
+        self.mutated.swapWithNone();
+    }
+
+    pub fn takeMutated(self: *Mutable) OptionalHandle {
+        const result = self.mutated;
+        self.mutated = .none;
+        return result;
+    }
+
+    pub fn getString(self: *const Mutable) ![:0]const u8 {
+        return try self.current().getString();
+    }
+
+    pub fn asShimmerable(self: *Mutable) *Shimmerable {
+        return @ptrCast(self);
+    }
+
+    pub fn prepareToShimmer(self: *Mutable) !void {
+        if (!self.current().canShimmer()) {
+            self.mutated.swap(try Heap.duplicate(self.current()));
+        }
+
+        try self.current().prepareToShimmer();
+    }
+
+    pub fn prepareToMutate(self: *Mutable) !void {
+        if (!self.current().canMutate()) {
+            self.mutated.swap(try Heap.duplicate(self.current()));
+        }
+    }
+};
 
 /// Signature for a lazy native command initializer. The interpreter pointer
 /// is opaque here to avoid a circular dependency on Interp.zig.
@@ -251,34 +372,14 @@ pub const HashRegistry = struct {
     }
 };
 
-const Heap = @This();
-pub threadlocal var local_heap: *Heap = undefined;
-export threadlocal var obj_ptr_for_gdb: [*]Object = undefined;
-
-/// GDB helper that returns an object's existing string representation
-/// without triggering any allocation. Returns null if no string is cached.
-export fn objStringPtrForGdb(object_idx: u32) ?[*:0]const u8 {
-    if (@intFromPtr(obj_ptr_for_gdb) == 0) return null;
-    const handle = local_heap.getHandle(object_idx);
-    if (handle.getStringIfExists()) |str| {
-        return str.ptr;
-    }
-    return null;
-}
-
-const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
-const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
-const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
-
 /// Used to create and destroy extra data.
 extra_data_mutex: std.Io.Mutex,
 /// Used for locking when adding trace info.
 trace_mutex: std.Io.Mutex,
 
-interned_strings: std.EnumArray(InternedString, *Object),
 /// Preallocated fallback used by `[catch]` when a script OOMs and building
 /// the real opts dict also OOMs. Pinned at init; released via `freeOomOptsDict`.
-oom_error_options_dict: ?*Object,
+oom_error_options_dict: ?Value,
 
 parsed_scripts: ParsedScripts,
 parsed_exprs: ParsedExpressions,
@@ -302,65 +403,6 @@ pub const Substitution = struct {
     flags: Tokenizer.SubstFlags,
 };
 const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
-
-pub const InternedString = enum {
-    @"apply lambdaExpr",
-    @"fn",
-    method,
-    impl,
-    scope,
-    @"^parent",
-    name,
-    type,
-    file,
-    line,
-    level,
-    regexp,
-    @"division by zero",
-    // Error handling.
-    NONE,
-    @"ZICL OOM",
-    @"ZICL LOOKUP VARNAME",
-    @"out of memory",
-    @"-code",
-    @"-level",
-    @"-errorstack",
-    @"-errorcode",
-    @"-during",
-    // Signal names, for use in the signal mask list.
-    SIGHUP,
-    SIGINT,
-    SIGQUIT,
-    SIGILL,
-    SIGTRAP,
-    SIGABRT,
-    SIGBUS,
-    SIGFPE,
-    SIGKILL,
-    SIGUSR1,
-    SIGSEGV,
-    SIGUSR2,
-    SIGPIPE,
-    SIGALRM,
-    SIGTERM,
-    SIGCHLD,
-    SIGCONT,
-    SIGSTOP,
-    SIGTSTP,
-    SIGTTIN,
-    SIGTTOU,
-    SIGURG,
-    SIGXCPU,
-    SIGXFSZ,
-    SIGVTALRM,
-    SIGPROF,
-    SIGWINCH,
-    SIGIO,
-    SIGPWR,
-    SIGSYS,
-};
-
-const interned_string_count = std.enums.values(InternedString).len;
 
 /// This is the script object internal representation. It is an array
 /// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
@@ -436,7 +478,7 @@ pub const ParsedScript = struct {
     /// Tokens array.
     tags: std.ArrayList(Tokenizer.Token.Tag),
     /// The associated values for their corresponding tokens.
-    values: []*Object,
+    values: []Value,
 
     pub fn printTokens(script: *const ParsedScript) void {
         const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
@@ -474,20 +516,388 @@ pub const ParsedExpression = struct {
     }
 };
 
-pub const Object = struct {
-    string: ?[]u8,
-    hashes: ?*[]struct {
+const ValueBacking = u64;
+const ValueRep = packed struct(ValueBacking) {
+    pub const Tag = enum(u3) {
+        canonical_nan = 0,
+        none,
+        ptr,
+        int,
+        false,
+        true,
+        interned,
+    };
+
+    /// First 2 bytes of the f64. We store the tag here, as well as
+    /// use `nan_value` to check if this is a tagged NaN, a canonical
+    /// NaN, or a float.
+    pub const Head = packed struct(u16) {
+        tag: Tag,
+        nan_value: u13 = 0xFFF,
+    };
+
+    pub const null_head: Head = .{ .tag = .none };
+
+    value: packed union(u48) {
+        ptr: u48,
+        int: packed struct { data: i32, padding: u16 = 0 },
+        padding: u48,
+        /// Pointer to the interned string, where the string is prefixed with its length.
+        interned: u48,
+    } = .{ .padding = 0 },
+    head: Head,
+};
+
+pub const OptionalValue = enum(ValueBacking) {
+    none = @bitCast(ValueRep.null_head),
+    _,
+
+    pub fn asValue(optional: OptionalValue) ?Value {
+        if (optional != .none) {
+            return @bitCast(@intFromEnum(optional));
+        } else return null;
+    }
+
+    pub fn fromValue(value: ?Value) OptionalValue {
+        if (value) |val| {
+            val.assert(val.asRep().head != ValueRep.null_head);
+            return val.asOptional();
+        } else {
+            return .none;
+        }
+    }
+
+    pub fn borrow(optional: OptionalValue) OptionalValue {
+        if (optional.asValue()) |val| return val.borrow().asOptional();
+        return .none;
+    }
+
+    pub fn release(optional: OptionalValue) void {
+        if (optional.asValue()) |val| val.release();
+    }
+
+    pub fn orElse(optional: OptionalValue, otherwise: Value) Value {
+        return optional.asValue() orelse otherwise;
+    }
+
+    pub fn swap(ref: *OptionalValue, new: Value) void {
+        if (ref.asValue()) |obj| obj.release();
+        ref.* = @enumFromInt(@as(ValueBacking, @bitCast(new)));
+    }
+
+    pub fn swapWithNone(ref: *OptionalValue) void {
+        if (ref.asValue()) |val| val.release();
+        ref.* = .none;
+    }
+};
+
+pub const Value = enum(ValueBacking) {
+    _,
+
+    /// Helper function that dumps the object's trace if the assertion fails.
+    pub fn assert(value: Value, ok: bool) void {
+        if (!ok) {
+            if (options.trace_mem) last_touched = value;
+            unreachable;
+        }
+    }
+
+    pub fn asOptional(value: Value) OptionalValue {
+        return @enumFromInt(@as(ValueBacking, @bitCast(value)));
+    }
+
+    pub fn asRep(value: *Value) *ValueRep {
+        return @ptrCast(value);
+    }
+
+    pub fn isFloat(value: Value) bool {
+        return value.asRep().head.nan_value != 0x0FFF or value.asRep().head.tag == .canonical_nan;
+    }
+
+    pub fn isPrimitive(value: Value) bool {
+        if (value.isFloat()) return true;
+        return value.asRep().head.tag != .ptr;
+    }
+
+    pub fn isPtr(value: Value) bool {
+        return !value.isPrimitive();
+    }
+
+    pub fn asPtr(value: Value) ?*ObjectHead {
+        if (value.isPtr()) return @ptrFromInt(value.asRep().value.ptr);
+        return null;
+    }
+
+    pub fn canShimmer(value: Value) bool {
+        if (value.asPtr()) |obj| {
+            return !obj.metadata.cross_thread;
+        } else {
+            // Primitives can't shimmer.
+            return false;
+        }
+    }
+
+    pub fn canMutate(value: Value) bool {
+        // Note: a crossthread object can _never_ mutate. A lot of asserts around
+        // the codebase assume that `canMutate` means that an object is not crossthread.
+
+        if (value.asPtr()) |obj| {
+            // Cross thread objects can't be mutated, even if the ref count is 1, because
+            // objects can be indirectly accessed by traversing lists. Imagine thread 1
+            // is traversing a list, while thread 2 is modifying the list elements.
+            // Thread 2 sees that the list element only has ref count one (since it's only
+            // owned by the list), so it figures it's safe to modify. Wrong! It's not safe
+            // to modify, because thread 1 is also reading the list. This is why crossthread
+            // objects are never safe to modify, or even shimmer.
+            if (obj.metadata.cross_thread) return false;
+            // If the hash is registered, it means it is considered frozen. We can't very
+            // well mutate something that has a fixed value.
+            if (obj.metadata.hash_registered) return false;
+            if (obj.getRefCount() > 1) return false;
+        } else {
+            // Primitives can't mutate.
+            return false;
+        }
+
+        return true;
+    }
+
+    /// Must be shimmerable.
+    pub fn prepareToShimmer(value: Value) !void {
+        value.assert(value.canShimmer());
+        // Make sure the object has a string rep before we free its body. That is, if
+        // it has a string rep. `.none` objects are brand new, so they obviously don't
+        // have a string rep yet.
+        if (value.tag() != .none) _ = try value.getString();
+        value.invalidateBody();
+
+        value.trace("Prepared to shimmer", .{});
+    }
+
+    pub fn borrow(value: Value) Value {
+        if (value.asPtr()) |obj| {
+            incrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        }
+        return value;
+    }
+
+    pub fn release(value: Value) void {
+        if (value.asPtr()) |obj| {
+            decrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        }
+    }
+
+    pub fn duplicate(value: Value) !Value {
+        if (value.asPtr()) |obj| {
+            return try obj.obj_type.duplicate(value);
+        } else {
+            return value;
+        }
+    }
+
+    pub fn swap(ref: *Value, new: Value) void {
+        const old = ref.*;
+        ref.* = new;
+        old.release();
+    }
+
+    pub fn fromRep(rep: ValueRep) Value {
+        debug.assert(rep.head != ValueRep.null_head);
+        return @enumFromInt(@as(ValueBacking, rep));
+    }
+
+    pub fn fromObject(obj: *ObjectHead) Value {
+        return Value.fromRep(.{
+            .head = .{ .tag = .ptr },
+            .value = .{ .ptr = @intCast(@intFromPtr(obj)) },
+        });
+    }
+};
+
+/// Special strings are strings that have special properties, such as being large,
+/// having a different allocation backing then what's visible, or (in the future)
+/// being memory mapped. This means that they have some more specialized handling,
+/// so this is the structure that encapsulates that behavior.
+pub const SpecialString = struct {
+    /// Special strings are special in that they can have
+    /// extended properties (mmaping is in the plans,
+    /// for example). Since it has special properties,
+    /// we have to track them so it can be freed correctly.
+    pub const Type = union(enum) {
+        normal: [:0]u8,
+        /// If the string was allocated with a different capacity
+        /// than its current reported length, set this field.
+        different_capacity: struct {
+            string: [:0]u8,
+            original_capacity: u64,
+        },
+    };
+    value: Type,
+    /// Length has not been determined if == `maxInt(u64)`.
+    utf8_length: u64 = math.maxInt(u64),
+
+    hashes: ?[]struct {
         str_index: usize,
         value: *?Object,
     },
-    ref_count: u32,
-    flags: packed struct(u8) {
-        crossthread: bool,
+    hash: struct {
+        value: ?u256 = null,
+        // TODO PERF this probably can be done with acquire/release, the mutex is a bit overkill.
+        mutex: std.Io.Mutex = .init,
+    } = .{},
+    ref_count: std.atomic.Value(u32) = 1,
+
+    pub fn deinit(self: *SpecialString) void {
+        switch (self.string_type) {
+            .normal => |string| global_gpa.free(string),
+            .different_capacity => |info| {
+                global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
+            },
+            .temp => {
+                // We don't want to free the string, as it's managed by someone else.
+            },
+        }
+        if (self.hashes) |hashes| {
+            for (hashes) |hash| if (hash.value) |val| val.decrRefCount();
+        }
+
+        global_gpa.destroy(self);
+    }
+
+    pub fn getHash(self: *SpecialString) u256 {
+        self.hash.mutex.lockUncancelable(global_io);
+        defer self.hash.mutex.unlock(global_io);
+
+        if (self.hash.value) |hash| {
+            return hash;
+        } else {
+            const hash = memutil.hashBytes(self.getString());
+            self.hash.value = hash;
+            return hash;
+        }
+    }
+
+    pub fn getUtf8Length(self: *SpecialString) ?u64 {
+        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
+        if (value == std.math.maxInt(u64)) return null else return value;
+    }
+
+    /// Value is `u64`, not `?u64`, since utf8 length should not ever
+    /// change (excluding `LongString` temp strings).
+    pub fn setUtf8Length(self: *SpecialString, value: u64) void {
+        assert(value != std.math.maxInt(u64));
+        @atomicStore(u64, &self.utf8_length, value, .monotonic);
+    }
+
+    pub fn getString(self: *SpecialString) [:0]const u8 {
+        switch (self.string_type) {
+            .normal => |string| return string,
+            .temp => |temp| return temp,
+            .different_capacity => |info| return info.string,
+        }
+    }
+
+    pub fn incrRefCount(self: *SpecialString) void {
+        incrRefCountOf(usize, &self.ref_count, options.threading);
+    }
+
+    pub fn decrRefCount(self: *SpecialString) void {
+        if (decrRefCountOf(usize, &self.ref_count, options.threading) == 0) {
+            self.deinit();
+        }
+    }
+};
+
+pub const empty_string = "";
+
+pub const ObjectHead = struct {
+    pub const String = union(enum) {
+        none,
+        normal: [:0]u8,
+        special: *SpecialString,
+
+        pub fn deinit(string: *String) void {
+            switch (string) {
+                .none => {},
+                .normal => |normal| global_gpa.free(normal),
+                .special => |special| special.decrRefCount(),
+            }
+        }
+    };
+
+    alloc_len: usize,
+    obj_type: *ObjectType,
+    metadata: packed struct(u8) {
+        cross_thread: bool,
         hash_registered: bool,
+        padding: u6 = 0,
     },
+    string: String,
+    ref_count: u32,
+
+    pub fn getRefCount(obj: *ObjectHead) void {
+        if (obj.metadata.cross_thread) {
+            return @atomicLoad(u32, &obj.ref_count, .monotonic);
+        } else {
+            return obj.ref_count;
+        }
+    }
+
+    pub fn invalidateString(obj: *ObjectHead) void {
+        switch (obj.string) {
+            .null => {},
+            .normal => |normal| global_gpa.free(normal),
+            .special => |special| special.decrRefCount(),
+        }
+        obj.string = .null;
+    }
+
+    /// Does not initialize `alloc_len`.
+    pub fn duplicateHead(src: *const ObjectHead, dest: *ObjectHead) error{OutOfMemory}!void {
+        const new_str: ObjectHead.String = switch (src.string) {
+            .none => .none,
+            .normal => |normal| try global_gpa.dupeSentinel(u8, normal, 0),
+            .special => |special| blk: {
+                special.incrRefCount();
+                break :blk special;
+            },
+        };
+
+        dest.obj_type = src.obj_type;
+        dest.metadata = .{
+            .cross_thread = false,
+            .hash_registered = false,
+        };
+        dest.string = new_str;
+        dest.ref_count = 1;
+    }
+};
+
+pub const ListObject = extern struct {
+    head: ObjectHead,
+    body: struct {
+        len: usize,
+    },
+
+    pub fn items(list: *ListObject) []Value {
+        // Items are stored directly after in the same allocation.
+        const item_start = @as([*]u8, list) + @sizeOf(ListObject);
+        return @as([*]Value, @ptrCast(item_start))[0..list.body.len];
+    }
+
+    pub fn shimmer(shim: *Shimmerable) !void {
+        try shim.ensureShimmerable();
+    }
+};
+
+pub const Object = struct {
+    string: ?[]u8,
+
+    ref_count: u32,
+
     body: Body,
 
-    pub fn deinit(obj: *Object) void {
+    pub fn deinit(obj: Value) void {
         obj.deinitBody();
         obj.deinitString();
     }
@@ -595,7 +1005,7 @@ pub const Object = struct {
     }
 };
 
-pub const Tag = enum(u5) {
+pub const TagOld = enum(u5) {
     none,
     /// Set this if an object's contents are no longer usable.
     invalid,
@@ -733,8 +1143,6 @@ comptime {
         assert(std.mem.eql(u8, tag_field.name, body_field.name));
     }
 }
-
-pub const ExtraData = enum(u32) { _ };
 
 /// Extra data, for when you can't store enough in the main object.
 pub const ExtraDataValue = union(enum) {
@@ -916,24 +1324,6 @@ pub const OptionalIndex = enum(HeapIndex) {
 pub const OptionalHandle = enum(HandleBacking) {
     none = 0,
     _,
-
-    pub fn toHandle(optional: OptionalHandle) ?Handle {
-        if (optional != .none) {
-            return @bitCast(@as(HandleBacking, @intFromEnum(optional)));
-        } else return null;
-    }
-
-    pub fn fromHandle(handle: ?Handle) OptionalHandle {
-        if (handle) |val| {
-            return val.toOptional();
-        } else return .none;
-    }
-
-    pub fn getIndex(optional: OptionalHandle) OptionalIndex {
-        if (optional.toHandle()) |val| {
-            return @enumFromInt(val.index);
-        } else return .none;
-    }
 
     pub fn toHandleRef(optional: *OptionalHandle) ?*Handle {
         if (optional.* != .none) {
@@ -1610,16 +2000,6 @@ pub const Handle = packed struct(HandleBacking) {
             defer handle.getHeap().trace_mutex.unlock(global_io);
             const trace_field = &handle.getHeap().objects.items(.trace)[handle.index];
             trace_field.addAddr(@returnAddress(), msg);
-        }
-    }
-
-    /// Helper function that dumps the object's trace if the assertion fails.
-    pub fn assert(handle: Handle, ok: bool) void {
-        if (!ok) {
-            if (options.trace_mem) {
-                last_touched = handle;
-            }
-            unreachable;
         }
     }
 };
@@ -3004,136 +3384,6 @@ fn getLocalStringDetails(heap: *Heap, str_or_ptr: Object.StrOrPtr) StringDetails
         }
     }
 }
-
-/// Special strings are strings that have special properties, such as being large,
-/// having a different allocation backing then what's visible, or (in the future)
-/// being memory mapped. This means that they have some more specialized handling,
-/// so this is the structure that encapsulates that behavior.
-pub const SpecialString = struct {
-    /// At what point should we switch to using a special string?
-    /// Whenever the string length >= `split_point`.
-    pub const split_point = math.maxInt(Object.StrOrPtr.SmallLength);
-    /// This needs to be aligned to 128, due to how pointers are stored in StrOrPtr.
-    pub const align_amt = 128;
-    pub const align_type = std.mem.Alignment.fromByteUnits(align_amt);
-
-    /// Special strings are special in that they can have
-    /// extended properties (mmaping is in the plans,
-    /// for example). Since it has special properties,
-    /// we have to track them so it can be freed correctly.
-    pub const Type = union(enum) {
-        normal: [:0]u8,
-        /// A temporary string has its bytes managed by someone else,
-        /// so when this `LongString` is freed, we won't free the string.
-        temp: [:0]const u8,
-        /// If the string was allocated with a different capacity
-        /// than its current reported length, set this field.
-        different_capacity: struct {
-            string: [:0]u8,
-            original_capacity: u64,
-        },
-    };
-    /// This is contains the handles to the hashes referenced in the string.
-    /// They are in order as appearing in the string, and are not deduplicated.
-    hash_handles: std.ArrayList(OptionalHandle),
-
-    string_type: Type,
-    /// Length has not been determined if == `maxInt(u64)`.
-    utf8_length: u64 = math.maxInt(u64),
-    hash: struct {
-        value: ?u256 = null,
-        // TODO PERF this probably can be done with acquire/release, the mutex is a bit overkill.
-        mutex: std.Io.Mutex = .init,
-    } = .{},
-    ref_count: usize = 1,
-
-    pub fn init(string: SpecialString.Type, hash_handles: []const OptionalHandle) !*align(align_amt) SpecialString {
-        const special_string_backing = try global_gpa.alignedAlloc(SpecialString, SpecialString.align_type, 1);
-        errdefer global_gpa.free(special_string_backing);
-        const special_string = &special_string_backing[0];
-
-        var owned_hash_handles = std.ArrayList(OptionalHandle).empty;
-        errdefer owned_hash_handles.deinit(global_gpa);
-        try owned_hash_handles.appendSlice(global_gpa, hash_handles);
-
-        for (owned_hash_handles.items) |handle| handle.incrOptional();
-        errdefer for (owned_hash_handles.items) |handle| handle.decrOptional();
-
-        special_string.* = .{
-            .string_type = string,
-            .hash_handles = owned_hash_handles,
-        };
-
-        return special_string;
-    }
-
-    pub fn fromInt(int: u58) *align(align_amt) SpecialString {
-        return @ptrFromInt(int << 6);
-    }
-
-    pub fn toInt(ptr: *align(align_amt) SpecialString) u58 {
-        return @intCast(@intFromPtr(ptr) >> 6);
-    }
-
-    pub fn getHash(self: *align(align_amt) SpecialString) u256 {
-        self.hash.mutex.lockUncancelable(global_io);
-        defer self.hash.mutex.unlock(global_io);
-
-        if (self.hash.value) |hash| {
-            return hash;
-        } else {
-            const hash = memutil.hashBytes(self.getString());
-            self.hash.value = hash;
-            return hash;
-        }
-    }
-
-    pub fn getUtf8Length(self: *align(align_amt) SpecialString) ?u64 {
-        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
-        if (value == std.math.maxInt(u64)) return null else return value;
-    }
-
-    /// Value is `u64`, not `?u64`, since utf8 length should not ever
-    /// change (excluding `LongString` temp strings).
-    pub fn setUtf8Length(self: *align(align_amt) SpecialString, value: u64) void {
-        assert(value != std.math.maxInt(u64));
-        @atomicStore(u64, &self.utf8_length, value, .monotonic);
-    }
-
-    pub fn getString(self: *align(align_amt) SpecialString) [:0]const u8 {
-        switch (self.string_type) {
-            .normal => |string| return string,
-            .temp => |temp| return temp,
-            .different_capacity => |info| return info.string,
-        }
-    }
-
-    pub fn incrRefCount(self: *align(align_amt) SpecialString) void {
-        incrRefCountOf(usize, &self.ref_count, options.threading);
-    }
-
-    pub fn decrRefCount(self: *align(align_amt) SpecialString) void {
-        if (decrRefCountOf(usize, &self.ref_count, options.threading) == 0) {
-            self.deinit();
-        }
-    }
-
-    pub fn deinit(self: *align(align_amt) SpecialString) void {
-        switch (self.string_type) {
-            .normal => |string| global_gpa.free(string),
-            .different_capacity => |info| {
-                global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
-            },
-            .temp => {
-                // We don't want to free the string, as it's managed by someone else.
-            },
-        }
-        for (self.hash_handles.items) |handle| handle.decrOptional();
-        self.hash_handles.deinit(global_gpa);
-
-        global_gpa.destroy(self);
-    }
-};
 
 pub fn createExtraData(self: *Heap) !ExtraData {
     // TODO PERF make a fast case where this uses a heap-local list of
