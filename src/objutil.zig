@@ -234,12 +234,12 @@ pub fn getCodepointLength(wb: *Shimmerable) !usize {
     // See if we already calculated the utf8 length.
     switch (wb.current().getStringDetails()) {
         .long => |long_str| {
-            const current_len = long_str.getUtf8Length();
+            const current_len = long_str.getCodepointLen();
             if (current_len) |val| return val;
 
             // String length hasn't been computed yet, so compute now.
             const utf8_length = strutil.codepointLength(long_str.getString());
-            long_str.setUtf8Length(utf8_length); // Cache utf8 length.
+            long_str.setCodepointLen(utf8_length); // Cache utf8 length.
             return utf8_length;
         },
         .normal => {
@@ -300,7 +300,7 @@ pub fn newStringWithCodepointLen(bytes: []const u8, cp_length: usize) !Handle {
 
     switch (handle.getStringDetails()) {
         .long => |long_str| {
-            long_str.setUtf8Length(cp_length);
+            long_str.setCodepointLen(cp_length);
             handle.peek().body = undefined;
         },
         .normal => {
