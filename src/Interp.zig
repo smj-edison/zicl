@@ -7,8 +7,8 @@ const objutil = @import("objutil.zig");
 const memutil = @import("memutil.zig");
 const ioutil = @import("ioutil.zig");
 const Heap = @import("Heap.zig");
-const Handle = Heap.Handle;
-const OptionalHandle = Heap.OptionalHandle;
+const Value = Heap.Value;
+const OptionalValue = Heap.OptionalValue;
 const Shimmerable = objutil.Shimmerable;
 const Mutable = objutil.Mutable;
 const expr_parse = @import("expr_parse.zig");
@@ -70,7 +70,22 @@ pending_error_code: OptionalHandle,
 /// original error in a `-pending` key, inside of the new error.
 pending_error_during: OptionalHandle,
 
+parsed_scripts: ParsedScripts,
+parsed_exprs: ParsedExpressions,
+parsed_closures: ParsedClosures,
+parsed_substs: ParsedSubstitutions,
+
 prng: std.Random.DefaultPrng,
+
+const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
+const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, struct { closure: ClosureObject }, FullHashContext);
+pub const Substitution = struct {
+    subst: ParsedScript,
+    /// Mainly used for integrity checks.
+    flags: Tokenizer.SubstFlags,
+};
+const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
 pub const CommandFn = fn (interp: *Interp, args: []Shimmerable) Error!void;

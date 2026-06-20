@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
 
-const Heap = @import("Heap.zig");
+const heap = @import("heap.zig");
 
 var stdout_mutex: std.Io.Mutex = .init;
 pub var global_stdout_fd: std.atomic.Value(i32) = .init(std.posix.STDOUT_FILENO);

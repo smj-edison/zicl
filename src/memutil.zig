@@ -14,14 +14,6 @@ const options = @import("options");
 const ioutil = @import("ioutil.zig");
 const builtin = @import("builtin");
 
-/// Uses blake3 to make a hash that, in theory, should never
-/// overlap with any other byte string.
-pub fn hashBytes(bytes: []const u8) u256 {
-    var out: [32]u8 = @splat(0);
-    std.crypto.hash.Blake3.hash(bytes, &out, .{});
-    return @bitCast(out);
-}
-
 // These functions are all when appending to the free list (it should have
 // already resized itself)
 fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
@@ -63,68 +55,6 @@ pub const null_allocator: Allocator = .{
         .free = null_free,
     },
 };
-
-pub fn getOrder(count: u32) u5 {
-    return @intCast(math.log2_int_ceil(u32, count));
-}
-
-pub fn getOrderSize(order: u5) u32 {
-    return @as(u32, 1) << order;
-}
-
-pub fn buddyOfOrder(index: u32, order: u5) u32 {
-    return buddyOf(index, getOrderSize(order));
-}
-
-fn buddyOf(index: u32, order_size: u32) u32 {
-    const mask = (order_size * 2) - 1;
-
-    if (index & mask == 0) {
-        return index + order_size;
-    } else {
-        return index - order_size;
-    }
-}
-
-const expectEqual = std.testing.expectEqual;
-const expectError = std.testing.expectError;
-const expectEqualSlices = std.testing.expectEqualSlices;
-
-pub fn vmemMap(byte_count: usize) ![]align(heap.page_size_min) u8 {
-    const mapped = heap.PageAllocator.map(byte_count, .fromByteUnits(heap.page_size_min)) orelse return error.OutOfMemory;
-
-    return @alignCast(mapped[0..byte_count]);
-}
-
-pub fn vmemUnmap(memory: []align(heap.page_size_min) u8) void {
-    heap.PageAllocator.unmap(memory);
-}
-
-pub fn vmemMapItems(comptime T: type, count: usize) ![]align(heap.page_size_min) T {
-    const byte_count = @sizeOf(T) * count;
-    const mapped = heap.PageAllocator.map(byte_count, .fromByteUnits(@alignOf(T))) orelse return error.OutOfMemory;
-    const items: [*]T = @ptrCast(@alignCast(mapped));
-
-    return @alignCast(items[0..count]);
-}
-
-pub fn vmemUnmapItems(comptime T: type, items: []align(heap.page_size_min) T) void {
-    const byte_count = items.len * @sizeOf(T);
-    const bytes: [*]align(heap.page_size_min) u8 = @ptrCast(items.ptr);
-    heap.PageAllocator.unmap(bytes[0..byte_count]);
-}
-
-test "virtual memory" {
-    var array = try vmemMap(5);
-    array[0] = 5;
-    array[1] = 10;
-    vmemUnmap(array);
-
-    array = try vmemMap(1 << 32);
-    array[1 << 20] = 5;
-    array[1 << 30] = 10;
-    vmemUnmap(array);
-}
 
 /// Note, this will hand out allocations that potentially alias. Really only useful for debugging.
 pub const RingBufferAllocator = struct {
@@ -206,7 +136,7 @@ pub const RingBufferAllocator = struct {
     }
 };
 
-pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
+pub fn IndexedMemoryPool(comptime Item: type) type {
     // Heavily inspired by std.heap.MemoryPool
 
     return struct {
@@ -228,29 +158,14 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
         /// Capacity must be > 0
         pub fn initWithCapacity(gpa: Allocator, capacity: usize) !Self {
             if (capacity == 0) @panic("Capacity must be larger than 0");
-
-            if (use_vmem) {
-                return .{
-                    .items = try vmemMapItems(Item, capacity),
-                };
-            } else {
-                return .{
-                    .items = try gpa.alloc(Item, capacity),
-                };
-            }
+            return .{ .items = try gpa.alloc(Item, capacity) };
         }
 
         pub fn create(self: *Self, gpa: Allocator) !usize {
             // Resize/realloc if needed
             const new_size = @max(self.items.len, 4) * 2;
             if (self.len >= self.items.len) {
-                if (use_vmem) {
-                    return error.OutOfMemory;
-                } else if (gpa.resize(self.items, new_size)) {
-                    self.items.len = new_size;
-                } else {
-                    self.items = try gpa.realloc(self.items, new_size);
-                }
+                self.items = try gpa.realloc(self.items, new_size);
             }
 
             return self.createAssumeCapacity();
@@ -296,11 +211,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
         }
 
         pub fn deinit(self: *Self, gpa: Allocator) void {
-            if (use_vmem) {
-                vmemUnmapItems(Item, @alignCast(self.items));
-            } else {
-                gpa.free(self.items);
-            }
+            gpa.free(self.items);
         }
 
         /// For debugging purposes only. Dumps everything that was leaked.

@@ -11,14 +11,9 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
 const options = @import("options");
-const ioutil = @import("ioutil.zig");
-const strutil = @import("strutil.zig");
 const memutil = @import("memutil.zig");
-const StringAllocator = @import("StringAllocator.zig");
-const Tokenizer = @import("Tokenizer.zig");
-const expr_parse = @import("expr_parse.zig");
-const regex = @import("regex.zig");
-const pcre2 = @import("pcre2");
+const ioutil = @import("ioutil.zig");
+const objects = @import("objects.zig");
 const objutil = @import("objutil.zig");
 
 threadlocal var debugging_buffer: if (options.trace_mem) [16 * 1024 * 1024]u8 else void = undefined;
@@ -26,147 +21,29 @@ threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocato
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 threadlocal var debug_gpa: Allocator = undefined;
 
-pub const GlobalHeapState = struct {
-    initialized: bool = false,
-    /// Use to lock `custom_types` or `script_metadata` when adding or removing
-    /// (no need to lock when using).
-    mutex: std.Io.Mutex = .init,
-    /// Used to turn some panics into useful messages.
-    running_leak_check: bool = false,
-};
+pub var initialized: bool = false;
+/// Use to lock `custom_types` or `script_metadata` when adding or removing
+/// (no need to lock when using).
+pub var init_mutex: std.Io.Mutex = .init;
+/// Used to turn some panics into useful messages.
+pub var running_leak_check: bool = false;
 
-pub var state: GlobalHeapState = .{};
 pub var global_gpa: mem.Allocator = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var nativefn_registry: NativeFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
 
-const ObjectType = struct {
-    duplicate: ?*const fn (src: *const ObjectHead) error{OutOfMemory}!*ObjectHead,
+var trace_mutex: std.Io.Mutex = .init;
+/// Preallocated fallback used by `[catch]` when a script OOMs and building
+/// the real opts dict also OOMs. Pinned at init, released via `freeOomOptsDict`.
+var oom_error_options_dict: ?Value = null;
+
+pub const ObjectType = struct {
+    duplicate: ?*const fn (src: *const ObjectHead, min_size: usize) error{OutOfMemory}!*ObjectHead,
     free_internal_rep: ?*const fn (obj: *ObjectHead) void,
     update_string: ?*const fn (obj: *ObjectHead) error{ OutOfMemory, OtherThreadSet }!void,
     name: [:0]const u8,
-};
-
-/// Note that this is often cast to `Mutable`, so you can't depend on `original`
-/// and `shimmered` as having the same value. Always use `.current()`. This is
-/// because `Shimmerable` and `Mutable` are more conventions to keep straight
-/// what's allowed to mutate, and what's just allowed to shimmer (a mutation is
-/// considered a shimmer if it has/will generate the same string rep).
-pub const Shimmerable = extern struct {
-    original: Value,
-    shimmered: OptionalValue = .none,
-
-    pub fn deinit(self: *Shimmerable) void {
-        self.original.release();
-        self.shimmered.release();
-        self.* = undefined;
-    }
-
-    pub fn current(self: Shimmerable) Value {
-        return self.shimmered.orElse(self.original);
-    }
-
-    pub fn consume(self: *Shimmerable) Value {
-        defer self.* = undefined;
-        if (self.shimmered.asValue()) |shimmered| {
-            self.original.release();
-            return shimmered;
-        } else {
-            return self.original;
-        }
-    }
-
-    pub fn discardChanges(self: *Shimmerable) void {
-        self.shimmered.swapWithNone();
-    }
-
-    pub fn takeShimmered(self: *Shimmerable) OptionalValue {
-        const shimmered = self.shimmered;
-        self.shimmered = .none;
-        return shimmered;
-    }
-
-    /// Be very careful when using `asMutable`, since mutation functions often invalidate
-    /// the original string. Even if the mutation you do is transparent with the object
-    /// model, it may free the original string, thus not being transparent.
-    pub fn asMutable(self: *Shimmerable) *Mutable {
-        return @ptrCast(self);
-    }
-
-    pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
-        if (!self.current().canShimmer()) {
-            self.shimmered.swap(self.current().duplicate());
-        }
-    }
-
-    pub fn prepareToShimmer(self: *Shimmerable) !void {
-        try self.ensureShimmerable();
-        try self.current().prepareToShimmer();
-    }
-
-    pub fn duplicateForMutable(self: *const Shimmerable) !Value {
-        // Even if `original` or `replacement` can mutate due to ref count = 1,
-        // we've been tasked with making sure this object doesn't mutate, since
-        // the purpose of `Shimmer` is to ensure that we only ever write back
-        // something that has the same string (or will have the same string
-        // when generated).
-        return try self.current().duplicate();
-    }
-};
-
-pub const Mutable = extern struct {
-    original: Value,
-    mutated: OptionalValue = .none,
-
-    pub fn deinit(self: *Mutable) void {
-        self.original.release();
-        self.mutated.release();
-        self.* = undefined;
-    }
-
-    pub fn current(self: *const Mutable) Value {
-        return self.mutated.orElse(self.original);
-    }
-
-    pub fn consume(self: *Mutable) Value {
-        defer self.* = undefined;
-        if (self.mutated.asValue()) |mutated| {
-            self.original.release();
-            return mutated;
-        } else {
-            return self.original;
-        }
-    }
-
-    pub fn discardChanges(self: *Mutable) void {
-        self.mutated.swapWithNone();
-    }
-
-    pub fn takeMutated(self: *Mutable) OptionalValue {
-        const mutated = self.mutated;
-        self.mutated = .none;
-        return mutated;
-    }
-
-    pub fn asShimmerable(self: *Mutable) *Shimmerable {
-        return @ptrCast(self);
-    }
-
-    pub fn prepareToShimmer(self: *Mutable) !void {
-        if (!self.current().canShimmer()) {
-            self.mutated.swap(try self.current().duplicate());
-        }
-
-        try self.current().prepareToShimmer();
-    }
-
-    pub fn prepareToMutate(self: *Mutable) !void {
-        if (!self.current().canMutate()) {
-            self.mutated.swap(try self.current().duplicate());
-        }
-    }
 };
 
 /// Signature for a lazy native command initializer. The interpreter pointer
@@ -349,150 +226,6 @@ pub const HashRegistry = struct {
     }
 };
 
-/// Used to create and destroy extra data.
-extra_data_mutex: std.Io.Mutex,
-/// Used for locking when adding trace info.
-trace_mutex: std.Io.Mutex,
-
-/// Preallocated fallback used by `[catch]` when a script OOMs and building
-/// the real opts dict also OOMs. Pinned at init; released via `freeOomOptsDict`.
-oom_error_options_dict: ?Value,
-
-parsed_scripts: ParsedScripts,
-parsed_exprs: ParsedExpressions,
-parsed_closures: ParsedClosures,
-parsed_substs: ParsedSubstitutions,
-
-const FullHashContext = struct {
-    pub fn hash(_: @This(), full_hash: u256) u64 {
-        return @truncate(full_hash);
-    }
-    pub fn eql(_: @This(), a: u256, b: u256) bool {
-        return a == b;
-    }
-};
-const ParsedScripts = memutil.LruCache(u256, struct { script: ParsedScript }, FullHashContext);
-const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, struct { closure: ClosureObject }, FullHashContext);
-pub const Substitution = struct {
-    subst: ParsedScript,
-    /// Mainly used for integrity checks.
-    flags: Tokenizer.SubstFlags,
-};
-const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
-
-/// This is the script object internal representation. It is an array
-/// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
-///
-/// For example the script:
-///
-/// puts hello
-/// set $i $x$y [foo]BAR
-///
-/// will produce a ParsedScript with the following token/object pairs:
-///
-/// | .start_of_command  | 2     |
-/// | .simple_string     | puts  |
-/// | .simple_string     | hello |
-/// | .start_of_command  | 4     |
-/// | .simple_string     | set   |
-/// | .variable_subst    | i     |
-/// | .start_of_word     | 2     |
-/// | .variable_subst    | x     |
-/// | .variable_subst    | y     |
-/// | .start_of_word     | 2     |
-/// | .command_subst     | foo   |
-/// | .simple_string     | BAR   |
-///
-/// "puts hello" has two args (.start_of_command 2), composed of single tokens.
-/// (Note that the .start_of_command token is omitted for the common case of a
-/// single token.)
-///
-/// "set $i $x$y [foo]BAR" has four (.start_of_command 4) args, the first word
-/// has 1 token (.simple_string set), and the last has two tokens
-/// (.start_of_word 2 .command_subst foo .simple_string BAR)
-///
-/// The precomputation of the command structure makes eval() faster,
-/// and simpler because there aren't dynamic lengths / allocations.
-///
-/// -- {*} handling --
-///
-/// Expand is handled in a special way.
-///
-///   If a "word" begins with {*}, the corrisponding object type is ".none".
-///
-/// For example the command:
-///
-/// list {*}{a b}
-///
-/// Will produce the following pairs:
-///
-/// | .start_of_command | 2     |
-/// | .simple_string | list  |
-/// | .start_of_word | .none |
-/// | .braced_string | a b   |
-///
-/// Note that the '.start_of_command' token also contains the source information
-/// for the first word of the line for error reporting purposes
-///
-/// -- the substFlags field of the structure --
-///
-/// The `scriptObj` structure is used to represent both "script" objects
-/// and "subst" objects. In the second case, there are no `LIN` and `WRD`
-/// tokens. Instead `SEP` and `EOL` tokens are added as-is.
-/// In addition, the field `substFlags` is used to represent the flags used to turn
-/// the string into the internal representation.
-/// If these flags do not match what the application requires,
-/// the scriptObj is created again. For example the script:
-///
-/// subst -nocommands $string
-/// subst -novariables $string
-///
-/// Will (re)create the internal representation of the $string object
-/// two times.
-///
-pub const ParsedScript = struct {
-    /// Tokens array.
-    tags: std.ArrayList(Tokenizer.Token.Tag),
-    /// The associated values for their corresponding tokens.
-    values: []Value,
-
-    pub fn printTokens(script: *const ParsedScript) void {
-        const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
-
-        var line: u64 = 0;
-        for (script.tags.items, objutil.listItems(script.values), 0..) |token, value, i| {
-            switch (token) {
-                .start_of_command => {
-                    line = value.body.parsed_script_command.line;
-                    ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.parsed_script_command });
-                },
-                .start_of_word => ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
-                else => {
-                    const item = objutil.listItem(script.values, @intCast(i));
-                    const str = item.getString() catch "<oom string>";
-                    ioutil.debug(formatting ++ "{s}\n", .{ i, line, @tagName(token), str });
-                },
-            }
-        }
-    }
-
-    pub fn deinit(parsed: *ParsedScript) void {
-        parsed.tags.deinit(global_gpa);
-        for (parsed.values) |value| value.decrRefCount();
-    }
-};
-
-pub const ParsedExpression = struct {
-    root_node: expr_parse.Node.Index,
-    nodes: std.MultiArrayList(expr_parse.Node),
-
-    pub fn deinit(expr: *ParsedExpression) void {
-        expr_parse.deinitNodes(global_gpa, &expr.nodes);
-        expr.* = undefined;
-    }
-};
-
 const ValueBacking = u64;
 const ValueRep = packed struct(ValueBacking) {
     pub const Tag = enum(u3) {
@@ -581,6 +314,10 @@ pub const Value = enum(ValueBacking) {
         }
     }
 
+    pub fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
+        if (value.asPtr()) |val| val.trace(fmt, args);
+    }
+
     pub fn asOptional(value: Value) OptionalValue {
         return @enumFromInt(@as(ValueBacking, @bitCast(value)));
     }
@@ -608,9 +345,24 @@ pub const Value = enum(ValueBacking) {
         return null;
     }
 
-    pub fn canShimmer(value: Value) bool {
+    pub fn tag(value: Value) ValueRep.Tag {
+        debug.assert(!value.isFloat());
+        return value.asRep().head.tag;
+    }
+
+    pub fn asInt(value: Value) ?i32 {
+        if (value.tag() == .int) return value.asRep().value.int.data;
+        return null;
+    }
+
+    pub fn asFloat(value: Value) ?f64 {
+        if (value.isFloat()) return @bitCast(value);
+        return null;
+    }
+
+    pub fn canShimmer(value: Value, new_size: usize) bool {
         if (value.asPtr()) |obj| {
-            return !obj.metadata.cross_thread;
+            return !obj.metadata.cross_thread and new_size <= obj.alloc_size;
         } else {
             // Primitives can't shimmer.
             return false;
@@ -643,13 +395,13 @@ pub const Value = enum(ValueBacking) {
     }
 
     /// Must be shimmerable.
-    pub fn prepareToShimmer(value: Value) !void {
-        value.assert(value.canShimmer());
+    pub fn prepareToShimmer(value: Value, new_size: usize) !void {
+        value.assert(value.canShimmer(new_size));
         // Make sure the object has a string rep before we free its body. That is, if
         // it has a string rep. `.none` objects are brand new, so they obviously don't
         // have a string rep yet.
         if (value.tag() != .none) _ = try value.getString();
-        value.invalidateBody();
+        if (value.asPtr()) |val| val.invalidateInternalRep();
 
         value.trace("Prepared to shimmer", .{});
     }
@@ -666,12 +418,66 @@ pub const Value = enum(ValueBacking) {
     pub fn duplicate(value: Value) !Value {
         if (value.asPtr()) |obj| {
             if (obj.obj_type.duplicate) |duplicate_fn| {
-                return try duplicate_fn(value);
+                const new_obj = try duplicate_fn(obj);
+                return Value.fromObjectPtr(new_obj);
             } else {
                 debug.panic("Could not duplicate {}", .{obj.obj_type.name});
             }
         } else {
             return value;
+        }
+    }
+
+    /// Must not be a packed pointer.
+    pub fn box(value: Value) !*ObjectHead {
+        if (value.asFloat()) |float_value| {
+            const obj = try objects.BoxedFloatObject.new(float_value);
+            return &obj.head;
+        }
+
+        switch (value.tag()) {
+            .canonical_nan => unreachable,
+            .none => unreachable, // .none is the null value, which is impossible for a `Value` to contain.
+            .ptr => unreachable,
+            .int => {
+                const obj = try objects.BoxedIntObject.new(value.asInt().?);
+                return &obj.head;
+            },
+            .false => {
+                const obj = try ObjectHead.newObject(objects.StringObject);
+                errdefer obj.head.freeBacking();
+                try obj.head.setStringLocalObject("false");
+                return &obj.head;
+            },
+            .true => {
+                const obj = try ObjectHead.newObject(objects.StringObject);
+                errdefer obj.head.freeBacking();
+                try obj.head.setStringLocalObject("true");
+                return &obj.head;
+            },
+            .interned => {
+                const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
+                const len_ptr = bytes_ptr - @sizeOf(usize);
+                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
+                const bytes = bytes_ptr[0..len :0];
+
+                const obj = try ObjectHead.newObject(objects.StringObject);
+                errdefer obj.head.freeBacking();
+                try obj.head.setStringLocalObject(bytes);
+                return &obj.head;
+            },
+        }
+    }
+
+    pub fn duplicateBoxed(value: Value) !*ObjectHead {
+        if (value.asPtr()) |obj| {
+            if (obj.obj_type.duplicate) |duplicate_fn| {
+                return try duplicate_fn(obj);
+            } else {
+                debug.panic("Could not duplicate {}", .{obj.obj_type.name});
+            }
+        } else {
+            return try value.box();
         }
     }
 
@@ -708,9 +514,10 @@ pub const Value = enum(ValueBacking) {
             .true => return "true",
             .interned => {
                 // Length of interned string is stored right before.
-                const bytes = @as([*]u8, @ptrFromInt(value.asRep().value.interned)) - @sizeOf(usize);
-                const len = mem.readInt(usize, bytes, .native);
-                return bytes[0..len :0];
+                const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
+                const len_ptr = bytes_ptr - @sizeOf(usize);
+                const len = mem.readInt(usize, len_ptr, .native);
+                return bytes_ptr[0..len :0];
             },
         }
     }
@@ -737,7 +544,7 @@ pub const Value = enum(ValueBacking) {
 
         // We don't save the hash when it's a primitive, since
         // it should be pretty cheap to compute it again.
-        return memutil.hashBytes(try value.getString());
+        return hashutil.hashBytes(try value.getString());
     }
 };
 
@@ -773,7 +580,7 @@ pub const SpecialString = struct {
     ref_count: std.atomic.Value(u32) = 1,
 
     pub fn deinit(self: *SpecialString) void {
-        switch (self.string_type) {
+        switch (self.value) {
             .normal => |string| global_gpa.free(string),
             .different_capacity => |info| {
                 global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
@@ -794,7 +601,7 @@ pub const SpecialString = struct {
             return hash.*;
         } else {
             const hash_alloc = try global_gpa.create(u256);
-            hash_alloc.* = memutil.hashBytes(self.getString());
+            hash_alloc.* = hashutil.hashBytes(self.getString());
             if (self.hash.cmpxchgStrong(null, hash_alloc, .release, .acquire)) |other_won| {
                 global_gpa.destroy(hash_alloc);
                 return other_won.?;
@@ -873,24 +680,36 @@ pub const ObjectHead = extern struct {
     string_metadata: std.atomic.Value(StringMetadata),
     metadata: Metadata,
 
-    alloc_len: usize,
     obj_type: *ObjectType,
     ref_count: u32,
 
-    pub const min_object_size = 64;
+    trace_values: ioutil.ConfigurableTrace(30, 16, options.trace_mem),
+
+    pub const object_size = 64 + @sizeOf(@FieldType(ObjectHead, "trace_values"));
     comptime {
-        assert(@sizeOf(ObjectHead) <= min_object_size);
+        assert(@sizeOf(ObjectHead) < object_size);
+    }
+
+    pub fn trace(obj: *ObjectHead, comptime fmt: []const u8, args: anytype) void {
+        if (options.trace_mem) {
+            // We need to create the message before locking the mutex, since `allocPrint` may
+            // call `getString`, which in turn traces setting the string.
+            const msg = std.fmt.allocPrint(debug_gpa, "\n" ++ fmt, args) catch unreachable;
+
+            trace_mutex.lockUncancelable(global_io);
+            defer trace_mutex.unlock(global_io);
+            obj.trace_values.addAddr(@returnAddress(), msg);
+        }
     }
 
     pub fn newObjectUninitialized(T: type) !*T {
         comptime assert(@bitOffsetOf(T, "head") == 0);
         comptime assert(@FieldType(T, "head") == ObjectHead);
+        comptime assert(@sizeOf(T) <= object_size);
 
-        const size = @max(T, ObjectHead.min_object_size);
-        const bytes = try global_gpa.alignedAlloc(u8, .of(ObjectHead), size);
+        const bytes = try global_gpa.alignedAlloc(u8, .of(ObjectHead), object_size);
         const obj: *ObjectHead = @ptrCast(bytes.ptr);
-        obj.alloc_len = size;
-        obj.obj_type = &NoneObject.Type;
+        obj.obj_type = &objects.NoneObject.Type;
         obj.ref_count = 1;
 
         return @ptrCast(bytes.ptr);
@@ -907,7 +726,7 @@ pub const ObjectHead = extern struct {
     }
 
     pub fn freeBacking(obj: *ObjectHead) void {
-        global_gpa.free(@as([*]u8, obj)[0..obj.alloc_len]);
+        global_gpa.free(@as([*]u8, obj)[0..obj.alloc_size]);
         obj.* = undefined;
     }
 
@@ -971,7 +790,7 @@ pub const ObjectHead = extern struct {
     }
 
     pub fn setString(obj: *ObjectHead, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
-        const hashes = try scanAndResolveHashRefs(global_gpa, bytes);
+        const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
         for (hashes) |hash| if (hash.value) |val| val.incrRefCount();
         errdefer for (hashes) |hash| if (hash.value) |val| val.release();
@@ -1025,7 +844,7 @@ pub const ObjectHead = extern struct {
         };
     }
 
-    pub fn getRefCount(obj: *ObjectHead) void {
+    pub fn getRefCount(obj: *ObjectHead) u32 {
         if (obj.metadata.cross_thread) {
             return @atomicLoad(u32, &obj.ref_count, .monotonic);
         } else {
@@ -1080,13 +899,13 @@ pub const ObjectHead = extern struct {
             },
         }
 
-        if (obj.obj_type == &SourceObject.Type) {
+        if (obj.obj_type == &objects.SourceObject.Type) {
             // If it's a source object, it may contain a cached hash.
-            const as_source: *SourceObject = @ptrCast(obj);
+            const as_source: *objects.SourceObject = @ptrCast(obj);
             if (as_source.hash.load(.monotonic)) |hash| {
                 return hash.*;
             } else {
-                const hash = memutil.hashBytes(try obj.getString());
+                const hash = hashutil.hashBytes(try obj.getString());
                 const hash_ptr = try global_gpa.create(u256);
                 hash_ptr.* = hash;
                 if (as_source.hash.cmpxchgStrong(null, hash_ptr, .release, .acquire)) |other_set| {
@@ -1131,7 +950,7 @@ pub const ObjectHead = extern struct {
                     .len = math.maxInt(u16),
                 };
             },
-            .none => .none,
+            .none => {},
         }
 
         dest.ref_count = 1;
@@ -1141,524 +960,87 @@ pub const ObjectHead = extern struct {
     pub fn duplicateStringOnly(src: *const ObjectHead) error{OutOfMemory}!*ObjectHead {
         // Downgrade the duplicate to a non-specialized string.
         assert(std.meta.activeTag(src.getStringDetails()) != .none);
-        const new_obj = try ObjectHead.newObject(NoneObject);
-        errdefer new_obj.head.deinit();
-        try src.duplicateHeadOnto(new_obj);
-        return &new_obj.head;
-    }
-};
-
-pub const NoneObject = extern struct {
-    head: ObjectHead,
-
-    pub fn new(bytes: [:0]const u8) !*NoneObject {
-        const new_obj = try ObjectHead.newObjectUninitialized(NoneObject);
-        errdefer new_obj.head.freeBacking();
-        try new_obj.head.setStringLocalObject(bytes);
-        errdefer new_obj.head.invalidateString();
-
-        return new_obj;
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
-        .free_internal_rep = null,
-        .update_string = null,
-        .name = "none",
-    };
-};
-
-pub const StringObject = extern struct {
-    head: ObjectHead,
-    codepoint_length: std.atomic.Value(usize) = .init(math.maxInt(usize)),
-
-    pub fn new(bytes: [:0]const u8) !*StringObject {
-        const new_obj = try ObjectHead.newObjectUninitialized(StringObject);
-        errdefer new_obj.head.freeBacking();
-        try new_obj.head.setStringLocalObject(bytes);
-        errdefer new_obj.head.invalidateString();
-
-        return new_obj;
-    }
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        assert(std.meta.activeTag(src.getStringDetails()) != .none);
-        const new_obj = try ObjectHead.newObjectUninitialized(StringObject);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(&new_obj.head);
-        errdefer new_obj.head.invalidateString();
-
-        const as_string: *StringObject = @ptrCast(src);
-        new_obj.codepoint_length = .init(as_string.codepoint_length.load(.monotonic));
-
-        return &new_obj.head;
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-        .update_string = null,
-        .name = "string",
-    };
-};
-
-pub const SourceObject = extern struct {
-    head: ObjectHead,
-    file_name: OptionalValue,
-    line: u32,
-    hash: std.atomic.Value(?*u256),
-
-    pub fn new(file_name: OptionalValue, line: u32) !*SourceObject {
-        const new_obj = try ObjectHead.newObject(SourceObject);
-        new_obj.file_name = file_name.borrow();
-        new_obj.line = line;
-
-        return new_obj;
-    }
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(SourceObject);
+        const new_obj = try ObjectHead.newObjectUninitialized(objects.NoneObject);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj);
-        errdefer new_obj.head.invalidateString();
-
-        const as_source_obj: *SourceObject = @ptrCast(src);
-        new_obj.file_name = as_source_obj.file_name.borrow();
-        new_obj.line = as_source_obj.line;
-
         return &new_obj.head;
     }
-
-    pub fn freeInternalRep(obj: *ObjectHead) void {
-        const as_source: *SourceObject = @ptrCast(obj);
-        as_source.file_name.release();
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-        .name = "source",
-    };
 };
 
-pub const Closure = struct {
-    /// Value for the argument list of the procedure.
-    args: Value,
-    /// Value for the script's body.
-    body: Value,
-    /// We do our best to track the closure's name.
-    name: OptionalValue,
-    /// Hash reference pointing to the scope.
-    scope_hash_ref: OptionalValue,
-    /// Required number of arguments.
-    required_arity: u32,
-    /// Optional number of arguments.
-    optional_arity: u32,
-    /// Default values of optional arguments, if any.
-    optional_values: OptionalValue,
-    /// Whether `args` is provided as an argument name. `args`, if present, is always
-    /// the last argument name.
-    has_args_parameter: bool,
-    /// Whether this is a method. If so, `self` is injected as the first variable at call time.
-    is_method: bool,
-    /// Unique identifier for cache keying.
-    cache_id: u64,
+pub const hashutil = struct {
+    pub const hash_prepend = "blake3~";
+    pub const hash_chars = std.base64.url_safe_alphabet_chars;
+    pub const hash_encoder = std.base64.Base64Encoder.init(hash_chars, null);
+    pub const hash_decoder = std.base64.Base64Decoder.init(hash_chars, null);
+    pub const hash_len = hash_encoder.calcSize(32);
+    pub const hash_and_prepend_len = hash_prepend.len + hash_len;
+    pub const HashInstance = struct { index: usize, hash: u256 };
 
-    pub fn borrow(closure: Closure) Closure {
-        return .{
-            .args = closure.args.borrow(),
-            .body = closure.body.borrow(),
-            .name = closure.name.borrow(),
-            .scope_hash_ref = closure.scope_hash_ref.borrow(),
-            .required_arity = closure.required_arity,
-            .optional_arity = closure.optional_arity,
-            .optional_values = closure.optional_values.borrow(),
-            .has_args_parameter = closure.has_args_parameter,
-            .is_method = closure.is_method,
-            .cache_id = closure.cache_id,
-        };
+    /// Uses blake3 to make a hash that, in theory, should never
+    /// overlap with any other byte string.
+    pub fn hashBytes(bytes: []const u8) u256 {
+        var out: [32]u8 = @splat(0);
+        std.crypto.hash.Blake3.hash(bytes, &out, .{});
+        return @bitCast(out);
     }
 
-    pub fn deinit(closure: Closure) void {
-        closure.args.release();
-        closure.body.release();
-        closure.name.release();
-        closure.scope_hash_ref.release();
-        closure.optional_values.release();
-    }
-};
+    pub fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(HashInstance) {
+        var found_hashes: std.ArrayList(HashInstance) = .empty;
+        errdefer found_hashes.deinit(arena);
 
-pub const ClosureObject = extern struct {
-    head: ObjectHead,
-    closure: Closure,
+        if (bytes.len < hash_and_prepend_len) return found_hashes;
 
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(ClosureObject);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj);
-        errdefer new_obj.head.invalidateString();
+        var current_index: usize = 0;
+        while (true) {
+            if (std.mem.findPos(u8, bytes, current_index, hash_prepend)) |next| {
+                if (bytes.len - next >= hash_and_prepend_len) {
+                    var output: [32]u8 = undefined;
+                    hash_decoder.decode(&output, bytes[(next + hash_prepend.len)..][0..hash_len]) catch {
+                        current_index = next + hash_and_prepend_len;
+                        continue;
+                    };
 
-        const as_closure: *ClosureObject = @ptrCast(src);
-
-        errdefer comptime unreachable;
-        new_obj.closure = as_closure.closure.borrow();
-
-        return &new_obj.head;
-    }
-
-    fn freeInternalRep(src: *ObjectHead) void {
-        const as_closure: *ClosureObject = @ptrCast(src);
-        as_closure.closure.deinit();
-    }
-
-    fn updateString(_: *ObjectHead) !void {
-        @panic("FIXME: generate closure from parts (see old code)");
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = freeInternalRep,
-        .update_string = updateString,
-        .name = "closure",
-    };
-};
-
-pub const UpvarLinkObject = extern struct {
-    head: ObjectHead,
-    /// An object containing the name of the variable in the linked
-    /// scope. Whenever someone shimmers this to a variable, they should
-    /// always do it in `call_frame`.
-    linked_name: Value,
-    /// The call frame the linked variable lives in.
-    call_frame: u32,
-
-    fn freeInternalRep(src: *ObjectHead) void {
-        const as_upvar: *UpvarLinkObject = @ptrCast(src);
-        as_upvar.linked_name.release();
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = null,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-    };
-};
-
-/// `dict_name` points  to an object that contains the name of the dictionary
-/// (and most likely specializes to whatever type of variable caching is necessary),
-/// while `dict_path` points to a list containing all parts of the path. For
-/// example, `foo::bar::baz` would turn into roughly
-/// ```
-/// dict_name: foo
-/// dict_path: {bar baz}
-/// ```
-pub const DictSugarObject = extern struct {
-    head: ObjectHead,
-    dict_name: Value,
-    dict_path: Value,
-
-    fn freeInternalRep(src: *ObjectHead) void {
-        const as_dict_sugar: *DictSugarObject = @ptrCast(src);
-        as_dict_sugar.dict_name.release();
-        as_dict_sugar.dict_path.release();
-    }
-
-    pub const Type: ObjectType = .{
-        .name = "dict_sugar",
-        .duplicate = ObjectHead.duplicateStringOnly,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-    };
-};
-
-pub const HashReferenceObject = extern struct {
-    head: ObjectHead,
-    /// This is of type `*ObjectType` instead of `Value`, because a
-    /// hash reference can only ever point to a heap `Object`.
-    ref: *ObjectHead,
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(HashReferenceObject);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(&new_obj.head);
-        errdefer new_obj.head.invalidateString();
-
-        const as_hash_ref: *HashReferenceObject = @ptrCast(src);
-        new_obj.ref = as_hash_ref.ref.borrow();
-
-        return new_obj;
-    }
-
-    fn freeInternalRep(obj: *ObjectHead) void {
-        const as_hash_ref: *HashReferenceObject = @ptrCast(obj);
-        as_hash_ref.ref.release();
-    }
-
-    fn updateString(obj: *ObjectHead) !void {
-        const as_hash_ref: *HashReferenceObject = @ptrCast(obj);
-        const target_hash = try as_hash_ref.ref.getHash();
-        var encoded: [hash_and_prepend_len]u8 = undefined;
-        _ = hash_encoder.encode(encoded[hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
-        @memcpy(encoded[0..hash_prepend.len], hash_prepend);
-        return try global_gpa.dupeSentinel(u8, &encoded, 0);
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .update_string = updateString,
-        .free_internal_rep = freeInternalRep,
-        .name = "hash_reference",
-    };
-};
-
-pub const RegexpObject = extern struct {
-    head: ObjectHead,
-    regexp: *pcre2.pcre2_code_8,
-
-    fn freeInternalRep(obj: *ObjectHead) void {
-        const as_regexp: *RegexpObject = @ptrCast(obj);
-        pcre2.pcre2_code_free_8(as_regexp.regexp);
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = freeInternalRep,
-        .name = "regexp",
-    };
-};
-
-pub const IndexObject = extern struct {
-    head: ObjectHead,
-    index: i64,
-    is_relative: bool,
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObjectUninitialized(IndexObject);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(&new_obj.head);
-
-        const as_index: *IndexObject = @ptrCast(src);
-        new_obj.index = as_index.index;
-        new_obj.is_relative = as_index.is_relative;
-
-        return &as_index.head;
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-    };
-};
-
-pub const BoxedFloatObject = extern struct {
-    head: ObjectHead,
-    value: f64,
-
-    fn updateString(obj: *ObjectHead) !void {
-        const as_float: *BoxedFloatObject = @ptrCast(obj);
-        const bytes = try std.fmt.allocPrintSentinel(global_gpa, "{}", .{as_float.value}, 0);
-        obj.setString(bytes);
-    }
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(BoxedFloatObject);
-        errdefer new_obj.head.deinit();
-        try src.duplicateHeadOnto(&new_obj.head);
-
-        const as_float: *BoxedFloatObject = @ptrCast(src);
-        new_obj.value = as_float.value;
-
-        return &new_obj.head;
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-        .update_string = updateString,
-        .name = "boxed_float",
-    };
-};
-
-pub const BoxedIntObject = extern struct {
-    head: ObjectHead,
-    value: i64,
-
-    fn updateString(obj: *ObjectHead) !void {
-        const as_float: *BoxedIntObject = @ptrCast(obj);
-        const bytes = try std.fmt.allocPrintSentinel(global_gpa, "{}", .{as_float.value}, 0);
-        obj.setString(bytes);
-    }
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(BoxedIntObject);
-        errdefer new_obj.head.deinit();
-        try src.duplicateHeadOnto(&new_obj.head);
-
-        const as_int: *BoxedIntObject = @ptrCast(src);
-        new_obj.value = as_int.value;
-
-        return &new_obj.head;
-    }
-
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-        .update_string = updateString,
-        .name = "boxed_int",
-    };
-};
-
-pub const CachedLocalVarObject = extern struct {
-    head: ObjectHead,
-    ref: *const Value,
-    call_epoch: u64,
-
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = null,
-        .name = "cached_local_var",
-    };
-};
-
-pub const CachedLexicalVarObject = extern struct {
-    head: ObjectHead,
-    ref: *const Value,
-    call_epoch: u64,
-
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = null,
-        .name = "cached_lexical_var",
-    };
-};
-
-pub const ParsedScriptCommandObject = extern struct {
-    head: ObjectHead,
-    line: u32,
-    word_count: u32,
-
-    pub const Type: ObjectType = .{
-        .duplicate = null,
-        .update_string = null,
-        .free_internal_rep = null,
-        .name = "parsed_script_command",
-    };
-};
-
-pub const ListObject = extern struct {
-    head: ObjectHead,
-    len: usize,
-
-    fn getLayout(len: usize) struct { alloc_size: usize } {
-        const capacity = math.ceilPowerOfTwo(usize, len) catch return error.OutOfMemory;
-        const total_size = @sizeOf(ListObject) + @sizeOf(Value) * capacity;
-        return .{ .alloc_size = total_size };
-    }
-
-    pub fn getItems(list: *ListObject) []Value {
-        // Items are stored directly after in the same allocation.
-        const item_start = @as([*]u8, list) + @sizeOf(ListObject);
-        return @as([*]Value, @ptrCast(item_start))[0..list.len];
-    }
-
-    pub fn new(items: []Value) !*ListObject {
-        const layout = getLayout(items.len);
-        const bytes = try global_gpa.alignedAlloc(u8, .of(ObjectHead), layout);
-
-        const as_list: *ListObject = @ptrCast(bytes.ptr);
-        as_list.len = items.len;
-
-        for (items, as_list.getItems()) |to_add, *list_item| {
-            list_item.* = to_add.borrow();
+                    try found_hashes.append(arena, .{ .index = current_index, .hash = @bitCast(output) });
+                    current_index = next + hash_and_prepend_len;
+                } else break;
+            } else break;
         }
 
-        return as_list;
+        return found_hashes;
     }
 
-    fn updateString(obj: *ObjectHead) !void {
-        const as_list: *ListObject = @ptrCast(obj);
-        const items = as_list.getItems();
+    /// Parse a string that is exactly a single hash reference.
+    /// The string must start with `blake3^` at position 0, followed by a valid
+    /// base64-encoded 32-byte hash.
+    pub fn parseHashReference(bytes: []const u8) ?u256 {
+        if (!std.mem.startsWith(u8, bytes, hash_prepend)) return null;
+        if (bytes.len != hash_and_prepend_len) return null;
 
-        // We need to calculate the quoting type for each item. This
-        // will also let us calculate the upper bound of the string's
-        // length.
-        var fallback = std.heap.stackFallback(64, global_gpa);
-        var quoting_types = try fallback.get().alloc(strutil.QuotingType, items.len);
-        defer fallback.get().free(quoting_types);
+        var output: [32]u8 = undefined;
+        hash_decoder.decode(&output, bytes[hash_prepend.len..]) catch return null;
+        return @bitCast(output);
+    }
 
-        var upper_bound_len: usize = 0;
-        for (0.., items, quoting_types) |i, item, *quote_type| {
-            const item_bytes = try item.getString();
+    pub fn scanAndResolveHashRefs(arena: Allocator, bytes: []const u8) error{OutOfMemory}![]SpecialString.HashAndInfo {
+        var found_hashes = try scanStringForHashRefs(arena, bytes);
+        defer found_hashes.deinit(arena);
 
-            quote_type.* = strutil.calculateNeededQuotingType(item_bytes);
-            if (i == 0 and quote_type.* == .bare and item_bytes.len > 0 and item_bytes[0] == '#') {
-                // Make sure the first element has # escaped in braces, instead of
-                // being bare. This way a list isn't accidentally interpreted as
-                // a comment.
-                quoting_types[i] = .brace;
-            }
+        // Look up all the found hashes.
+        var resolved_hashes: []SpecialString.HashAndInfo = try arena.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
+        {
+            registered_hashes.rw_lock.lockSharedUncancelable(global_io);
+            defer registered_hashes.rw_lock.unlockShared(global_io);
 
-            upper_bound_len += strutil.quoteSize(quote_type.*, item_bytes.len);
-            upper_bound_len += 1; // Space between each element.
-        }
-
-        // Step 2: actually create said string.
-        var unfinished_str = try global_gpa.alloc(u8, upper_bound_len + 1);
-        errdefer global_gpa.free(unfinished_str);
-        var written: usize = 0;
-
-        for (0.., items, quoting_types) |i, item, quote_type| {
-            const item_bytes = try item.getString();
-            written += strutil.quoteString(
-                quote_type,
-                item_bytes,
-                unfinished_str[written..],
-                i == 0,
-            );
-
-            // Add a space to separate the elements (except at the end of the list).
-            if (i + 1 < items.len) {
-                unfinished_str[written] = ' ';
-                written += 1;
+            for (found_hashes.items, &resolved_hashes) |found_hash, *resolved_hash| {
+                if (registered_hashes.entries.get(found_hash)) |resolved| {
+                    resolved_hash.* = resolved.representative;
+                } else {
+                    resolved_hash.* = null;
+                }
             }
         }
 
-        // Slap a nul on the end.
-        unfinished_str[written] = 0x00;
-
-        // We actually need to realloc, because `allocator.free` needs the
-        // original slice length (and we don't track the original slice
-        // length, only the accessible length). TODO PERF might be worth
-        // creating a long string if this string is long enough.
-        const finished_str = try global_gpa.realloc(unfinished_str, written + 1);
-        try obj.setString(finished_str[0..written :0]);
-    }
-};
-
-pub const DictObject = extern struct {
-    head: ObjectHead,
-    table: ?std.HashMapUnmanaged(Value, *Value, struct {
-        pub fn hash(_: @This(), key: Value) u64 {
-            key.getHashNoRegister() catch unreachable;
-        }
-        pub fn eql(_: @This(), a: Value, b: Value) bool {
-            return areValuesEqual(a, b) catch unreachable;
-        }
-    }, 80),
-    len: usize,
-
-    pub fn items(list: *ListObject) []Value {
-        // Items are stored directly after in the same allocation.
-        const item_start = @as([*]u8, list) + @sizeOf(ListObject);
-        return @as([*]Value, @ptrCast(item_start))[0..list.len];
-    }
-
-    pub fn shimmer(shim: *Shimmerable) !void {
-        try shim.ensureShimmerable();
+        return resolved_hashes;
     }
 };
 
