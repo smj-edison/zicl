@@ -1,5 +1,6 @@
 const std = @import("std");
 const math = std.math;
+const testing = std.testing;
 const assert = std.debug.assert;
 
 const pcre2 = @import("pcre2");
@@ -10,10 +11,9 @@ const heap = @import("heap.zig");
 const hashutil = heap.hashutil;
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
-const ObjectHead = heap.ObjectHead;
-const ObjectType = heap.ObjectType;
+const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
-const expr_parse = @import("expr_parse.zig");
+// const expr_parse = @import("expr_parse.zig");
 
 /// Note that this is often cast to `Mutable`, so you can't depend on `original`
 /// and `shimmered` as having the same value. Always use `.current()`. This is
@@ -61,15 +61,23 @@ pub const Shimmerable = extern struct {
         return @ptrCast(self);
     }
 
-    pub fn ensureShimmerable(self: *Shimmerable, new_size: usize) error{OutOfMemory}!void {
-        if (!self.current().canShimmer(new_size)) {
+    pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
+        if (!self.current().canShimmer()) {
             self.shimmered.swap(self.current().duplicate());
         }
     }
 
-    pub fn prepareToShimmer(self: *Shimmerable, new_size: usize) !void {
-        try self.ensureShimmerable(new_size);
-        try self.current().prepareToShimmer(new_size);
+    pub fn prepareToShimmer(self: *Shimmerable) !*Object {
+        if (self.current().isPrimitive()) {
+            self.shimmered.swap(try self.current().box());
+        } else {
+            try self.ensureShimmerable();
+        }
+
+        try self.current().prepareToShimmer();
+
+        // We know that this must be a boxed object.
+        return self.current().asPtr().?;
     }
 
     pub fn duplicateForMutable(self: *const Shimmerable) !Value {
@@ -135,60 +143,90 @@ pub const Mutable = extern struct {
     }
 };
 
-pub const NoneObject = extern struct {
-    head: ObjectHead,
-
+pub const NoneObject = struct {
     pub fn new(bytes: [:0]const u8) !*NoneObject {
-        const new_obj = try ObjectHead.newObject(NoneObject);
-        errdefer new_obj.head.deinit();
-        try new_obj.head.setStringLocalObject(bytes);
+        const new_obj = try Object.newObjectUninitialized(NoneObject);
+        errdefer new_obj.head.freeBacking();
+        const duped = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
+        errdefer heap.global_gpa.free(duped);
+        try new_obj.head.setStringLocalObject(duped);
 
-        return new_obj;
+        return new_obj.body;
     }
 
-    pub const Type: heap.ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
+    fn duplicate(src: *const Object) !*Object {
+        assert(std.meta.activeTag(src.getStringDetails()) != .none);
+
+        const new_obj = try Object.newObjectUninitialized(NoneObject);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+        return new_obj.head;
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .make_crossthread = null,
         .free_internal_rep = null,
         .update_string = null,
         .name = "none",
     };
 };
 
-pub const StringObject = extern struct {
-    head: ObjectHead,
+pub const StringObject = struct {
     codepoint_length: std.atomic.Value(usize) = .init(math.maxInt(usize)),
 
     pub fn new(bytes: [:0]const u8) !*StringObject {
-        const new_obj = try ObjectHead.newObject(StringObject, null);
-        errdefer new_obj.head.deinit();
-        try new_obj.head.setStringLocalObject(bytes);
+        const new_obj = try Object.newObjectUninitialized(StringObject);
+        errdefer new_obj.head.freeBacking();
+        const duped = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
+        errdefer heap.global_gpa.free(duped);
+        try new_obj.head.setStringLocalObject(duped);
 
-        return new_obj;
+        return new_obj.body;
     }
 
-    fn duplicate(src: *const ObjectHead, min_size: usize) !*ObjectHead {
-        assert(std.meta.activeTag(src.getStringDetails()) != .none);
-        const new_obj = try ObjectHead.newObjectUninitialized(StringObject, min_size);
+    pub fn asHead(self: *StringObject) *Object {
+        return Object.from(StringObject, self);
+    }
+
+    fn duplicate(src: *const Object) !*Object {
+        assert(src.getStringDetails() != .none);
+        const new_obj = try Object.newObjectUninitialized(StringObject);
         errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(&new_obj.head);
+        try src.duplicateHeadOnto(new_obj.head);
 
-        const as_string: *StringObject = @ptrCast(src);
-        new_obj.codepoint_length = .init(as_string.codepoint_length.load(.monotonic));
+        new_obj.body.codepoint_length = .init(src.castToConst(StringObject).codepoint_length.load(.monotonic));
 
-        return &new_obj.head;
+        return new_obj.head;
     }
 
     pub fn shimmer(shim: *Shimmerable) !void {
-        try shim.prepareToShimmer();
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        obj.castTo(StringObject).* = .{};
     }
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = null,
+        .make_crossthread = null,
         .name = "string",
     };
 };
+
+fn testString(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    const obj = (try StringObject.new("hello")).asHead();
+    defer obj.release();
+    try testing.expectEqualStrings("hello", try obj.getString());
+}
+
+test "object test string" {
+    try testing.checkAllAllocationFailures(testing.allocator, testString, .{});
+}
 
 /// This is the script object internal representation. It is an array
 /// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
@@ -295,52 +333,56 @@ pub const ParsedScript = struct {
     }
 };
 
-pub const ParsedExpression = struct {
-    root_node: expr_parse.Node.Index,
-    nodes: std.MultiArrayList(expr_parse.Node),
+// pub const ParsedExpression = struct {
+//     root_node: expr_parse.Node.Index,
+//     nodes: std.MultiArrayList(expr_parse.Node),
+//
+//     pub fn deinit(expr: *ParsedExpression) void {
+//         expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
+//         expr.* = undefined;
+//     }
+// };
 
-    pub fn deinit(expr: *ParsedExpression) void {
-        expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
-        expr.* = undefined;
-    }
-};
-
-pub const SourceObject = extern struct {
-    head: ObjectHead,
+pub const SourceObject = struct {
     file_name: OptionalValue,
     line: u32,
     hash: std.atomic.Value(?*u256),
 
     pub fn new(file_name: OptionalValue, line: u32) !*SourceObject {
-        const new_obj = try ObjectHead.newObject(SourceObject);
-        new_obj.file_name = file_name.borrow();
-        new_obj.line = line;
+        const new_obj = try Object.newObject(SourceObject);
+        new_obj.body.file_name = file_name.borrow();
+        new_obj.body.line = line;
 
-        return new_obj;
+        return new_obj.body;
     }
 
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(SourceObject);
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObjectUninitialized(SourceObject);
         errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj);
-        errdefer new_obj.head.invalidateString();
+        try src.duplicateHeadOnto(new_obj.head);
 
-        const as_source_obj: *SourceObject = @ptrCast(src);
-        new_obj.file_name = as_source_obj.file_name.borrow();
-        new_obj.line = as_source_obj.line;
+        const cast_src = src.castToConst(SourceObject);
+        new_obj.body.file_name = cast_src.file_name.borrow();
+        new_obj.body.line = cast_src.line;
 
-        return &new_obj.head;
+        return new_obj.head;
     }
 
-    pub fn freeInternalRep(obj: *ObjectHead) void {
-        const as_source: *SourceObject = @ptrCast(obj);
+    fn freeInternalRep(obj: *Object) void {
+        const as_source = obj.castTo(SourceObject);
         as_source.file_name.release();
+        if (as_source.hash.load(.monotonic)) |hash_ptr| heap.global_gpa.destroy(hash_ptr);
     }
 
-    pub const Type: ObjectType = .{
+    fn makeCrossthread(obj: *Object) void {
+        obj.castTo(SourceObject).file_name.makeCrossthread();
+    }
+
+    pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
+        .make_crossthread = makeCrossthread,
         .name = "source",
     };
 };
@@ -392,43 +434,40 @@ pub const Closure = struct {
     }
 };
 
-pub const ClosureObject = extern struct {
-    head: ObjectHead,
-    closure: Closure,
+pub const ClosureObject = struct {
+    closure: *Closure,
 
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(ClosureObject);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj);
-        errdefer new_obj.head.invalidateString();
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.duplicateStringOnly(src);
+        errdefer new_obj.deinit();
 
-        const as_closure: *ClosureObject = @ptrCast(src);
+        const new_closure = try heap.global_gpa.create(Closure);
+        new_obj.vtable = &vtable;
+        new_closure.* = src.castToConst(ClosureObject).closure.borrow();
 
-        errdefer comptime unreachable;
-        new_obj.closure = as_closure.closure.borrow();
-
-        return &new_obj.head;
+        return new_obj;
     }
 
-    fn freeInternalRep(src: *ObjectHead) void {
-        const as_closure: *ClosureObject = @ptrCast(src);
+    fn freeInternalRep(src: *Object) void {
+        const as_closure = src.castTo(ClosureObject);
         as_closure.closure.deinit();
+        heap.global_gpa.destroy(as_closure.closure);
     }
 
-    fn updateString(_: *ObjectHead) !void {
+    fn updateString(_: *Object) !void {
         @panic("FIXME: generate closure from parts (see old code)");
     }
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
+        .make_crossthread = null,
         .name = "closure",
     };
 };
 
-pub const UpvarLinkObject = extern struct {
-    head: ObjectHead,
+pub const UpvarLinkObject = struct {
     /// An object containing the name of the variable in the linked
     /// scope. Whenever someone shimmers this to a variable, they should
     /// always do it in `call_frame`.
@@ -436,15 +475,16 @@ pub const UpvarLinkObject = extern struct {
     /// The call frame the linked variable lives in.
     call_frame: u32,
 
-    fn freeInternalRep(src: *ObjectHead) void {
-        const as_upvar: *UpvarLinkObject = @ptrCast(src);
-        as_upvar.linked_name.release();
+    fn freeInternalRep(src: *Object) void {
+        src.castTo(UpvarLinkObject).linked_name.release();
     }
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = null,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
+        .make_crossthread = null,
+        .name = "upvar_link",
     };
 };
 
@@ -456,50 +496,49 @@ pub const UpvarLinkObject = extern struct {
 /// dict_name: foo
 /// dict_path: {bar baz}
 /// ```
-pub const DictSugarObject = extern struct {
-    head: ObjectHead,
+pub const DictSugarObject = struct {
     dict_name: Value,
     dict_path: Value,
 
-    fn freeInternalRep(src: *ObjectHead) void {
-        const as_dict_sugar: *DictSugarObject = @ptrCast(src);
+    fn freeInternalRep(src: *Object) void {
+        const as_dict_sugar = src.castTo(DictSugarObject);
         as_dict_sugar.dict_name.release();
         as_dict_sugar.dict_path.release();
     }
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .name = "dict_sugar",
-        .duplicate = ObjectHead.duplicateStringOnly,
+        .duplicate = Object.duplicateStringOnly,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
+        .make_crossthread = null,
     };
 };
 
-pub const HashReferenceObject = extern struct {
-    head: ObjectHead,
+pub const HashReferenceObject = struct {
     /// This is of type `*ObjectType` instead of `Value`, because a
     /// hash reference can only ever point to a heap `Object`.
-    ref: *ObjectHead,
+    ref: *Object,
 
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(HashReferenceObject);
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObject(HashReferenceObject);
         errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(&new_obj.head);
+        try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        const as_hash_ref: *HashReferenceObject = @ptrCast(src);
-        new_obj.ref = as_hash_ref.ref.borrow();
+        const as_hash_ref = src.castToConst(HashReferenceObject);
+        new_obj.body.ref = as_hash_ref.ref.borrow();
 
-        return new_obj;
+        return new_obj.head;
     }
 
-    fn freeInternalRep(obj: *ObjectHead) void {
-        const as_hash_ref: *HashReferenceObject = @ptrCast(obj);
+    fn freeInternalRep(obj: *Object) void {
+        const as_hash_ref = obj.castTo(HashReferenceObject);
         as_hash_ref.ref.release();
     }
 
-    fn updateString(obj: *ObjectHead) !void {
-        const as_hash_ref: *HashReferenceObject = @ptrCast(obj);
+    fn updateString(obj: *Object) !void {
+        const as_hash_ref = obj.castTo(HashReferenceObject);
         const target_hash = try as_hash_ref.ref.getHash();
         var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
         _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
@@ -511,275 +550,408 @@ pub const HashReferenceObject = extern struct {
         };
     }
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .update_string = updateString,
         .free_internal_rep = freeInternalRep,
+        .make_crossthread = null,
         .name = "hash_reference",
     };
 };
 
-pub const RegexpObject = extern struct {
-    head: ObjectHead,
+pub const RegexpObject = struct {
     regexp: *pcre2.pcre2_code_8,
 
-    fn freeInternalRep(obj: *ObjectHead) void {
-        const as_regexp: *RegexpObject = @ptrCast(obj);
+    fn freeInternalRep(obj: *Object) void {
+        const as_regexp = obj.castTo(RegexpObject);
         pcre2.pcre2_code_free_8(as_regexp.regexp);
     }
 
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
+    pub const vtable: Object.VTable = .{
+        .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = freeInternalRep,
+        .make_crossthread = null,
         .name = "regexp",
     };
 };
 
-pub const IndexObject = extern struct {
-    head: ObjectHead,
+pub const IndexObject = struct {
     index: i64,
     is_relative: bool,
 
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObjectUninitialized(IndexObject);
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObjectUninitialized(IndexObject);
         errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(&new_obj.head);
+        try src.duplicateHeadOnto(new_obj.head);
 
-        const as_index: *IndexObject = @ptrCast(src);
-        new_obj.index = as_index.index;
-        new_obj.is_relative = as_index.is_relative;
+        const as_index = src.castToConst(IndexObject);
+        new_obj.body.index = as_index.index;
+        new_obj.body.is_relative = as_index.is_relative;
 
-        return &as_index.head;
+        return new_obj.head;
     }
 
-    pub const Type: ObjectType = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-    };
-};
-
-pub const BoxedFloatObject = extern struct {
-    head: ObjectHead,
-    value: f64,
-
-    pub fn new(value: f64) !*BoxedFloatObject {
-        const new_obj = try ObjectHead.newObject(BoxedFloatObject);
-        new_obj.value = value;
-        return new_obj;
+    fn updateString(obj: *Object) !void {
+        const as_index = obj.castTo(IndexObject);
+        const bytes = if (as_index.is_relative)
+            try std.fmt.allocPrintSentinel(heap.global_gpa, "end{s}{d}", .{ if (as_index.index >= 0) "+" else "", as_index.index }, 0)
+        else
+            try std.fmt.allocPrintSentinel(heap.global_gpa, "{d}", .{as_index.index}, 0);
+        try obj.setStringConsuming(bytes);
     }
 
-    fn updateString(obj: *ObjectHead) !void {
-        const as_float: *BoxedFloatObject = @ptrCast(obj);
-        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_float.value}, 0);
-        obj.setString(bytes);
-    }
-
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(BoxedFloatObject);
-        errdefer new_obj.head.deinit();
-        try src.duplicateHeadOnto(&new_obj.head);
-
-        const as_float: *BoxedFloatObject = @ptrCast(src);
-        new_obj.value = as_float.value;
-
-        return &new_obj.head;
-    }
-
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
+        .make_crossthread = null,
+        .name = "index",
+    };
+};
+
+pub const BoxedFloatObject = struct {
+    value: f64,
+
+    pub fn new(value: f64) !*BoxedFloatObject {
+        const new_obj = try Object.newObject(BoxedFloatObject);
+        new_obj.body.value = value;
+        return new_obj.body;
+    }
+
+    fn updateString(obj: *Object) !void {
+        const as_float = obj.castTo(BoxedFloatObject);
+        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_float.value}, 0);
+        try obj.setStringConsuming(bytes);
+    }
+
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObject(BoxedFloatObject);
+        errdefer new_obj.head.deinit();
+        try src.duplicateHeadOnto(new_obj.head);
+
+        const as_float = src.castToConst(BoxedFloatObject);
+        new_obj.body.value = as_float.value;
+
+        return new_obj.head;
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .free_internal_rep = null,
+        .update_string = updateString,
+        .make_crossthread = null,
         .name = "boxed_float",
     };
 };
 
-pub const BoxedIntObject = extern struct {
-    head: ObjectHead,
+pub const BoxedIntObject = struct {
     value: i64,
 
     pub fn new(value: i64) !*BoxedIntObject {
-        const new_obj = try ObjectHead.newObject(BoxedIntObject);
-        new_obj.value = value;
-        return new_obj;
+        const new_obj = try Object.newObject(BoxedIntObject);
+        new_obj.body.value = value;
+        return new_obj.body;
     }
 
-    fn updateString(obj: *ObjectHead) !void {
-        const as_int: *BoxedIntObject = @ptrCast(obj);
-        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_int.value}, 0);
-        obj.setString(bytes);
+    fn updateString(obj: *Object) !void {
+        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{obj.castTo(BoxedIntObject).value}, 0);
+        try obj.setStringConsuming(bytes);
     }
 
-    fn duplicate(src: *const ObjectHead) !*ObjectHead {
-        const new_obj = try ObjectHead.newObject(BoxedIntObject);
-        errdefer new_obj.head.deinit();
-        try src.duplicateHeadOnto(&new_obj.head);
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObjectUninitialized(BoxedIntObject);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
 
-        const as_int: *BoxedIntObject = @ptrCast(src);
-        new_obj.value = as_int.value;
+        new_obj.body.value = src.castToConst(BoxedIntObject).value;
 
-        return &new_obj.head;
+        return new_obj.head;
     }
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
+        .make_crossthread = null,
         .name = "boxed_int",
     };
 };
 
-pub const CachedLocalVarObject = extern struct {
-    head: ObjectHead,
+pub const BoxedBooleanObject = struct {
+    value: bool,
+
+    pub fn new(value: bool) !*BoxedBooleanObject {
+        const new_obj = try Object.newObject(BoxedBooleanObject);
+        new_obj.body.value = value;
+        return new_obj.body;
+    }
+
+    fn updateString(obj: *Object) !void {
+        const bytes = if (obj.castTo(BoxedBooleanObject).value)
+            try heap.global_gpa.dupeSentinel(u8, "true", 0)
+        else
+            try heap.global_gpa.dupeSentinel(u8, "false", 0);
+        try obj.setStringConsuming(bytes);
+    }
+
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObjectUninitialized(BoxedBooleanObject);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+
+        new_obj.body.value = src.castToConst(BoxedBooleanObject).value;
+
+        return new_obj.head;
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .free_internal_rep = null,
+        .update_string = updateString,
+        .make_crossthread = null,
+        .name = "boxed_boolean",
+    };
+};
+
+pub const CachedLocalVarObject = struct {
     ref: *const Value,
     call_epoch: u64,
 
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
+    pub const vtable: Object.VTable = .{
+        .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = null,
+        .make_crossthread = null,
         .name = "cached_local_var",
     };
 };
 
-pub const CachedLexicalVarObject = extern struct {
-    head: ObjectHead,
+pub const CachedLexicalVarObject = struct {
     ref: *const Value,
     call_epoch: u64,
 
-    pub const Type: ObjectType = .{
-        .duplicate = ObjectHead.duplicateStringOnly,
+    pub const vtable: Object.VTable = .{
+        .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = null,
+        .make_crossthread = null,
         .name = "cached_lexical_var",
     };
 };
 
-pub const ParsedScriptCommandObject = extern struct {
-    head: ObjectHead,
+pub const ParsedScriptCommandObject = struct {
     line: u32,
     word_count: u32,
 
-    pub const Type: ObjectType = .{
+    pub const vtable: Object.VTable = .{
         .duplicate = null,
         .update_string = null,
         .free_internal_rep = null,
+        .make_crossthread = null,
         .name = "parsed_script_command",
     };
 
-    pub fn castFrom(obj: *ObjectHead) *ParsedScriptCommandObject {
-        assert(obj.obj_type == &Type);
+    pub fn castFrom(obj: *Object) *ParsedScriptCommandObject {
+        assert(obj.vtable == &vtable);
         return @ptrCast(obj);
     }
 };
 
-pub const ListObject = extern struct {
-    head: ObjectHead,
-    len: usize,
+fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
+    var fallback = std.heap.stackFallback(64, gpa);
+    var quoting_types = try fallback.get().alloc(strutil.QuotingType, items.len);
+    defer fallback.get().free(quoting_types);
 
-    fn getLayout(len: usize) struct { alloc_size: usize } {
-        const capacity = math.ceilPowerOfTwo(usize, len) catch return error.OutOfMemory;
-        const total_size = @sizeOf(ListObject) + @sizeOf(Value) * capacity;
-        return .{ .alloc_size = total_size };
+    var upper_bound_len: usize = 0;
+    for (0.., items, quoting_types) |i, item, *quote_type| {
+        const item_bytes = try item.getString();
+
+        quote_type.* = strutil.calculateNeededQuotingType(item_bytes);
+        if (i == 0 and quote_type.* == .bare and item_bytes.len > 0 and item_bytes[0] == '#') {
+            // Make sure the first element has # escaped in braces, instead of
+            // being bare. This way a list isn't accidentally interpreted as
+            // a comment.
+            quoting_types[i] = .brace;
+        }
+
+        upper_bound_len += strutil.quoteSize(quote_type.*, item_bytes.len);
+        upper_bound_len += 1; // Space between each element.
     }
 
-    pub fn getItems(list: *ListObject) []Value {
-        // Items are stored directly after in the same allocation.
-        const item_start = @as([*]u8, list) + @sizeOf(ListObject);
-        return @as([*]Value, @ptrCast(item_start))[0..list.len];
+    var unfinished_str = try gpa.alloc(u8, upper_bound_len + 1);
+    errdefer gpa.free(unfinished_str);
+    var written: usize = 0;
+
+    for (0.., items, quoting_types) |i, item, quote_type| {
+        const item_bytes = try item.getString();
+        written += strutil.quoteString(
+            quote_type,
+            item_bytes,
+            unfinished_str[written..],
+            i == 0,
+        );
+
+        if (i + 1 < items.len) {
+            unfinished_str[written] = ' ';
+            written += 1;
+        }
+    }
+
+    // Slap a nul on the end.
+    unfinished_str[written] = 0x00;
+
+    // We actually need to realloc, because `allocator.free` needs the
+    // original slice length (and we don't track the original slice
+    // length, only the accessible length). TODO PERF might be worth
+    // creating a long string if this string is long enough.
+    const finished_str = try gpa.realloc(unfinished_str, written + 1);
+    return finished_str[0..written :0];
+}
+
+pub const ListObject = struct {
+    items: []Value,
+    capacity: usize,
+
+    fn getCapacity(len: usize) error{OutOfMemory}!usize {
+        return math.ceilPowerOfTwo(usize, len) catch error.OutOfMemory;
     }
 
     pub fn new(items: []Value) !*ListObject {
-        const layout = getLayout(items.len);
-        const new_list = try ObjectHead.newObject(ListObject, layout.alloc_size);
-        new_list.len = items.len;
+        const capacity = try getCapacity(items.len);
+        const new_list = try Object.newObject(ListObject);
+        errdefer new_list.head.freeBacking();
 
-        for (items, new_list.getItems()) |to_add, *list_item| {
-            list_item.* = to_add.borrow();
+        const new_items = try heap.global_gpa.alloc(Value, capacity);
+        for (items, new_items[0..items.len]) |item, *new_item| {
+            new_item.* = item.borrow();
         }
+        new_list.body.items = new_items[0..items.len];
+        new_list.body.capacity = capacity;
 
-        return new_list;
+        return new_list.body;
     }
 
-    fn updateString(obj: *ObjectHead) !void {
-        const as_list: *ListObject = @ptrCast(obj);
-        const items = as_list.getItems();
-
-        // We need to calculate the quoting type for each item. This
-        // will also let us calculate the upper bound of the string's
-        // length.
-        var fallback = std.heap.stackFallback(64, heap.global_gpa);
-        var quoting_types = try fallback.get().alloc(strutil.QuotingType, items.len);
-        defer fallback.get().free(quoting_types);
-
-        var upper_bound_len: usize = 0;
-        for (0.., items, quoting_types) |i, item, *quote_type| {
-            const item_bytes = try item.getString();
-
-            quote_type.* = strutil.calculateNeededQuotingType(item_bytes);
-            if (i == 0 and quote_type.* == .bare and item_bytes.len > 0 and item_bytes[0] == '#') {
-                // Make sure the first element has # escaped in braces, instead of
-                // being bare. This way a list isn't accidentally interpreted as
-                // a comment.
-                quoting_types[i] = .brace;
-            }
-
-            upper_bound_len += strutil.quoteSize(quote_type.*, item_bytes.len);
-            upper_bound_len += 1; // Space between each element.
-        }
-
-        // Step 2: actually create said string.
-        var unfinished_str = try heap.global_gpa.alloc(u8, upper_bound_len + 1);
-        errdefer heap.global_gpa.free(unfinished_str);
-        var written: usize = 0;
-
-        for (0.., items, quoting_types) |i, item, quote_type| {
-            const item_bytes = try item.getString();
-            written += strutil.quoteString(
-                quote_type,
-                item_bytes,
-                unfinished_str[written..],
-                i == 0,
-            );
-
-            // Add a space to separate the elements (except at the end of the list).
-            if (i + 1 < items.len) {
-                unfinished_str[written] = ' ';
-                written += 1;
-            }
-        }
-
-        // Slap a nul on the end.
-        unfinished_str[written] = 0x00;
-
-        // We actually need to realloc, because `allocator.free` needs the
-        // original slice length (and we don't track the original slice
-        // length, only the accessible length). TODO PERF might be worth
-        // creating a long string if this string is long enough.
-        const finished_str = try heap.global_gpa.realloc(unfinished_str, written + 1);
-        try obj.setString(finished_str[0..written :0]);
+    fn updateString(obj: *Object) !void {
+        const as_list = obj.castTo(ListObject);
+        const bytes = try quoteValues(heap.global_gpa, as_list.items);
+        try obj.setStringConsuming(bytes);
     }
+
+    fn duplicate(src: *const Object) !*Object {
+        const as_list = src.castToConst(ListObject);
+        const new_obj = try Object.newObjectUninitialized(ListObject);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+        errdefer new_obj.head.invalidateString();
+
+        const new_items = try heap.global_gpa.alloc(Value, as_list.capacity);
+        for (as_list.items, new_items[0..as_list.items.len]) |item, *new_item| {
+            new_item.* = item.borrow();
+        }
+        new_obj.body.items = new_items[0..as_list.items.len];
+        new_obj.body.capacity = as_list.capacity;
+
+        return new_obj.head;
+    }
+
+    fn freeInternalRep(obj: *Object) void {
+        const as_list = obj.castTo(ListObject);
+        for (as_list.items) |item| item.release();
+        heap.global_gpa.free(as_list.items.ptr[0..as_list.capacity]);
+    }
+
+    fn makeCrossthread(obj: *Object) void {
+        const as_list = obj.castTo(ListObject);
+        for (as_list.items) |item| item.makeCrossthread();
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .free_internal_rep = freeInternalRep,
+        .update_string = updateString,
+        .make_crossthread = makeCrossthread,
+        .name = "list",
+    };
 };
 
-pub const DictObject = extern struct {
-    head: ObjectHead,
-    table: ?std.HashMapUnmanaged(Value, *Value, struct {
+pub const DictObject = struct {
+    items: []Value,
+    capacity: usize,
+    table: ?*Table,
+
+    /// Note that the caller is responsible for ensuring that each key has a string when calling any function
+    /// that uses its `hash` or `eql` functions.
+    const Table = std.HashMapUnmanaged(Value, usize, struct {
         pub fn hash(_: @This(), key: Value) u64 {
-            key.getHashNoRegister() catch unreachable;
+            return key.getHashNoRegister() catch unreachable;
         }
         pub fn eql(_: @This(), a: Value, b: Value) bool {
-            return a.equals(a, b) catch unreachable;
+            return a.equals(b) catch unreachable;
         }
-    }, 80),
-    len: usize,
+    }, 80);
 
-    pub fn items(list: *ListObject) []Value {
-        // Items are stored directly after in the same allocation.
-        const item_start = @as([*]u8, list) + @sizeOf(ListObject);
-        return @as([*]Value, @ptrCast(item_start))[0..list.len];
+    fn getCapacity(len: usize) error{OutOfMemory}!usize {
+        return math.ceilPowerOfTwo(usize, len) catch error.OutOfMemory;
     }
 
-    pub fn shimmer(shim: *Shimmerable) !void {
-        try shim.ensureShimmerable();
+    pub fn new(items: []Value) !*DictObject {
+        const capacity = try getCapacity(items.len);
+        const new_dict = try Object.newObject(DictObject);
+        errdefer new_dict.head.freeBacking();
+
+        const new_items = try heap.global_gpa.alloc(Value, capacity);
+        for (items, new_items[0..items.len]) |item, *new_item| {
+            new_item.* = item.borrow();
+        }
+        new_dict.body.items = new_items[0..items.len];
+        new_dict.body.capacity = capacity;
+        new_dict.body.table = null;
+
+        return new_dict.body;
     }
+
+    fn duplicate(src: *const Object) !*Object {
+        const as_dict = src.castToConst(DictObject);
+        const new_obj = try Object.newObjectUninitialized(DictObject);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+        errdefer new_obj.head.invalidateString();
+
+        const new_items = try heap.global_gpa.alloc(Value, as_dict.capacity);
+        for (as_dict.items, new_items[0..as_dict.items.len]) |item, *new_item| {
+            new_item.* = item.borrow();
+        }
+        new_obj.body.items = new_items[0..as_dict.items.len];
+        new_obj.body.capacity = as_dict.capacity;
+        new_obj.body.table = null;
+
+        return new_obj.head;
+    }
+
+    fn freeInternalRep(obj: *Object) void {
+        const as_dict = obj.castTo(DictObject);
+        for (as_dict.items) |item| item.release();
+        heap.global_gpa.free(as_dict.items.ptr[0..as_dict.capacity]);
+        if (as_dict.table) |table| table.deinit(heap.global_gpa);
+    }
+
+    fn makeCrossthread(obj: *Object) void {
+        const as_dict = obj.castTo(DictObject);
+        for (as_dict.items) |item| item.makeCrossthread();
+    }
+
+    fn updateString(obj: *Object) !void {
+        const as_dict = obj.castTo(DictObject);
+        const bytes = try quoteValues(heap.global_gpa, as_dict.items);
+        try obj.setStringConsuming(bytes);
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .free_internal_rep = freeInternalRep,
+        .update_string = updateString,
+        .make_crossthread = makeCrossthread,
+        .name = "dict",
+    };
 };

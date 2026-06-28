@@ -247,22 +247,10 @@ test "indexed memory pool" {
         b: u64,
     };
 
-    const PoolWithVmem = IndexedMemoryPool(TestStruct, true);
-    const PoolWithoutVmem = IndexedMemoryPool(TestStruct, false);
+    const Pool = IndexedMemoryPool(TestStruct);
 
     // Make sure values are created and freed in the correct order
-    var vmem_pool = try PoolWithVmem.initWithCapacity(null_allocator, 32);
-    defer vmem_pool.deinit(null_allocator);
-    try testing.expectEqual(0, vmem_pool.create(null_allocator));
-    try testing.expectEqual(1, vmem_pool.create(null_allocator));
-    try testing.expectEqual(2, vmem_pool.create(null_allocator));
-    vmem_pool.destroy(1);
-    vmem_pool.destroy(0);
-    try testing.expectEqual(0, vmem_pool.create(null_allocator));
-    try testing.expectEqual(1, vmem_pool.create(null_allocator));
-
-    // Make sure values are created and freed in the correct order
-    var pool = try PoolWithoutVmem.initWithCapacity(ta, 1);
+    var pool = try Pool.initWithCapacity(ta, 1);
     defer pool.deinit(ta);
     try testing.expectEqual(0, pool.create(ta));
     try testing.expectEqual(1, pool.create(ta));
@@ -294,7 +282,7 @@ pub fn LruCache(comptime K: type, comptime V: type, comptime Context: type) type
             item: V,
         };
 
-        pool: IndexedMemoryPool(Node, false),
+        pool: IndexedMemoryPool(Node),
         mapping: std.HashMapUnmanaged(K, u32, Context, 80),
         max_size: u32,
         last: ?u32 = null,

@@ -14,7 +14,6 @@ const options = @import("options");
 const memutil = @import("memutil.zig");
 const ioutil = @import("ioutil.zig");
 const objects = @import("objects.zig");
-const objutil = @import("objutil.zig");
 
 threadlocal var debugging_buffer: if (options.trace_mem) [16 * 1024 * 1024]u8 else void = undefined;
 threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
@@ -30,6 +29,7 @@ pub var running_leak_check: bool = false;
 
 pub var global_gpa: mem.Allocator = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
+threadlocal var local_arena_instance: std.heap.ArenaAllocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var nativefn_registry: NativeFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
@@ -39,12 +39,63 @@ var trace_mutex: std.Io.Mutex = .init;
 /// the real opts dict also OOMs. Pinned at init, released via `freeOomOptsDict`.
 var oom_error_options_dict: ?Value = null;
 
-pub const ObjectType = struct {
-    duplicate: ?*const fn (src: *const ObjectHead, min_size: usize) error{OutOfMemory}!*ObjectHead,
-    free_internal_rep: ?*const fn (obj: *ObjectHead) void,
-    update_string: ?*const fn (obj: *ObjectHead) error{ OutOfMemory, OtherThreadSet }!void,
-    name: [:0]const u8,
-};
+/// Initialize global heap state. Must be called once per process (or test).
+pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
+    init_mutex.lockUncancelable(io);
+    defer init_mutex.unlock(io);
+
+    if (initialized) return;
+
+    global_gpa = gpa;
+    global_io = io;
+
+    if (options.trace_mem) {
+        debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer[0..]);
+        debug_gpa = debugging_gpa.allocator();
+    }
+
+    nativefn_registry = .{};
+    registered_hashes = .{};
+
+    initialized = true;
+}
+
+/// Tear down global heap state. After this call, `initGlobals` may be called again.
+pub fn deinitAll() void {
+    init_mutex.lockUncancelable(global_io);
+    defer init_mutex.unlock(global_io);
+
+    if (!initialized) return;
+
+    nativefn_registry.deinit(global_gpa);
+    registered_hashes.entries.deinit(global_gpa);
+
+    initialized = false;
+}
+
+pub fn initThread(arena_gpa: Allocator) void {
+    local_arena_instance = std.heap.ArenaAllocator.init(arena_gpa);
+    local_arena = local_arena_instance.allocator();
+}
+
+pub fn deinitThread() void {
+    local_arena_instance.deinit();
+    local_arena = undefined;
+}
+
+pub fn testStart(gpa: Allocator, io: std.Io) !void {
+    try initGlobals(gpa, io);
+    initThread(gpa);
+}
+
+pub fn testFinish() void {
+    deinitThread();
+    deinitAll();
+}
+
+pub export fn dumpLastTouchedTrace(fd: i32) void {
+    _ = fd;
+}
 
 /// Signature for a lazy native command initializer. The interpreter pointer
 /// is opaque here to avoid a circular dependency on Interp.zig.
@@ -120,7 +171,7 @@ pub const NativeFnRegistry = struct {
 pub const HashRegistry = struct {
     pub const Entry = struct {
         /// Registry owns a reference to the representative.
-        representative: *ObjectHead,
+        representative: *Object,
         instances: std.atomic.Value(usize),
     };
 
@@ -136,7 +187,7 @@ pub const HashRegistry = struct {
         }
     }, 80) = .empty,
 
-    pub fn get(registry: *HashRegistry, hash: u256) ?*ObjectHead {
+    pub fn get(registry: *HashRegistry, hash: u256) ?*Object {
         registry.rw_lock.lockSharedUncancelable(global_io);
         defer registry.rw_lock.unlockShared(global_io);
 
@@ -146,7 +197,7 @@ pub const HashRegistry = struct {
         } else return null;
     }
 
-    pub fn register(registry: *HashRegistry, key: u256, obj: *ObjectHead) !void {
+    pub fn register(registry: *HashRegistry, key: u256, obj: *Object) !void {
         registry.rw_lock.lockSharedUncancelable(global_io);
 
         if (registry.entries.getPtr(key)) |entry| {
@@ -187,7 +238,7 @@ pub const HashRegistry = struct {
         assert(obj.metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire) == null);
     }
 
-    pub fn unregister(registry: *HashRegistry, key: u256, obj: *ObjectHead) void {
+    pub fn unregister(registry: *HashRegistry, key: u256, obj: *Object) void {
         registry.rw_lock.lockSharedUncancelable(global_io);
 
         if (registry.entries.getPtr(key)) |entry| {
@@ -212,7 +263,7 @@ pub const HashRegistry = struct {
 
                     // Make sure to `decrRefCount` only after unlocking the mutex, to avoid
                     // recursive locking.
-                    entry_second_check.representative.decrRefCount();
+                    entry_second_check.representative.release();
                 } else {
                     registry.rw_lock.unlockShared(global_io);
                 }
@@ -256,7 +307,7 @@ const ValueRep = packed struct(ValueBacking) {
     head: Head,
 
     pub const none_value: ValueRep = .{
-        .tag = .none,
+        .head = .{ .tag = .none },
     };
 };
 
@@ -266,7 +317,7 @@ pub const OptionalValue = enum(ValueBacking) {
 
     pub fn asValue(optional: OptionalValue) ?Value {
         if (optional != .none) {
-            return @bitCast(@intFromEnum(optional));
+            return @enumFromInt(@intFromEnum(optional));
         } else return null;
     }
 
@@ -282,6 +333,12 @@ pub const OptionalValue = enum(ValueBacking) {
     pub fn borrow(optional: OptionalValue) OptionalValue {
         if (optional.asValue()) |val| return val.borrow().asOptional();
         return .none;
+    }
+
+    pub fn makeCrossthread(optional: OptionalValue) void {
+        const val = optional.asValue() orelse return;
+        const obj = val.asPtr() orelse return;
+        obj.makeCrossthread();
     }
 
     pub fn release(optional: OptionalValue) void {
@@ -319,16 +376,17 @@ pub const Value = enum(ValueBacking) {
     }
 
     pub fn asOptional(value: Value) OptionalValue {
-        return @enumFromInt(@as(ValueBacking, @bitCast(value)));
+        return @enumFromInt(@intFromEnum(value));
     }
 
-    pub fn asRep(value: *Value) *ValueRep {
-        return @ptrCast(value);
+    pub fn asRep(value: Value) ValueRep {
+        return @bitCast(@intFromEnum(value));
     }
 
     pub fn isFloat(value: Value) bool {
-        const is_nan = value.asRep().head.nan_value == 0x0FFF;
-        return !is_nan or (is_nan and value.asRep().head.tag == .canonical_nan);
+        const rep = value.asRep();
+        const is_nan = rep.head.nan_value == 0x0FFF;
+        return !is_nan or (is_nan and rep.head.tag == .canonical_nan);
     }
 
     pub fn isPrimitive(value: Value) bool {
@@ -340,7 +398,7 @@ pub const Value = enum(ValueBacking) {
         return !value.isPrimitive();
     }
 
-    pub fn asPtr(value: Value) ?*ObjectHead {
+    pub fn asPtr(value: Value) ?*Object {
         if (value.isPtr()) return @ptrFromInt(value.asRep().value.ptr);
         return null;
     }
@@ -356,13 +414,13 @@ pub const Value = enum(ValueBacking) {
     }
 
     pub fn asFloat(value: Value) ?f64 {
-        if (value.isFloat()) return @bitCast(value);
+        if (value.isFloat()) return @as(f64, @bitCast(@as(ValueBacking, @intFromEnum(value))));
         return null;
     }
 
-    pub fn canShimmer(value: Value, new_size: usize) bool {
+    pub fn canShimmer(value: Value) bool {
         if (value.asPtr()) |obj| {
-            return !obj.metadata.cross_thread and new_size <= obj.alloc_size;
+            return !obj.metadata.cross_thread;
         } else {
             // Primitives can't shimmer.
             return false;
@@ -395,8 +453,8 @@ pub const Value = enum(ValueBacking) {
     }
 
     /// Must be shimmerable.
-    pub fn prepareToShimmer(value: Value, new_size: usize) !void {
-        value.assert(value.canShimmer(new_size));
+    pub fn prepareToShimmer(value: Value) !void {
+        value.assert(value.canShimmer());
         // Make sure the object has a string rep before we free its body. That is, if
         // it has a string rep. `.none` objects are brand new, so they obviously don't
         // have a string rep yet.
@@ -417,22 +475,17 @@ pub const Value = enum(ValueBacking) {
 
     pub fn duplicate(value: Value) !Value {
         if (value.asPtr()) |obj| {
-            if (obj.obj_type.duplicate) |duplicate_fn| {
-                const new_obj = try duplicate_fn(obj);
-                return Value.fromObjectPtr(new_obj);
-            } else {
-                debug.panic("Could not duplicate {}", .{obj.obj_type.name});
-            }
+            return Value.fromObjectPtr(obj.duplicate());
         } else {
             return value;
         }
     }
 
-    /// Must not be a packed pointer.
-    pub fn box(value: Value) !*ObjectHead {
+    /// Must be a primitive.
+    pub fn box(value: Value) !*Object {
         if (value.asFloat()) |float_value| {
             const obj = try objects.BoxedFloatObject.new(float_value);
-            return &obj.head;
+            return Object.from(objects.BoxedFloatObject, obj);
         }
 
         switch (value.tag()) {
@@ -441,19 +494,15 @@ pub const Value = enum(ValueBacking) {
             .ptr => unreachable,
             .int => {
                 const obj = try objects.BoxedIntObject.new(value.asInt().?);
-                return &obj.head;
+                return Object.from(objects.BoxedIntObject, obj);
             },
             .false => {
-                const obj = try ObjectHead.newObject(objects.StringObject);
-                errdefer obj.head.freeBacking();
-                try obj.head.setStringLocalObject("false");
-                return &obj.head;
+                const obj = try objects.BoxedBooleanObject.new(false);
+                return Object.from(objects.BoxedBooleanObject, obj);
             },
             .true => {
-                const obj = try ObjectHead.newObject(objects.StringObject);
-                errdefer obj.head.freeBacking();
-                try obj.head.setStringLocalObject("true");
-                return &obj.head;
+                const obj = try objects.BoxedBooleanObject.new(true);
+                return Object.from(objects.BoxedBooleanObject, obj);
             },
             .interned => {
                 const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
@@ -461,20 +510,22 @@ pub const Value = enum(ValueBacking) {
                 const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
                 const bytes = bytes_ptr[0..len :0];
 
-                const obj = try ObjectHead.newObject(objects.StringObject);
+                const obj = try Object.newObject(objects.StringObject);
                 errdefer obj.head.freeBacking();
-                try obj.head.setStringLocalObject(bytes);
-                return &obj.head;
+                const duped = try global_gpa.dupeSentinel(u8, bytes, 0);
+                errdefer global_gpa.free(duped);
+                try obj.head.setStringLocalObject(duped);
+                return obj.head;
             },
         }
     }
 
-    pub fn duplicateBoxed(value: Value) !*ObjectHead {
+    pub fn duplicateBoxed(value: Value) !*Object {
         if (value.asPtr()) |obj| {
-            if (obj.obj_type.duplicate) |duplicate_fn| {
+            if (obj.vtable.duplicate) |duplicate_fn| {
                 return try duplicate_fn(obj);
             } else {
-                debug.panic("Could not duplicate {}", .{obj.obj_type.name});
+                debug.panic("Could not duplicate {s}", .{obj.vtable.name});
             }
         } else {
             return try value.box();
@@ -489,34 +540,55 @@ pub const Value = enum(ValueBacking) {
 
     pub fn fromRep(rep: ValueRep) Value {
         debug.assert(rep != ValueRep.none_value);
-        return @enumFromInt(@as(ValueBacking, rep));
+        return @enumFromInt(@as(ValueBacking, @bitCast(rep)));
     }
 
-    pub fn fromObjectPtr(obj: *ObjectHead) Value {
+    pub fn fromObjectPtr(obj: *Object) Value {
         return Value.fromRep(.{
             .head = .{ .tag = .ptr },
             .value = .{ .ptr = @intCast(@intFromPtr(obj)) },
         });
     }
 
+    pub fn makeCrossthread(value: Value) void {
+        if (value.asPtr()) |obj| obj.makeCrossthread();
+    }
+
+    pub fn newInt(value: i32) Value {
+        return Value.fromRep(.{
+            .head = .{ .tag = .int },
+            .value = .{ .int = .{ .data = value } },
+        });
+    }
+
+    pub fn newFloat(value: f64) Value {
+        return @enumFromInt(@as(ValueBacking, @bitCast(value)));
+    }
+
+    pub fn newBool(value: bool) Value {
+        return Value.fromRep(.{
+            .head = .{ .tag = if (value) .true else .false },
+        });
+    }
+
     pub fn getString(value: Value) ![:0]const u8 {
         if (value.isFloat()) {
-            return try std.fmt.allocPrintSentinel(local_arena, "{}", .{@as(f64, @bitCast(value))}, 0);
+            return try std.fmt.allocPrintSentinel(local_arena, "{}", .{@as(f64, @bitCast(@intFromEnum(value)))}, 0);
         } else switch (value.asRep().head.tag) {
             .canonical_nan => unreachable,
             .none => unreachable,
             .ptr => {
-                const obj_head: *ObjectHead = @ptrFromInt(value.asRep().value.ptr);
+                const obj_head: *Object = @ptrFromInt(value.asRep().value.ptr);
                 return try obj_head.getString();
             },
-            .int => return try std.fmt.allocPrintSentinel(local_arena, "{}", .{value.asRep().value.int}, 0),
+            .int => return try std.fmt.allocPrintSentinel(local_arena, "{}", .{value.asInt().?}, 0),
             .false => return "false",
             .true => return "true",
             .interned => {
                 // Length of interned string is stored right before.
                 const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
                 const len_ptr = bytes_ptr - @sizeOf(usize);
-                const len = mem.readInt(usize, len_ptr, .native);
+                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
                 return bytes_ptr[0..len :0];
             },
         }
@@ -559,7 +631,7 @@ pub const SpecialString = struct {
 
     pub const HashAndInfo = struct {
         str_index: usize,
-        value: ?*ObjectHead,
+        value: ?*Object,
     };
 
     pub const Type = union(enum) {
@@ -577,7 +649,7 @@ pub const SpecialString = struct {
 
     hashes: []HashAndInfo,
     hash: std.atomic.Value(?*u256),
-    ref_count: std.atomic.Value(u32) = 1,
+    ref_count: std.atomic.Value(u32) = .init(1),
 
     pub fn deinit(self: *SpecialString) void {
         switch (self.value) {
@@ -585,13 +657,8 @@ pub const SpecialString = struct {
             .different_capacity => |info| {
                 global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
             },
-            .temp => {
-                // We don't want to free the string, as it's managed by someone else.
-            },
         }
-        if (self.hashes) |hashes| {
-            for (hashes) |hash| if (hash.value) |val| val.decrRefCount();
-        }
+        for (self.hashes) |hash| if (hash.value) |val| val.release();
 
         global_gpa.destroy(self);
     }
@@ -604,7 +671,7 @@ pub const SpecialString = struct {
             hash_alloc.* = hashutil.hashBytes(self.getString());
             if (self.hash.cmpxchgStrong(null, hash_alloc, .release, .acquire)) |other_won| {
                 global_gpa.destroy(hash_alloc);
-                return other_won.?;
+                return other_won.?.*;
             }
             return hash_alloc.*;
         }
@@ -623,25 +690,36 @@ pub const SpecialString = struct {
     }
 
     pub fn getString(self: *SpecialString) [:0]const u8 {
-        switch (self.string_type) {
+        switch (self.value) {
             .normal => |string| return string,
-            .temp => |temp| return temp,
             .different_capacity => |info| return info.string,
         }
     }
 
     pub fn incrRefCount(self: *SpecialString) void {
-        incrRefCountOf(usize, &self.ref_count, options.threading);
+        _ = self.ref_count.fetchAdd(1, .monotonic);
     }
 
     pub fn decrRefCount(self: *SpecialString) void {
-        if (decrRefCountOf(usize, &self.ref_count, options.threading) == 0) {
+        if (self.ref_count.fetchSub(1, .release) == 1) {
+            // The release store above synchronizes with this acquire load to
+            // ensure all prior operations on this string (from other threads)
+            // are visible before we deinit and free it.
+            _ = self.ref_count.load(.acquire);
             self.deinit();
         }
     }
 };
 
-pub const ObjectHead = extern struct {
+pub const Object = struct {
+    pub const VTable = struct {
+        duplicate: ?*const fn (src: *const Object) error{OutOfMemory}!*Object,
+        free_internal_rep: ?*const fn (obj: *Object) void,
+        update_string: ?*const fn (obj: *Object) error{ OutOfMemory, OtherThreadSet }!void,
+        make_crossthread: ?*const fn (obj: *Object) void,
+        name: [:0]const u8,
+    };
+
     pub const Metadata = packed struct(u8) {
         cross_thread: bool = false,
         hash_registered: bool = false,
@@ -671,7 +749,7 @@ pub const ObjectHead = extern struct {
         len: u16 = 0,
         has_value: bool = false,
         is_special: bool = false,
-        padding: u14,
+        padding: u14 = 0,
     };
 
     /// See `setString` for an explanation of how the sequencing of
@@ -680,59 +758,76 @@ pub const ObjectHead = extern struct {
     string_metadata: std.atomic.Value(StringMetadata),
     metadata: Metadata,
 
-    obj_type: *ObjectType,
+    vtable: *const VTable,
     ref_count: u32,
 
-    trace_values: ioutil.ConfigurableTrace(30, 16, options.trace_mem),
-
-    pub const object_size = 64 + @sizeOf(@FieldType(ObjectHead, "trace_values"));
+    pub const object_size: usize = 64;
     comptime {
-        assert(@sizeOf(ObjectHead) < object_size);
+        assert(@sizeOf(Object) < object_size);
     }
 
-    pub fn trace(obj: *ObjectHead, comptime fmt: []const u8, args: anytype) void {
-        if (options.trace_mem) {
-            // We need to create the message before locking the mutex, since `allocPrint` may
-            // call `getString`, which in turn traces setting the string.
-            const msg = std.fmt.allocPrint(debug_gpa, "\n" ++ fmt, args) catch unreachable;
-
-            trace_mutex.lockUncancelable(global_io);
-            defer trace_mutex.unlock(global_io);
-            obj.trace_values.addAddr(@returnAddress(), msg);
-        }
+    pub fn from(T: type, ptr: *T) *Object {
+        const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(ptr));
+        return @ptrCast(aligned_bytes - @sizeOf(Object));
     }
 
-    pub fn newObjectUninitialized(T: type) !*T {
-        comptime assert(@bitOffsetOf(T, "head") == 0);
-        comptime assert(@FieldType(T, "head") == ObjectHead);
-        comptime assert(@sizeOf(T) <= object_size);
+    /// Asserts that `obj` has type `T.vtable`.
+    pub fn castTo(obj: *Object, T: type) *T {
+        assert(obj.vtable == &T.vtable);
+        const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
+        return @ptrCast(aligned_bytes + @sizeOf(Object));
+    }
 
-        const bytes = try global_gpa.alignedAlloc(u8, .of(ObjectHead), object_size);
-        const obj: *ObjectHead = @ptrCast(bytes.ptr);
-        obj.obj_type = &objects.NoneObject.Type;
+    pub fn castToConst(obj: *const Object, T: type) *const T {
+        assert(obj.vtable == &T.vtable);
+        const aligned_bytes: [*]align(@alignOf(Object)) const u8 = @ptrCast(@alignCast(obj));
+        return @ptrCast(aligned_bytes + @sizeOf(Object));
+    }
+
+    pub fn newObjectUninitialized(T: type) !struct { head: *Object, body: *T } {
+        comptime assert(@sizeOf(Object) + @sizeOf(T) <= object_size);
+        comptime assert(@alignOf(T) <= @alignOf(Object));
+
+        const bytes = try global_gpa.alignedAlloc(u8, .of(Object), object_size);
+        const obj: *Object = @ptrCast(bytes.ptr);
+        obj.vtable = &T.vtable;
         obj.ref_count = 1;
+        obj.metadata = .{};
 
-        return @ptrCast(bytes.ptr);
+        return .{
+            .head = @ptrCast(bytes),
+            .body = @ptrCast(bytes.ptr + @sizeOf(Object)),
+        };
     }
 
-    pub fn newObject(T: type) !*T {
+    pub fn newObject(T: type) !struct { head: *Object, body: *T } {
         const new_obj = try newObjectUninitialized(T);
         new_obj.head.string = .init(null);
         new_obj.head.string_metadata = .init(.{});
-        new_obj.head.metadata = .{};
-        new_obj.head.obj_type = &@field(T, "Type");
-
-        return new_obj;
+        return .{ .head = new_obj.head, .body = new_obj.body };
     }
 
-    pub fn freeBacking(obj: *ObjectHead) void {
-        global_gpa.free(@as([*]u8, obj)[0..obj.alloc_size]);
-        obj.* = undefined;
+    pub fn duplicate(obj: *Object) !*Object {
+        if (obj.vtable.duplicate) |duplicate_fn| {
+            return try duplicate_fn(obj);
+        } else {
+            debug.panic("Could not duplicate {s}", .{obj.vtable.name});
+        }
     }
 
-    pub fn deinit(obj: *ObjectHead) void {
+    pub fn makeCrossthread(obj: *Object) void {
+        if (obj.vtable.make_crossthread) |make_crossthread_fn| make_crossthread_fn(obj);
+    }
+
+    pub fn freeBacking(obj: *Object) void {
+        const bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
+        const slice: []align(@alignOf(Object)) u8 = bytes[0..object_size];
+        global_gpa.free(slice);
+    }
+
+    pub fn deinit(obj: *Object) void {
         obj.invalidateInternalRep();
-        obj.invalidateString();
+        obj.freeStringInner();
         obj.freeBacking();
     }
 
@@ -741,9 +836,15 @@ pub const ObjectHead = extern struct {
         special: *SpecialString,
         normal: [:0]const u8,
     };
-    pub fn getStringDetails(obj: *ObjectHead) StringDetails {
-        const str_metadata = obj.string_metadata.load(if (obj.metadata.cross_thread) .acquire else .unordered);
-        const str_value = obj.string.load(if (obj.metadata.cross_thread) .monotonic else .unordered);
+    pub fn getStringDetails(obj: *const Object) StringDetails {
+        const str_metadata = if (obj.metadata.cross_thread)
+            obj.string_metadata.load(.acquire)
+        else
+            obj.string_metadata.load(.unordered);
+        const str_value = if (obj.metadata.cross_thread)
+            obj.string.load(.monotonic)
+        else
+            obj.string.load(.unordered);
 
         // We check `has_value` instead of `current_str`, since only `string_metadata` is
         // acquired. We could potentially read `current_str` with a value, but read
@@ -753,18 +854,18 @@ pub const ObjectHead = extern struct {
             const current_str = str_value.?;
 
             if (str_metadata.is_special) {
-                const as_special: *SpecialString = @ptrCast(current_str);
+                const as_special: *SpecialString = @ptrCast(@alignCast(current_str));
                 return .{ .special = as_special };
             } else {
                 const as_normal: [*]const u8 = @ptrCast(current_str);
-                return .{ .normal = as_normal[0..str_metadata.len] };
+                return .{ .normal = as_normal[0..str_metadata.len :0] };
             }
         } else {
             return .none;
         }
     }
 
-    pub fn getString(obj: *ObjectHead) error{OutOfMemory}![:0]const u8 {
+    pub fn getString(obj: *Object) error{OutOfMemory}![:0]const u8 {
         switch (obj.getStringDetails()) {
             .special => |special| return special.getString(),
             .normal => |normal| return normal,
@@ -772,8 +873,8 @@ pub const ObjectHead = extern struct {
                 // No string set (at least that we saw), so we'll go ahead and generate it
                 // and attempt to set it. If we fail it's fine, since strings are always
                 // generated the same way.
-                const update_str_fn = obj.obj_type.update_string orelse {
-                    debug.panic("Can't generate string for {} (should always have a string rep)", .{obj.obj_type.name});
+                const update_str_fn = obj.vtable.update_string orelse {
+                    debug.panic("Can't generate string for {s} (should always have a string rep)", .{obj.vtable.name});
                 };
                 update_str_fn(obj) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -789,7 +890,22 @@ pub const ObjectHead = extern struct {
         }
     }
 
-    pub fn setString(obj: *ObjectHead, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
+    /// Takes ownership of `bytes` and sets it as the object's string representation.
+    /// On error.OtherThreadSet, frees `bytes` silently.
+    /// On error.OutOfMemory, frees `bytes` and propagates the error.
+    pub fn setStringConsuming(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
+        obj.setString(bytes) catch |err| switch (err) {
+            error.OutOfMemory => {
+                global_gpa.free(bytes);
+                return error.OutOfMemory;
+            },
+            error.OtherThreadSet => {
+                global_gpa.free(bytes);
+            },
+        };
+    }
+
+    pub fn setString(obj: *Object, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
         const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
         for (hashes) |hash| if (hash.value) |val| val.incrRefCount();
@@ -802,7 +918,7 @@ pub const ObjectHead = extern struct {
             special_string.* = .{
                 .value = .{ .normal = bytes },
                 .hashes = hashes,
-                .hash = null,
+                .hash = .init(null),
             };
 
             // Attempt to set the string.
@@ -835,16 +951,43 @@ pub const ObjectHead = extern struct {
         }
     }
 
-    pub fn setStringLocalObject(obj: *ObjectHead, bytes: [:0]u8) error{OutOfMemory}!void {
+    pub fn setStringLocalObject(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
         assert(obj.metadata.cross_thread == false);
 
-        obj.setString(bytes) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.OtherThreadSet => unreachable,
-        };
+        const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
+        errdefer global_gpa.free(hashes);
+        for (hashes) |hash| if (hash.value) |val| val.incrRefCount();
+        errdefer for (hashes) |hash| if (hash.value) |val| val.release();
+
+        if (hashes.len > 0 or bytes.len > 1024) {
+            const special_string = try global_gpa.create(SpecialString);
+            errdefer global_gpa.destroy(special_string);
+
+            special_string.* = .{
+                .value = .{ .normal = bytes },
+                .hashes = hashes,
+                .hash = .init(null),
+            };
+
+            obj.string = .init(@ptrCast(special_string));
+            obj.string_metadata = .init(.{
+                .has_value = true,
+                .is_special = true,
+                // `.len` shouldn't be used in the case of a `SpecialString`, so we pick a value
+                // that should hopefully blow things up if it is touched in this case.
+                .len = std.math.maxInt(u16),
+            });
+        } else {
+            obj.string = .init(@ptrCast(bytes.ptr));
+            obj.string_metadata = .init(.{
+                .has_value = true,
+                .is_special = false,
+                .len = @intCast(bytes.len),
+            });
+        }
     }
 
-    pub fn getRefCount(obj: *ObjectHead) u32 {
+    pub fn getRefCount(obj: *Object) u32 {
         if (obj.metadata.cross_thread) {
             return @atomicLoad(u32, &obj.ref_count, .monotonic);
         } else {
@@ -852,23 +995,23 @@ pub const ObjectHead = extern struct {
         }
     }
 
-    pub fn incrRefCount(obj: *ObjectHead) void {
+    pub fn incrRefCount(obj: *Object) void {
         incrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
     }
 
-    pub fn borrow(obj: *ObjectHead) *ObjectHead {
+    pub fn borrow(obj: *Object) *Object {
         obj.incrRefCount();
         return obj;
     }
 
-    pub fn release(obj: *ObjectHead) void {
+    pub fn release(obj: *Object) void {
         const new_ref_count = decrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
 
         // You may be wondering, why the heck `<= 1`, and not `== 0`? Because hash representatives
         // are owned by the hash registry, so there's a circular reference. But, hash representatives
         // can be safely freed if nobody else references them, so this is the needed logic to deal
         // with the circular reference created by the hash registry.
-        if (new_ref_count <= 1 and @atomicLoad(ObjectHead.Metadata, &obj.metadata, .monotonic).hash_registered) {
+        if (new_ref_count <= 1 and @atomicLoad(Object.Metadata, &obj.metadata, .monotonic).hash_registered) {
             // It's impossible for this to not have a string, since if the hash
             // was registered, we know that it has a string.
             const hash = obj.getHashNoRegister() catch unreachable;
@@ -878,20 +1021,26 @@ pub const ObjectHead = extern struct {
         if (new_ref_count == 0) obj.deinit();
     }
 
-    pub fn invalidateString(obj: *ObjectHead) void {
+    fn freeStringInner(obj: *Object) void {
         switch (obj.getStringDetails()) {
-            .null => {},
+            .none => {},
             .normal => |normal| global_gpa.free(normal),
             .special => |special| special.decrRefCount(),
         }
-        obj.string = .null;
+        obj.string.store(null, .unordered);
+        obj.string_metadata.store(.{}, .unordered);
     }
 
-    pub fn invalidateInternalRep(obj: *ObjectHead) void {
-        obj.obj_type.free_internal_rep(obj);
+    pub fn invalidateString(obj: *Object) void {
+        assert(!obj.metadata.cross_thread);
+        obj.freeStringInner();
     }
 
-    pub fn getHashNoRegister(obj: *ObjectHead) !u256 {
+    pub fn invalidateInternalRep(obj: *Object) void {
+        if (obj.vtable.free_internal_rep) |free_fn| free_fn(obj);
+    }
+
+    pub fn getHashNoRegister(obj: *Object) !u256 {
         switch (obj.getStringDetails()) {
             .special => |special| return special.getHash(),
             .none, .normal => {
@@ -899,9 +1048,9 @@ pub const ObjectHead = extern struct {
             },
         }
 
-        if (obj.obj_type == &objects.SourceObject.Type) {
+        if (obj.vtable == &objects.SourceObject.vtable) {
             // If it's a source object, it may contain a cached hash.
-            const as_source: *objects.SourceObject = @ptrCast(obj);
+            const as_source: *objects.SourceObject = Object.castTo(obj, objects.SourceObject);
             if (as_source.hash.load(.monotonic)) |hash| {
                 return hash.*;
             } else {
@@ -909,23 +1058,24 @@ pub const ObjectHead = extern struct {
                 const hash_ptr = try global_gpa.create(u256);
                 hash_ptr.* = hash;
                 if (as_source.hash.cmpxchgStrong(null, hash_ptr, .release, .acquire)) |other_set| {
-                    global_gpa.free(hash_ptr);
-                    return other_set.*;
+                    global_gpa.destroy(hash_ptr);
+                    return other_set.?.*;
                 }
                 return hash_ptr.*;
             }
         }
+
+        return hashutil.hashBytes(try obj.getString());
     }
 
-    pub fn getHash(obj: *ObjectHead) !u256 {
-        const hash = obj.getHashNoRegister();
+    pub fn getHash(obj: *Object) !u256 {
+        const hash = try obj.getHashNoRegister();
         try registered_hashes.register(hash, obj); // Idempotent.
         return hash;
     }
 
-    /// Does not initialize `alloc_len`.
-    pub fn duplicateHeadOnto(src: *const ObjectHead, dest: *ObjectHead) error{OutOfMemory}!void {
-        dest.obj_type = src.obj_type;
+    pub fn duplicateHeadOnto(src: *const Object, dest: *Object) error{OutOfMemory}!void {
+        dest.vtable = src.vtable;
         dest.metadata = .{
             .cross_thread = false,
             .hash_registered = false,
@@ -934,36 +1084,26 @@ pub const ObjectHead = extern struct {
         switch (src.getStringDetails()) {
             .normal => |normal| {
                 const new_str = try global_gpa.dupeSentinel(u8, normal, 0);
-                dest.string.store(new_str.ptr, .unordered);
-                dest.string_metadata = .{
+                dest.string = .init(new_str.ptr);
+                dest.string_metadata = .init(.{
                     .has_value = true,
                     .is_special = false,
                     .len = @intCast(new_str.len),
-                };
+                });
             },
             .special => |special| {
                 special.incrRefCount();
-                dest.string.store(special.ptr, .unordered);
-                dest.string_metadata = .{
+                dest.string = .init(special);
+                dest.string_metadata = .init(.{
                     .has_value = true,
                     .is_special = true,
                     .len = math.maxInt(u16),
-                };
+                });
             },
             .none => {},
         }
 
         dest.ref_count = 1;
-    }
-
-    /// Assumes that `src` has a string.
-    pub fn duplicateStringOnly(src: *const ObjectHead) error{OutOfMemory}!*ObjectHead {
-        // Downgrade the duplicate to a non-specialized string.
-        assert(std.meta.activeTag(src.getStringDetails()) != .none);
-        const new_obj = try ObjectHead.newObjectUninitialized(objects.NoneObject);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj);
-        return &new_obj.head;
     }
 };
 
@@ -1010,7 +1150,7 @@ pub const hashutil = struct {
     }
 
     /// Parse a string that is exactly a single hash reference.
-    /// The string must start with `blake3^` at position 0, followed by a valid
+    /// The string must start with `blake3~` at position 0, followed by a valid
     /// base64-encoded 32-byte hash.
     pub fn parseHashReference(bytes: []const u8) ?u256 {
         if (!std.mem.startsWith(u8, bytes, hash_prepend)) return null;
@@ -1026,17 +1166,16 @@ pub const hashutil = struct {
         defer found_hashes.deinit(arena);
 
         // Look up all the found hashes.
-        var resolved_hashes: []SpecialString.HashAndInfo = try arena.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
+        const resolved_hashes: []SpecialString.HashAndInfo = try arena.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
         {
             registered_hashes.rw_lock.lockSharedUncancelable(global_io);
             defer registered_hashes.rw_lock.unlockShared(global_io);
 
-            for (found_hashes.items, &resolved_hashes) |found_hash, *resolved_hash| {
-                if (registered_hashes.entries.get(found_hash)) |resolved| {
-                    resolved_hash.* = resolved.representative;
-                } else {
-                    resolved_hash.* = null;
-                }
+            for (found_hashes.items, resolved_hashes) |found_hash, *resolved_hash| {
+                resolved_hash.* = .{
+                    .str_index = found_hash.index,
+                    .value = if (registered_hashes.entries.get(found_hash.hash)) |resolved| resolved.representative else null,
+                };
             }
         }
 
@@ -1068,4 +1207,79 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) T {
     }
 
     return after_sub;
+}
+
+fn testBoxInteger(ta: std.mem.Allocator) !void {
+    try testStart(ta, testing.io);
+    defer testFinish();
+
+    const obj = try Value.newInt(42).box();
+    defer obj.release();
+    try testing.expectEqualStrings("42", try obj.getString());
+}
+
+test "value box int" {
+    try testing.checkAllAllocationFailures(testing.allocator, testBoxInteger, .{});
+}
+
+fn testBoxFloat(ta: std.mem.Allocator) !void {
+    try testStart(ta, testing.io);
+    defer testFinish();
+
+    const obj = try Value.newFloat(3.14).box();
+    defer obj.release();
+    try testing.expectEqualStrings("3.14", try obj.getString());
+}
+
+test "value box float" {
+    try testing.checkAllAllocationFailures(testing.allocator, testBoxFloat, .{});
+}
+
+fn testBoxBool(ta: std.mem.Allocator) !void {
+    try testStart(ta, testing.io);
+    defer testFinish();
+
+    const true_obj = try Value.newBool(true).box();
+    defer true_obj.release();
+    try testing.expectEqualStrings("true", try true_obj.getString());
+
+    const false_obj = try Value.newBool(false).box();
+    defer false_obj.release();
+    try testing.expectEqualStrings("false", try false_obj.getString());
+}
+
+test "value box bool" {
+    try testing.checkAllAllocationFailures(testing.allocator, testBoxBool, .{});
+}
+
+fn testReferenceCounting(ta: std.mem.Allocator) !void {
+    try testStart(ta, testing.io);
+    defer testFinish();
+
+    const obj = (try objects.StringObject.new("foo")).asHead();
+    try testing.expectEqual(@as(u32, 1), obj.getRefCount());
+    _ = obj.borrow();
+    try testing.expectEqual(@as(u32, 2), obj.getRefCount());
+    obj.release();
+    try testing.expectEqual(@as(u32, 1), obj.getRefCount());
+    obj.release();
+}
+
+test "object ref count" {
+    try testing.checkAllAllocationFailures(testing.allocator, testReferenceCounting, .{});
+}
+
+fn testDuplicateObject(ta: std.mem.Allocator) !void {
+    try testStart(ta, testing.io);
+    defer testFinish();
+
+    const original = (try objects.StringObject.new("to duplicate")).asHead();
+    defer original.release();
+    const dup_obj = try original.duplicate();
+    defer dup_obj.release();
+    try testing.expectEqualStrings("to duplicate", try dup_obj.getString());
+}
+
+test "object duplicate" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDuplicateObject, .{});
 }
