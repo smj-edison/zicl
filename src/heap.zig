@@ -351,7 +351,7 @@ pub const OptionalValue = enum(ValueBacking) {
 
     pub fn swap(ref: *OptionalValue, new: Value) void {
         if (ref.asValue()) |obj| obj.release();
-        ref.* = @enumFromInt(@as(ValueBacking, @bitCast(new)));
+        ref.* = new.asOptional();
     }
 
     pub fn swapWithNone(ref: *OptionalValue) void {
@@ -362,14 +362,6 @@ pub const OptionalValue = enum(ValueBacking) {
 
 pub const Value = enum(ValueBacking) {
     _,
-
-    /// Helper function that dumps the object's trace if the assertion fails.
-    pub fn assert(value: Value, ok: bool) void {
-        _ = value;
-        if (!ok) {
-            unreachable;
-        }
-    }
 
     pub fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
         if (value.asPtr()) |val| val.trace(fmt, args);
@@ -389,32 +381,58 @@ pub const Value = enum(ValueBacking) {
         return !is_nan or (is_nan and rep.head.tag == .canonical_nan);
     }
 
-    pub fn isPrimitive(value: Value) bool {
-        if (value.isFloat()) return true;
-        return value.asRep().head.tag != .ptr;
-    }
-
-    pub fn isPtr(value: Value) bool {
-        return !value.isPrimitive();
+    const Expanded = union(enum) {
+        ptr: *Object,
+        int: i32,
+        false,
+        true,
+        interned: [:0]const u8,
+        float: f64,
+    };
+    pub fn expandedValue(value: Value) Expanded {
+        const rep = value.asRep();
+        if (value.isFloat()) return .{ .float = @bitCast(rep) };
+        switch (rep.head.tag) {
+            .canonical_nan => unreachable, // Already handled by `.isFloat()`.
+            .none => unreachable,
+            .ptr => return .{ .ptr = @ptrFromInt(rep.value.ptr) },
+            .int => return .{ .int = rep.value.int.data },
+            .false => return .false,
+            .true => return .true,
+            .interned => {
+                const bytes_ptr = @as([*]const u8, @ptrFromInt(value.asRep().value.interned));
+                const len_ptr = bytes_ptr - @sizeOf(usize);
+                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
+                const bytes = bytes_ptr[0..len :0];
+                return .{ .interned = bytes };
+            },
+        }
     }
 
     pub fn asPtr(value: Value) ?*Object {
-        if (value.isPtr()) return @ptrFromInt(value.asRep().value.ptr);
-        return null;
-    }
-
-    pub fn tag(value: Value) ValueRep.Tag {
-        debug.assert(!value.isFloat());
-        return value.asRep().head.tag;
+        switch (value.expandedValue()) {
+            .ptr => |val| return val,
+            else => return null,
+        }
     }
 
     pub fn asInt(value: Value) ?i32 {
-        if (value.tag() == .int) return value.asRep().value.int.data;
-        return null;
+        switch (value.expandedValue()) {
+            .int => |val| return val,
+            else => return null,
+        }
     }
 
     pub fn asFloat(value: Value) ?f64 {
-        if (value.isFloat()) return @as(f64, @bitCast(@as(ValueBacking, @intFromEnum(value))));
+        switch (value.expandedValue()) {
+            .float => |val| return val,
+            else => return null,
+        }
+    }
+
+    pub fn asType(value: Value, T: type) ?*T {
+        const obj = value.asPtr() orelse return null;
+        if (obj.vtable == &T.vtable) return obj.castTo(T);
         return null;
     }
 
@@ -454,14 +472,12 @@ pub const Value = enum(ValueBacking) {
 
     /// Must be shimmerable.
     pub fn prepareToShimmer(value: Value) !void {
-        value.assert(value.canShimmer());
+        assert(value.canShimmer());
         // Make sure the object has a string rep before we free its body. That is, if
         // it has a string rep. `.none` objects are brand new, so they obviously don't
         // have a string rep yet.
-        if (value.tag() != .none) _ = try value.getString();
+        if (value.asType(objects.None) == null) _ = try value.getString();
         if (value.asPtr()) |val| val.invalidateInternalRep();
-
-        value.trace("Prepared to shimmer", .{});
     }
 
     pub fn borrow(value: Value) Value {
@@ -475,7 +491,7 @@ pub const Value = enum(ValueBacking) {
 
     pub fn duplicate(value: Value) !Value {
         if (value.asPtr()) |obj| {
-            return Value.fromObjectPtr(obj.duplicate());
+            return (try obj.duplicate()).toValue();
         } else {
             return value;
         }
@@ -483,39 +499,31 @@ pub const Value = enum(ValueBacking) {
 
     /// Must be a primitive.
     pub fn box(value: Value) !*Object {
-        if (value.asFloat()) |float_value| {
-            const obj = try objects.BoxedFloatObject.new(float_value);
-            return Object.from(objects.BoxedFloatObject, obj);
-        }
-
-        switch (value.tag()) {
-            .canonical_nan => unreachable,
-            .none => unreachable, // .none is the null value, which is impossible for a `Value` to contain.
+        switch (value.expandedValue()) {
             .ptr => unreachable,
-            .int => {
-                const obj = try objects.BoxedIntObject.new(value.asInt().?);
-                return Object.from(objects.BoxedIntObject, obj);
+            .int => |int| {
+                const obj = try objects.Integer.newBoxed(int);
+                return Object.from(objects.Integer, obj);
             },
             .false => {
-                const obj = try objects.BoxedBooleanObject.new(false);
-                return Object.from(objects.BoxedBooleanObject, obj);
+                const obj = try objects.BoxedBoolean.new(false);
+                return Object.from(objects.BoxedBoolean, obj);
             },
             .true => {
-                const obj = try objects.BoxedBooleanObject.new(true);
-                return Object.from(objects.BoxedBooleanObject, obj);
+                const obj = try objects.BoxedBoolean.new(true);
+                return Object.from(objects.BoxedBoolean, obj);
             },
-            .interned => {
-                const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
-                const len_ptr = bytes_ptr - @sizeOf(usize);
-                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
-                const bytes = bytes_ptr[0..len :0];
-
-                const obj = try Object.newObject(objects.StringObject);
+            .interned => |bytes| {
+                const obj = try Object.newObject(objects.String);
                 errdefer obj.head.freeBacking();
                 const duped = try global_gpa.dupeSentinel(u8, bytes, 0);
                 errdefer global_gpa.free(duped);
                 try obj.head.setStringLocalObject(duped);
                 return obj.head;
+            },
+            .float => |float| {
+                const obj = try objects.Float.newBoxed(float);
+                return Object.from(objects.Float, obj);
             },
         }
     }
@@ -543,13 +551,6 @@ pub const Value = enum(ValueBacking) {
         return @enumFromInt(@as(ValueBacking, @bitCast(rep)));
     }
 
-    pub fn fromObjectPtr(obj: *Object) Value {
-        return Value.fromRep(.{
-            .head = .{ .tag = .ptr },
-            .value = .{ .ptr = @intCast(@intFromPtr(obj)) },
-        });
-    }
-
     pub fn makeCrossthread(value: Value) void {
         if (value.asPtr()) |obj| obj.makeCrossthread();
     }
@@ -562,6 +563,8 @@ pub const Value = enum(ValueBacking) {
     }
 
     pub fn newFloat(value: f64) Value {
+        const rep: ValueRep = @bitCast(value);
+        if (rep.head.nan_value == 0x0FFF) assert(rep.head.tag == .canonical_nan);
         return @enumFromInt(@as(ValueBacking, @bitCast(value)));
     }
 
@@ -611,6 +614,11 @@ pub const Value = enum(ValueBacking) {
         return try a.getString() == try b.getString();
     }
 
+    pub fn equalsString(value: Value, str: []const u8) error{OutOfMemory}!bool {
+        const bytes = try value.getString();
+        return mem.eql(u8, bytes, str);
+    }
+
     pub fn getHashNoRegister(value: Value) !u256 {
         if (value.asPtr()) |obj| return obj.getHashNoRegister();
 
@@ -645,7 +653,7 @@ pub const SpecialString = struct {
     };
     value: Type,
     /// Length has not been determined if == `maxInt(u64)`.
-    utf8_length: u64 = math.maxInt(u64),
+    utf8_length: std.atomic.Value(u64) = .init(math.maxInt(u64)),
 
     hashes: []HashAndInfo,
     hash: std.atomic.Value(?*u256),
@@ -677,16 +685,16 @@ pub const SpecialString = struct {
         }
     }
 
-    pub fn getCodepointLen(self: *SpecialString) ?u64 {
-        const value = @atomicLoad(u64, &self.utf8_length, .monotonic);
+    pub fn getCodepointLength(self: *SpecialString) ?u64 {
+        const value = self.utf8_length.load(.monotonic);
         if (value == std.math.maxInt(u64)) return null else return value;
     }
 
     /// Value is `u64`, not `?u64`, since utf8 length should not ever
-    /// change (excluding `LongString` temp strings).
-    pub fn setCodepointLen(self: *SpecialString, value: u64) void {
+    /// change.
+    pub fn setCodepointLength(self: *SpecialString, value: u64) void {
         assert(value != std.math.maxInt(u64));
-        @atomicStore(u64, &self.utf8_length, value, .monotonic);
+        self.utf8_length.store(value, .monotonic);
     }
 
     pub fn getString(self: *SpecialString) [:0]const u8 {
@@ -782,6 +790,13 @@ pub const Object = struct {
         assert(obj.vtable == &T.vtable);
         const aligned_bytes: [*]align(@alignOf(Object)) const u8 = @ptrCast(@alignCast(obj));
         return @ptrCast(aligned_bytes + @sizeOf(Object));
+    }
+
+    pub fn toValue(obj: *Object) Value {
+        return Value.fromRep(.{
+            .head = .{ .tag = .ptr },
+            .value = .{ .ptr = @intCast(@intFromPtr(obj)) },
+        });
     }
 
     pub fn newObjectUninitialized(T: type) !struct { head: *Object, body: *T } {
@@ -891,7 +906,7 @@ pub const Object = struct {
     }
 
     /// Takes ownership of `bytes` and sets it as the object's string representation.
-    /// On error.OtherThreadSet, frees `bytes` silently.
+    /// On error.OtherThreadSet, frees `bytes` and returns normally.
     /// On error.OutOfMemory, frees `bytes` and propagates the error.
     pub fn setStringConsuming(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
         obj.setString(bytes) catch |err| switch (err) {
@@ -1048,9 +1063,9 @@ pub const Object = struct {
             },
         }
 
-        if (obj.vtable == &objects.SourceObject.vtable) {
+        if (obj.vtable == &objects.Source.vtable) {
             // If it's a source object, it may contain a cached hash.
-            const as_source: *objects.SourceObject = Object.castTo(obj, objects.SourceObject);
+            const as_source: *objects.Source = Object.castTo(obj, objects.Source);
             if (as_source.hash.load(.monotonic)) |hash| {
                 return hash.*;
             } else {
@@ -1256,7 +1271,7 @@ fn testReferenceCounting(ta: std.mem.Allocator) !void {
     try testStart(ta, testing.io);
     defer testFinish();
 
-    const obj = (try objects.StringObject.new("foo")).asHead();
+    const obj = (try objects.String.new("foo")).asHead();
     try testing.expectEqual(@as(u32, 1), obj.getRefCount());
     _ = obj.borrow();
     try testing.expectEqual(@as(u32, 2), obj.getRefCount());
@@ -1273,7 +1288,7 @@ fn testDuplicateObject(ta: std.mem.Allocator) !void {
     try testStart(ta, testing.io);
     defer testFinish();
 
-    const original = (try objects.StringObject.new("to duplicate")).asHead();
+    const original = (try objects.String.new("to duplicate")).asHead();
     defer original.release();
     const dup_obj = try original.duplicate();
     defer dup_obj.release();

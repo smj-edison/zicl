@@ -1,6 +1,7 @@
 const std = @import("std");
 const math = std.math;
 const testing = std.testing;
+const mem = std.mem;
 const assert = std.debug.assert;
 
 const pcre2 = @import("pcre2");
@@ -14,6 +15,10 @@ const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
 // const expr_parse = @import("expr_parse.zig");
+
+pub const ErrorDetails = struct {
+    message: [:0]u8,
+};
 
 /// Note that this is often cast to `Mutable`, so you can't depend on `original`
 /// and `shimmered` as having the same value. Always use `.current()`. This is
@@ -63,21 +68,26 @@ pub const Shimmerable = extern struct {
 
     pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
         if (!self.current().canShimmer()) {
-            self.shimmered.swap(self.current().duplicate());
+            self.shimmered.swap(try self.current().duplicate());
         }
     }
 
     pub fn prepareToShimmer(self: *Shimmerable) !*Object {
-        if (self.current().isPrimitive()) {
-            self.shimmered.swap(try self.current().box());
-        } else {
-            try self.ensureShimmerable();
+        switch (self.current().expandedValue()) {
+            .ptr => try self.ensureShimmerable(),
+            else => self.shimmered.swap((try self.current().box()).toValue()),
         }
 
-        try self.current().prepareToShimmer();
+        // We know that this must be an object, since we boxed it if
+        // it was a primitive.
+        const obj = self.current().asPtr().?;
+        // Make sure the object has a string rep before we free its body. That is, if
+        // it has a string rep. `.none` objects are brand new, so they obviously don't
+        // have a string rep yet.
+        if (obj.vtable != &None.vtable) _ = try obj.getString();
+        obj.invalidateInternalRep();
 
-        // We know that this must be a boxed object.
-        return self.current().asPtr().?;
+        return obj;
     }
 
     pub fn duplicateForMutable(self: *const Shimmerable) !Value {
@@ -128,12 +138,22 @@ pub const Mutable = extern struct {
         return @ptrCast(self);
     }
 
-    pub fn prepareToShimmer(self: *Mutable) !void {
-        if (!self.current().canShimmer()) {
-            self.mutated.swap(try self.current().duplicate());
+    pub fn prepareToShimmer(self: *Mutable) !*Object {
+        switch (self.current().expandedValue()) {
+            .ptr => try self.ensureShimmerable(),
+            else => self.shimmered.swap(Value.fromPtr(try self.current().box())),
         }
 
-        try self.current().prepareToShimmer();
+        // We know that this must be an object, since we boxed it if
+        // it was a primitive.
+        const obj = self.current().asPtr().?;
+        // Make sure the object has a string rep before we free its body. That is, if
+        // it has a string rep. `.none` objects are brand new, so they obviously don't
+        // have a string rep yet.
+        if (obj.vtable != &None.vtable) _ = try obj.getString();
+        obj.invalidateInternalRep();
+
+        return obj;
     }
 
     pub fn prepareToMutate(self: *Mutable) !void {
@@ -143,9 +163,9 @@ pub const Mutable = extern struct {
     }
 };
 
-pub const NoneObject = struct {
-    pub fn new(bytes: [:0]const u8) !*NoneObject {
-        const new_obj = try Object.newObjectUninitialized(NoneObject);
+pub const None = struct {
+    pub fn new(bytes: [:0]const u8) !*None {
+        const new_obj = try Object.newObjectUninitialized(None);
         errdefer new_obj.head.freeBacking();
         const duped = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
         errdefer heap.global_gpa.free(duped);
@@ -157,7 +177,7 @@ pub const NoneObject = struct {
     fn duplicate(src: *const Object) !*Object {
         assert(std.meta.activeTag(src.getStringDetails()) != .none);
 
-        const new_obj = try Object.newObjectUninitialized(NoneObject);
+        const new_obj = try Object.newObjectUninitialized(None);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
         return new_obj.head;
@@ -172,38 +192,98 @@ pub const NoneObject = struct {
     };
 };
 
-pub const StringObject = struct {
-    codepoint_length: std.atomic.Value(usize) = .init(math.maxInt(usize)),
+pub const String = struct {
+    const null_sentinel: usize = math.maxInt(usize);
+    codepoint_length: std.atomic.Value(usize) = .init(null_sentinel),
 
-    pub fn new(bytes: [:0]const u8) !*StringObject {
-        const new_obj = try Object.newObjectUninitialized(StringObject);
+    pub fn new(bytes: []const u8) !*String {
+        const new_obj = try Object.newObjectUninitialized(String);
         errdefer new_obj.head.freeBacking();
-        const duped = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
-        errdefer heap.global_gpa.free(duped);
-        try new_obj.head.setStringLocalObject(duped);
+        const duped_bytes = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
+        errdefer heap.global_gpa.free(duped_bytes);
+        try new_obj.head.setStringLocalObject(duped_bytes);
 
         return new_obj.body;
     }
 
-    pub fn asHead(self: *StringObject) *Object {
-        return Object.from(StringObject, self);
+    pub fn newObject(bytes: []const u8) !*Object {
+        return (try new(bytes)).asHead();
+    }
+
+    pub fn newValue(bytes: []const u8) !Value {
+        return (try newObject(bytes)).toValue();
+    }
+
+    pub fn newFormatted(comptime fmt: []const u8, args: anytype) !*String {
+        const formatted = try std.fmt.allocPrintSentinel(heap.global_gpa, fmt, args, 0);
+        errdefer heap.global_gpa.free(formatted);
+        const new_obj = try Object.newObjectUninitialized(String);
+        errdefer new_obj.head.freeBacking();
+        try new_obj.head.setStringLocalObject(formatted);
+
+        return new_obj.body;
+    }
+
+    pub fn newFromEscaped(escaped: []const u8) !void {
+        // Unescaped will be equal or shorter than escaped version.
+        const unescaped = try heap.global_gpa.alloc(u8, escaped.len);
+        defer heap.global_gpa.free(unescaped);
+        const written = strutil.removeEscaping(escaped, unescaped);
+
+        return try new(unescaped[0..written]);
+    }
+
+    pub fn getCodepointLength(shim: *Shimmerable) !usize {
+        const as_str = try String.shimmerFrom(null, shim);
+
+        // See if we already calculated the utf8 length.
+        switch (as_str.asHead().getStringDetails()) {
+            .special => |special_str| {
+                if (special_str.getCodepointLength()) |len| return len;
+
+                // String length hasn't been computed yet, so compute now.
+                const codepoint_len = strutil.codepointLength(special_str.getString());
+                special_str.setCodepointLength(codepoint_len); // Cache utf8 length.
+                return codepoint_len;
+            },
+            .normal => |bytes| {
+                const len = as_str.codepoint_length.load(.monotonic);
+                if (len != null_sentinel) return len;
+
+                const codepoint_len = strutil.codepointLength(bytes);
+                assert(codepoint_len != null_sentinel);
+                as_str.codepoint_length.store(codepoint_len, .monotonic);
+
+                return codepoint_len;
+            },
+            .none => unreachable,
+        }
+    }
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*String {
+        _ = det;
+        if (shim.current().asType(String)) |str| return str;
+
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        const as_string = obj.castTo(String);
+        as_string.* = .{};
+        return as_string;
+    }
+
+    pub fn asHead(self: *String) *Object {
+        return Object.from(String, self);
     }
 
     fn duplicate(src: *const Object) !*Object {
         assert(src.getStringDetails() != .none);
-        const new_obj = try Object.newObjectUninitialized(StringObject);
+        const new_obj = try Object.newObjectUninitialized(String);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.codepoint_length = .init(src.castToConst(StringObject).codepoint_length.load(.monotonic));
+        new_obj.body.codepoint_length = .init(src.castToConst(String).codepoint_length.load(.monotonic));
 
         return new_obj.head;
-    }
-
-    pub fn shimmer(shim: *Shimmerable) !void {
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        obj.castTo(StringObject).* = .{};
     }
 
     pub const vtable: Object.VTable = .{
@@ -219,7 +299,7 @@ fn testString(ta: std.mem.Allocator) !void {
     try heap.testStart(ta, testing.io);
     defer heap.testFinish();
 
-    const obj = (try StringObject.new("hello")).asHead();
+    const obj = (try String.new("hello")).asHead();
     defer obj.release();
     try testing.expectEqualStrings("hello", try obj.getString());
 }
@@ -311,7 +391,7 @@ pub const ParsedScript = struct {
         for (script.tags.items, script.values, 0..) |token, value, i| {
             switch (token) {
                 .start_of_command => {
-                    const command_details = ParsedScriptCommandObject.castFrom(value.asPtr().?);
+                    const command_details = ParsedScriptCommand.castFrom(value.asPtr().?);
                     line = command_details.line;
                     ioutil.debug(
                         formatting ++ "line: {}, word count: {}\n",
@@ -343,13 +423,13 @@ pub const ParsedScript = struct {
 //     }
 // };
 
-pub const SourceObject = struct {
+pub const Source = struct {
     file_name: OptionalValue,
     line: u32,
     hash: std.atomic.Value(?*u256),
 
-    pub fn new(file_name: OptionalValue, line: u32) !*SourceObject {
-        const new_obj = try Object.newObject(SourceObject);
+    pub fn new(file_name: OptionalValue, line: u32) !*Source {
+        const new_obj = try Object.newObject(Source);
         new_obj.body.file_name = file_name.borrow();
         new_obj.body.line = line;
 
@@ -357,11 +437,11 @@ pub const SourceObject = struct {
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(SourceObject);
+        const new_obj = try Object.newObjectUninitialized(Source);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const cast_src = src.castToConst(SourceObject);
+        const cast_src = src.castToConst(Source);
         new_obj.body.file_name = cast_src.file_name.borrow();
         new_obj.body.line = cast_src.line;
 
@@ -369,13 +449,13 @@ pub const SourceObject = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_source = obj.castTo(SourceObject);
+        const as_source = obj.castTo(Source);
         as_source.file_name.release();
         if (as_source.hash.load(.monotonic)) |hash_ptr| heap.global_gpa.destroy(hash_ptr);
     }
 
     fn makeCrossthread(obj: *Object) void {
-        obj.castTo(SourceObject).file_name.makeCrossthread();
+        obj.castTo(Source).file_name.makeCrossthread();
     }
 
     pub const vtable: Object.VTable = .{
@@ -387,7 +467,7 @@ pub const SourceObject = struct {
     };
 };
 
-pub const Closure = struct {
+pub const ClosureValues = struct {
     /// Value for the argument list of the procedure.
     args: Value,
     /// Value for the script's body.
@@ -410,7 +490,7 @@ pub const Closure = struct {
     /// Unique identifier for cache keying.
     cache_id: u64,
 
-    pub fn borrow(closure: Closure) Closure {
+    pub fn borrow(closure: ClosureValues) ClosureValues {
         return .{
             .args = closure.args.borrow(),
             .body = closure.body.borrow(),
@@ -425,7 +505,7 @@ pub const Closure = struct {
         };
     }
 
-    pub fn deinit(closure: Closure) void {
+    pub fn deinit(closure: ClosureValues) void {
         closure.args.release();
         closure.body.release();
         closure.name.release();
@@ -434,22 +514,22 @@ pub const Closure = struct {
     }
 };
 
-pub const ClosureObject = struct {
-    closure: *Closure,
+pub const Closure = struct {
+    closure: *ClosureValues,
 
     fn duplicate(src: *const Object) !*Object {
         const new_obj = try Object.duplicateStringOnly(src);
         errdefer new_obj.deinit();
 
-        const new_closure = try heap.global_gpa.create(Closure);
+        const new_closure = try heap.global_gpa.create(ClosureValues);
         new_obj.vtable = &vtable;
-        new_closure.* = src.castToConst(ClosureObject).closure.borrow();
+        new_closure.* = src.castToConst(Closure).closure.borrow();
 
         return new_obj;
     }
 
     fn freeInternalRep(src: *Object) void {
-        const as_closure = src.castTo(ClosureObject);
+        const as_closure = src.castTo(Closure);
         as_closure.closure.deinit();
         heap.global_gpa.destroy(as_closure.closure);
     }
@@ -467,7 +547,7 @@ pub const ClosureObject = struct {
     };
 };
 
-pub const UpvarLinkObject = struct {
+pub const UpvarLink = struct {
     /// An object containing the name of the variable in the linked
     /// scope. Whenever someone shimmers this to a variable, they should
     /// always do it in `call_frame`.
@@ -476,7 +556,7 @@ pub const UpvarLinkObject = struct {
     call_frame: u32,
 
     fn freeInternalRep(src: *Object) void {
-        src.castTo(UpvarLinkObject).linked_name.release();
+        src.castTo(UpvarLink).linked_name.release();
     }
 
     pub const vtable: Object.VTable = .{
@@ -496,12 +576,12 @@ pub const UpvarLinkObject = struct {
 /// dict_name: foo
 /// dict_path: {bar baz}
 /// ```
-pub const DictSugarObject = struct {
+pub const DictSugar = struct {
     dict_name: Value,
     dict_path: Value,
 
     fn freeInternalRep(src: *Object) void {
-        const as_dict_sugar = src.castTo(DictSugarObject);
+        const as_dict_sugar = src.castTo(DictSugar);
         as_dict_sugar.dict_name.release();
         as_dict_sugar.dict_path.release();
     }
@@ -515,30 +595,69 @@ pub const DictSugarObject = struct {
     };
 };
 
-pub const HashReferenceObject = struct {
+pub const HashReference = struct {
     /// This is of type `*ObjectType` instead of `Value`, because a
     /// hash reference can only ever point to a heap `Object`.
     ref: *Object,
 
+    pub fn new(referent: *Object) !*HashReference {
+        const new_obj = try Object.newObject(HashReference);
+        new_obj.body.* = .{ .ref = referent.borrow() };
+        return new_obj.body;
+    }
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*HashReference {
+        if (shim.current().asType(HashReference)) |hash_ref| return hash_ref;
+
+        const bytes = try shim.current().getString();
+        const hash = heap.hashutil.parseHashReference(bytes) orelse {
+            if (det) |details| details.* = .{
+                .message = try std.fmt.allocPrintSentinel(
+                    heap.global_gpa,
+                    "expected a hash reference like \"blake3~...\" in \"{s}\".",
+                    .{bytes},
+                    0,
+                ),
+            };
+            return error.NotHashReference;
+        };
+        const target = heap.registered_hashes.get(hash) orelse {
+            if (det) |details| details.* = .{
+                .message = try std.fmt.allocPrintSentinel(
+                    "could not find value for hash reference {s}",
+                    .{bytes},
+                    0,
+                ),
+            };
+            return error.HashLookupFailed;
+        };
+
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        obj.castTo(HashReference).* = .{
+            .ref = target.borrow(),
+        };
+    }
+
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObject(HashReferenceObject);
+        const new_obj = try Object.newObject(HashReference);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        const as_hash_ref = src.castToConst(HashReferenceObject);
+        const as_hash_ref = src.castToConst(HashReference);
         new_obj.body.ref = as_hash_ref.ref.borrow();
 
         return new_obj.head;
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_hash_ref = obj.castTo(HashReferenceObject);
+        const as_hash_ref = obj.castTo(HashReference);
         as_hash_ref.ref.release();
     }
 
     fn updateString(obj: *Object) !void {
-        const as_hash_ref = obj.castTo(HashReferenceObject);
+        const as_hash_ref = obj.castTo(HashReference);
         const target_hash = try as_hash_ref.ref.getHash();
         var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
         _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
@@ -559,11 +678,11 @@ pub const HashReferenceObject = struct {
     };
 };
 
-pub const RegexpObject = struct {
+pub const Regexp = struct {
     regexp: *pcre2.pcre2_code_8,
 
     fn freeInternalRep(obj: *Object) void {
-        const as_regexp = obj.castTo(RegexpObject);
+        const as_regexp = obj.castTo(Regexp);
         pcre2.pcre2_code_free_8(as_regexp.regexp);
     }
 
@@ -576,16 +695,121 @@ pub const RegexpObject = struct {
     };
 };
 
-pub const IndexObject = struct {
+pub const Index = struct {
     index: i64,
     is_relative: bool,
 
+    pub const as_end: Index = .{ .index = 0, .is_relative = true };
+
+    /// `start` is inclusive, `end` is exclusive. (Note, this is different from Tcl's
+    /// convention, where both are inclusive. `fromIndexes` accounts for this when
+    /// running the conversion).
+    pub const Range = struct {
+        start: usize,
+        end: usize,
+
+        /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
+        pub fn fromIndexes(len: u32, start_index: Index, end_index: Index) Range {
+            var start = start_index.asAbsoluteIndex(len);
+            // Convert inclusive to exclusive with `+ 1`.
+            var end = end_index.asAbsoluteIndex(len) + 1;
+
+            if (start < 0) start = 0;
+            if (end < 0) end = 0;
+            if (end > len) end = len;
+
+            return .{
+                .start = @intCast(start),
+                .end = @intCast(end),
+            };
+        }
+    };
+
+    pub fn asAbsoluteIndex(self: Index, len: u32) i64 {
+        if (self.is_relative) {
+            return self.index + (len -| 1);
+        } else {
+            return self.index;
+        }
+    }
+
+    /// Sets the details to a bad index message, and returns error.BadIndex.
+    fn badIndexError(det: ?*ErrorDetails, bytes: []const u8) error{ OutOfMemory, BadIndex } {
+        if (det) |details| details.* = .{
+            .message = try std.fmt.allocPrintSentinel(
+                heap.global_gpa,
+                "bad index \"{f}\": must be intexpr or end?[+-]intexpr?",
+                .{bytes},
+                0,
+            ),
+        };
+
+        return error.BadIndex;
+    }
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*Index {
+        if (shim.current().asType(Index)) |index| return index;
+
+        const bytes = try shim.current().getString();
+        const index: Index = blk: {
+            // Does it start with "end"? If so, it might be end+5, or end-2, etc
+            if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
+                if (bytes.len >= 4) {
+                    if (bytes[3] != '+' and bytes[3] != '-') return badIndexError(det, bytes);
+
+                    const index_offset = std.fmt.parseInt(i64, bytes[3..], 10) catch return badIndexError(det, bytes);
+                    break :blk .{
+                        .index = index_offset,
+                        .is_relative = true,
+                    };
+                } else break :blk as_end;
+            } else {
+                break :blk .{
+                    .index = std.fmt.parseInt(i64, bytes, 0) catch return badIndexError(det, bytes),
+                    .is_relative = false,
+                };
+            }
+        };
+
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        obj.castTo(Index).* = index;
+    }
+
+    pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !Index {
+        // Fast case: if it's an integer or float, we can quickly cast it (don't
+        // shimmer though, as it'll probably still be used for its original purpose).
+
+        switch (shim.current().expandedValue()) {
+            .int => |int| {
+                return .{ .index = int, .is_relative = false };
+            },
+            .float => |float| {
+                if (math.isNan(float)) return badIndexError(det, try shim.current().getString());
+                if (float < std.math.minInt(i64)) return badIndexError(det, try shim.current().getString());
+                if (float > std.math.maxInt(i64)) return badIndexError(det, try shim.current().getString());
+                if (@trunc(float) != float) return badIndexError(det, try shim.current().getString());
+
+                return .{ .index = @trunc(float), .is_relative = false };
+            },
+            else => {
+                return (try shimmerFrom(det, shim)).*;
+            },
+        }
+    }
+
+    pub fn getRange(det: ?*ErrorDetails, len: usize, start: *Shimmerable, end: *Shimmerable) !Range {
+        const start_index = try get(det, start);
+        const end_index = try get(det, end);
+        return Range.fromIndexes(len, start_index, end_index);
+    }
+
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(IndexObject);
+        const new_obj = try Object.newObjectUninitialized(Index);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const as_index = src.castToConst(IndexObject);
+        const as_index = src.castToConst(Index);
         new_obj.body.index = as_index.index;
         new_obj.body.is_relative = as_index.is_relative;
 
@@ -593,11 +817,15 @@ pub const IndexObject = struct {
     }
 
     fn updateString(obj: *Object) !void {
-        const as_index = obj.castTo(IndexObject);
-        const bytes = if (as_index.is_relative)
-            try std.fmt.allocPrintSentinel(heap.global_gpa, "end{s}{d}", .{ if (as_index.index >= 0) "+" else "", as_index.index }, 0)
-        else
-            try std.fmt.allocPrintSentinel(heap.global_gpa, "{d}", .{as_index.index}, 0);
+        const as_index = obj.castTo(Index);
+        const bytes = blk: {
+            if (as_index.is_relative) {
+                const sign = if (as_index.index >= 0) "+" else "";
+                break :blk try std.fmt.allocPrintSentinel(heap.global_gpa, "end{s}{d}", .{ sign, as_index.index }, 0);
+            } else {
+                break :blk try std.fmt.allocPrintSentinel(heap.global_gpa, "{d}", .{as_index.index}, 0);
+            }
+        };
         try obj.setStringConsuming(bytes);
     }
 
@@ -610,27 +838,80 @@ pub const IndexObject = struct {
     };
 };
 
-pub const BoxedFloatObject = struct {
+pub const Float = struct {
     value: f64,
 
-    pub fn new(value: f64) !*BoxedFloatObject {
-        const new_obj = try Object.newObject(BoxedFloatObject);
+    pub fn new(value: f64) Value {
+        if (math.isNan(value)) return Value.newFloat(math.nan(f64));
+        return Value.newFloat(value);
+    }
+
+    pub fn asHead(self: *Integer) *Object {
+        return Object.from(String, self);
+    }
+
+    pub fn newBoxed(value: f64) !*Float {
+        const new_obj = try Object.newObject(Float);
         new_obj.body.value = value;
         return new_obj.body;
     }
 
+    pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !f64 {
+        if (std.fmt.parseFloat(f64, bytes)) |parsed| {
+            return parsed;
+        } else |_| {
+            if (det) |details| details.* = .{
+                .message = try std.fmt.allocPrint("expected float but got \"{s}\"", .{bytes}),
+            };
+            return error.BadFloat;
+        }
+    }
+
+    pub fn shimmer(det: ?*ErrorDetails, shim: *Shimmerable) !void {
+        if (shim.current().asFloat() != null) return;
+        if (shim.current().asType(Float) != null) return;
+
+        const parsed = try parse(det, try shim.current().getString());
+
+        // Compare the parsed version to the regenerated version, and if identical,
+        // shimmer to a float value. This way, we don't lose a string representation
+        // if it wouldn't be regenerated the same way.
+        var buf: [32]u8 = undefined;
+        const written = std.fmt.bufPrint(&buf, parsed);
+        const regenerated = buf[0..written];
+
+        if (mem.eql(u8, parsed, regenerated)) {
+            // The two strings are identical, so we can use a float value.
+            shim.shimmered.swap(Value.newFloat(parsed));
+        }
+
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        const as_boxed_float = obj.castTo(Float);
+        as_boxed_float = .{ .value = parsed };
+        return as_boxed_float;
+    }
+
+    pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
+        try shimmer(det, shim);
+
+        if (shim.current().asFloat()) |float| return float;
+        if (shim.current().asType(Float)) |boxed| return boxed.value;
+        unreachable;
+    }
+
     fn updateString(obj: *Object) !void {
-        const as_float = obj.castTo(BoxedFloatObject);
+        const as_float = obj.castTo(Float);
         const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_float.value}, 0);
         try obj.setStringConsuming(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObject(BoxedFloatObject);
+        const new_obj = try Object.newObject(Float);
         errdefer new_obj.head.deinit();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const as_float = src.castToConst(BoxedFloatObject);
+        const as_float = src.castToConst(Float);
         new_obj.body.value = as_float.value;
 
         return new_obj.head;
@@ -645,26 +926,95 @@ pub const BoxedFloatObject = struct {
     };
 };
 
-pub const BoxedIntObject = struct {
+pub const Integer = struct {
     value: i64,
 
-    pub fn new(value: i64) !*BoxedIntObject {
-        const new_obj = try Object.newObject(BoxedIntObject);
+    pub fn new(value: i64) !Value {
+        if (value >= math.minInt(i32) and value <= math.maxInt(i32)) {
+            return Value.newInt(@intCast(value));
+        }
+        return Value.fromPtr((try newBoxed(value)).asHead());
+    }
+
+    pub fn newBoxed(value: i64) !*Integer {
+        const new_obj = try Object.newObject(Integer);
         new_obj.body.value = value;
         return new_obj.body;
     }
 
+    pub fn asHead(self: *Integer) *Object {
+        return Object.from(String, self);
+    }
+
+    pub fn integerOverflowError(det: ?*ErrorDetails, rendered_int: []const u8) error{ OutOfMemory, IntegerOverflow } {
+        if (det) |details| details.* = .{
+            .message = try std.fmt.allocPrint("integer value \"{s}\" too big to be represented", .{rendered_int}),
+        };
+        return error.IntegerOverflow;
+    }
+
+    pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !i64 {
+        if (std.fmt.parseInt(i64, bytes, 0)) |integer| {
+            return integer;
+        } else |err| switch (err) {
+            error.InvalidCharacter => {
+                if (det) |details| details.* = .{
+                    .message = try std.fmt.allocPrint("expected integer but got \"{s}\"", .{bytes}),
+                };
+                return error.BadInteger;
+            },
+            error.Overflow => {
+                return integerOverflowError(det, bytes);
+            },
+        }
+    }
+
+    pub fn shimmer(det: ?*ErrorDetails, shim: *Shimmerable) !void {
+        if (shim.current().asInt() != null) return;
+        if (shim.current().asType(Integer) != null) return;
+
+        const parsed = try parse(det, try shim.current().getString());
+
+        if (parsed >= math.minInt(i32) and parsed <= math.maxInt(i32)) {
+            // Compare the parsed version to the regenerated version, and if identical,
+            // shimmer to an integer value. TODO PERF if we have our own int parser,
+            // we could see if it was a normal parse, and bypass the byte comparsion.
+            var buf: [32]u8 = undefined;
+            const written = std.fmt.bufPrint(&buf, parsed);
+            const regenerated = buf[0..written];
+
+            if (mem.eql(u8, parsed, regenerated)) {
+                // The two strings are identical, so we can use an int value.
+                shim.shimmered.swap(Value.newInt(@intCast(parsed)));
+            }
+        }
+
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        const as_boxed_int = obj.castTo(Integer);
+        as_boxed_int = .{ .value = parsed };
+        return as_boxed_int;
+    }
+
+    pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
+        try shimmer(det, shim);
+
+        if (shim.current().asInt()) |int| return int;
+        if (shim.current().asType(Integer)) |boxed| return boxed.value;
+        unreachable;
+    }
+
     fn updateString(obj: *Object) !void {
-        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{obj.castTo(BoxedIntObject).value}, 0);
+        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{obj.castTo(Integer).value}, 0);
         try obj.setStringConsuming(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(BoxedIntObject);
+        const new_obj = try Object.newObjectUninitialized(Integer);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.value = src.castToConst(BoxedIntObject).value;
+        new_obj.body.value = src.castToConst(Integer).value;
 
         return new_obj.head;
     }
@@ -678,17 +1028,315 @@ pub const BoxedIntObject = struct {
     };
 };
 
-pub const BoxedBooleanObject = struct {
+/// Enum names joined by ", "
+pub fn enumNames(comptime E: type, comptime joiner: []const u8) []const u8 {
+    return comptime blk: {
+        var result: []const u8 = @tagName(std.enums.values(E)[0]);
+        for (std.enums.values(E)[1..]) |value| {
+            result = &(result[0..].* ++ joiner[0..].* ++ @tagName(value).*);
+        }
+
+        break :blk result;
+    };
+}
+
+pub fn EnumMapping(comptime E: type, include_numbers: bool) type {
+    comptime {
+        @setEvalBranchQuota(20000);
+
+        const values = std.enums.values(E);
+
+        // Fill out the mapping.
+        const final_entries = blk: {
+            if (include_numbers) {
+                var entries: [values.len * 2]struct { []const u8, E } = undefined;
+                for (values, 0..) |value, i| {
+                    entries[i * 2] = .{ @tagName(value), value };
+                    // Add an entry for the integer value of the enum, to match Tcl behavior.
+                    entries[i * 2 + 1] = .{ std.fmt.comptimePrint("{}", .{@intFromEnum(value)}), value };
+                }
+                break :blk entries;
+            } else {
+                var entries: [values.len]struct { []const u8, E } = undefined;
+                for (values, 0..) |value, i| {
+                    entries[i] = .{ @tagName(value), value };
+                }
+                break :blk entries;
+            }
+        };
+
+        // Create the table
+        return struct {
+            pub const StaticStringMap = std.StaticStringMap(E);
+
+            map: StaticStringMap = StaticStringMap.initComptime(final_entries),
+        };
+    }
+}
+
+pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
+    return struct {
+        pub const names = enumNames(E, ", ");
+        pub const map = (EnumMapping(E, include_numbers){}).map;
+        pub const enum_name = @typeName(E);
+        const Self = @This();
+
+        variant: E,
+
+        pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*Self {
+            if (shim.current().asType(Self)) |self| return self;
+
+            const bytes = try shim.current().getString();
+            const variant = map.get(bytes);
+            if (variant) |val| {
+                const obj = try shim.prepareToShimmer();
+                obj.vtable = &vtable;
+                const self = obj.castTo(Self);
+                self.variant = val;
+                return self;
+            } else {
+                if (det) |details| details.* = .{
+                    .message = try std.fmt.allocPrintSentinel(
+                        heap.global_gpa,
+                        "bad {s} \"{s}\": must be {s}",
+                        .{ enum_name, bytes, names },
+                        0,
+                    ),
+                };
+                return error.BadEnumVariant;
+            }
+        }
+
+        pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !E {
+            return (try shimmerFrom(det, shim)).variant;
+        }
+
+        fn duplicate(src: *const Object) !*Object {
+            assert(src.getStringDetails() != .none);
+            const new_obj = try Object.newObjectUninitialized(Self);
+            errdefer new_obj.head.freeBacking();
+            try src.duplicateHeadOnto(new_obj.head);
+
+            new_obj.body.variant = src.castToConst(Self).variant;
+
+            return new_obj.head;
+        }
+
+        pub const vtable: Object.VTable = .{
+            .duplicate = duplicate,
+            .free_internal_rep = null,
+            .update_string = null,
+            .make_crossthread = null,
+            .name = "enum_for_" ++ enum_name,
+        };
+    };
+}
+
+test "enum mapping" {
+    const Things = enum { foo, bar, baz };
+    const map = (EnumMapping(Things, false){}).map;
+    const names = enumNames(Things, ", ");
+    try testing.expectEqual(Things.foo, map.get("foo"));
+    try testing.expectEqualSlices(u8, "foo, bar, baz", names);
+}
+
+test "tcl enum" {
+    try heap.testStart(testing.allocator, testing.io);
+    defer heap.testFinish();
+
+    const MyEnum = enum { foo, bar, baz };
+    const MyTclEnum = EnumConstructor(MyEnum, true);
+
+    var foo_str = try String.newValue("foo");
+    defer foo_str.release();
+    var one_str = try String.newValue("1");
+    defer one_str.release();
+    var bad_str = try String.newValue("bad");
+    defer bad_str.release();
+
+    var working: Shimmerable = .{ .original = foo_str, .shimmered = .none };
+    try testing.expectEqual(MyEnum.foo, MyTclEnum.get(null, &working));
+    working.discardChanges();
+    working = .{ .original = one_str };
+    try testing.expectEqual(MyEnum.bar, MyTclEnum.get(null, &working));
+    working.discardChanges();
+    working = .{ .original = bad_str };
+    try testing.expectError(error.BadEnumVariant, MyTclEnum.get(null, &working));
+    working.discardChanges();
+}
+
+fn generateSubcommandUsage(comptime E: type, args: []Shimmerable) ![:0]u8 {
+    return try std.fmt.allocPrintSentinel(
+        heap.global_gpa,
+        "Usage: \"{s} command ... \", where command is one of: {s}",
+        .{ try args[0].current().getString(), enumNames(E, ", ") },
+        0,
+    );
+}
+
+pub fn SubcommandParser(
+    comptime E: type,
+    comptime subcommands: []const struct {
+        variant: E,
+        usage: []const u8,
+        min_args: u32 = 0,
+        max_args: ?u32 = null,
+        stride: u32 = 1,
+    },
+) type {
+    const Subcommand = @typeInfo(@TypeOf(subcommands)).pointer.child;
+
+    comptime assert(std.enums.values(E).len == subcommands.len);
+
+    return struct {
+        // Create a mapping from subcommand name -> Enum.
+        pub const NameToEnum = EnumConstructor(E, false);
+        // As well as a mapping from Enum -> subcommand.
+        pub const EnumToSubcommand = blk: {
+            const variants = std.enums.values(E);
+
+            var converted_mapping: std.enums.EnumFieldStruct(E, Subcommand, null) = undefined;
+            for (0..variants.len) |i| {
+                const value = @tagName(variants[i]);
+                assert(subcommands[i].variant == variants[i]);
+                @field(converted_mapping, value) = subcommands[i];
+            }
+
+            break :blk std.EnumArray(E, Subcommand).init(converted_mapping);
+        };
+
+        const space_joined_names = enumNames(E, " ");
+        const comma_joined_names = enumNames(E, ",");
+
+        /// `args` should include the original command name.
+        pub fn parse(det: ?*ErrorDetails, args: []Shimmerable) !E {
+            if (args.len < 2) {
+                const bytes = try args[0].current().getString();
+                if (det) |details| details.* = .{
+                    .message = try std.fmt.allocPrintSentinel(heap.global_gpa,
+                        \\wrong # args: should be "{s} command ..."
+                        \\Use "{s} -help ?command?" for help
+                    , .{ bytes, bytes }, 0),
+                };
+                return error.WrongUsage;
+            }
+
+            // TODO PERF cache the subcommand lookup.
+
+            if (try args[1].current().equalsString("-help")) {
+                if (args.len >= 3) {
+                    const subcommand_queried = &args[2];
+
+                    // Generate help for a specific subcommand, if the subcommand exists.
+                    if (NameToEnum.get(null, subcommand_queried)) |val| {
+                        const subcommand = EnumToSubcommand.get(val);
+                        if (det) |details| details.* = .{
+                            .message = try std.fmt.allocPrintSentinel(
+                                heap.global_gpa,
+                                "Usage: \"{s} {s} {s}\"",
+                                .{
+                                    try args[0].current().getString(),
+                                    try subcommand_queried.current().getString(),
+                                    subcommand.usage,
+                                },
+                                0,
+                            ),
+                        };
+                        return error.UsageHelp;
+                    } else |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => {
+                            // Else, fall through to the general usage.
+                        },
+                    }
+                }
+                if (det) |details| details.* = .{ .message = try generateSubcommandUsage(E, args) };
+                return error.UsageHelp;
+            }
+
+            if (try args[1].current().equalsString("-commands")) {
+                if (det) |details| details.* = .{ .message = try heap.global_gpa.dupeSentinel(u8, space_joined_names, 0) };
+                return error.UsageHelp;
+            }
+
+            const subcommand_name = &args[1];
+            const subcommand_enum = NameToEnum.get(null, subcommand_name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadEnumVariant => {
+                    if (det) |details| details.* = .{
+                        .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "{s}, unknown command \"{s}\": should be {s}", .{
+                            try args[0].current().getString(),
+                            try args[1].current().getString(),
+                            space_joined_names,
+                        }, 0),
+                    };
+                    return error.WrongUsage;
+                },
+            };
+            const subcommand = EnumToSubcommand.get(subcommand_enum);
+
+            // Now that we've gotten the usage, we need to make sure that we have the right
+            // number of arguments.
+            const correct_arg_count = blk: {
+                if (args.len - 2 < subcommand.min_args) break :blk false;
+                if (subcommand.max_args) |max_args| if (args.len - 2 > max_args) break :blk false;
+                if (@mod(args.len - 2, subcommand.stride) != 0) break :blk false;
+                break :blk true;
+            };
+            if (!correct_arg_count) {
+                if (det) |details| details.* = .{
+                    .message = try std.fmt.allocPrintSentinel(
+                        heap.global_gpa,
+                        "wrong # args: should be \"{s}\"",
+                        .{subcommand.usage},
+                        0,
+                    ),
+                };
+                return error.WrongUsage;
+            }
+
+            return subcommand_enum;
+        }
+    };
+}
+
+test "subcommand parser" {
+    const Parser = SubcommandParser(enum { foo }, &.{
+        .{ .variant = .foo, .usage = "arg1 arg2 ?arg3?", .min_args = 2, .max_args = 3 },
+    });
+
+    try heap.testStart(testing.allocator, testing.io);
+    defer heap.testFinish();
+
+    var base_str: Shimmerable = .{ .original = try String.newValue("base") };
+    defer base_str.deinit();
+    var foo_str: Shimmerable = .{ .original = try String.newValue("foo") };
+    defer foo_str.deinit();
+    var arg1_str: Shimmerable = .{ .original = try String.newValue("arg1") };
+    defer arg1_str.deinit();
+    var arg2_str: Shimmerable = .{ .original = try String.newValue("arg2") };
+    defer arg2_str.deinit();
+    var arg3_str: Shimmerable = .{ .original = try String.newValue("arg3") };
+    defer arg3_str.deinit();
+
+    var args = [_]Shimmerable{ base_str, foo_str, arg1_str, arg2_str };
+    try testing.expectEqual(.foo, try Parser.parse(null, &args));
+
+    var args2 = [_]Shimmerable{ base_str, foo_str, arg1_str };
+    try testing.expectError(error.WrongUsage, Parser.parse(null, &args2));
+}
+
+pub const BoxedBoolean = struct {
     value: bool,
 
-    pub fn new(value: bool) !*BoxedBooleanObject {
-        const new_obj = try Object.newObject(BoxedBooleanObject);
+    pub fn new(value: bool) !*BoxedBoolean {
+        const new_obj = try Object.newObject(BoxedBoolean);
         new_obj.body.value = value;
         return new_obj.body;
     }
 
     fn updateString(obj: *Object) !void {
-        const bytes = if (obj.castTo(BoxedBooleanObject).value)
+        const bytes = if (obj.castTo(BoxedBoolean).value)
             try heap.global_gpa.dupeSentinel(u8, "true", 0)
         else
             try heap.global_gpa.dupeSentinel(u8, "false", 0);
@@ -696,11 +1344,11 @@ pub const BoxedBooleanObject = struct {
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(BoxedBooleanObject);
+        const new_obj = try Object.newObjectUninitialized(BoxedBoolean);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.value = src.castToConst(BoxedBooleanObject).value;
+        new_obj.body.value = src.castToConst(BoxedBoolean).value;
 
         return new_obj.head;
     }
@@ -714,7 +1362,7 @@ pub const BoxedBooleanObject = struct {
     };
 };
 
-pub const CachedLocalVarObject = struct {
+pub const CachedLocalVar = struct {
     ref: *const Value,
     call_epoch: u64,
 
@@ -727,7 +1375,7 @@ pub const CachedLocalVarObject = struct {
     };
 };
 
-pub const CachedLexicalVarObject = struct {
+pub const CachedLexicalVar = struct {
     ref: *const Value,
     call_epoch: u64,
 
@@ -740,7 +1388,7 @@ pub const CachedLexicalVarObject = struct {
     };
 };
 
-pub const ParsedScriptCommandObject = struct {
+pub const ParsedScriptCommand = struct {
     line: u32,
     word_count: u32,
 
@@ -752,7 +1400,7 @@ pub const ParsedScriptCommandObject = struct {
         .name = "parsed_script_command",
     };
 
-    pub fn castFrom(obj: *Object) *ParsedScriptCommandObject {
+    pub fn castFrom(obj: *Object) *ParsedScriptCommand {
         assert(obj.vtable == &vtable);
         return @ptrCast(obj);
     }
@@ -809,7 +1457,7 @@ fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
     return finished_str[0..written :0];
 }
 
-pub const ListObject = struct {
+pub const List = struct {
     items: []Value,
     capacity: usize,
 
@@ -817,9 +1465,9 @@ pub const ListObject = struct {
         return math.ceilPowerOfTwo(usize, len) catch error.OutOfMemory;
     }
 
-    pub fn new(items: []Value) !*ListObject {
+    pub fn new(items: []Value) !*List {
         const capacity = try getCapacity(items.len);
-        const new_list = try Object.newObject(ListObject);
+        const new_list = try Object.newObject(List);
         errdefer new_list.head.freeBacking();
 
         const new_items = try heap.global_gpa.alloc(Value, capacity);
@@ -832,15 +1480,40 @@ pub const ListObject = struct {
         return new_list.body;
     }
 
+    fn backingSlice(self: *List) []Value {
+        return self.items.ptr[0..self.capacity];
+    }
+
+    pub fn resize(self: *List, new_capacity: usize) !void {
+        if (new_capacity < self.capacity) {
+            if (new_capacity < self.items.len) {
+                for (self.items[new_capacity..self.items.len]) |item| item.release();
+                self.items.len = new_capacity;
+            }
+        } else if (new_capacity > self.capacity) {
+            const new_backing = try heap.global_gpa.realloc(self.backingSlice(), new_capacity);
+            self.items = new_backing[0..self.items.len];
+            self.capacity = new_capacity;
+        }
+    }
+
+    pub fn append(self: *List, value: Value) !void {
+        if (self.capacity < self.items.len + 1) try self.resize(self.capacity * 2);
+
+        const old_len = self.items.len;
+        self.items = self.items.ptr[0..(old_len + 1)];
+        self.items[old_len] = value.borrow();
+    }
+
     fn updateString(obj: *Object) !void {
-        const as_list = obj.castTo(ListObject);
+        const as_list = obj.castTo(List);
         const bytes = try quoteValues(heap.global_gpa, as_list.items);
         try obj.setStringConsuming(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const as_list = src.castToConst(ListObject);
-        const new_obj = try Object.newObjectUninitialized(ListObject);
+        const as_list = src.castToConst(List);
+        const new_obj = try Object.newObjectUninitialized(List);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
@@ -856,13 +1529,13 @@ pub const ListObject = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_list = obj.castTo(ListObject);
+        const as_list = obj.castTo(List);
         for (as_list.items) |item| item.release();
         heap.global_gpa.free(as_list.items.ptr[0..as_list.capacity]);
     }
 
     fn makeCrossthread(obj: *Object) void {
-        const as_list = obj.castTo(ListObject);
+        const as_list = obj.castTo(List);
         for (as_list.items) |item| item.makeCrossthread();
     }
 
@@ -875,7 +1548,7 @@ pub const ListObject = struct {
     };
 };
 
-pub const DictObject = struct {
+pub const Dictionary = struct {
     items: []Value,
     capacity: usize,
     table: ?*Table,
@@ -895,9 +1568,9 @@ pub const DictObject = struct {
         return math.ceilPowerOfTwo(usize, len) catch error.OutOfMemory;
     }
 
-    pub fn new(items: []Value) !*DictObject {
+    pub fn new(items: []Value) !*Dictionary {
         const capacity = try getCapacity(items.len);
-        const new_dict = try Object.newObject(DictObject);
+        const new_dict = try Object.newObject(Dictionary);
         errdefer new_dict.head.freeBacking();
 
         const new_items = try heap.global_gpa.alloc(Value, capacity);
@@ -912,8 +1585,8 @@ pub const DictObject = struct {
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const as_dict = src.castToConst(DictObject);
-        const new_obj = try Object.newObjectUninitialized(DictObject);
+        const as_dict = src.castToConst(Dictionary);
+        const new_obj = try Object.newObjectUninitialized(Dictionary);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
@@ -930,19 +1603,19 @@ pub const DictObject = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_dict = obj.castTo(DictObject);
+        const as_dict = obj.castTo(Dictionary);
         for (as_dict.items) |item| item.release();
         heap.global_gpa.free(as_dict.items.ptr[0..as_dict.capacity]);
         if (as_dict.table) |table| table.deinit(heap.global_gpa);
     }
 
     fn makeCrossthread(obj: *Object) void {
-        const as_dict = obj.castTo(DictObject);
+        const as_dict = obj.castTo(Dictionary);
         for (as_dict.items) |item| item.makeCrossthread();
     }
 
     fn updateString(obj: *Object) !void {
-        const as_dict = obj.castTo(DictObject);
+        const as_dict = obj.castTo(Dictionary);
         const bytes = try quoteValues(heap.global_gpa, as_dict.items);
         try obj.setStringConsuming(bytes);
     }
