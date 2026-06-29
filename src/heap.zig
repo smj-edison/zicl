@@ -491,7 +491,7 @@ pub const Value = enum(ValueBacking) {
 
     pub fn duplicate(value: Value) !Value {
         if (value.asPtr()) |obj| {
-            return (try obj.duplicate()).toValue();
+            return (try obj.duplicate()).asValue();
         } else {
             return value;
         }
@@ -627,6 +627,19 @@ pub const Value = enum(ValueBacking) {
         return hashutil.hashBytes(try value.getString());
     }
 };
+
+pub fn makeInterned(comptime bytes: []const u8) Value {
+    var len_buf: [@sizeOf(usize)]u8 = undefined;
+    std.mem.writeInt(usize, &len_buf, bytes.len, .native);
+
+    const len_and_str = len_buf ++ bytes.*;
+    const str_ptr = &len_and_str[@sizeOf(usize)..];
+
+    return Value.fromRep(.{
+        .head = .{ .tag = .interned },
+        .value = .{ .interned = @intFromPtr(&str_ptr) },
+    });
+}
 
 /// Special strings are strings that have special properties, such as being large,
 /// having a different allocation backing then what's visible, or (in the future)
@@ -792,7 +805,7 @@ pub const Object = struct {
         return @ptrCast(aligned_bytes + @sizeOf(Object));
     }
 
-    pub fn toValue(obj: *Object) Value {
+    pub fn asValue(obj: *Object) Value {
         return Value.fromRep(.{
             .head = .{ .tag = .ptr },
             .value = .{ .ptr = @intCast(@intFromPtr(obj)) },

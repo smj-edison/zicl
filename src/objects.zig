@@ -16,6 +16,8 @@ const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
 // const expr_parse = @import("expr_parse.zig");
 
+pub const interned_empty_string = heap.makeInterned("");
+
 pub const ErrorDetails = struct {
     message: [:0]u8,
 };
@@ -67,7 +69,7 @@ pub const Shimmerable = extern struct {
     }
 
     pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
-        if (!self.current().canShimmer()) {
+        if (self.current().asPtr() != null and !self.current().canShimmer()) {
             self.shimmered.swap(try self.current().duplicate());
         }
     }
@@ -75,7 +77,7 @@ pub const Shimmerable = extern struct {
     pub fn prepareToShimmer(self: *Shimmerable) !*Object {
         switch (self.current().expandedValue()) {
             .ptr => try self.ensureShimmerable(),
-            else => self.shimmered.swap((try self.current().box()).toValue()),
+            else => self.shimmered.swap((try self.current().box()).asValue()),
         }
 
         // We know that this must be an object, since we boxed it if
@@ -203,6 +205,8 @@ pub const String = struct {
         errdefer heap.global_gpa.free(duped_bytes);
         try new_obj.head.setStringLocalObject(duped_bytes);
 
+        new_obj.body.* = .{};
+
         return new_obj.body;
     }
 
@@ -211,7 +215,7 @@ pub const String = struct {
     }
 
     pub fn newValue(bytes: []const u8) !Value {
-        return (try newObject(bytes)).toValue();
+        return (try newObject(bytes)).asValue();
     }
 
     pub fn newFormatted(comptime fmt: []const u8, args: anytype) !*String {
@@ -224,13 +228,27 @@ pub const String = struct {
         return new_obj.body;
     }
 
-    pub fn newFromEscaped(escaped: []const u8) !void {
+    pub fn newFromEscaped(escaped: []const u8) !*String {
         // Unescaped will be equal or shorter than escaped version.
         const unescaped = try heap.global_gpa.alloc(u8, escaped.len);
         defer heap.global_gpa.free(unescaped);
         const written = strutil.removeEscaping(escaped, unescaped);
 
         return try new(unescaped[0..written]);
+    }
+
+    pub fn newWithCodepointLength(bytes: []const u8, codepoint_len: usize) !*String {
+        const new_obj = try Object.newObjectUninitialized(String);
+        errdefer new_obj.head.freeBacking();
+        const duped_bytes = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
+        errdefer heap.global_gpa.free(duped_bytes);
+        try new_obj.head.setStringLocalObject(duped_bytes);
+
+        new_obj.body.* = .{
+            .codepoint_len = codepoint_len,
+        };
+
+        return new_obj.body;
     }
 
     pub fn getCodepointLength(shim: *Shimmerable) !usize {
@@ -425,13 +443,13 @@ pub const ParsedScript = struct {
 
 pub const Source = struct {
     file_name: OptionalValue,
-    line: u32,
+    line_no: u32,
     hash: std.atomic.Value(?*u256),
 
     pub fn new(file_name: OptionalValue, line: u32) !*Source {
         const new_obj = try Object.newObject(Source);
         new_obj.body.file_name = file_name.borrow();
-        new_obj.body.line = line;
+        new_obj.body.line_no = line;
 
         return new_obj.body;
     }
@@ -443,7 +461,7 @@ pub const Source = struct {
 
         const cast_src = src.castToConst(Source);
         new_obj.body.file_name = cast_src.file_name.borrow();
-        new_obj.body.line = cast_src.line;
+        new_obj.body.line_no = cast_src.line_no;
 
         return new_obj.head;
     }
@@ -847,7 +865,7 @@ pub const Float = struct {
     }
 
     pub fn asHead(self: *Integer) *Object {
-        return Object.from(String, self);
+        return Object.from(Integer, self);
     }
 
     pub fn newBoxed(value: f64) !*Float {
@@ -1461,12 +1479,12 @@ pub const List = struct {
     items: []Value,
     capacity: usize,
 
-    fn getCapacity(len: usize) error{OutOfMemory}!usize {
-        return math.ceilPowerOfTwo(usize, len) catch error.OutOfMemory;
+    pub fn new(items: []const Value) !*List {
+        const capacity = math.ceilPowerOfTwo(usize, items.len) catch return error.OutOfMemory;
+        return try newWithCapacity(items, capacity);
     }
 
-    pub fn new(items: []Value) !*List {
-        const capacity = try getCapacity(items.len);
+    pub fn newWithCapacity(items: []const Value, capacity: usize) !*List {
         const new_list = try Object.newObject(List);
         errdefer new_list.head.freeBacking();
 
@@ -1484,7 +1502,19 @@ pub const List = struct {
         return self.items.ptr[0..self.capacity];
     }
 
-    pub fn resize(self: *List, new_capacity: usize) !void {
+    pub fn append(det: ?*ErrorDetails, mut: *Mutable, value: Value) !void {
+        try mut.prepareToMutate();
+        const list = try List.shimmerFrom(det, mut.asShimmerable());
+        try list.appendInner(value);
+    }
+
+    pub fn set(det: ?*ErrorDetails, mut: *Mutable, index: usize, value: Value) !void {
+        try mut.prepareToMutate();
+        const list = try List.shimmerFrom(det, mut.asShimmerable());
+        list.setInner(index, value);
+    }
+
+    fn resize(self: *List, new_capacity: usize) !void {
         if (new_capacity < self.capacity) {
             if (new_capacity < self.items.len) {
                 for (self.items[new_capacity..self.items.len]) |item| item.release();
@@ -1497,12 +1527,113 @@ pub const List = struct {
         }
     }
 
-    pub fn append(self: *List, value: Value) !void {
+    fn appendInner(self: *List, value: Value) !void {
         if (self.capacity < self.items.len + 1) try self.resize(self.capacity * 2);
 
         const old_len = self.items.len;
         self.items = self.items.ptr[0..(old_len + 1)];
         self.items[old_len] = value.borrow();
+    }
+
+    fn setInner(self: *List, index: usize, value: Value) void {
+        self.items[index].swap(value);
+    }
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*List {
+        if (shim.current().asType(List)) |list| return list;
+
+        // Optimise dict -> list.
+        if (shim.current().asType(Dictionary)) |_| {
+            try shim.ensureShimmerable();
+
+            const obj: *Object = shim.current().asPtr().?;
+            const as_dict = obj.castTo(Dictionary);
+            if (as_dict.table) |table| table.deinit(heap.global_gpa);
+            const old_items = as_dict.items;
+            const old_capacity = as_dict.capacity;
+
+            obj.vtable = &vtable;
+            const as_list = obj.castTo(List);
+            as_list.* = .{ .items = old_items, .capacity = old_capacity };
+
+            return as_list;
+        }
+
+        // Try to preserve information about filename / line number.
+        var file_name: OptionalValue = .none;
+        var line_no: u32 = 1;
+        if (shim.current().asType(Source)) |source_info| {
+            line_no = source_info.line_no;
+            file_name = source_info.file_name;
+        }
+
+        const bytes = try shim.current().getString();
+        var parser = Tokenizer.init(bytes, line_no);
+
+        var new_items: std.ArrayList(Value) = .empty;
+        errdefer {
+            for (new_items.items) |item| item.release();
+            new_items.deinit(heap.global_gpa);
+        }
+
+        while (true) {
+            const next_token = parser.nextListToken() catch |err| {
+                if (det) |details| details.* = .{ .message = try convertTokenizerError(err) };
+                return error.BadList;
+            };
+            switch (next_token.tag) {
+                .simple_string, .escaped_string => {
+                    const token_value = bytes[next_token.loc.start..next_token.loc.end];
+                    const str = if (next_token.tag == .escaped_string)
+                        try String.newFromEscaped(token_value)
+                    else
+                        try String.new(token_value);
+                    const obj = str.asHead();
+                    errdefer obj.release();
+
+                    obj.vtable = &Source.vtable;
+                    obj.castTo(Source).* = .{
+                        .file_name = file_name.borrow(),
+                        .line_no = line_no,
+                        .hash = .init(null),
+                    };
+
+                    try new_items.append(heap.global_gpa, obj.asValue());
+                },
+                .end_of_file => break,
+                else => {
+                    // Skip any line breaks or word breaks.
+                },
+            }
+        }
+
+        const obj = try shim.prepareToShimmer();
+        obj.vtable = &vtable;
+        const as_list = obj.castTo(List);
+        as_list.* = .{
+            .items = new_items.items,
+            .capacity = new_items.capacity,
+        };
+
+        return as_list;
+    }
+
+    fn convertTokenizerError(err: Tokenizer.Error) error{OutOfMemory}![:0]u8 {
+        return switch (err) {
+            error.CharactersAfterCloseBrace => try heap.global_gpa.dupeSentinel(u8, "extra characters after close-brace", 0),
+            error.MissingCloseBrace => try heap.global_gpa.dupeSentinel(u8, "missing close-brace", 0),
+            error.MissingCloseBracket => try heap.global_gpa.dupeSentinel(u8, "unmatched \"[\"", 0),
+            error.MissingCloseQuote => try heap.global_gpa.dupeSentinel(u8, "missing quote", 0),
+            error.TrailingBackslash => try heap.global_gpa.dupeSentinel(u8, "no character after \\", 0),
+            error.FunctionMissingParentheses => try heap.global_gpa.dupeSentinel(u8, "function missing parentheses", 0),
+            error.NotOperator => try heap.global_gpa.dupeSentinel(u8, "not operator", 0),
+            error.NotNumber => try heap.global_gpa.dupeSentinel(u8, "not number", 0),
+            error.NotVariable => unreachable,
+        };
+    }
+
+    pub fn asHead(self: *List) *Object {
+        return Object.from(List, self);
     }
 
     fn updateString(obj: *Object) !void {
@@ -1547,6 +1678,47 @@ pub const List = struct {
         .name = "list",
     };
 };
+
+fn testLists(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    var det: ErrorDetails = undefined;
+
+    // Simple case: two objects in a list
+    const obj1 = try String.newValue("object 1");
+    defer obj1.release();
+    const obj2 = try String.newValue("object 2");
+    defer obj2.release();
+    var list1 = try List.new(&.{ obj1, obj2 });
+    defer list1.asHead().release();
+
+    try testing.expectEqual(2, list1.items.len);
+    try testing.expectEqualStrings("object 1", try list1.items[0].getString());
+
+    const to_append = try String.newValue("appended item");
+    defer to_append.release();
+
+    var list1_mut: Mutable = .{ .original = list1.asHead().asValue() };
+    defer list1_mut.discardChanges();
+    try List.append(&det, &list1_mut, to_append);
+    const appended = list1_mut.current().asType(List).?.items[2];
+    try testing.expectEqualStrings("appended item", try appended.getString());
+
+    var string_list: Shimmerable = .{ .original = try String.newValue(
+        \\item1 {item 2} item\ 3
+    ) };
+    defer string_list.deinit();
+
+    const new_list = try List.shimmerFrom(&det, &string_list);
+    try testing.expectEqualStrings("item1", try new_list.items[0].getString());
+    try testing.expectEqualStrings("item 2", try new_list.items[1].getString());
+    try testing.expectEqualStrings("item 3", try new_list.items[2].getString());
+}
+
+test "lists" {
+    try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
+}
 
 pub const Dictionary = struct {
     items: []Value,
