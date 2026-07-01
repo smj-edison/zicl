@@ -575,16 +575,14 @@ pub const Value = enum(ValueBacking) {
     }
 
     pub fn getString(value: Value) ![:0]const u8 {
-        if (value.isFloat()) {
-            return try std.fmt.allocPrintSentinel(local_arena, "{}", .{@as(f64, @bitCast(@intFromEnum(value)))}, 0);
-        } else switch (value.asRep().head.tag) {
-            .canonical_nan => unreachable,
-            .none => unreachable,
-            .ptr => {
-                const obj_head: *Object = @ptrFromInt(value.asRep().value.ptr);
-                return try obj_head.getString();
+        switch (value.expandedValue()) {
+            .float => |float| {
+                var buf: [350]u8 = undefined;
+                const rendered = objects.Float.renderFloat(float, &buf);
+                return try local_arena.dupeSentinel(u8, rendered, 0);
             },
-            .int => return try std.fmt.allocPrintSentinel(local_arena, "{}", .{value.asInt().?}, 0),
+            .ptr => |obj| return try obj.getString(),
+            .int => |int| return try std.fmt.allocPrintSentinel(local_arena, "{}", .{int}, 0),
             .false => return "false",
             .true => return "true",
             .interned => {
@@ -597,9 +595,42 @@ pub const Value = enum(ValueBacking) {
         }
     }
 
+    /// Guaranteed to return error.OutOfMemory if and only if the `Value` is
+    /// an object pointer, and that Object OOM'd while generating its string.
+    pub fn getStringWithBuffer(value: Value, buf: *[350]u8) ![:0]const u8 {
+        comptime assert(std.fmt.count("{}", .{-std.math.floatMin(f64)}) + 1 <= 350); // + 1 for null.
+        comptime assert(std.fmt.count("{}", .{-std.math.floatMax(f64)}) + 1 <= 350);
+
+        switch (value.expandedValue()) {
+            .float => |float| return objects.Float.renderFloat(float, buf),
+            .ptr => |obj| return try obj.getString(),
+            .int => |int| return std.fmt.bufPrintSentinel(buf, "{}", .{int}, 0) catch unreachable,
+            .false => return "false",
+            .true => return "true",
+            .interned => {
+                // Length of interned string is stored right before.
+                const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
+                const len_ptr = bytes_ptr - @sizeOf(usize);
+                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
+                return bytes_ptr[0..len :0];
+            },
+        }
+    }
+
+    /// Guaranteed to return error.OutOfMemory if and only if one of the value `Value`'s
+    /// is an object pointer, and that Object OOM'd while generating its string.
     pub fn equals(a: Value, b: Value) error{OutOfMemory}!bool {
-        // If they're both primitives, we can compare their values directly.
-        if (a.isPrimitive() and b.isPrimitive()) return a == b;
+        // If they're both primitives, we can compare their values directly. Note that we can't compare
+        // interned string values directly, since they're not guaranteed to be unique.
+        const is_a_primitive = switch (a.expandedValue()) {
+            .int, .false, .true, .interned, .float => true,
+            else => false,
+        };
+        const is_b_primitive = switch (b.expandedValue()) {
+            .int, .false, .true, .interned, .float => true,
+            else => false,
+        };
+        if (is_a_primitive and is_b_primitive) return a == b;
 
         if (a.asPtr()) |a_ptr| if (b.asPtr()) |b_ptr| {
             // If both strings are special strings, we can compare their hashes, to avoid
@@ -611,7 +642,11 @@ pub const Value = enum(ValueBacking) {
             }
         };
 
-        return try a.getString() == try b.getString();
+        var buf_a: [350]u8 = undefined;
+        const a_bytes = try a.getStringWithBuffer(&buf_a);
+        var buf_b: [350]u8 = undefined;
+        const b_bytes = try b.getStringWithBuffer(&buf_b);
+        return mem.eql(u8, a_bytes, b_bytes);
     }
 
     pub fn equalsString(value: Value, str: []const u8) error{OutOfMemory}!bool {
@@ -624,21 +659,42 @@ pub const Value = enum(ValueBacking) {
 
         // We don't save the hash when it's a primitive, since
         // it should be pretty cheap to compute it again.
-        return hashutil.hashBytes(try value.getString());
+        var buf: [350]u8 = undefined;
+        return hashutil.hashBytes(value.getStringWithBuffer(&buf) catch unreachable);
     }
 };
 
-pub fn makeInterned(comptime bytes: []const u8) Value {
-    var len_buf: [@sizeOf(usize)]u8 = undefined;
-    std.mem.writeInt(usize, &len_buf, bytes.len, .native);
+/// Produces a type that owns a length-prefixed, NUL-terminated interned string
+/// buffer in rodata. The layout is `[@sizeOf(usize) bytes of length][bytes][0]`,
+/// matching how `getString` reads the length from just before the bytes pointer.
+/// The buffer's address is stable for the life of the program but is only known
+/// at run time, so the `Value` is built by `value()` at run time -- it can't be
+/// a comptime `const`, since the final rodata address isn't known at compile.
+pub fn createInternedString(comptime bytes: []const u8) type {
+    const len_bytes = comptime blk: {
+        var b: [@sizeOf(usize)]u8 = undefined;
+        std.mem.writeInt(usize, &b, bytes.len, .native);
+        break :blk b;
+    };
+    const null_byte: [1]u8 = .{0};
+    const combined = len_bytes ++ bytes ++ null_byte;
+    return struct {
+        const interned_str = combined;
 
-    const len_and_str = len_buf ++ bytes.*;
-    const str_ptr = &len_and_str[@sizeOf(usize)..];
+        /// Pointer to the bytes (just past the length prefix), NUL-terminated.
+        pub fn get() [*:0]const u8 {
+            const s = interned_str.ptr[@sizeOf(usize)..(interned_str.len - 1) :0];
+            return s.ptr;
+        }
 
-    return Value.fromRep(.{
-        .head = .{ .tag = .interned },
-        .value = .{ .interned = @intFromPtr(&str_ptr) },
-    });
+        pub fn value() Value {
+            const ptr = get();
+            return Value.fromRep(.{
+                .head = .{ .tag = .interned },
+                .value = .{ .interned = @intCast(@intFromPtr(ptr)) },
+            });
+        }
+    };
 }
 
 /// Special strings are strings that have special properties, such as being large,
@@ -782,7 +838,7 @@ pub const Object = struct {
     vtable: *const VTable,
     ref_count: u32,
 
-    pub const object_size: usize = 64;
+    pub const object_size: usize = 80;
     comptime {
         assert(@sizeOf(Object) < object_size);
     }

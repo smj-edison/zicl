@@ -199,45 +199,45 @@ fn resolveVariable(
     }
 
     const var_dict = interp.call_frames.items[var_call_frame].variables;
-    var maybe_scope_hash_ref = &interp.call_frames.items[var_call_frame].signature.scope_hash_ref;
+    const maybe_scope_hash_ref = &interp.call_frames.items[var_call_frame].signature.scope_hash_ref;
 
     // Check the variables dictionary. Don't follow refs here so the
     // cached index points at the dict slot, not the ref target.
-    const in_local_variables = try var_dict.get(var_name);
-    if (in_local_variables.toHandle()) |local_var| {
+    if (try var_dict.getPtr(var_name)) |local_var| {
         return .{ .local_variable = .{
             .target = local_var,
         } };
     }
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
-    if (maybe_scope_hash_ref.toHandleRef()) |scope_hash_ref| {
-        assert(scope_hash_ref.tag() == .hash_reference);
-        var scope_dict_wb: Shimmerable = .{ .original = scope_hash_ref.peek().body.hash_reference };
-        defer scope_dict_wb.discardChanges();
-        objutil.shimmerToDict(det, &scope_dict_wb) catch |err| switch (err) {
+    if (maybe_scope_hash_ref.*) |*scope_hash_ref| {
+        var scope_dict_shim: Shimmerable = .{ .original = scope_hash_ref.*.ref };
+        defer scope_dict_shim.discardChanges();
+        const scope_dict: *objects.Dictionary = objects.Dictionary.shimmerFrom(null, &scope_dict_shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadDict => {
                 if (det) |details| details.* = .{
-                    .message = try objutil.newString("hash lookup resolved to a bad dictionary"),
+                    .message = try heap.global_gpa.dupeSentinel(u8, "hash lookup resolved to a bad dictionary", 0),
                 };
                 return error.LinkLookupFailed;
             },
         };
-        const scope_dict = scope_dict_wb.current();
-        if (scope_dict_wb.shimmered.toHandle()) |new_dict| {
-            const new_hash_ref = try objutil.createHashReference(new_dict);
-            scope_hash_ref.swap(new_hash_ref);
+
+        if (scope_dict_shim.takeShimmered().toValue()) |new_dict| {
+            const new_hash_ref = try objects.HashReference.new(new_dict);
+            scope_hash_ref.*.asHead().release();
+            scope_hash_ref.* = new_hash_ref;
         }
 
-        var scope_wb: Shimmerable = .{ .original = scope_dict };
-        defer scope_wb.discardChanges();
-        const in_linked_scope = try objutil.dictLookupFollowLinks(det, &scope_wb, var_name);
-        if (scope_wb.shimmered.toHandle()) |new_dict| {
-            const new_hash_ref = try objutil.createHashReference(new_dict);
-            scope_hash_ref.swap(new_hash_ref);
+        var scope_shim: Shimmerable = .{ .original = scope_dict };
+        defer scope_shim.discardChanges();
+        const in_linked_scope = try objects.Dictionary.lookup(det, &scope_shim, var_name);
+        if (scope_shim.takeShimmered().toValue()) |new_dict| {
+            const new_hash_ref = try objects.HashReference.new(new_dict);
+            scope_hash_ref.*.asHead().release();
+            scope_hash_ref.* = new_hash_ref;
         }
-        if (in_linked_scope.toHandle()) |val| {
+        if (in_linked_scope.toValue()) |val| {
             return .{ .lexical_variable = .{
                 .target = val,
             } };
@@ -249,7 +249,6 @@ fn resolveVariable(
 
 const VariableLookupResult = enum { not_found, dict_sugar, normal };
 
-const no_variable_fmt_string = "can't read \"{s}\": no such variable";
 /// This always recalculates .variable. You probably should be using `ensureValidVariableType`.
 /// Must be called with a heap-native variable name, so it can shimmer in place.
 fn reshimmerToVariable(
@@ -1578,15 +1577,14 @@ const CallFrame = struct {
     args: []Shimmerable,
     /// Signature of this procedure.
     signature: objects.ClosureValues,
-    /// Call epoch. Used to invalidate previous variable lookups. Can overflow,
-    /// but when it overflows it'll scan the heap and reset all cached lookups.
-    call_epoch: u32,
+    /// Call epoch. Used to invalidate previous variable lookups.
+    call_epoch: u64,
     /// Set this during evaluation to trigger a tailcall.
     tailcall: ?Tailcall,
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
-        frame.variables.decrRefCount();
+        frame.variables.asHead().release();
         frame.signature.deinit();
     }
 };
@@ -2686,7 +2684,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
             // Shave off the end, because we're looking up `self`, not the method in this case.
             var ending = std.mem.lastIndexOf(u8, var_name, "::").?;
             while (ending > 0 and var_name[ending - 1] == ':') ending -= 1;
-            try interp.setResultFormatted(no_variable_fmt_string, .{var_name[0..ending]});
+            try interp.setResultFormatted("can't read \"{s}\": no such variable", .{var_name[0..ending]});
             return error.EvalError;
         }
     } else {

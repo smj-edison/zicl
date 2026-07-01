@@ -16,7 +16,8 @@ const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
 // const expr_parse = @import("expr_parse.zig");
 
-pub const interned_empty_string = heap.makeInterned("");
+pub const interned_empty_string = heap.createInternedString("");
+pub const interned_tilde_parent = heap.createInternedString("~parent");
 
 pub const ErrorDetails = struct {
     message: [:0]u8,
@@ -493,7 +494,7 @@ pub const ClosureValues = struct {
     /// We do our best to track the closure's name.
     name: OptionalValue,
     /// Hash reference pointing to the scope.
-    scope_hash_ref: OptionalValue,
+    scope_hash_ref: ?*HashReference,
     /// Required number of arguments.
     required_arity: u32,
     /// Optional number of arguments.
@@ -509,11 +510,13 @@ pub const ClosureValues = struct {
     cache_id: u64,
 
     pub fn borrow(closure: ClosureValues) ClosureValues {
+        const borrowed_hash_ref = closure.scope_hash_ref;
+        if (borrowed_hash_ref) |val| _ = val.asHead().borrow();
         return .{
             .args = closure.args.borrow(),
             .body = closure.body.borrow(),
             .name = closure.name.borrow(),
-            .scope_hash_ref = closure.scope_hash_ref.borrow(),
+            .scope_hash_ref = borrowed_hash_ref,
             .required_arity = closure.required_arity,
             .optional_arity = closure.optional_arity,
             .optional_values = closure.optional_values.borrow(),
@@ -527,7 +530,7 @@ pub const ClosureValues = struct {
         closure.args.release();
         closure.body.release();
         closure.name.release();
-        closure.scope_hash_ref.release();
+        if (closure.scope_hash_ref) |val| val.asHead().release();
         closure.optional_values.release();
     }
 };
@@ -642,6 +645,7 @@ pub const HashReference = struct {
         const target = heap.registered_hashes.get(hash) orelse {
             if (det) |details| details.* = .{
                 .message = try std.fmt.allocPrintSentinel(
+                    heap.global_gpa,
                     "could not find value for hash reference {s}",
                     .{bytes},
                     0,
@@ -652,9 +656,13 @@ pub const HashReference = struct {
 
         const obj = try shim.prepareToShimmer();
         obj.vtable = &vtable;
-        obj.castTo(HashReference).* = .{
-            .ref = target.borrow(),
-        };
+        const as_hash_ref = obj.castTo(HashReference);
+        as_hash_ref.* = .{ .ref = target.borrow() };
+        return as_hash_ref;
+    }
+
+    pub fn asHead(self: *HashReference) *Object {
+        return Object.from(HashReference, self);
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -862,6 +870,15 @@ pub const Float = struct {
     pub fn new(value: f64) Value {
         if (math.isNan(value)) return Value.newFloat(math.nan(f64));
         return Value.newFloat(value);
+    }
+
+    pub fn renderFloat(float: f64, buf: *[350]u8) [:0]const u8 {
+        if (@trunc(float) == float) {
+            // If it has no fractional part, we render it with ".0" at the end.
+            return std.fmt.bufPrintSentinel(buf, "{:.1}", .{float}, 0) catch unreachable;
+        } else {
+            return std.fmt.bufPrintSentinel(buf, "{}", .{float}, 0) catch unreachable;
+        }
     }
 
     pub fn asHead(self: *Integer) *Object {
@@ -1480,7 +1497,7 @@ pub const List = struct {
     capacity: usize,
 
     pub fn new(items: []const Value) !*List {
-        const capacity = math.ceilPowerOfTwo(usize, items.len) catch return error.OutOfMemory;
+        const capacity = math.ceilPowerOfTwo(usize, items.len) catch items.len;
         return try newWithCapacity(items, capacity);
     }
 
@@ -1514,13 +1531,8 @@ pub const List = struct {
         list.setInner(index, value);
     }
 
-    fn resize(self: *List, new_capacity: usize) !void {
-        if (new_capacity < self.capacity) {
-            if (new_capacity < self.items.len) {
-                for (self.items[new_capacity..self.items.len]) |item| item.release();
-                self.items.len = new_capacity;
-            }
-        } else if (new_capacity > self.capacity) {
+    fn ensureCapacity(self: *List, new_capacity: usize) !void {
+        if (new_capacity > self.capacity) {
             const new_backing = try heap.global_gpa.realloc(self.backingSlice(), new_capacity);
             self.items = new_backing[0..self.items.len];
             self.capacity = new_capacity;
@@ -1528,7 +1540,7 @@ pub const List = struct {
     }
 
     fn appendInner(self: *List, value: Value) !void {
-        if (self.capacity < self.items.len + 1) try self.resize(self.capacity * 2);
+        if (self.capacity < self.items.len + 1) try self.ensureCapacity(@max(4, self.capacity * 2));
 
         const old_len = self.items.len;
         self.items = self.items.ptr[0..(old_len + 1)];
@@ -1548,7 +1560,9 @@ pub const List = struct {
 
             const obj: *Object = shim.current().asPtr().?;
             const as_dict = obj.castTo(Dictionary);
-            if (as_dict.table) |table| table.deinit(heap.global_gpa);
+            // The list shares the dict's items, so just free the dict's table
+            // and swap the head over.
+            as_dict.table.deinit(heap.global_gpa);
             const old_items = as_dict.items;
             const old_capacity = as_dict.capacity;
 
@@ -1723,37 +1737,512 @@ test "lists" {
 pub const Dictionary = struct {
     items: []Value,
     capacity: usize,
-    table: ?*Table,
+    table: Table,
 
-    /// Note that the caller is responsible for ensuring that each key has a string when calling any function
-    /// that uses its `hash` or `eql` functions.
+    /// This table is always used in a way that ensures that any
+    /// key inserted already has its string generated.
     const Table = std.HashMapUnmanaged(Value, usize, struct {
         pub fn hash(_: @This(), key: Value) u64 {
-            return key.getHashNoRegister() catch unreachable;
+            return @truncate(key.getHashNoRegister() catch unreachable);
         }
         pub fn eql(_: @This(), a: Value, b: Value) bool {
             return a.equals(b) catch unreachable;
         }
     }, 80);
 
-    fn getCapacity(len: usize) error{OutOfMemory}!usize {
-        return math.ceilPowerOfTwo(usize, len) catch error.OutOfMemory;
+    pub fn asHead(self: *Dictionary) *Object {
+        return Object.from(Dictionary, self);
     }
 
-    pub fn new(items: []Value) !*Dictionary {
-        const capacity = try getCapacity(items.len);
+    fn backingSlice(self: *Dictionary) []Value {
+        return self.items.ptr[0..self.capacity];
+    }
+
+    fn ensureCapacity(self: *Dictionary, new_capacity: usize) !void {
+        if (new_capacity > self.capacity) {
+            const new_backing = try heap.global_gpa.realloc(self.backingSlice(), new_capacity);
+            self.items = new_backing[0..self.items.len];
+            self.capacity = new_capacity;
+            try self.table.ensureTotalCapacity(heap.global_gpa, @intCast(new_capacity / 2));
+        }
+    }
+
+    pub fn new(items: []const Value) !*Dictionary {
+        const capacity = math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len;
         const new_dict = try Object.newObject(Dictionary);
         errdefer new_dict.head.freeBacking();
 
         const new_items = try heap.global_gpa.alloc(Value, capacity);
+        errdefer heap.global_gpa.free(new_items);
         for (items, new_items[0..items.len]) |item, *new_item| {
             new_item.* = item.borrow();
         }
-        new_dict.body.items = new_items[0..items.len];
-        new_dict.body.capacity = capacity;
-        new_dict.body.table = null;
+        errdefer for (new_items) |item| item.release();
+
+        new_dict.body.* = .{
+            .items = new_items[0..items.len],
+            .capacity = capacity,
+            .table = try generateTable(new_items[0..items.len]),
+        };
 
         return new_dict.body;
+    }
+
+    /// Generate the mapping from keys to values.
+    fn generateTable(items: []Value) !Table {
+        var table: Table = .empty;
+        errdefer table.deinit(heap.global_gpa);
+        try table.ensureTotalCapacity(heap.global_gpa, @intCast(items.len));
+
+        var item_index: usize = 0;
+        while (item_index < items.len) : (item_index += 2) {
+            // Note that if a key appears multiple times, the last instance
+            // of that key will win.
+            _ = try items[item_index].getHashNoRegister(); // Make sure it has a hash in advance.
+            try table.put(heap.global_gpa, items[item_index], item_index + 1);
+        }
+        return table;
+    }
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*Dictionary {
+        if (shim.current().asType(Dictionary)) |dict| return dict;
+
+        const list = List.shimmerFrom(det, shim) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadList => return error.BadDict,
+        };
+        // A dict needs an even number of elements.
+        if (list.items.len % 2 != 0) {
+            if (det) |details| details.* = .{
+                .message = try std.fmt.allocPrintSentinel(
+                    heap.global_gpa,
+                    "Missing value to go with key when converting \"{s}\" to a dictionary.",
+                    .{try shim.current().getString()},
+                    0,
+                ),
+            };
+            return error.BadDict;
+        }
+
+        const table = try generateTable(list.items);
+
+        const old_items = list.items;
+        const old_capacity = list.capacity;
+        const obj = list.asHead();
+        obj.vtable = &vtable;
+        const as_dict = obj.castTo(Dictionary);
+        as_dict.* = .{
+            .items = old_items,
+            .capacity = old_capacity,
+            .table = table,
+        };
+        return as_dict;
+    }
+
+    pub fn get(self: *Dictionary, key: Value) !OptionalValue {
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        if (self.table.get(key)) |idx| return self.items[idx].asOptional();
+        return .none;
+    }
+
+    pub fn getPtr(self: *Dictionary, key: Value) !?*Value {
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        if (self.table.get(key)) |idx| return &self.items[idx];
+        return .none;
+    }
+
+    pub fn put(det: ?*ErrorDetails, mut: *Mutable, key: Value, value: Value) !usize {
+        const result = try putInner(det, mut, key, value);
+        if (mut.current().asPtr()) |obj| obj.invalidateString();
+        return result;
+    }
+
+    /// Does not invalidate the string.
+    pub fn putInner(det: ?*ErrorDetails, mut: *Mutable, key: Value, value: Value) !usize {
+        // Ensure the key already has a hash, since the table requires everything used
+        // to have a precomputed hash.
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+
+        try mut.prepareToMutate();
+        const dict = try Dictionary.shimmerFrom(det, mut.asShimmerable());
+
+        if (dict.table.get(key)) |existing_value_index| {
+            // Key exists, so replace the value in place.
+            const old = dict.items[existing_value_index];
+            dict.items[existing_value_index] = value.borrow();
+            errdefer {
+                dict.items[existing_value_index].release();
+                dict.items[existing_value_index] = old;
+            }
+
+            const shifted_index = removeDuplicates(dict, existing_value_index);
+            old.release();
+            return shifted_index.?;
+        } else {
+            // New item, so we need to expand the dict.
+
+            const old_len = dict.items.len;
+            const new_key_index = old_len;
+            const new_value_index = old_len + 1;
+
+            if (dict.capacity < old_len + 2) try dict.ensureCapacity(@max(4, dict.capacity * 2));
+            // `ensureCapacity` also ensures enough room for the table.
+            dict.table.putAssumeCapacity(key, new_value_index);
+
+            // Expand the items slice to include the new items we made room for.
+            dict.items = dict.backingSlice()[0..(old_len + 2)];
+            dict.items[new_key_index] = key.borrow();
+            dict.items[new_value_index] = value.borrow();
+
+            const shifted_index = removeDuplicates(dict, new_value_index);
+            return shifted_index.?;
+        }
+    }
+
+    /// Remove all pairs with key `key`. Returns true if any were removed, and
+    /// keeps the table live (clearing and re-putting into the same allocation).
+    pub fn remove(det: ?*ErrorDetails, mut: *Mutable, key: Value) !bool {
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+
+        try mut.prepareToMutate();
+        var dict = try Dictionary.shimmerFrom(det, mut.asShimmerable());
+
+        // Locate the first key. We have to do a scan instead of using `dict.get`, since
+        // `dict.get` only returns the last key.
+        var first_key_index: usize = 0;
+        while (first_key_index < dict.items.len) : (first_key_index += 2) {
+            if (key.equals(dict.items[first_key_index]) catch unreachable) break;
+        } else {
+            return false; // No matching key.
+        }
+
+        // Before removing a key from the dictionary, we first need to check if
+        // that key is contained in a linked parent. For example, say we have
+        // 1: {a 5}
+        // 2: {a 10 parent 1}
+        // then we remove "a" from 2. So it would look something like
+        // 1: {a 5}
+        // 2: {parent 1}
+        // The problem is when "a" is looked up, it will traverse to 1, thus returning
+        // "5" as the value of "a", instead of returning none. So we have to flatten
+        // the linked dictionaries into a singular dictionary so we can remove "a"
+        // without resolving to a parent.
+        const tilde_parent = interned_tilde_parent.value();
+        if ((try dict.get(tilde_parent)).asValue()) |parent_hash_ref| {
+            // This dictionary has a parent link, so we need to see if any of the parents
+            // contain `key`. This requires a decent bit of shimmering, since at any point
+            // we could have strings instead of internal representations.
+            var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
+            defer parent_hash_ref_shim.discardChanges();
+            const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
+            var parent_shim: Shimmerable = .{ .original = parent.asValue() };
+            defer parent_shim.discardChanges();
+            // We've finally hash reference and resolved it to its dictionary, so we'll now
+            // see if the key is in any of the linked parents.
+            const key_in_parent = (try getFollowingLinks(det, &parent_shim, key)) != .none;
+
+            if (parent_shim.takeShimmered().asValue()) |new_parent| {
+                // Write back the shimmered value to the dictionary.
+                const ref_to_new_parent = (try HashReference.new(new_parent.asPtr().?)).asHead();
+                defer ref_to_new_parent.release();
+                _ = try putInner(det, mut, tilde_parent, ref_to_new_parent.asValue());
+            } else if (parent_hash_ref_shim.takeShimmered().asValue()) |new_hash_ref| {
+                defer new_hash_ref.release();
+                _ = try putInner(det, mut, tilde_parent, new_hash_ref);
+            }
+
+            // Reload `dict` after potential modifications.
+            dict = mut.current().asType(Dictionary).?;
+
+            if (key_in_parent) {
+                // Key was found in the parent, so we do need to flatten.
+                try flatten(det, mut);
+                dict = mut.current().asType(Dictionary).?;
+
+                // Flattening may change indicies, so we need to rescan for the first key.
+                first_key_index = 0;
+                while (first_key_index < dict.items.len) : (first_key_index += 2) {
+                    if (key.equals(dict.items[first_key_index]) catch unreachable) break;
+                } else {
+                    return false; // No matching key.
+                }
+            }
+        }
+
+        // Remove the key from the table before shifting everything around.
+        _ = dict.table.remove(key);
+
+        // Main removal loop.
+        const original_len = dict.items.len;
+        var pairs_removed: usize = 0;
+        var item_index: usize = 0;
+        while (item_index < original_len) : (item_index += 2) {
+            if (dict.items[item_index].equals(key) catch unreachable) {
+                dict.items[item_index].release();
+                dict.items[item_index + 1].release();
+                pairs_removed += 1;
+            } else if (pairs_removed > 0) {
+                // Be sure to shift items back after we've removed one or more pairs.
+                const new_key_index = item_index - pairs_removed * 2;
+                dict.items[new_key_index] = dict.items[item_index];
+                dict.items[new_key_index + 1] = dict.items[item_index + 1];
+            }
+        }
+        dict.items.len -= pairs_removed * 2;
+
+        // Rebuild the table in place. Pretty sure this will be faster in most cases
+        // compared to updating all the hash table indexes. If we use swap removal
+        // this would be a lot easier, but I do like having dictionaries preserve
+        // their ordering.
+        dict.table.clearRetainingCapacity();
+        item_index = 0;
+        while (item_index < dict.items.len) : (item_index += 2) {
+            // Items after removal will be strictly less than items before removal.
+            dict.table.putAssumeCapacity(dict.items[item_index], item_index + 1);
+        }
+
+        // Match Tcl behavior by removing duplicates in other parts of the dictionary.
+        _ = dict.removeDuplicates(null);
+        dict.asHead().invalidateString();
+        return true;
+    }
+
+    /// Remove earlier duplicate pairs, keeping the last value for each key. If
+    /// `to_track` is given, returns its new index (or null if it was removed).
+    fn removeDuplicates(dict: *Dictionary, to_track: ?usize) ?usize {
+        if (dict.table.count() * 2 == dict.items.len) return to_track; // No duplicates.
+
+        var to_track_new_location: ?usize = null;
+        var pairs_removed: usize = 0;
+        var item_index: usize = 0;
+        while (item_index < dict.items.len) : (item_index += 2) {
+            const key_index = item_index;
+            const value_index = item_index + 1;
+            // Figure out whether this key is the last key or not by seeing whether
+            // it's the key stored in the table or not.
+            const canonical = dict.table.get(dict.items[key_index]).?;
+            if (value_index != canonical) {
+                // This was not the value that was registered in the table,
+                // so we'll go ahead and remove it.
+                dict.items[item_index].release();
+                dict.items[item_index + 1].release();
+                pairs_removed += 1;
+            } else if (pairs_removed > 0) {
+                // Be sure to shift items back after we've removed one or more pairs.
+                const new_key_index = item_index - pairs_removed * 2;
+                const new_value_index = new_key_index + 1;
+
+                dict.items[new_key_index] = dict.items[item_index];
+                dict.items[new_value_index] = dict.items[item_index + 1];
+
+                if (key_index == to_track) to_track_new_location = new_key_index;
+                if (value_index == to_track) to_track_new_location = new_value_index;
+            } else {
+                if (key_index == to_track) to_track_new_location = key_index;
+                if (value_index == to_track) to_track_new_location = value_index;
+            }
+        }
+        dict.items.len -= pairs_removed * 2;
+
+        // Rebuild the table after removing duplicates.
+        dict.table.clearRetainingCapacity();
+        item_index = 0;
+        while (item_index < dict.items.len) : (item_index += 2) {
+            dict.table.putAssumeCapacity(dict.items[item_index], item_index + 1);
+        }
+
+        return to_track_new_location;
+    }
+
+    pub fn flatten(det: ?*ErrorDetails, mut: *Mutable) !void {
+        const dict = try shimmerFrom(det, mut.asShimmerable());
+        const flattened = try flattenInner(det, dict);
+        if (flattened) |new_dict| mut.mutated.swap(new_dict.asHead().asValue());
+    }
+
+    /// Remove all links from a dict and combine them into one dict.
+    pub fn flattenInner(det: ?*ErrorDetails, original: *Dictionary) !?*Dictionary {
+        if ((try original.get(interned_tilde_parent.value())).asValue()) |parent_hash_ref| {
+            var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
+            defer parent_hash_ref_shim.discardChanges();
+            const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
+            var parent_shim: Shimmerable = .{ .original = parent.asValue() };
+            errdefer parent_shim.discardChanges();
+            const parent_as_dict = try shimmerFrom(det, &parent_shim);
+
+            const new_dict = try flattenInner(det, parent_as_dict);
+            const to_add_to = if (new_dict) |val| val.asHead() else try parent.duplicate();
+            var to_add_to_mut: Mutable = .{ .original = to_add_to.asValue() };
+            errdefer to_add_to_mut.deinit();
+
+            var pair_index: u32 = 0;
+            while (pair_index < original.items.len) : (pair_index += 2) {
+                _ = try put(det, &to_add_to_mut, original.items[pair_index], original.items[pair_index + 1]);
+            }
+
+            return to_add_to_mut.consume().asType(Dictionary).?;
+        } else {
+            return null; // We've reached the end, so no need to flatten.
+        }
+    }
+
+    pub fn getFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LinkLookupFailed }!OptionalValue {
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+
+        const dict = shimmerFrom(det, shim) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadDict => return error.LinkLookupFailed,
+        };
+
+        // See if it's immediately in this dictionary.
+        if ((try dict.get(key)).asValue()) |val| return val.asOptional();
+
+        // Wasn't in this dictionary, so check if it's in a parent dict.
+        const tilde_parent = interned_tilde_parent.value();
+        if ((try dict.get(tilde_parent)).asValue()) |parent_hash_ref| {
+            var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
+            defer parent_hash_ref_shim.discardChanges();
+            const parent_as_dict = HashReference.shimmerFrom(det, &parent_hash_ref_shim) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NotHashReference, error.HashLookupFailed => return error.LinkLookupFailed,
+            };
+            const parent = parent_as_dict.ref; // Resolve to value of hash.
+
+            var parent_shim: Shimmerable = .{ .original = parent.asValue(), .shimmered = .none };
+            defer parent_shim.discardChanges();
+            const looked_up = try getFollowingLinks(det, &parent_shim, key);
+
+            if (parent_shim.takeShimmered().asValue()) |new_parent| {
+                // Write back the shimmered value to the dictionary.
+                const ref_to_new_parent = (try HashReference.new(new_parent.asPtr().?)).asHead();
+                defer ref_to_new_parent.release();
+
+                // This is delicate, but it's not mutation, since we're switching out the hash reference
+                // with its shimmered representation, so it is transparent to the caller. Note that
+                // `putInner` does not invalidate the string representation, so even if the underlying
+                // dictionary mutates, we preserve the original string.
+                _ = putInner(det, shim.asMutable(), tilde_parent, ref_to_new_parent.asValue()) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => unreachable,
+                };
+            } else if (parent_hash_ref_shim.takeShimmered().asValue()) |new_hash_ref| {
+                defer new_hash_ref.release();
+                _ = putInner(det, shim.asMutable(), tilde_parent, new_hash_ref) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => unreachable,
+                };
+            }
+
+            return looked_up;
+        }
+
+        // Nothing found, even after checking parent links.
+        return .none;
+    }
+
+    pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !OptionalValue {
+        if (context.len() == 0) return shim.current().asOptional();
+        if (context.len() == 1) return try getFollowingLinks(det, shim, context.get(0));
+
+        if ((try getFollowingLinks(det, shim, context.get(0))).asValue()) |child_dict| {
+            var child_shim: Shimmerable = .{ .original = child_dict };
+            defer child_shim.discardChanges();
+            const child_result = try getRecursively(det, &child_shim, context.sliceAfter(1));
+            if (child_shim.takeShimmered().asValue()) |new_child| {
+                defer new_child.release();
+                // The child dict changed, propagate back up.
+                _ = try putInner(det, shim.asMutable(), context.get(0), new_child);
+            }
+            return child_result;
+        } else {
+            return .none;
+        }
+    }
+
+    pub fn putRecursively(det: ?*ErrorDetails, mut: *Mutable, context: anytype, value: Value) !Value {
+        const dict = try shimmerFrom(det, mut.asShimmerable());
+
+        assert(context.len() > 0);
+        if (context.len() == 1) {
+            const inserted_at = try put(mut, context.get(0), value);
+            return mut.current().asType(Dictionary).?.items[inserted_at];
+        }
+
+        // Find/create the child dict.
+        const child_dict = blk: {
+            if ((try dict.get(context.get(0))).asValue()) |existing_dict| {
+                break :blk existing_dict;
+            } else {
+                // Create a new child dictionary.
+                const new_child_dict = (try new(&.{})).asHead().asValue();
+                defer new_child_dict.release();
+
+                _ = try put(mut, context.get(0), new_child_dict);
+                break :blk new_child_dict;
+            }
+        };
+
+        var child_wb: Mutable = .{ .original = child_dict };
+        defer child_wb.discardChanges();
+        const child_put_result = try putRecursively(det, &child_wb, context.sliceAfter(1), value);
+        if (child_wb.takeMutated().asValue()) |new_child| {
+            // The child dict changed, so we need to update ours.
+            defer new_child.release();
+            _ = try put(mut, context.get(0), new_child);
+        }
+
+        mut.current().asPtr().?.invalidateString();
+
+        return child_put_result;
+    }
+
+    pub fn removeRecursively(det: ?*ErrorDetails, mut: *Mutable, context: anytype) !bool {
+        var dict = try shimmerFrom(det, mut.asShimmerable());
+
+        assert(context.len() > 0);
+        if (context.len() == 1) return try remove(det, mut, context.get(0));
+
+        if ((try dict.get(context.get(0))).asValue()) |child_dict| {
+            var child_mut: Mutable = .{ .original = child_dict };
+            defer child_mut.discardChanges();
+
+            const did_remove = try removeRecursively(det, &child_mut, context.sliceAfter(1));
+            if (child_mut.takeMutated().asValue()) |new_child| {
+                defer new_child.release();
+                _ = try put(mut, context.get(0), new_child);
+            }
+
+            mut.current().asPtr().?.invalidateString();
+
+            return did_remove;
+        } else {
+            if (det) |details| details.* = .{
+                .message = std.fmt.allocPrintSentinel(
+                    heap.global_gpa,
+                    "key \"{s}\" not known in dictionary \"{s}\"",
+                    .{ try context.get(0).getString(), try mut.current().getString() },
+                    0,
+                ),
+            };
+            return error.PathNonexistent;
+        }
+    }
+
+    /// A key->value map, with parent keys inserted before child keys.
+    pub const KvResult = std.array_hash_map.Custom(Value, Value, struct {
+        pub fn hash(_: @This(), key: Value) u32 {
+            return @truncate(key.getHashNoRegister() catch unreachable);
+        }
+        pub fn eql(_: @This(), a: Value, b: Value, _: usize) bool {
+            return a.equals(b) catch unreachable;
+        }
+    }, true);
+
+    pub fn getKvPairs(det: ?*ErrorDetails, arena: std.mem.Allocator, shim: *Shimmerable) !KvResult {
+        _ = det;
+        _ = arena;
+        _ = shim;
+        @panic("TODO: ~parent getKvPairs not yet ported to the new heap");
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -1767,9 +2256,13 @@ pub const Dictionary = struct {
         for (as_dict.items, new_items[0..as_dict.items.len]) |item, *new_item| {
             new_item.* = item.borrow();
         }
-        new_obj.body.items = new_items[0..as_dict.items.len];
-        new_obj.body.capacity = as_dict.capacity;
-        new_obj.body.table = null;
+        errdefer for (new_items) |item| item.release();
+
+        new_obj.body.* = .{
+            .items = new_items[0..as_dict.items.len],
+            .capacity = as_dict.capacity,
+            .table = try generateTable(new_items[0..as_dict.items.len]),
+        };
 
         return new_obj.head;
     }
@@ -1777,8 +2270,8 @@ pub const Dictionary = struct {
     fn freeInternalRep(obj: *Object) void {
         const as_dict = obj.castTo(Dictionary);
         for (as_dict.items) |item| item.release();
-        heap.global_gpa.free(as_dict.items.ptr[0..as_dict.capacity]);
-        if (as_dict.table) |table| table.deinit(heap.global_gpa);
+        heap.global_gpa.free(as_dict.backingSlice());
+        as_dict.table.deinit(heap.global_gpa);
     }
 
     fn makeCrossthread(obj: *Object) void {
@@ -1800,3 +2293,112 @@ pub const Dictionary = struct {
         .name = "dict",
     };
 };
+
+fn testDicts(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    var det: ErrorDetails = undefined;
+
+    const key_foo = try String.newValue("foo");
+    defer key_foo.release();
+    const value1 = try String.newValue("1");
+    defer value1.release();
+    const key_bar = try String.newValue("bar");
+    defer key_bar.release();
+    const value2 = try String.newValue("2");
+    defer value2.release();
+
+    const dict1 = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
+    defer dict1.asHead().release();
+
+    const good_key = try String.newValue("foo");
+    defer good_key.release();
+    const bad_key = try String.newValue("bogus");
+    defer bad_key.release();
+
+    try testing.expectEqualStrings("1", try (try dict1.get(good_key)).asValue().?.getString());
+    try testing.expectEqual(OptionalValue.none, try dict1.get(bad_key));
+
+    // Dict with duplicate entries.
+    var dup_wb: Mutable = .{ .original = try String.newValue("foo 5 bar 10 foo 15") };
+    defer dup_wb.deinit();
+    const dup_dict = try Dictionary.shimmerFrom(&det, dup_wb.asShimmerable());
+    try testing.expectEqual(@as(usize, 3), dup_dict.items.len / 2);
+    // A duplicate key maps to its last value.
+    try testing.expectEqualStrings("15", try (try dup_dict.get(key_foo)).asValue().?.getString());
+
+    const as_dict = try Dictionary.shimmerFrom(null, dup_wb.asShimmerable());
+    _ = Dictionary.removeDuplicates(as_dict, null);
+    try testing.expectEqual(@as(usize, 2), as_dict.items.len / 2);
+
+    // Dict put.
+    const dict_for_put = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
+    defer dict_for_put.asHead().release();
+    const key3 = try String.newValue("baz");
+    defer key3.release();
+    const value3 = try String.newValue("3");
+    defer value3.release();
+
+    var put_wb: Mutable = .{ .original = dict_for_put.asHead().asValue() };
+    defer put_wb.discardChanges();
+    try testing.expectEqual(@as(usize, 2), put_wb.current().asType(Dictionary).?.items.len / 2);
+    // Replace an existing key's value; pair count stays the same.
+    _ = try Dictionary.put(null, &put_wb, key_bar, value3.borrow());
+    try testing.expectEqual(@as(usize, 2), put_wb.current().asType(Dictionary).?.items.len / 2);
+    // Add a new key; pair count grows.
+    _ = try Dictionary.put(null, &put_wb, key3, value3.borrow());
+    try testing.expectEqual(@as(usize, 3), put_wb.current().asType(Dictionary).?.items.len / 2);
+    try testing.expectEqualStrings(
+        "3",
+        try (try put_wb.current().asType(Dictionary).?.get(key3)).asValue().?.getString(),
+    );
+
+    // Dict remove. Tcl removes all matching keys, so both "foo" pairs go.
+    var remove_wb: Mutable = .{
+        .original = (try Dictionary.new(&.{ key_foo, value1, key_bar, value2, key_foo, value3 })).asHead().asValue(),
+    };
+    defer remove_wb.deinit();
+    try testing.expect(try Dictionary.remove(null, &remove_wb, key_foo));
+    try testing.expectEqualStrings("bar 2", try remove_wb.current().getString());
+
+    // Edge cases: using internal objects as keys and values.
+    const edge_dict = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
+    defer edge_dict.asHead().release();
+    var edge_wb: Mutable = .{ .original = edge_dict.asHead().asValue() };
+    defer edge_wb.discardChanges();
+
+    // Use a value as a key, and a key as the value.
+    {
+        const cur = edge_wb.current().asType(Dictionary).?;
+        _ = try Dictionary.put(null, &edge_wb, cur.items[1], cur.items[2].borrow());
+    }
+    try testing.expectEqualStrings(
+        "bar",
+        try (try edge_wb.current().asType(Dictionary).?.get(value1)).asValue().?.getString(),
+    );
+
+    // Alias a key by using it as both key and value.
+    {
+        const cur = edge_wb.current().asType(Dictionary).?;
+        _ = try Dictionary.put(null, &edge_wb, cur.items[0], cur.items[0].borrow());
+    }
+    try testing.expectEqualStrings(
+        "foo",
+        try (try edge_wb.current().asType(Dictionary).?.get(key_foo)).asValue().?.getString(),
+    );
+
+    // Alias a value by using it as both key and value.
+    {
+        const cur = edge_wb.current().asType(Dictionary).?;
+        _ = try Dictionary.put(null, &edge_wb, cur.items[3], cur.items[3].borrow());
+    }
+    try testing.expectEqualStrings(
+        "2",
+        try (try edge_wb.current().asType(Dictionary).?.get(value2)).asValue().?.getString(),
+    );
+}
+
+test "dicts" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDicts, .{});
+}
