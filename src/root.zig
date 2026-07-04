@@ -24,6 +24,7 @@ test {
     _ = @import("memutil.zig");
     _ = @import("strutil.zig");
     _ = @import("ioutil.zig");
+    _ = @import("leak_check.zig");
 
     // _ = @import("Heap.zig");
     // _ = @import("objutil.zig");

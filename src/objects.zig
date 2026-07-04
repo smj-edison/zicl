@@ -8,9 +8,10 @@ const pcre2 = @import("pcre2");
 
 const ioutil = @import("ioutil.zig");
 const strutil = @import("strutil.zig");
+const memutil = @import("memutil.zig");
+const StructIterator = memutil.StructIterator;
 const heap = @import("heap.zig");
 const leak_check = @import("leak_check.zig");
-const StructIterator = leak_check.StructIterator;
 const hashutil = heap.hashutil;
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
@@ -745,6 +746,28 @@ pub const HashReference = struct {
         const as_hash_ref = obj.castTo(HashReference);
         as_hash_ref.* = .{ .ref = target.borrow() };
         return as_hash_ref;
+    }
+
+    /// Helper function, as hash references are often resolved to dictionaries.
+    pub fn resolveAsDictionary(det: ?*ErrorDetails, shim: *Shimmerable) error{ LinkLookupFailed, OutOfMemory }!*Dictionary {
+        const as_hash_ref = shimmerFrom(det, shim) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.LinkLookupFailed,
+        };
+        const resolved = as_hash_ref.ref;
+        var resolved_shim: Shimmerable = .{ .original = resolved.asValue() };
+        defer resolved_shim.discardChanges();
+        const dict = Dictionary.shimmerFrom(det, &resolved_shim) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadDict => return error.LinkLookupFailed,
+        };
+
+        if (resolved_shim.takeShimmered().asValue()) |new_dict| {
+            defer new_dict.release();
+            shim.shimmered.swap((try new(new_dict.asPtr().?)).asHead().asValue());
+        }
+
+        return dict;
     }
 
     pub fn asHead(self: *HashReference) *Object {
@@ -1536,11 +1559,18 @@ pub const ParsedScriptCommand = struct {
     line: u32,
     word_count: u32,
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const command = obj.castToConst(ParsedScriptCommand);
+        try ctx.addField(u32, info, "line", "{}", command.line);
+        try ctx.addField(u32, info, "word_count", "{}", command.word_count);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = null,
         .update_string = null,
         .free_internal_rep = null,
         .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
         .name = "parsed_script_command",
     };
 
@@ -1552,8 +1582,10 @@ pub const ParsedScriptCommand = struct {
 
 fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
     var fallback = std.heap.stackFallback(64, gpa);
-    var quoting_types = try fallback.get().alloc(strutil.QuotingType, items.len);
-    defer fallback.get().free(quoting_types);
+    // `stackFallback.get()` asserts it's called once, so reuse the stored allocator for both alloc and free.
+    const fb = fallback.get();
+    var quoting_types = try fb.alloc(strutil.QuotingType, items.len);
+    defer fb.free(quoting_types);
 
     var upper_bound_len: usize = 0;
     for (0.., items, quoting_types) |i, item, *quote_type| {
@@ -1913,17 +1945,19 @@ pub const Dictionary = struct {
         const new_dict = try Object.newObject(Dictionary);
         errdefer new_dict.head.freeBacking();
 
-        const new_items = try heap.global_gpa.alloc(Value, capacity);
-        errdefer heap.global_gpa.free(new_items);
-        for (items, new_items[0..items.len]) |item, *new_item| {
+        const item_backing = try heap.global_gpa.alloc(Value, capacity);
+        errdefer heap.global_gpa.free(item_backing);
+
+        const new_items = item_backing[0..items.len];
+        for (items, new_items) |item, *new_item| {
             new_item.* = item.borrow();
         }
         errdefer for (new_items) |item| item.release();
 
         new_dict.body.* = .{
-            .items = new_items[0..items.len],
+            .items = new_items,
             .capacity = capacity,
-            .table = try generateTable(new_items[0..items.len], capacity),
+            .table = try generateTable(new_items, capacity),
         };
 
         return new_dict.body;
@@ -2043,6 +2077,30 @@ pub const Dictionary = struct {
         }
     }
 
+    pub fn resolveParentDict(det: ?*ErrorDetails, shim: *Shimmerable) error{ LinkLookupFailed, OutOfMemory }!?*Dictionary {
+        var dict = Dictionary.shimmerFrom(det, shim) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadDict => return error.LinkLookupFailed,
+        };
+
+        const tilde_parent = interned_tilde_parent.value();
+        if ((try dict.get(tilde_parent)).asValue()) |hash_ref| {
+            var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
+            defer hash_ref_shim.discardChanges();
+            const parent_dict = try HashReference.resolveAsDictionary(det, &hash_ref_shim);
+            if (hash_ref_shim.takeShimmered().asValue()) |new_hash_ref| {
+                defer new_hash_ref.release();
+                _ = putInner(det, shim.asMutable(), tilde_parent, new_hash_ref) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => unreachable,
+                };
+            }
+            return parent_dict;
+        }
+
+        return null;
+    }
+
     /// Remove all pairs with key `key`. Returns true if any were removed, and
     /// keeps the table live (clearing and re-putting into the same allocation).
     pub fn remove(det: ?*ErrorDetails, mut: *Mutable, key: Value) !bool {
@@ -2154,46 +2212,49 @@ pub const Dictionary = struct {
     /// Remove earlier duplicate pairs, keeping the last value for each key. If
     /// `to_track` is given, returns its new index (or null if it was removed).
     fn removeDuplicates(dict: *Dictionary, to_track: ?usize) ?usize {
-        if (dict.table.count() * 2 == dict.items.len) return to_track; // No duplicates.
+        const orig_len = dict.items.len;
+        if (dict.table.count() * 2 == orig_len) return to_track; // No duplicates.
+
+        // Walk from the end into a fresh "seen keys" set, so the first sighting of
+        // each key is its canonical (last) pair and earlier ones are duplicates.
+        // Reusing the old table would dangle: it stores each key's first occurrence
+        // (a duplicate), which a later `get` could probe after we free it. Keys are
+        // never mutated, so cross-thread keys still free through their real vtable.
+        dict.table.clearRetainingCapacity();
 
         var to_track_new_location: ?usize = null;
-        var pairs_removed: usize = 0;
-        var item_index: usize = 0;
-        while (item_index < dict.items.len) : (item_index += 2) {
-            const key_index = item_index;
-            const value_index = item_index + 1;
-            // Figure out whether this key is the last key or not by seeing whether
-            // it's the key stored in the table or not.
-            const canonical = dict.table.get(dict.items[key_index]).?;
-            if (value_index != canonical) {
-                // This was not the value that was registered in the table,
-                // so we'll go ahead and remove it.
-                dict.items[item_index].release();
-                dict.items[item_index + 1].release();
-                pairs_removed += 1;
-            } else if (pairs_removed > 0) {
-                // Be sure to shift items back after we've removed one or more pairs.
-                const new_key_index = item_index - pairs_removed * 2;
-                const new_value_index = new_key_index + 1;
-
-                dict.items[new_key_index] = dict.items[item_index];
-                dict.items[new_value_index] = dict.items[item_index + 1];
-
-                if (key_index == to_track) to_track_new_location = new_key_index;
-                if (value_index == to_track) to_track_new_location = new_value_index;
+        var new_len: usize = 0;
+        var item_index: usize = orig_len;
+        while (item_index > 0) {
+            item_index -= 2;
+            const key = dict.items[item_index];
+            const value = dict.items[item_index + 1];
+            if (dict.table.contains(key)) {
+                // A later pair already claimed this key.
+                key.release();
+                value.release();
             } else {
-                if (key_index == to_track) to_track_new_location = key_index;
-                if (value_index == to_track) to_track_new_location = value_index;
+                // Canonical. Build the kept region back-to-front.
+                new_len += 2;
+                const new_key_index = orig_len - new_len;
+                dict.items[new_key_index] = key;
+                dict.items[new_key_index + 1] = value;
+                dict.table.putAssumeCapacity(key, new_key_index + 1);
+                if (item_index == to_track) to_track_new_location = new_key_index;
+                if (item_index + 1 == to_track) to_track_new_location = new_key_index + 1;
             }
         }
-        dict.items.len -= pairs_removed * 2;
 
-        // Rebuild the table after removing duplicates.
-        dict.table.clearRetainingCapacity();
-        item_index = 0;
-        while (item_index < dict.items.len) : (item_index += 2) {
-            dict.table.putAssumeCapacity(dict.items[item_index], item_index + 1);
+        // Slide the kept region to the front; adjust value indices instead of
+        // rebuilding, since stored keys survive the slide.
+        const shift = orig_len - new_len;
+        if (shift > 0) {
+            std.mem.copyForwards(Value, dict.items[0..new_len], dict.items[shift..orig_len]);
+            if (to_track_new_location) |loc| to_track_new_location = loc - shift;
+            var it = dict.table.iterator();
+            while (it.next()) |entry| entry.value_ptr.* -= shift;
         }
+        dict.items.len = new_len;
 
         return to_track_new_location;
     }
@@ -2243,40 +2304,17 @@ pub const Dictionary = struct {
 
         // Wasn't in this dictionary, so check if it's in a parent dict.
         const tilde_parent = interned_tilde_parent.value();
-        if ((try dict.get(tilde_parent)).asValue()) |parent_hash_ref| {
-            var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
-            defer parent_hash_ref_shim.discardChanges();
-            const parent_as_dict = HashReference.shimmerFrom(det, &parent_hash_ref_shim) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.NotHashReference, error.HashLookupFailed => return error.LinkLookupFailed,
-            };
-            const parent = parent_as_dict.ref; // Resolve to value of hash.
-
-            var parent_shim: Shimmerable = .{ .original = parent.asValue(), .shimmered = .none };
+        if (try Dictionary.resolveParentDict(det, shim)) |parent_dict| {
+            var parent_shim: Shimmerable = .{ .original = parent_dict.asHead().asValue() };
             defer parent_shim.discardChanges();
             const looked_up = try getFollowingLinks(det, &parent_shim, key);
-
-            if (parent_shim.takeShimmered().asValue()) |new_parent| {
-                // Write back the shimmered value to the dictionary.
-                const ref_to_new_parent = (try HashReference.new(new_parent.asPtr().?)).asHead();
-                defer ref_to_new_parent.release();
-
-                // This is delicate, but it's not mutation, since we're switching out the hash reference
-                // with its shimmered representation, so it is transparent to the caller. Note that
-                // `putInner` does not invalidate the string representation, so even if the underlying
-                // dictionary mutates, we preserve the original string.
-                _ = putInner(det, shim.asMutable(), tilde_parent, ref_to_new_parent.asValue()) catch |err| switch (err) {
+            if (parent_shim.takeShimmered().asValue()) |value| {
+                defer value.release();
+                _ = putInner(det, shim.asMutable(), tilde_parent, value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => unreachable,
-                };
-            } else if (parent_hash_ref_shim.takeShimmered().asValue()) |new_hash_ref| {
-                defer new_hash_ref.release();
-                _ = putInner(det, shim.asMutable(), tilde_parent, new_hash_ref) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => unreachable,
+                    error.BadDict => return error.LinkLookupFailed,
                 };
             }
-
             return looked_up;
         }
 
@@ -2396,16 +2434,19 @@ pub const Dictionary = struct {
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        const new_items = try heap.global_gpa.alloc(Value, as_dict.capacity);
-        for (as_dict.items, new_items[0..as_dict.items.len]) |item, *new_item| {
+        const item_backing = try heap.global_gpa.alloc(Value, as_dict.capacity);
+        errdefer heap.global_gpa.free(item_backing);
+
+        const new_items = item_backing[0..as_dict.items.len];
+        for (as_dict.items, new_items) |item, *new_item| {
             new_item.* = item.borrow();
         }
         errdefer for (new_items) |item| item.release();
 
         new_obj.body.* = .{
-            .items = new_items[0..as_dict.items.len],
+            .items = new_items,
             .capacity = as_dict.capacity,
-            .table = try generateTable(new_items[0..as_dict.items.len], as_dict.capacity),
+            .table = try generateTable(new_items, as_dict.capacity),
         };
 
         return new_obj.head;
@@ -2506,10 +2547,13 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer put_wb.discardChanges();
     try testing.expectEqual(@as(usize, 2), put_wb.current().asType(Dictionary).?.items.len / 2);
     // Replace an existing key's value; pair count stays the same.
-    _ = try Dictionary.put(null, &put_wb, key_bar, value3.borrow());
+    // `put` borrows the value into the dict, so the caller retains its handle
+    // (released by `defer value3.release()` above) -- no extra `.borrow()` or
+    // the call leaks a ref.
+    _ = try Dictionary.put(null, &put_wb, key_bar, value3);
     try testing.expectEqual(@as(usize, 2), put_wb.current().asType(Dictionary).?.items.len / 2);
     // Add a new key; pair count grows.
-    _ = try Dictionary.put(null, &put_wb, key3, value3.borrow());
+    _ = try Dictionary.put(null, &put_wb, key3, value3);
     try testing.expectEqual(@as(usize, 3), put_wb.current().asType(Dictionary).?.items.len / 2);
     try testing.expectEqualStrings(
         "3",
@@ -2533,7 +2577,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Use a value as a key, and a key as the value.
     {
         const cur = edge_wb.current().asType(Dictionary).?;
-        _ = try Dictionary.put(null, &edge_wb, cur.items[1], cur.items[2].borrow());
+        _ = try Dictionary.put(null, &edge_wb, cur.items[1], cur.items[2]);
     }
     try testing.expectEqualStrings(
         "bar",
@@ -2543,7 +2587,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Alias a key by using it as both key and value.
     {
         const cur = edge_wb.current().asType(Dictionary).?;
-        _ = try Dictionary.put(null, &edge_wb, cur.items[0], cur.items[0].borrow());
+        _ = try Dictionary.put(null, &edge_wb, cur.items[0], cur.items[0]);
     }
     try testing.expectEqualStrings(
         "foo",
@@ -2553,7 +2597,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Alias a value by using it as both key and value.
     {
         const cur = edge_wb.current().asType(Dictionary).?;
-        _ = try Dictionary.put(null, &edge_wb, cur.items[3], cur.items[3].borrow());
+        _ = try Dictionary.put(null, &edge_wb, cur.items[3], cur.items[3]);
     }
     try testing.expectEqualStrings(
         "2",
@@ -2606,7 +2650,7 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
 
     // putRecursively into an existing nested key creates a new leaf beside the old one.
     const path_foo_baz = ValueSliceContext{ .items = &.{ key_foo, key_baz } };
-    _ = try Dictionary.putRecursively(null, &rec_wb, path_foo_baz, value3.borrow());
+    _ = try Dictionary.putRecursively(null, &rec_wb, path_foo_baz, value3);
     try testing.expectEqualStrings(
         "3",
         try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_baz)).asValue().?.getString(),
@@ -2619,7 +2663,7 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
 
     // putRecursively creating a wholly new child dict at a fresh top-level key.
     const path_qux_baz = ValueSliceContext{ .items = &.{ key_qux, key_baz } };
-    _ = try Dictionary.putRecursively(null, &rec_wb, path_qux_baz, value3.borrow());
+    _ = try Dictionary.putRecursively(null, &rec_wb, path_qux_baz, value3);
     try testing.expectEqualStrings(
         "3",
         try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_qux_baz)).asValue().?.getString(),

@@ -36,9 +36,22 @@ extern fn dumpLastTouchedTrace(fd: i32) void;
 pub const panic = std.debug.FullPanic(panicFn);
 pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
-    dumpLastTouchedTrace(-1);
+    dumpLastTouchedTrace(2);
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
+
+/// Segfaults do _not_ route through `panicFn`: Zig's signal handler calls
+/// `handleSegfault`, which without this override goes straight to
+/// `defaultHandleSegfault` and aborts, skipping `dumpLastTouchedTrace`. Hook
+/// the official `root.debug.handleSegfault` override so a use-after-free (which
+/// faults here, not in `panicFn`) still gets a trace.
+pub const debug = struct {
+    pub fn handleSegfault(addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) noreturn {
+        @branchHint(.cold);
+        dumpLastTouchedTrace(2);
+        std.debug.defaultHandleSegfault(addr, name, opt_ctx);
+    }
+};
 
 pub fn panicFmt(comptime format: []const u8, args: anytype) noreturn {
     std.debug.panicExtra(@returnAddress(), format, args);

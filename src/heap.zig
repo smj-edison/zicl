@@ -12,15 +12,10 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 
 const options = @import("options");
 const memutil = @import("memutil.zig");
+const StructIterator = memutil.StructIterator;
 const ioutil = @import("ioutil.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
-const StructIterator = leak_check.StructIterator;
-
-threadlocal var debugging_buffer: if (options.trace_mem) [16 * 1024 * 1024]u8 else void = undefined;
-threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
-/// Use this for debugging objects (traces, etc) that can afford to leak.
-threadlocal var debug_gpa: Allocator = undefined;
 
 pub var initialized: bool = false;
 /// Use to lock `custom_types` or `script_metadata` when adding or removing
@@ -51,23 +46,22 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     global_gpa = gpa;
     global_io = io;
 
-    if (options.trace_mem) {
-        debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer[0..]);
-        debug_gpa = debugging_gpa.allocator();
-    }
-
     nativefn_registry = .{};
     registered_hashes = .{};
+
+    leak_check.init();
 
     initialized = true;
 }
 
 /// Tear down global heap state. After this call, `initGlobals` may be called again.
-pub fn deinitAll() void {
+pub fn deinitGlobals() void {
     init_mutex.lockUncancelable(global_io);
     defer init_mutex.unlock(global_io);
 
     if (!initialized) return;
+
+    leak_check.deinit();
 
     nativefn_registry.deinit(global_gpa);
     registered_hashes.entries.deinit(global_gpa);
@@ -91,12 +85,13 @@ pub fn testStart(gpa: Allocator, io: std.Io) !void {
 }
 
 pub fn testFinish() void {
+    if (options.trace_mem) leak_check.dumpLeaks() catch {};
     deinitThread();
-    deinitAll();
+    deinitGlobals();
 }
 
 pub export fn dumpLastTouchedTrace(fd: i32) void {
-    _ = fd;
+    leak_check.dumpLastTouchedTrace(fd);
 }
 
 /// Signature for a lazy native command initializer. The interpreter pointer
@@ -201,6 +196,7 @@ pub const HashRegistry = struct {
 
     pub fn register(registry: *HashRegistry, key: u256, obj: *Object) !void {
         registry.rw_lock.lockSharedUncancelable(global_io);
+        obj.makeCrossthread();
 
         if (registry.entries.getPtr(key)) |entry| {
             if (obj.metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire)) |_| {
@@ -498,7 +494,7 @@ pub const Value = enum(ValueBacking) {
     }
 
     pub inline fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
-        globalTrace(.other, value, fmt, args);
+        leak_check.globalTrace(.other, value, fmt, args);
     }
 
     /// Must be a primitive.
@@ -892,7 +888,7 @@ pub const Object = struct {
         obj.ref_count = 1;
         obj.metadata = .{};
 
-        globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{@typeName(T)});
+        leak_check.globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{@typeName(T)});
 
         return .{
             .head = @ptrCast(bytes),
@@ -944,13 +940,13 @@ pub const Object = struct {
     }
 
     pub fn freeBacking(obj: *Object) void {
+        leak_check.globalTrace(.free, obj.asValue(), "Freed", .{});
         const bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
         const slice: []align(@alignOf(Object)) u8 = bytes[0..object_size];
         global_gpa.free(slice);
     }
 
     pub fn deinit(obj: *Object) void {
-        globalTrace(.free, obj.asValue(), "Freed", .{});
         obj.invalidateInternalRep();
         obj.freeStringInner();
         obj.freeBacking();
@@ -1421,135 +1417,4 @@ fn testDuplicateObject(ta: std.mem.Allocator) !void {
 
 test "object duplicate" {
     try testing.checkAllAllocationFailures(testing.allocator, testDuplicateObject, .{});
-}
-
-const LogCategory = enum {
-    alloc,
-    free,
-    other,
-};
-const LogEntry = struct {
-    /// We assume that the memory containing the entry is zero-initialized.
-    initialized: std.atomic.Value(bool),
-    value: Value,
-    addrs: [32]usize,
-    stack_trace: std.debug.StackTrace,
-    category: LogCategory,
-    message: []u8,
-};
-var debug_log: if (options.trace_mem) [1024 * 1024]LogEntry else void = undefined;
-var next_debug_location: std.atomic.Value(usize) = .init(0);
-var alloc_count: std.atomic.Value(isize) = .init(0);
-
-pub inline fn globalTrace(category: LogCategory, value: Value, comptime fmt: []const u8, args: anytype) void {
-    if (options.trace_mem) {
-        if (category == .alloc) {
-            _ = alloc_count.fetchAdd(1, .monotonic);
-        } else if (category == .free) {
-            _ = alloc_count.fetchSub(1, .monotonic);
-        }
-
-        const slot = next_debug_location.fetchAdd(1, .monotonic);
-        const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &debug_log[slot].addrs);
-        debug_log[slot].category = category;
-        debug_log[slot].stack_trace = st;
-        debug_log[slot].value = value;
-        debug_log[slot].message = std.fmt.allocPrint(debug_gpa, fmt, args) catch unreachable;
-        debug_log[slot].initialized.store(true, .release);
-    }
-}
-
-const LeakResult = struct {
-    arena: std.heap.ArenaAllocator,
-    nodes: std.AutoHashMapUnmanaged(*const anyopaque, leak_check.GraphWalker.Node),
-    edges: std.ArrayList(leak_check.GraphWalker.Edge),
-};
-pub fn captureLeaks() !LeakResult {
-    if (options.trace_mem) {
-        // Don't do expensive leak checks unless the allocation count is off.
-        if (alloc_count.load(.monotonic) == 0) {
-            return .{
-                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                .nodes = .empty,
-                .edges = .empty,
-            };
-        }
-
-        // It's unsafe to use `global_gpa`, since that's the allocator we're
-        // checking leaks against right now. Hence, we use `external_arena` for
-        // all our tracing needs.
-        var external_arena_allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        errdefer external_arena_allocator.deinit();
-        const external_arena = external_arena_allocator.allocator();
-
-        // We now sort out the combined log into individual object logs.
-        const ObjectLogs = struct {
-            /// We split up all of the entries based on their object address.
-            entries: std.ArrayList(*const LogEntry),
-            /// Not all log entries end with being leaked at the end.
-            leaked: bool,
-        };
-        var object_logs: std.AutoHashMapUnmanaged(*Object, ObjectLogs) = .empty;
-
-        for (debug_log[0..next_debug_location.load(.monotonic)]) |*log_entry| {
-            // Make sure this entry was fully initialized, else we'll ignore it.
-            if (log_entry.initialized.load(.acquire) == false) continue;
-
-            const ptr = log_entry.value.asPtr() orelse continue; // Only track values with pointers.
-            const entry = object_logs.getOrPut(external_arena, ptr) catch @panic("OOM");
-            if (!entry.found_existing) entry.value_ptr.* = .{ .entries = .empty, .leaked = false };
-
-            entry.value_ptr.entries.append(external_arena, log_entry) catch @panic("OOM");
-
-            // We need to figure out whether this entry is an object or not.
-            // The address may have been reused by another structure, but we
-            // know if it was allocated and not freed as an object, it's an
-            // object.
-            if (log_entry.category == .alloc) {
-                entry.value_ptr.leaked = true;
-            } else if (log_entry.category == .free) {
-                entry.value_ptr.leaked = false;
-            }
-        }
-
-        // Next, figure out which objects ended up leaking.
-        var leaked_objects: std.ArrayList(*Object) = .empty;
-        var iter = object_logs.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.leaked) {
-                leaked_objects.append(external_arena, entry.key_ptr.*) catch @panic("OOM");
-            }
-        }
-
-        var walker = leak_check.GraphWalker.empty;
-        const struct_iter = walker.promote(external_arena);
-        for (leaked_objects.items) |leaked_object| {
-            struct_iter.followUnparentedNode(Object, leaked_object) catch @panic("OOM");
-        }
-
-        return .{
-            .arena = external_arena_allocator,
-            .nodes = walker.nodes,
-            .edges = walker.edges,
-        };
-    } else {
-        return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .nodes = .empty,
-            .edges = .empty,
-        };
-    }
-}
-
-test "leak" {
-    try testStart(testing.allocator, testing.io);
-    defer testFinish();
-
-    _ = try objects.String.newObject("hello");
-
-    const leaked = try captureLeaks();
-    var iter = leaked.nodes.iterator();
-    while (iter.next()) |val| {
-        ioutil.debug("Type name: {s}, as string: {?s}\n", .{ val.value_ptr.type_name, val.value_ptr.as_string });
-    }
 }
