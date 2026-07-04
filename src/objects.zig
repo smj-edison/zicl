@@ -9,6 +9,8 @@ const pcre2 = @import("pcre2");
 const ioutil = @import("ioutil.zig");
 const strutil = @import("strutil.zig");
 const heap = @import("heap.zig");
+const leak_check = @import("leak_check.zig");
+const StructIterator = leak_check.StructIterator;
 const hashutil = heap.hashutil;
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
@@ -166,6 +168,40 @@ pub const Mutable = extern struct {
     }
 };
 
+/// Helpers to work with child walking, used for walking the heap if a leak occured.
+pub const ChildWalkHelper = struct {
+    ctx: StructIterator,
+    info: *const StructIterator.NodeInfo,
+
+    pub fn follow(helper: *const ChildWalkHelper, T: type, field_name: []const u8, ptr: *const T) StructIterator.Error!void {
+        if (@hasDecl(T, "vtable") and @TypeOf(T.vtable) == Object.VTable)
+            @compileError("Can't follow an object body directly, follow its *Object instead.");
+        try helper.ctx.followNode(T, helper.info, field_name, ptr);
+    }
+
+    pub fn followOptional(helper: *const ChildWalkHelper, T: type, field_name: []const u8, ptr: ?*const T) StructIterator.Error!void {
+        if (ptr) |val| try helper.ctx.followNode(T, helper.info, field_name, val);
+    }
+
+    pub fn followValue(helper: *const ChildWalkHelper, field_name: []const u8, value: Value) StructIterator.Error!void {
+        if (value.asPtr()) |obj| {
+            try helper.ctx.followNode(Object, helper.info, field_name, obj);
+        } else {
+            var buf: [350]u8 = undefined;
+            const str = value.getStringWithBuffer(&buf) catch unreachable;
+            try helper.ctx.addFieldString(Value, helper.info, field_name, str);
+        }
+    }
+
+    pub fn followOptionalValue(
+        helper: *const ChildWalkHelper,
+        field_name: []const u8,
+        optional: OptionalValue,
+    ) StructIterator.Error!void {
+        if (optional.asValue()) |val| try helper.followValue(field_name, val);
+    }
+};
+
 pub const None = struct {
     pub fn new(bytes: [:0]const u8) !*None {
         const new_obj = try Object.newObjectUninitialized(None);
@@ -191,6 +227,7 @@ pub const None = struct {
         .make_crossthread = null,
         .free_internal_rep = null,
         .update_string = null,
+        .enumerate_struct = null,
         .name = "none",
     };
 };
@@ -305,12 +342,18 @@ pub const String = struct {
         return new_obj.head;
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const string = obj.castToConst(String);
+        try ctx.addField(usize, info, "codepoint_length", "{}", string.codepoint_length.load(.monotonic));
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = null,
         .make_crossthread = null,
-        .name = "string",
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(String),
     };
 };
 
@@ -318,7 +361,7 @@ fn testString(ta: std.mem.Allocator) !void {
     try heap.testStart(ta, testing.io);
     defer heap.testFinish();
 
-    const obj = (try String.new("hello")).asHead();
+    const obj = try String.newObject("hello");
     defer obj.release();
     try testing.expectEqualStrings("hello", try obj.getString());
 }
@@ -477,12 +520,20 @@ pub const Source = struct {
         obj.castTo(Source).file_name.makeCrossthread();
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const source = obj.castToConst(Source);
+        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        try helper.followOptionalValue("file_name", source.file_name);
+        if (source.hash.load(.monotonic)) |hash| try ctx.followNode(u256, info, "hash", hash);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = makeCrossthread,
-        .name = "source",
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(Source),
     };
 };
 
@@ -533,6 +584,19 @@ pub const ClosureValues = struct {
         if (closure.scope_hash_ref) |val| val.asHead().release();
         closure.optional_values.release();
     }
+
+    pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const closure: *const ClosureValues = @ptrCast(@alignCast(info.node));
+        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValue("args", closure.args);
+        try helper.followValue("body", closure.body);
+        try helper.followOptionalValue("name", closure.name);
+        try helper.followOptional(HashReference, "scope_hash_ref", closure.scope_hash_ref);
+        @compileLog("here");
+        // if (closure.scope_hash_ref) |hash_ref|
+        //     try helper.followOptional(Object, "scope_hash_ref", hash_ref.asHead());
+        try helper.followOptionalValue("optional_values", closure.optional_values);
+    }
 };
 
 pub const Closure = struct {
@@ -559,11 +623,18 @@ pub const Closure = struct {
         @panic("FIXME: generate closure from parts (see old code)");
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const closure = obj.castToConst(Closure);
+        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        try helper.follow(ClosureValues, "closure", closure.closure);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
         .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
         .name = "closure",
     };
 };
@@ -580,11 +651,18 @@ pub const UpvarLink = struct {
         src.castTo(UpvarLink).linked_name.release();
     }
 
+    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const upvar: *const UpvarLink = @ptrCast(@alignCast(info.node));
+        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValue("linked_name", upvar.linked_name);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = null,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
         .name = "upvar_link",
     };
 };
@@ -599,12 +677,19 @@ pub const UpvarLink = struct {
 /// ```
 pub const DictSugar = struct {
     dict_name: Value,
-    dict_path: Value,
+    dict_path: *List,
 
     fn freeInternalRep(src: *Object) void {
         const as_dict_sugar = src.castTo(DictSugar);
         as_dict_sugar.dict_name.release();
-        as_dict_sugar.dict_path.release();
+        as_dict_sugar.dict_path.asHead().release();
+    }
+
+    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const dict_sugar: *const DictSugar = @ptrCast(@alignCast(info.node));
+        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValue("dict_name", dict_sugar.dict_name);
+        try helper.follow(List, "dict_path", dict_sugar.dict_path);
     }
 
     pub const vtable: Object.VTable = .{
@@ -613,6 +698,7 @@ pub const DictSugar = struct {
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
     };
 };
 
@@ -695,11 +781,18 @@ pub const HashReference = struct {
         };
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const hash_ref = obj.castToConst(HashReference);
+        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        try helper.follow(Object, "ref", hash_ref.ref);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .update_string = updateString,
         .free_internal_rep = freeInternalRep,
         .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
         .name = "hash_reference",
     };
 };
@@ -712,11 +805,17 @@ pub const Regexp = struct {
         pcre2.pcre2_code_free_8(as_regexp.regexp);
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const regexp = obj.castToConst(Regexp);
+        ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = freeInternalRep,
         .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
         .name = "regexp",
     };
 };
@@ -860,6 +959,7 @@ pub const Index = struct {
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = null,
+        .enumerate_struct = null,
         .name = "index",
     };
 };
@@ -957,6 +1057,7 @@ pub const Float = struct {
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = null,
+        .enumerate_struct = null,
         .name = "boxed_float",
     };
 };
@@ -1059,6 +1160,7 @@ pub const Integer = struct {
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = null,
+        .enumerate_struct = null,
         .name = "boxed_int",
     };
 };
@@ -1162,6 +1264,7 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
             .free_internal_rep = null,
             .update_string = null,
             .make_crossthread = null,
+            .enumerate_struct = null,
             .name = "enum_for_" ++ enum_name,
         };
     };
@@ -1393,6 +1496,7 @@ pub const BoxedBoolean = struct {
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = null,
+        .enumerate_struct = null,
         .name = "boxed_boolean",
     };
 };
@@ -1406,6 +1510,9 @@ pub const CachedLocalVar = struct {
         .update_string = null,
         .free_internal_rep = null,
         .make_crossthread = null,
+        // TODO it would be nice to be able to walk the cached local var,
+        // but we'd need the call epoch invalidation logic embedded in it.
+        .enumerate_struct = null,
         .name = "cached_local_var",
     };
 };
@@ -1419,6 +1526,8 @@ pub const CachedLexicalVar = struct {
         .update_string = null,
         .free_internal_rep = null,
         .make_crossthread = null,
+        // TODO same as `CachedLocalVar.vtable`.
+        .enumerate_struct = null,
         .name = "cached_lexical_var",
     };
 };
@@ -1684,11 +1793,29 @@ pub const List = struct {
         for (as_list.items) |item| item.makeCrossthread();
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const list = obj.castToConst(List);
+        if (list.items.len == 0) return;
+
+        const items_info: StructIterator.NodeInfo = .{
+            .node = @ptrCast(list.items.ptr),
+            .parent_info = info,
+            .enumerate_struct = null, // `[]Value` has no walking function.
+            .type_name = @typeName([]Value),
+            .as_string = null,
+        };
+        try ctx.vtable.visit_node(ctx, &items_info, "items");
+
+        const items_helper: ChildWalkHelper = .{ .ctx = ctx, .info = &items_info };
+        for (list.items) |item| try items_helper.followValue("items", item);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
+        .enumerate_struct = enumerateStruct,
         .name = "list",
     };
 };
@@ -1733,6 +1860,20 @@ fn testLists(ta: std.mem.Allocator) !void {
 test "lists" {
     try testing.checkAllAllocationFailures(testing.allocator, testLists, .{});
 }
+
+/// A key path passed to the recursive dict operations, as a slice of `Value`s.
+pub const ValueSliceContext = struct {
+    items: []const Value,
+    pub fn len(self: @This()) usize {
+        return self.items.len;
+    }
+    pub fn get(self: @This(), index: usize) Value {
+        return self.items[index];
+    }
+    pub fn sliceAfter(self: @This(), index: usize) @This() {
+        return .{ .items = self.items[index..] };
+    }
+};
 
 pub const Dictionary = struct {
     items: []Value,
@@ -1782,17 +1923,20 @@ pub const Dictionary = struct {
         new_dict.body.* = .{
             .items = new_items[0..items.len],
             .capacity = capacity,
-            .table = try generateTable(new_items[0..items.len]),
+            .table = try generateTable(new_items[0..items.len], capacity),
         };
 
         return new_dict.body;
     }
 
-    /// Generate the mapping from keys to values.
-    fn generateTable(items: []Value) !Table {
+    /// Generate the mapping from keys to values. `capacity` is the backing
+    /// capacity the dict will hold, not the live item count, so the table is
+    /// sized to absorb future `putAssumeCapacity` calls without the items
+    /// backing having to grow first.
+    fn generateTable(items: []Value, capacity: usize) !Table {
         var table: Table = .empty;
         errdefer table.deinit(heap.global_gpa);
-        try table.ensureTotalCapacity(heap.global_gpa, @intCast(items.len));
+        try table.ensureTotalCapacity(heap.global_gpa, @intCast(capacity / 2));
 
         var item_index: usize = 0;
         while (item_index < items.len) : (item_index += 2) {
@@ -1824,7 +1968,7 @@ pub const Dictionary = struct {
             return error.BadDict;
         }
 
-        const table = try generateTable(list.items);
+        const table = try generateTable(list.items, list.capacity);
 
         const old_items = list.items;
         const old_capacity = list.capacity;
@@ -2164,7 +2308,7 @@ pub const Dictionary = struct {
 
         assert(context.len() > 0);
         if (context.len() == 1) {
-            const inserted_at = try put(mut, context.get(0), value);
+            const inserted_at = try put(det, mut, context.get(0), value);
             return mut.current().asType(Dictionary).?.items[inserted_at];
         }
 
@@ -2177,7 +2321,7 @@ pub const Dictionary = struct {
                 const new_child_dict = (try new(&.{})).asHead().asValue();
                 defer new_child_dict.release();
 
-                _ = try put(mut, context.get(0), new_child_dict);
+                _ = try put(det, mut, context.get(0), new_child_dict);
                 break :blk new_child_dict;
             }
         };
@@ -2188,7 +2332,7 @@ pub const Dictionary = struct {
         if (child_wb.takeMutated().asValue()) |new_child| {
             // The child dict changed, so we need to update ours.
             defer new_child.release();
-            _ = try put(mut, context.get(0), new_child);
+            _ = try put(det, mut, context.get(0), new_child);
         }
 
         mut.current().asPtr().?.invalidateString();
@@ -2209,7 +2353,7 @@ pub const Dictionary = struct {
             const did_remove = try removeRecursively(det, &child_mut, context.sliceAfter(1));
             if (child_mut.takeMutated().asValue()) |new_child| {
                 defer new_child.release();
-                _ = try put(mut, context.get(0), new_child);
+                _ = try put(det, mut, context.get(0), new_child);
             }
 
             mut.current().asPtr().?.invalidateString();
@@ -2217,7 +2361,7 @@ pub const Dictionary = struct {
             return did_remove;
         } else {
             if (det) |details| details.* = .{
-                .message = std.fmt.allocPrintSentinel(
+                .message = try std.fmt.allocPrintSentinel(
                     heap.global_gpa,
                     "key \"{s}\" not known in dictionary \"{s}\"",
                     .{ try context.get(0).getString(), try mut.current().getString() },
@@ -2261,7 +2405,7 @@ pub const Dictionary = struct {
         new_obj.body.* = .{
             .items = new_items[0..as_dict.items.len],
             .capacity = as_dict.capacity,
-            .table = try generateTable(new_items[0..as_dict.items.len]),
+            .table = try generateTable(new_items[0..as_dict.items.len], as_dict.capacity),
         };
 
         return new_obj.head;
@@ -2285,11 +2429,29 @@ pub const Dictionary = struct {
         try obj.setStringConsuming(bytes);
     }
 
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const list = obj.castToConst(Dictionary);
+        if (list.items.len == 0) return;
+
+        const items_info: StructIterator.NodeInfo = .{
+            .node = @ptrCast(list.items.ptr),
+            .parent_info = info,
+            .enumerate_struct = null, // `[]Value` has no walking function.
+            .type_name = @typeName([]Value),
+            .as_string = null,
+        };
+        try ctx.vtable.visit_node(ctx, &items_info, "items");
+
+        const items_helper: ChildWalkHelper = .{ .ctx = ctx, .info = &items_info };
+        for (list.items) |item| try items_helper.followValue("items", item);
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
+        .enumerate_struct = enumerateStruct,
         .name = "dict",
     };
 };
@@ -2401,4 +2563,78 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
 test "dicts" {
     try testing.checkAllAllocationFailures(testing.allocator, testDicts, .{});
+}
+
+fn testRecursiveDicts(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    const key_foo = try String.newValue("foo");
+    defer key_foo.release();
+    const key_bar = try String.newValue("bar");
+    defer key_bar.release();
+    const key_baz = try String.newValue("baz");
+    defer key_baz.release();
+    const key_qux = try String.newValue("qux");
+    defer key_qux.release();
+    const bad_key = try String.newValue("bogus");
+    defer bad_key.release();
+    const value2 = try String.newValue("2");
+    defer value2.release();
+    const value3 = try String.newValue("3");
+    defer value3.release();
+
+    // Build {foo {bar 2}} as a nested dict.
+    const inner_dict = try Dictionary.new(&.{ key_bar, value2 });
+    defer inner_dict.asHead().release();
+    const outer_dict = try Dictionary.new(&.{ key_foo, inner_dict.asHead().asValue() });
+    var rec_wb: Mutable = .{ .original = outer_dict.asHead().asValue() };
+    defer rec_wb.deinit();
+
+    // getRecursively walks a {b 2} and reads b.
+    const path_foo_bar = ValueSliceContext{ .items = &.{ key_foo, key_bar } };
+    try testing.expectEqualStrings(
+        "2",
+        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bar)).asValue().?.getString(),
+    );
+
+    // A missing leaf, and a missing top-level key, both yield none.
+    const path_foo_bogus = ValueSliceContext{ .items = &.{ key_foo, bad_key } };
+    try testing.expectEqual(OptionalValue.none, try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bogus));
+    const path_bogus = ValueSliceContext{ .items = &.{bad_key} };
+    try testing.expectEqual(OptionalValue.none, try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_bogus));
+
+    // putRecursively into an existing nested key creates a new leaf beside the old one.
+    const path_foo_baz = ValueSliceContext{ .items = &.{ key_foo, key_baz } };
+    _ = try Dictionary.putRecursively(null, &rec_wb, path_foo_baz, value3.borrow());
+    try testing.expectEqualStrings(
+        "3",
+        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_baz)).asValue().?.getString(),
+    );
+    // The pre-existing sibling is untouched.
+    try testing.expectEqualStrings(
+        "2",
+        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bar)).asValue().?.getString(),
+    );
+
+    // putRecursively creating a wholly new child dict at a fresh top-level key.
+    const path_qux_baz = ValueSliceContext{ .items = &.{ key_qux, key_baz } };
+    _ = try Dictionary.putRecursively(null, &rec_wb, path_qux_baz, value3.borrow());
+    try testing.expectEqualStrings(
+        "3",
+        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_qux_baz)).asValue().?.getString(),
+    );
+
+    // removeRecursively drops the nested leaf.
+    try testing.expect(try Dictionary.removeRecursively(null, &rec_wb, path_foo_bar));
+    try testing.expectEqual(OptionalValue.none, try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bar));
+
+    // removeRecursively on a missing intermediate key errors. With no `det`, the
+    // error path does no allocation, so this is deterministic under OOM injection.
+    const path_bogus_baz = ValueSliceContext{ .items = &.{ bad_key, key_baz } };
+    try testing.expectError(error.PathNonexistent, Dictionary.removeRecursively(null, &rec_wb, path_bogus_baz));
+}
+
+test "dict recursive" {
+    try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDicts, .{});
 }

@@ -14,6 +14,8 @@ const options = @import("options");
 const memutil = @import("memutil.zig");
 const ioutil = @import("ioutil.zig");
 const objects = @import("objects.zig");
+const leak_check = @import("leak_check.zig");
+const StructIterator = leak_check.StructIterator;
 
 threadlocal var debugging_buffer: if (options.trace_mem) [16 * 1024 * 1024]u8 else void = undefined;
 threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
@@ -363,10 +365,6 @@ pub const OptionalValue = enum(ValueBacking) {
 pub const Value = enum(ValueBacking) {
     _,
 
-    pub fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
-        if (value.asPtr()) |val| val.trace(fmt, args);
-    }
-
     pub fn asOptional(value: Value) OptionalValue {
         return @enumFromInt(@intFromEnum(value));
     }
@@ -478,6 +476,8 @@ pub const Value = enum(ValueBacking) {
         // have a string rep yet.
         if (value.asType(objects.None) == null) _ = try value.getString();
         if (value.asPtr()) |val| val.invalidateInternalRep();
+
+        value.trace("Prepared to shimmer", .{});
     }
 
     pub fn borrow(value: Value) Value {
@@ -495,6 +495,10 @@ pub const Value = enum(ValueBacking) {
         } else {
             return value;
         }
+    }
+
+    pub inline fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
+        globalTrace(.other, value, fmt, args);
     }
 
     /// Must be a primitive.
@@ -794,6 +798,11 @@ pub const Object = struct {
         free_internal_rep: ?*const fn (obj: *Object) void,
         update_string: ?*const fn (obj: *Object) error{ OutOfMemory, OtherThreadSet }!void,
         make_crossthread: ?*const fn (obj: *Object) void,
+        enumerate_struct: ?*const fn (
+            obj: *const Object,
+            ctx: StructIterator,
+            node_info: *const StructIterator.NodeInfo,
+        ) StructIterator.Error!void,
         name: [:0]const u8,
     };
 
@@ -848,6 +857,11 @@ pub const Object = struct {
         return @ptrCast(aligned_bytes - @sizeOf(Object));
     }
 
+    pub fn castToInner(obj: *Object) *align(@alignOf(Object)) anyopaque {
+        const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
+        return @ptrCast(aligned_bytes + @sizeOf(Object));
+    }
+
     /// Asserts that `obj` has type `T.vtable`.
     pub fn castTo(obj: *Object, T: type) *T {
         assert(obj.vtable == &T.vtable);
@@ -878,6 +892,8 @@ pub const Object = struct {
         obj.ref_count = 1;
         obj.metadata = .{};
 
+        globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{@typeName(T)});
+
         return .{
             .head = @ptrCast(bytes),
             .body = @ptrCast(bytes.ptr + @sizeOf(Object)),
@@ -903,6 +919,30 @@ pub const Object = struct {
         if (obj.vtable.make_crossthread) |make_crossthread_fn| make_crossthread_fn(obj);
     }
 
+    pub fn enumerateStruct(
+        ctx: StructIterator,
+        info: *const StructIterator.NodeInfo,
+    ) StructIterator.Error!void {
+        const obj: *const Object = @ptrCast(@alignCast(info.node));
+        switch (obj.getStringDetails()) {
+            .special => |special| try ctx.followNode(SpecialString, info, "string", special),
+            .normal => |normal| {
+                const child_node: StructIterator.NodeInfo = .{
+                    .parent_info = info,
+                    .node = normal.ptr,
+                    .enumerate_struct = null,
+                    .type_name = @typeName([:0]const u8),
+                    .as_string = normal,
+                };
+                try ctx.vtable.visit_node(ctx, &child_node, "string");
+            },
+            .none => {},
+        }
+        try ctx.addField(Metadata, info, "metadata", "{any}", obj.metadata);
+        try ctx.addField(u32, info, "ref_count", "{}", obj.getRefCount());
+        if (obj.vtable.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
+    }
+
     pub fn freeBacking(obj: *Object) void {
         const bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
         const slice: []align(@alignOf(Object)) u8 = bytes[0..object_size];
@@ -910,6 +950,7 @@ pub const Object = struct {
     }
 
     pub fn deinit(obj: *Object) void {
+        globalTrace(.free, obj.asValue(), "Freed", .{});
         obj.invalidateInternalRep();
         obj.freeStringInner();
         obj.freeBacking();
@@ -1033,6 +1074,8 @@ pub const Object = struct {
                 .len = @intCast(bytes.len),
             }, .release);
         }
+
+        obj.asValue().trace("Set string to \"{s}\"", .{bytes});
     }
 
     pub fn setStringLocalObject(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
@@ -1069,9 +1112,11 @@ pub const Object = struct {
                 .len = @intCast(bytes.len),
             });
         }
+
+        obj.asValue().trace("Set string to \"{s}\"", .{bytes});
     }
 
-    pub fn getRefCount(obj: *Object) u32 {
+    pub fn getRefCount(obj: *const Object) u32 {
         if (obj.metadata.cross_thread) {
             return @atomicLoad(u32, &obj.ref_count, .monotonic);
         } else {
@@ -1080,7 +1125,8 @@ pub const Object = struct {
     }
 
     pub fn incrRefCount(obj: *Object) void {
-        incrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        const new_count = incrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        obj.asValue().trace("Incremented ref count (now {})", .{new_count});
     }
 
     pub fn borrow(obj: *Object) *Object {
@@ -1090,6 +1136,7 @@ pub const Object = struct {
 
     pub fn release(obj: *Object) void {
         const new_ref_count = decrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        obj.asValue().trace("Decremented ref count (now {})", .{new_ref_count});
 
         // You may be wondering, why the heck `<= 1`, and not `== 0`? Because hash representatives
         // are owned by the hash registry, so there's a circular reference. But, hash representatives
@@ -1117,10 +1164,16 @@ pub const Object = struct {
 
     pub fn invalidateString(obj: *Object) void {
         assert(!obj.metadata.cross_thread);
+        switch (obj.getStringDetails()) {
+            .special => |special| obj.asValue().trace("Invalidate string (was {s})", .{special.getString()}),
+            .normal => |bytes| obj.asValue().trace("Invalidate string (was {s})", .{bytes}),
+            .none => {},
+        }
         obj.freeStringInner();
     }
 
     pub fn invalidateInternalRep(obj: *Object) void {
+        obj.asValue().trace("Invalidate body", .{});
         if (obj.vtable.free_internal_rep) |free_fn| free_fn(obj);
     }
 
@@ -1267,11 +1320,13 @@ pub const hashutil = struct {
     }
 };
 
-pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) void {
+pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) T {
     if (is_atomic) {
-        _ = @atomicRmw(T, ref, .Add, 1, .monotonic);
+        const old = @atomicRmw(T, ref, .Add, 1, .monotonic);
+        return old + 1;
     } else {
         ref.* += 1;
+        return ref.*;
     }
 }
 
@@ -1366,4 +1421,135 @@ fn testDuplicateObject(ta: std.mem.Allocator) !void {
 
 test "object duplicate" {
     try testing.checkAllAllocationFailures(testing.allocator, testDuplicateObject, .{});
+}
+
+const LogCategory = enum {
+    alloc,
+    free,
+    other,
+};
+const LogEntry = struct {
+    /// We assume that the memory containing the entry is zero-initialized.
+    initialized: std.atomic.Value(bool),
+    value: Value,
+    addrs: [32]usize,
+    stack_trace: std.debug.StackTrace,
+    category: LogCategory,
+    message: []u8,
+};
+var debug_log: if (options.trace_mem) [1024 * 1024]LogEntry else void = undefined;
+var next_debug_location: std.atomic.Value(usize) = .init(0);
+var alloc_count: std.atomic.Value(isize) = .init(0);
+
+pub inline fn globalTrace(category: LogCategory, value: Value, comptime fmt: []const u8, args: anytype) void {
+    if (options.trace_mem) {
+        if (category == .alloc) {
+            _ = alloc_count.fetchAdd(1, .monotonic);
+        } else if (category == .free) {
+            _ = alloc_count.fetchSub(1, .monotonic);
+        }
+
+        const slot = next_debug_location.fetchAdd(1, .monotonic);
+        const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &debug_log[slot].addrs);
+        debug_log[slot].category = category;
+        debug_log[slot].stack_trace = st;
+        debug_log[slot].value = value;
+        debug_log[slot].message = std.fmt.allocPrint(debug_gpa, fmt, args) catch unreachable;
+        debug_log[slot].initialized.store(true, .release);
+    }
+}
+
+const LeakResult = struct {
+    arena: std.heap.ArenaAllocator,
+    nodes: std.AutoHashMapUnmanaged(*const anyopaque, leak_check.GraphWalker.Node),
+    edges: std.ArrayList(leak_check.GraphWalker.Edge),
+};
+pub fn captureLeaks() !LeakResult {
+    if (options.trace_mem) {
+        // Don't do expensive leak checks unless the allocation count is off.
+        if (alloc_count.load(.monotonic) == 0) {
+            return .{
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                .nodes = .empty,
+                .edges = .empty,
+            };
+        }
+
+        // It's unsafe to use `global_gpa`, since that's the allocator we're
+        // checking leaks against right now. Hence, we use `external_arena` for
+        // all our tracing needs.
+        var external_arena_allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer external_arena_allocator.deinit();
+        const external_arena = external_arena_allocator.allocator();
+
+        // We now sort out the combined log into individual object logs.
+        const ObjectLogs = struct {
+            /// We split up all of the entries based on their object address.
+            entries: std.ArrayList(*const LogEntry),
+            /// Not all log entries end with being leaked at the end.
+            leaked: bool,
+        };
+        var object_logs: std.AutoHashMapUnmanaged(*Object, ObjectLogs) = .empty;
+
+        for (debug_log[0..next_debug_location.load(.monotonic)]) |*log_entry| {
+            // Make sure this entry was fully initialized, else we'll ignore it.
+            if (log_entry.initialized.load(.acquire) == false) continue;
+
+            const ptr = log_entry.value.asPtr() orelse continue; // Only track values with pointers.
+            const entry = object_logs.getOrPut(external_arena, ptr) catch @panic("OOM");
+            if (!entry.found_existing) entry.value_ptr.* = .{ .entries = .empty, .leaked = false };
+
+            entry.value_ptr.entries.append(external_arena, log_entry) catch @panic("OOM");
+
+            // We need to figure out whether this entry is an object or not.
+            // The address may have been reused by another structure, but we
+            // know if it was allocated and not freed as an object, it's an
+            // object.
+            if (log_entry.category == .alloc) {
+                entry.value_ptr.leaked = true;
+            } else if (log_entry.category == .free) {
+                entry.value_ptr.leaked = false;
+            }
+        }
+
+        // Next, figure out which objects ended up leaking.
+        var leaked_objects: std.ArrayList(*Object) = .empty;
+        var iter = object_logs.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.leaked) {
+                leaked_objects.append(external_arena, entry.key_ptr.*) catch @panic("OOM");
+            }
+        }
+
+        var walker = leak_check.GraphWalker.empty;
+        const struct_iter = walker.promote(external_arena);
+        for (leaked_objects.items) |leaked_object| {
+            struct_iter.followUnparentedNode(Object, leaked_object) catch @panic("OOM");
+        }
+
+        return .{
+            .arena = external_arena_allocator,
+            .nodes = walker.nodes,
+            .edges = walker.edges,
+        };
+    } else {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .nodes = .empty,
+            .edges = .empty,
+        };
+    }
+}
+
+test "leak" {
+    try testStart(testing.allocator, testing.io);
+    defer testFinish();
+
+    _ = try objects.String.newObject("hello");
+
+    const leaked = try captureLeaks();
+    var iter = leaked.nodes.iterator();
+    while (iter.next()) |val| {
+        ioutil.debug("Type name: {s}, as string: {?s}\n", .{ val.value_ptr.type_name, val.value_ptr.as_string });
+    }
 }
