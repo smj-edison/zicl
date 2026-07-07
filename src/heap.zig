@@ -25,15 +25,15 @@ pub var init_mutex: std.Io.Mutex = .init;
 pub var running_leak_check: bool = false;
 
 pub var global_gpa: mem.Allocator = undefined;
-pub threadlocal var local_arena: mem.Allocator = undefined;
 threadlocal var local_arena_instance: std.heap.ArenaAllocator = undefined;
+pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var nativefn_registry: NativeFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
 
 var trace_mutex: std.Io.Mutex = .init;
 /// Preallocated fallback used by `[catch]` when a script OOMs and building
-/// the real opts dict also OOMs. Pinned at init, released via `freeOomOptsDict`.
+/// the real opts dict also OOMs.
 var oom_error_options_dict: ?Value = null;
 
 /// Initialize global heap state. Must be called once per process (or test).
@@ -432,7 +432,7 @@ pub const Value = enum(ValueBacking) {
 
     pub fn canShimmer(value: Value) bool {
         if (value.asPtr()) |obj| {
-            return !obj.metadata.cross_thread;
+            return obj.canShimmer();
         } else {
             // Primitives can't shimmer.
             return false;
@@ -444,18 +444,7 @@ pub const Value = enum(ValueBacking) {
         // the codebase assume that `canMutate` means that an object is not crossthread.
 
         if (value.asPtr()) |obj| {
-            // Cross thread objects can't be mutated, even if the ref count is 1, because
-            // objects can be indirectly accessed by traversing lists. Imagine thread 1
-            // is traversing a list, while thread 2 is modifying the list elements.
-            // Thread 2 sees that the list element only has ref count one (since it's only
-            // owned by the list), so it figures it's safe to modify. Wrong! It's not safe
-            // to modify, because thread 1 is also reading the list. This is why crossthread
-            // objects are never safe to modify, or even shimmer.
-            if (obj.metadata.cross_thread) return false;
-            // If the hash is registered, it means it is considered frozen. We can't very
-            // well mutate something that has a fixed value.
-            if (obj.metadata.hash_registered) return false;
-            if (obj.getRefCount() > 1) return false;
+            return obj.canMutate();
         } else {
             // Primitives can't mutate.
             return false;
@@ -476,8 +465,12 @@ pub const Value = enum(ValueBacking) {
         value.trace("Prepared to shimmer", .{});
     }
 
-    pub fn borrow(value: Value) Value {
+    pub fn incrRefCount(value: Value) void {
         if (value.asPtr()) |obj| obj.incrRefCount();
+    }
+
+    pub fn borrow(value: Value) Value {
+        value.incrRefCount();
         return value;
     }
 
@@ -853,6 +846,11 @@ pub const Object = struct {
         return @ptrCast(aligned_bytes - @sizeOf(Object));
     }
 
+    pub fn fromConst(T: type, ptr: *const T) *const Object {
+        const aligned_bytes: [*]align(@alignOf(Object)) const u8 = @ptrCast(@alignCast(ptr));
+        return @ptrCast(aligned_bytes - @sizeOf(Object));
+    }
+
     pub fn castToInner(obj: *Object) *align(@alignOf(Object)) anyopaque {
         const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
         return @ptrCast(aligned_bytes + @sizeOf(Object));
@@ -865,7 +863,7 @@ pub const Object = struct {
         return @ptrCast(aligned_bytes + @sizeOf(Object));
     }
 
-    pub fn castToConst(obj: *const Object, T: type) *const T {
+    pub fn constCastTo(obj: *const Object, T: type) *const T {
         assert(obj.vtable == &T.vtable);
         const aligned_bytes: [*]align(@alignOf(Object)) const u8 = @ptrCast(@alignCast(obj));
         return @ptrCast(aligned_bytes + @sizeOf(Object));
@@ -876,6 +874,26 @@ pub const Object = struct {
             .head = .{ .tag = .ptr },
             .value = .{ .ptr = @intCast(@intFromPtr(obj)) },
         });
+    }
+
+    pub fn canMutate(obj: *const Object) bool {
+        // Cross thread objects can't be mutated, even if the ref count is 1, because
+        // objects can be indirectly accessed by traversing lists. Imagine thread 1
+        // is traversing a list, while thread 2 is modifying the list elements.
+        // Thread 2 sees that the list element only has ref count one (since it's only
+        // owned by the list), so it figures it's safe to modify. Wrong! It's not safe
+        // to modify, because thread 1 is also reading the list. This is why crossthread
+        // objects are never safe to modify, or even shimmer.
+        if (obj.metadata.cross_thread) return false;
+        // If the hash is registered, it means it is considered frozen. We can't very
+        // well mutate something that has a fixed value.
+        if (obj.metadata.hash_registered) return false;
+        if (obj.getRefCount() > 1) return false;
+        return true;
+    }
+
+    pub fn canShimmer(obj: *const Object) bool {
+        return !obj.metadata.cross_thread;
     }
 
     pub fn newObjectUninitialized(T: type) !struct { head: *Object, body: *T } {
@@ -1014,8 +1032,8 @@ pub const Object = struct {
     /// Takes ownership of `bytes` and sets it as the object's string representation.
     /// On error.OtherThreadSet, frees `bytes` and returns normally.
     /// On error.OutOfMemory, frees `bytes` and propagates the error.
-    pub fn setStringConsuming(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
-        obj.setString(bytes) catch |err| switch (err) {
+    pub fn setStringIgnoreRace(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
+        obj.setStringOwning(bytes) catch |err| switch (err) {
             error.OutOfMemory => {
                 global_gpa.free(bytes);
                 return error.OutOfMemory;
@@ -1026,7 +1044,24 @@ pub const Object = struct {
         };
     }
 
-    pub fn setString(obj: *Object, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
+    pub fn setStringDuplicatingIgnoreRace(obj: *Object, bytes: []const u8) error{OutOfMemory}!void {
+        const owned_bytes = try global_gpa.dupeSentinel(u8, bytes, 0);
+        obj.setStringOwning(owned_bytes) catch |err| {
+            global_gpa.free(owned_bytes);
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.OtherThreadSet => {},
+            }
+        };
+    }
+
+    pub fn setStringDuplicating(obj: *Object, bytes: []const u8) error{ OutOfMemory, OtherThreadSet }!void {
+        const owned_bytes = try global_gpa.dupeSentinel(u8, bytes, 0);
+        errdefer global_gpa.free(owned_bytes);
+        try obj.setStringOwning(owned_bytes);
+    }
+
+    pub fn setStringOwning(obj: *Object, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
         const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
         for (hashes) |hash| if (hash.value) |val| val.incrRefCount();

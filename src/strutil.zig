@@ -868,3 +868,39 @@ pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escap
         },
     }
 }
+
+/// Note: this assumes `arena` is an arena that is periodically cleaned up, since
+/// this function does not clean up any internal state allocated on `arena`.
+pub fn quoteStrings(arena: std.mem.Allocator, items: []const []const u8) ![:0]u8 {
+    var quoting_types = try arena.alloc(QuotingType, items.len);
+
+    var upper_bound_len: usize = 0;
+    for (0.., items, quoting_types) |i, item, *quote_type| {
+        quote_type.* = calculateNeededQuotingType(item);
+        if (i == 0 and quote_type.* == .bare and item.len > 0 and item[0] == '#') {
+            // Make sure the first element has # escaped in braces, instead of
+            // being bare. This way a list isn't accidentally interpreted as
+            // a comment.
+            quoting_types[i] = .brace;
+        }
+
+        upper_bound_len += quoteSize(quote_type.*, item.len);
+        upper_bound_len += 1; // Space between each element.
+    }
+
+    var unfinished_str = try arena.alloc(u8, upper_bound_len + 1);
+    var written: usize = 0;
+
+    for (0.., items, quoting_types) |i, item, quote_type| {
+        written += quoteString(quote_type, item, unfinished_str[written..], i == 0);
+
+        if (i + 1 < items.len) {
+            unfinished_str[written] = ' ';
+            written += 1;
+        }
+    }
+
+    // Slap a nul on the end.
+    unfinished_str[written] = 0x00;
+    return unfinished_str[0..written :0];
+}

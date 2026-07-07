@@ -26,11 +26,6 @@ pub const ErrorDetails = struct {
     message: [:0]u8,
 };
 
-/// Note that this is often cast to `Mutable`, so you can't depend on `original`
-/// and `shimmered` as having the same value. Always use `.current()`. This is
-/// because `Shimmerable` and `Mutable` are more conventions to keep straight
-/// what's allowed to mutate, and what's just allowed to shimmer (a mutation is
-/// considered a shimmer if it has/will generate the same string rep).
 pub const Shimmerable = extern struct {
     original: Value,
     shimmered: OptionalValue = .none,
@@ -65,13 +60,6 @@ pub const Shimmerable = extern struct {
         return shimmered;
     }
 
-    /// Be very careful when using `asMutable`, since mutation functions often invalidate
-    /// the original string. Even if the mutation you do is transparent with the object
-    /// model, it may free the original string, thus not being transparent.
-    pub fn asMutable(self: *Shimmerable) *Mutable {
-        return @ptrCast(self);
-    }
-
     pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
         if (self.current().asPtr() != null and !self.current().canShimmer()) {
             self.shimmered.swap(try self.current().duplicate());
@@ -96,112 +84,99 @@ pub const Shimmerable = extern struct {
         return obj;
     }
 
-    pub fn duplicateForMutable(self: *const Shimmerable) !Value {
-        // Even if `original` or `replacement` can mutate due to ref count = 1,
-        // we've been tasked with making sure this object doesn't mutate, since
-        // the purpose of `Shimmer` is to ensure that we only ever write back
-        // something that has the same string (or will have the same string
-        // when generated).
-        return try self.current().duplicate();
+    pub fn getMutable(self: *Shimmerable, T: type, det: ?*ErrorDetails) !*T {
+        _ = try T.shimmerFrom(det, self);
+
+        // Even if `original` or `shimmered` can mutate due to their ref count
+        // being 1, we've been tasked with making sure this object doesn't
+        // mutate, since the purpose of `Shimmer` is to ensure that we only ever
+        // write back something that has the same string (or will have the same
+        // string when generated).
+        if (self.shimmered.asValue()) |value| {
+            if (value.canMutate()) {
+                self.shimmered = .none;
+                return value.asType(T).?;
+            }
+        }
+
+        return (try self.current().duplicate()).asType(T).?;
     }
 };
 
-pub const Mutable = extern struct {
-    original: Value,
-    mutated: OptionalValue = .none,
-
-    pub fn deinit(self: *Mutable) void {
-        self.original.release();
-        self.mutated.release();
-        self.* = undefined;
-    }
-
-    pub fn current(self: *const Mutable) Value {
-        return self.mutated.orElse(self.original);
-    }
-
-    pub fn consume(self: *Mutable) Value {
-        defer self.* = undefined;
-        if (self.mutated.asValue()) |mutated| {
-            self.original.release();
-            return mutated;
-        } else {
-            return self.original;
-        }
-    }
-
-    pub fn discardChanges(self: *Mutable) void {
-        self.mutated.swapWithNone();
-    }
-
-    pub fn takeMutated(self: *Mutable) OptionalValue {
-        const mutated = self.mutated;
-        self.mutated = .none;
-        return mutated;
-    }
-
-    pub fn asShimmerable(self: *Mutable) *Shimmerable {
-        return @ptrCast(self);
-    }
-
-    pub fn prepareToShimmer(self: *Mutable) !*Object {
-        switch (self.current().expandedValue()) {
-            .ptr => try self.ensureShimmerable(),
-            else => self.shimmered.swap(Value.fromPtr(try self.current().box())),
-        }
-
-        // We know that this must be an object, since we boxed it if
-        // it was a primitive.
-        const obj = self.current().asPtr().?;
-        // Make sure the object has a string rep before we free its body. That is, if
-        // it has a string rep. `.none` objects are brand new, so they obviously don't
-        // have a string rep yet.
-        if (obj.vtable != &None.vtable) _ = try obj.getString();
-        obj.invalidateInternalRep();
-
-        return obj;
-    }
-
-    pub fn prepareToMutate(self: *Mutable) !void {
-        if (!self.current().canMutate()) {
-            self.mutated.swap(try self.current().duplicate());
-        }
-    }
-};
-
-/// Helpers to work with child walking, used for walking the heap if a leak occured.
-pub const ChildWalkHelper = struct {
+/// Helpers to work with struct iteration, used for walking the heap if a leak occured.
+pub const IterHelper = struct {
     ctx: StructIterator,
     info: *const StructIterator.NodeInfo,
 
-    pub fn follow(helper: *const ChildWalkHelper, T: type, field_name: []const u8, ptr: *const T) StructIterator.Error!void {
+    pub fn follow(helper: *const IterHelper, T: type, field_name: []const u8, ptr: *const T) StructIterator.Error!void {
         if (@hasDecl(T, "vtable") and @TypeOf(T.vtable) == Object.VTable)
             @compileError("Can't follow an object body directly, follow its *Object instead.");
         try helper.ctx.followNode(T, helper.info, field_name, ptr);
     }
 
-    pub fn followOptional(helper: *const ChildWalkHelper, T: type, field_name: []const u8, ptr: ?*const T) StructIterator.Error!void {
+    pub fn followOptional(helper: *const IterHelper, T: type, field_name: []const u8, ptr: ?*const T) StructIterator.Error!void {
         if (ptr) |val| try helper.ctx.followNode(T, helper.info, field_name, val);
     }
 
-    pub fn followValue(helper: *const ChildWalkHelper, field_name: []const u8, value: Value) StructIterator.Error!void {
+    fn followValueInner(
+        ctx: StructIterator,
+        info: *const StructIterator.NodeInfo,
+        field_name: []const u8,
+        value: Value,
+    ) StructIterator.Error!void {
         if (value.asPtr()) |obj| {
-            try helper.ctx.followNode(Object, helper.info, field_name, obj);
+            try ctx.followNode(Object, info, field_name, obj);
         } else {
             var buf: [350]u8 = undefined;
             const str = value.getStringWithBuffer(&buf) catch unreachable;
-            try helper.ctx.addFieldString(Value, helper.info, field_name, str);
+            try ctx.addFieldString(Value, info, field_name, str);
+        }
+    }
+
+    pub fn followValue(helper: *const IterHelper, field_name: []const u8, value: Value) StructIterator.Error!void {
+        try followValueInner(helper.ctx, helper.info, field_name, value);
+    }
+
+    pub fn followValueSlice(helper: *const IterHelper, field_name: []const u8, values: []const Value) StructIterator.Error!void {
+        const items_info: StructIterator.NodeInfo = .{
+            .node = @ptrCast(values.ptr),
+            .parent_info = helper.info,
+            .enumerate_struct = null, // `[]Value` has no walking function.
+            .type_name = @typeName([]Value),
+            .as_string = null,
+        };
+        try helper.ctx.vtable.visit_node(helper.ctx, &items_info, field_name);
+
+        for (values, 0..) |item, i| {
+            const rendered_index = try std.fmt.allocPrint(helper.ctx.arena, "{}", .{i});
+            try followValueInner(helper.ctx, &items_info, rendered_index, item);
         }
     }
 
     pub fn followOptionalValue(
-        helper: *const ChildWalkHelper,
+        helper: *const IterHelper,
         field_name: []const u8,
         optional: OptionalValue,
     ) StructIterator.Error!void {
         if (optional.asValue()) |val| try helper.followValue(field_name, val);
     }
+
+    pub fn addField(
+        helper: *const IterHelper,
+        T: type,
+        edge_coming_from: []const u8,
+        comptime fmt: []const u8,
+        val: T,
+    ) StructIterator.Error!void {
+        try helper.ctx.addField(T, helper.info, edge_coming_from, fmt, val);
+    }
 };
+
+pub fn allocPrintZ(comptime fmt: []const u8, args: anytype) error{OutOfMemory}![:0]u8 {
+    return try std.fmt.allocPrintSentinel(heap.global_gpa, fmt, args, 0);
+}
+
+// Start of objects. //
 
 pub const None = struct {
     pub fn new(bytes: [:0]const u8) !*None {
@@ -229,7 +204,7 @@ pub const None = struct {
         .free_internal_rep = null,
         .update_string = null,
         .enumerate_struct = null,
-        .name = "none",
+        .name = @typeName(None),
     };
 };
 
@@ -291,7 +266,8 @@ pub const String = struct {
     }
 
     pub fn getCodepointLength(shim: *Shimmerable) !usize {
-        const as_str = try String.shimmerFrom(null, shim);
+        _ = try String.shimmerFrom(null, shim);
+        const as_str = shim.current().asType(String).?; // Get non-const pointer to the String.
 
         // See if we already calculated the utf8 length.
         switch (as_str.asHead().getStringDetails()) {
@@ -317,7 +293,7 @@ pub const String = struct {
         }
     }
 
-    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*String {
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const String {
         _ = det;
         if (shim.current().asType(String)) |str| return str;
 
@@ -338,13 +314,13 @@ pub const String = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.codepoint_length = .init(src.castToConst(String).codepoint_length.load(.monotonic));
+        new_obj.body.codepoint_length = .init(src.constCastTo(String).codepoint_length.load(.monotonic));
 
         return new_obj.head;
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const string = obj.castToConst(String);
+        const string = obj.constCastTo(String);
         try ctx.addField(usize, info, "codepoint_length", "{}", string.codepoint_length.load(.monotonic));
     }
 
@@ -504,7 +480,7 @@ pub const Source = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const cast_src = src.castToConst(Source);
+        const cast_src = src.constCastTo(Source);
         new_obj.body.file_name = cast_src.file_name.borrow();
         new_obj.body.line_no = cast_src.line_no;
 
@@ -514,7 +490,7 @@ pub const Source = struct {
     fn freeInternalRep(obj: *Object) void {
         const as_source = obj.castTo(Source);
         as_source.file_name.release();
-        if (as_source.hash.load(.monotonic)) |hash_ptr| heap.global_gpa.destroy(hash_ptr);
+        if (as_source.hash.load(.acquire)) |hash_ptr| heap.global_gpa.destroy(hash_ptr);
     }
 
     fn makeCrossthread(obj: *Object) void {
@@ -522,8 +498,8 @@ pub const Source = struct {
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const source = obj.castToConst(Source);
-        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        const source = obj.constCastTo(Source);
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followOptionalValue("file_name", source.file_name);
         if (source.hash.load(.monotonic)) |hash| try ctx.followNode(u256, info, "hash", hash);
     }
@@ -539,20 +515,16 @@ pub const Source = struct {
 };
 
 pub const ClosureValues = struct {
-    /// Value for the argument list of the procedure.
-    args: Value,
+    /// Argument list of the procedure.
+    args: []Value,
+    /// Default values of optional arguments.
+    optional_values: []Value,
     /// Value for the script's body.
     body: Value,
     /// We do our best to track the closure's name.
     name: OptionalValue,
     /// Hash reference pointing to the scope.
     scope_hash_ref: ?*HashReference,
-    /// Required number of arguments.
-    required_arity: u32,
-    /// Optional number of arguments.
-    optional_arity: u32,
-    /// Default values of optional arguments, if any.
-    optional_values: OptionalValue,
     /// Whether `args` is provided as an argument name. `args`, if present, is always
     /// the last argument name.
     has_args_parameter: bool,
@@ -561,42 +533,54 @@ pub const ClosureValues = struct {
     /// Unique identifier for cache keying.
     cache_id: u64,
 
-    pub fn borrow(closure: ClosureValues) ClosureValues {
+    pub fn requiredArity(closure: *const ClosureValues) usize {
+        return closure.args.len - closure.optional_values.len - if (closure.has_args_parameter) 1 else 0;
+    }
+
+    pub fn duplicate(closure: *const ClosureValues) !ClosureValues {
+        const duplicated_args = try heap.global_gpa.dupe(Value, closure.args);
+        errdefer heap.global_gpa.free(duplicated_args);
+        const duplicated_optional_values = try heap.global_gpa.dupe(Value, closure.optional_values);
+        for (duplicated_args) |arg| arg.incrRefCount();
+        for (duplicated_optional_values) |value| value.incrRefCount();
+
         const borrowed_hash_ref = closure.scope_hash_ref;
-        if (borrowed_hash_ref) |val| _ = val.asHead().borrow();
+        if (borrowed_hash_ref) |obj| obj.asHead().incrRefCount();
+
         return .{
-            .args = closure.args.borrow(),
+            .args = duplicated_args,
+            .optional_values = duplicated_optional_values,
             .body = closure.body.borrow(),
             .name = closure.name.borrow(),
             .scope_hash_ref = borrowed_hash_ref,
-            .required_arity = closure.required_arity,
-            .optional_arity = closure.optional_arity,
-            .optional_values = closure.optional_values.borrow(),
             .has_args_parameter = closure.has_args_parameter,
             .is_method = closure.is_method,
             .cache_id = closure.cache_id,
         };
     }
 
-    pub fn deinit(closure: ClosureValues) void {
-        closure.args.release();
+    pub fn deinit(closure: *ClosureValues) void {
+        for (closure.args) |arg| arg.release();
+        heap.global_gpa.free(closure.args);
+        for (closure.optional_values) |value| value.release();
+        heap.global_gpa.free(closure.optional_values);
+
         closure.body.release();
         closure.name.release();
         if (closure.scope_hash_ref) |val| val.asHead().release();
-        closure.optional_values.release();
     }
 
     pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const closure: *const ClosureValues = @ptrCast(@alignCast(info.node));
-        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
-        try helper.followValue("args", closure.args);
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValueSlice("args", closure.args);
+        try helper.followValueSlice("optional_values", closure.optional_values);
         try helper.followValue("body", closure.body);
         try helper.followOptionalValue("name", closure.name);
-        try helper.followOptional(HashReference, "scope_hash_ref", closure.scope_hash_ref);
-        @compileLog("here");
-        // if (closure.scope_hash_ref) |hash_ref|
-        //     try helper.followOptional(Object, "scope_hash_ref", hash_ref.asHead());
-        try helper.followOptionalValue("optional_values", closure.optional_values);
+        try helper.followOptional(Object, "scope_hash_ref", if (closure.scope_hash_ref) |val| val.asHead() else null);
+        try helper.addField(bool, "has_args_parameter", "{}", closure.has_args_parameter);
+        try helper.addField(bool, "is_method", "{}", closure.is_method);
+        try helper.addField(u64, "cache_id", "{}", closure.cache_id);
     }
 };
 
@@ -604,14 +588,18 @@ pub const Closure = struct {
     closure: *ClosureValues,
 
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.duplicateStringOnly(src);
-        errdefer new_obj.deinit();
+        const new_obj = try Object.newObjectUninitialized(Closure);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+        errdefer new_obj.head.invalidateString();
 
         const new_closure = try heap.global_gpa.create(ClosureValues);
-        new_obj.vtable = &vtable;
-        new_closure.* = src.castToConst(Closure).closure.borrow();
+        errdefer heap.global_gpa.destroy(new_closure);
+        new_closure.* = try src.constCastTo(Closure).closure.duplicate();
 
-        return new_obj;
+        new_obj.body.* = .{ .closure = new_closure };
+
+        return new_obj.head;
     }
 
     fn freeInternalRep(src: *Object) void {
@@ -620,13 +608,62 @@ pub const Closure = struct {
         heap.global_gpa.destroy(as_closure.closure);
     }
 
-    fn updateString(_: *Object) !void {
-        @panic("FIXME: generate closure from parts (see old code)");
+    fn updateString(obj: *Object) !void {
+        const as_closure = obj.castTo(Closure);
+        const closure = as_closure.closure;
+        const required = closure.requiredArity();
+        const optional = closure.optional_values.len;
+
+        // Step 1: Rebuild the arguments list from required and optional args.
+
+        var rebuilt_args = try heap.local_arena.alloc([]const u8, closure.args.len);
+
+        // Get all the strings (we'll overwrite the strings for the optional arguments).
+        for (closure.args, &rebuilt_args) |arg, *str| str.* = try arg.getString();
+
+        // Next, copy over the optional args.
+        var optional_written: usize = 0;
+        while (optional_written < optional) : (optional_written += 1) {
+            const name_and_value: [2][]const u8 = .{
+                try closure.args[required + optional_written].getString(), // Argument name.
+                try closure.optional_values[optional_written].getString(), // Default value.
+            };
+            const bytes = try strutil.quoteStrings(heap.local_arena, name_and_value);
+            rebuilt_args[required + optional_written] = bytes;
+        }
+
+        // Combine all the arguments together to get the args string.
+        const args_as_string = try strutil.quoteStrings(heap.local_arena, rebuilt_args);
+
+        // Step 2: build the closure string from its parts.
+
+        // Build the closure: fn|method ?name <name>? impl <impl> ?scope <scope>?
+        var backing: [7][]const u8 = undefined;
+        var result = std.ArrayList([]const u8).initBuffer(&backing);
+
+        result.appendAssumeCapacity(if (closure.is_method) "method" else "fn");
+
+        if (closure.name.asValue()) |val| {
+            result.appendAssumeCapacity("name");
+            result.appendAssumeCapacity(try val.getString());
+        }
+
+        // `impl` is a two element list: {args body}.
+        const args_and_body: [2][]const u8 = .{ args_as_string, try closure.body.getString() };
+        result.appendAssumeCapacity("impl");
+        result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, args_and_body));
+
+        if (closure.scope_hash_ref) |hash_ref| {
+            result.appendAssumeCapacity("scope");
+            result.appendAssumeCapacity(try hash_ref.asHead().getString());
+        }
+
+        try obj.setStringDuplicating(try strutil.quoteStrings(heap.local_arena, result.items));
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const closure = obj.castToConst(Closure);
-        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        const closure = obj.constCastTo(Closure);
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.follow(ClosureValues, "closure", closure.closure);
     }
 
@@ -636,7 +673,7 @@ pub const Closure = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = "closure",
+        .name = @typeName(Closure),
     };
 };
 
@@ -654,8 +691,9 @@ pub const UpvarLink = struct {
 
     fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const upvar: *const UpvarLink = @ptrCast(@alignCast(info.node));
-        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followValue("linked_name", upvar.linked_name);
+        try helper.addField(u32, "call_frame", "{}", upvar.call_frame);
     }
 
     pub const vtable: Object.VTable = .{
@@ -664,7 +702,7 @@ pub const UpvarLink = struct {
         .update_string = null,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = "upvar_link",
+        .name = @typeName(UpvarLink),
     };
 };
 
@@ -688,13 +726,13 @@ pub const DictSugar = struct {
 
     fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const dict_sugar: *const DictSugar = @ptrCast(@alignCast(info.node));
-        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followValue("dict_name", dict_sugar.dict_name);
-        try helper.follow(List, "dict_path", dict_sugar.dict_path);
+        try helper.follow(Object, "dict_path", dict_sugar.dict_path.asHead());
     }
 
     pub const vtable: Object.VTable = .{
-        .name = "dict_sugar",
+        .name = @typeName(DictSugar),
         .duplicate = Object.duplicateStringOnly,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
@@ -714,7 +752,7 @@ pub const HashReference = struct {
         return new_obj.body;
     }
 
-    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*HashReference {
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const HashReference {
         if (shim.current().asType(HashReference)) |hash_ref| return hash_ref;
 
         const bytes = try shim.current().getString();
@@ -749,7 +787,7 @@ pub const HashReference = struct {
     }
 
     /// Helper function, as hash references are often resolved to dictionaries.
-    pub fn resolveAsDictionary(det: ?*ErrorDetails, shim: *Shimmerable) error{ LinkLookupFailed, OutOfMemory }!*Dictionary {
+    pub fn resolveAsDictionary(det: ?*ErrorDetails, shim: *Shimmerable) error{ LinkLookupFailed, OutOfMemory }!*const Dictionary {
         const as_hash_ref = shimmerFrom(det, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.LinkLookupFailed,
@@ -762,8 +800,7 @@ pub const HashReference = struct {
             error.BadDict => return error.LinkLookupFailed,
         };
 
-        if (resolved_shim.takeShimmered().asValue()) |new_dict| {
-            defer new_dict.release();
+        if (resolved_shim.shimmered.asValue()) |new_dict| {
             shim.shimmered.swap((try new(new_dict.asPtr().?)).asHead().asValue());
         }
 
@@ -780,8 +817,7 @@ pub const HashReference = struct {
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        const as_hash_ref = src.castToConst(HashReference);
-        new_obj.body.ref = as_hash_ref.ref.borrow();
+        new_obj.body.ref = src.constCastTo(HashReference).ref.borrow();
 
         return new_obj.head;
     }
@@ -797,16 +833,12 @@ pub const HashReference = struct {
         var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
         _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
         @memcpy(encoded[0..hashutil.hash_prepend.len], hashutil.hash_prepend);
-        const new_str = try heap.global_gpa.dupeSentinel(u8, &encoded, 0);
-        obj.setString(new_str) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.OtherThreadSet => {},
-        };
+        try obj.setStringDuplicatingIgnoreRace(&encoded);
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const hash_ref = obj.castToConst(HashReference);
-        const helper: ChildWalkHelper = .{ .ctx = ctx, .info = info };
+        const hash_ref = obj.constCastTo(HashReference);
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.follow(Object, "ref", hash_ref.ref);
     }
 
@@ -816,7 +848,7 @@ pub const HashReference = struct {
         .free_internal_rep = freeInternalRep,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = "hash_reference",
+        .name = @typeName(HashReference),
     };
 };
 
@@ -829,7 +861,7 @@ pub const Regexp = struct {
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const regexp = obj.castToConst(Regexp);
+        const regexp = obj.constCastTo(Regexp);
         ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
     }
 
@@ -839,7 +871,7 @@ pub const Regexp = struct {
         .free_internal_rep = freeInternalRep,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = "regexp",
+        .name = @typeName(Regexp),
     };
 };
 
@@ -895,7 +927,7 @@ pub const Index = struct {
         return error.BadIndex;
     }
 
-    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*Index {
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const Index {
         if (shim.current().asType(Index)) |index| return index;
 
         const bytes = try shim.current().getString();
@@ -925,24 +957,15 @@ pub const Index = struct {
     }
 
     pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !Index {
-        // Fast case: if it's an integer or float, we can quickly cast it (don't
-        // shimmer though, as it'll probably still be used for its original purpose).
+        // Fast case: if it's an integer, we can quickly cast it (don't
+        // shimmer though, as it'll probably still be used for its
+        // original purpose).
 
         switch (shim.current().expandedValue()) {
             .int => |int| {
                 return .{ .index = int, .is_relative = false };
             },
-            .float => |float| {
-                if (math.isNan(float)) return badIndexError(det, try shim.current().getString());
-                if (float < std.math.minInt(i64)) return badIndexError(det, try shim.current().getString());
-                if (float > std.math.maxInt(i64)) return badIndexError(det, try shim.current().getString());
-                if (@trunc(float) != float) return badIndexError(det, try shim.current().getString());
-
-                return .{ .index = @trunc(float), .is_relative = false };
-            },
-            else => {
-                return (try shimmerFrom(det, shim)).*;
-            },
+            else => return (try shimmerFrom(det, shim)).*,
         }
     }
 
@@ -957,7 +980,7 @@ pub const Index = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const as_index = src.castToConst(Index);
+        const as_index = src.constCastTo(Index);
         new_obj.body.index = as_index.index;
         new_obj.body.is_relative = as_index.is_relative;
 
@@ -969,12 +992,12 @@ pub const Index = struct {
         const bytes = blk: {
             if (as_index.is_relative) {
                 const sign = if (as_index.index >= 0) "+" else "";
-                break :blk try std.fmt.allocPrintSentinel(heap.global_gpa, "end{s}{d}", .{ sign, as_index.index }, 0);
+                break :blk try std.fmt.allocPrintSentinel(heap.global_gpa, "end{s}{}", .{ sign, as_index.index }, 0);
             } else {
-                break :blk try std.fmt.allocPrintSentinel(heap.global_gpa, "{d}", .{as_index.index}, 0);
+                break :blk try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_index.index}, 0);
             }
         };
-        try obj.setStringConsuming(bytes);
+        try obj.setStringIgnoreRace(bytes);
     }
 
     pub const vtable: Object.VTable = .{
@@ -983,7 +1006,7 @@ pub const Index = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = null,
-        .name = "index",
+        .name = @typeName(Index),
     };
 };
 
@@ -1061,7 +1084,7 @@ pub const Float = struct {
     fn updateString(obj: *Object) !void {
         const as_float = obj.castTo(Float);
         const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_float.value}, 0);
-        try obj.setStringConsuming(bytes);
+        try obj.setStringIgnoreRace(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -1069,7 +1092,7 @@ pub const Float = struct {
         errdefer new_obj.head.deinit();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const as_float = src.castToConst(Float);
+        const as_float = src.constCastTo(Float);
         new_obj.body.value = as_float.value;
 
         return new_obj.head;
@@ -1081,7 +1104,7 @@ pub const Float = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = null,
-        .name = "boxed_float",
+        .name = @typeName(Float),
     };
 };
 
@@ -1092,7 +1115,7 @@ pub const Integer = struct {
         if (value >= math.minInt(i32) and value <= math.maxInt(i32)) {
             return Value.newInt(@intCast(value));
         }
-        return Value.fromPtr((try newBoxed(value)).asHead());
+        return (try newBoxed(value)).asHead().asValue();
     }
 
     pub fn newBoxed(value: i64) !*Integer {
@@ -1128,9 +1151,9 @@ pub const Integer = struct {
         }
     }
 
-    pub fn shimmer(det: ?*ErrorDetails, shim: *Shimmerable) !void {
-        if (shim.current().asInt() != null) return;
-        if (shim.current().asType(Integer) != null) return;
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
+        if (shim.current().asInt()) |int| return int;
+        if (shim.current().asType(Integer)) |boxed_int| return boxed_int.value;
 
         const parsed = try parse(det, try shim.current().getString());
 
@@ -1146,26 +1169,19 @@ pub const Integer = struct {
                 // The two strings are identical, so we can use an int value.
                 shim.shimmered.swap(Value.newInt(@intCast(parsed)));
             }
+            return parsed;
         }
 
         const obj = try shim.prepareToShimmer();
         obj.vtable = &vtable;
         const as_boxed_int = obj.castTo(Integer);
-        as_boxed_int = .{ .value = parsed };
-        return as_boxed_int;
-    }
-
-    pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
-        try shimmer(det, shim);
-
-        if (shim.current().asInt()) |int| return int;
-        if (shim.current().asType(Integer)) |boxed| return boxed.value;
-        unreachable;
+        as_boxed_int.* = .{ .value = parsed };
+        return obj.asValue();
     }
 
     fn updateString(obj: *Object) !void {
         const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{obj.castTo(Integer).value}, 0);
-        try obj.setStringConsuming(bytes);
+        try obj.setStringIgnoreRace(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -1173,7 +1189,7 @@ pub const Integer = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.value = src.castToConst(Integer).value;
+        new_obj.body.value = src.constCastTo(Integer).value;
 
         return new_obj.head;
     }
@@ -1184,7 +1200,7 @@ pub const Integer = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = null,
-        .name = "boxed_int",
+        .name = @typeName(Integer),
     };
 };
 
@@ -1243,25 +1259,19 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
 
         variant: E,
 
-        pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*Self {
+        pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const Self {
             if (shim.current().asType(Self)) |self| return self;
 
             const bytes = try shim.current().getString();
-            const variant = map.get(bytes);
-            if (variant) |val| {
+            if (map.get(bytes)) |variant| {
                 const obj = try shim.prepareToShimmer();
                 obj.vtable = &vtable;
                 const self = obj.castTo(Self);
-                self.variant = val;
+                self.variant = variant;
                 return self;
             } else {
                 if (det) |details| details.* = .{
-                    .message = try std.fmt.allocPrintSentinel(
-                        heap.global_gpa,
-                        "bad {s} \"{s}\": must be {s}",
-                        .{ enum_name, bytes, names },
-                        0,
-                    ),
+                    .message = try allocPrintZ("bad {s} \"{s}\": must be {s}", .{ enum_name, bytes, names }),
                 };
                 return error.BadEnumVariant;
             }
@@ -1277,7 +1287,7 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
             errdefer new_obj.head.freeBacking();
             try src.duplicateHeadOnto(new_obj.head);
 
-            new_obj.body.variant = src.castToConst(Self).variant;
+            new_obj.body.variant = src.constCastTo(Self).variant;
 
             return new_obj.head;
         }
@@ -1288,7 +1298,7 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
             .update_string = null,
             .make_crossthread = null,
             .enumerate_struct = null,
-            .name = "enum_for_" ++ enum_name,
+            .name = @typeName(Self),
         };
     };
 }
@@ -1374,15 +1384,13 @@ pub fn SubcommandParser(
             if (args.len < 2) {
                 const bytes = try args[0].current().getString();
                 if (det) |details| details.* = .{
-                    .message = try std.fmt.allocPrintSentinel(heap.global_gpa,
+                    .message = try allocPrintZ(
                         \\wrong # args: should be "{s} command ..."
                         \\Use "{s} -help ?command?" for help
-                    , .{ bytes, bytes }, 0),
+                    , .{ bytes, bytes }),
                 };
                 return error.WrongUsage;
             }
-
-            // TODO PERF cache the subcommand lookup.
 
             if (try args[1].current().equalsString("-help")) {
                 if (args.len >= 3) {
@@ -1391,18 +1399,14 @@ pub fn SubcommandParser(
                     // Generate help for a specific subcommand, if the subcommand exists.
                     if (NameToEnum.get(null, subcommand_queried)) |val| {
                         const subcommand = EnumToSubcommand.get(val);
-                        if (det) |details| details.* = .{
-                            .message = try std.fmt.allocPrintSentinel(
-                                heap.global_gpa,
-                                "Usage: \"{s} {s} {s}\"",
-                                .{
-                                    try args[0].current().getString(),
-                                    try subcommand_queried.current().getString(),
-                                    subcommand.usage,
-                                },
-                                0,
-                            ),
-                        };
+                        if (det) |details| details.* = .{ .message = try allocPrintZ(
+                            "Usage: \"{s} {s} {s}\"",
+                            .{
+                                try args[0].current().getString(),
+                                try subcommand_queried.current().getString(),
+                                subcommand.usage,
+                            },
+                        ) };
                         return error.UsageHelp;
                     } else |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1424,13 +1428,14 @@ pub fn SubcommandParser(
             const subcommand_enum = NameToEnum.get(null, subcommand_name) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadEnumVariant => {
-                    if (det) |details| details.* = .{
-                        .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "{s}, unknown command \"{s}\": should be {s}", .{
+                    if (det) |details| details.* = .{ .message = try allocPrintZ(
+                        "{s}, unknown command \"{s}\": should be {s}",
+                        .{
                             try args[0].current().getString(),
                             try args[1].current().getString(),
                             space_joined_names,
-                        }, 0),
-                    };
+                        },
+                    ) };
                     return error.WrongUsage;
                 },
             };
@@ -1446,12 +1451,7 @@ pub fn SubcommandParser(
             };
             if (!correct_arg_count) {
                 if (det) |details| details.* = .{
-                    .message = try std.fmt.allocPrintSentinel(
-                        heap.global_gpa,
-                        "wrong # args: should be \"{s}\"",
-                        .{subcommand.usage},
-                        0,
-                    ),
+                    .message = try allocPrintZ("wrong # args: should be \"{s}\"", .{subcommand.usage}),
                 };
                 return error.WrongUsage;
             }
@@ -1497,11 +1497,7 @@ pub const BoxedBoolean = struct {
     }
 
     fn updateString(obj: *Object) !void {
-        const bytes = if (obj.castTo(BoxedBoolean).value)
-            try heap.global_gpa.dupeSentinel(u8, "true", 0)
-        else
-            try heap.global_gpa.dupeSentinel(u8, "false", 0);
-        try obj.setStringConsuming(bytes);
+        try obj.setStringDuplicatingIgnoreRace(if (obj.castTo(BoxedBoolean).value) "true" else "false");
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -1509,7 +1505,7 @@ pub const BoxedBoolean = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.value = src.castToConst(BoxedBoolean).value;
+        new_obj.body.value = src.constCastTo(BoxedBoolean).value;
 
         return new_obj.head;
     }
@@ -1520,7 +1516,7 @@ pub const BoxedBoolean = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = null,
-        .name = "boxed_boolean",
+        .name = @typeName(BoxedBoolean),
     };
 };
 
@@ -1536,7 +1532,7 @@ pub const CachedLocalVar = struct {
         // TODO it would be nice to be able to walk the cached local var,
         // but we'd need the call epoch invalidation logic embedded in it.
         .enumerate_struct = null,
-        .name = "cached_local_var",
+        .name = @typeName(CachedLocalVar),
     };
 };
 
@@ -1551,7 +1547,7 @@ pub const CachedLexicalVar = struct {
         .make_crossthread = null,
         // TODO same as `CachedLocalVar.vtable`.
         .enumerate_struct = null,
-        .name = "cached_lexical_var",
+        .name = @typeName(CachedLexicalVar),
     };
 };
 
@@ -1560,7 +1556,7 @@ pub const ParsedScriptCommand = struct {
     word_count: u32,
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const command = obj.castToConst(ParsedScriptCommand);
+        const command = obj.constCastTo(ParsedScriptCommand);
         try ctx.addField(u32, info, "line", "{}", command.line);
         try ctx.addField(u32, info, "word_count", "{}", command.word_count);
     }
@@ -1571,7 +1567,7 @@ pub const ParsedScriptCommand = struct {
         .free_internal_rep = null,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = "parsed_script_command",
+        .name = @typeName(ParsedScriptCommand),
     };
 
     pub fn castFrom(obj: *Object) *ParsedScriptCommand {
@@ -1660,39 +1656,33 @@ pub const List = struct {
         return self.items.ptr[0..self.capacity];
     }
 
-    pub fn append(det: ?*ErrorDetails, mut: *Mutable, value: Value) !void {
-        try mut.prepareToMutate();
-        const list = try List.shimmerFrom(det, mut.asShimmerable());
-        try list.appendInner(value);
+    /// `list` must be mutable.
+    pub fn append(list: *List, value: Value) !void {
+        assert(list.asHead().canMutate());
+        if (list.capacity < list.items.len + 1) try list.ensureCapacity(@max(4, list.capacity * 2));
+
+        const old_len = list.items.len;
+        list.items = list.items.ptr[0..(old_len + 1)];
+        list.items[old_len] = value.borrow();
     }
 
-    pub fn set(det: ?*ErrorDetails, mut: *Mutable, index: usize, value: Value) !void {
-        try mut.prepareToMutate();
-        const list = try List.shimmerFrom(det, mut.asShimmerable());
-        list.setInner(index, value);
+    /// `list` must be mutable.
+    pub fn set(list: *List, index: usize, value: Value) !void {
+        assert(list.asHead().canMutate());
+        list.items[index].swap(value);
     }
 
-    fn ensureCapacity(self: *List, new_capacity: usize) !void {
-        if (new_capacity > self.capacity) {
-            const new_backing = try heap.global_gpa.realloc(self.backingSlice(), new_capacity);
-            self.items = new_backing[0..self.items.len];
-            self.capacity = new_capacity;
+    /// `list` must be mutable.
+    fn ensureCapacity(list: *List, new_capacity: usize) !void {
+        assert(list.asHead().canMutate());
+        if (new_capacity > list.capacity) {
+            const new_backing = try heap.global_gpa.realloc(list.backingSlice(), new_capacity);
+            list.items = new_backing[0..list.items.len];
+            list.capacity = new_capacity;
         }
     }
 
-    fn appendInner(self: *List, value: Value) !void {
-        if (self.capacity < self.items.len + 1) try self.ensureCapacity(@max(4, self.capacity * 2));
-
-        const old_len = self.items.len;
-        self.items = self.items.ptr[0..(old_len + 1)];
-        self.items[old_len] = value.borrow();
-    }
-
-    fn setInner(self: *List, index: usize, value: Value) void {
-        self.items[index].swap(value);
-    }
-
-    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*List {
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const List {
         if (shim.current().asType(List)) |list| return list;
 
         // Optimise dict -> list.
@@ -1794,11 +1784,11 @@ pub const List = struct {
     fn updateString(obj: *Object) !void {
         const as_list = obj.castTo(List);
         const bytes = try quoteValues(heap.global_gpa, as_list.items);
-        try obj.setStringConsuming(bytes);
+        try obj.setStringIgnoreRace(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const as_list = src.castToConst(List);
+        const as_list = src.constCastTo(List);
         const new_obj = try Object.newObjectUninitialized(List);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
@@ -1826,20 +1816,11 @@ pub const List = struct {
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const list = obj.castToConst(List);
-        if (list.items.len == 0) return;
+        const as_list = obj.constCastTo(List);
+        if (as_list.items.len == 0) return;
 
-        const items_info: StructIterator.NodeInfo = .{
-            .node = @ptrCast(list.items.ptr),
-            .parent_info = info,
-            .enumerate_struct = null, // `[]Value` has no walking function.
-            .type_name = @typeName([]Value),
-            .as_string = null,
-        };
-        try ctx.vtable.visit_node(ctx, &items_info, "items");
-
-        const items_helper: ChildWalkHelper = .{ .ctx = ctx, .info = &items_info };
-        for (list.items) |item| try items_helper.followValue("items", item);
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValueSlice("items", as_list.items);
     }
 
     pub const vtable: Object.VTable = .{
@@ -1848,7 +1829,7 @@ pub const List = struct {
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = "list",
+        .name = @typeName(List),
     };
 };
 
@@ -1872,11 +1853,8 @@ fn testLists(ta: std.mem.Allocator) !void {
     const to_append = try String.newValue("appended item");
     defer to_append.release();
 
-    var list1_mut: Mutable = .{ .original = list1.asHead().asValue() };
-    defer list1_mut.discardChanges();
-    try List.append(&det, &list1_mut, to_append);
-    const appended = list1_mut.current().asType(List).?.items[2];
-    try testing.expectEqualStrings("appended item", try appended.getString());
+    try list1.append(to_append);
+    try testing.expectEqualStrings("appended item", try list1.items[2].getString());
 
     var string_list: Shimmerable = .{ .original = try String.newValue(
         \\item1 {item 2} item\ 3
@@ -1982,7 +1960,7 @@ pub const Dictionary = struct {
         return table;
     }
 
-    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*Dictionary {
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const Dictionary {
         if (shim.current().asType(Dictionary)) |dict| return dict;
 
         const list = List.shimmerFrom(det, shim) catch |err| switch (err) {
@@ -1991,14 +1969,10 @@ pub const Dictionary = struct {
         };
         // A dict needs an even number of elements.
         if (list.items.len % 2 != 0) {
-            if (det) |details| details.* = .{
-                .message = try std.fmt.allocPrintSentinel(
-                    heap.global_gpa,
-                    "Missing value to go with key when converting \"{s}\" to a dictionary.",
-                    .{try shim.current().getString()},
-                    0,
-                ),
-            };
+            if (det) |details| details.* = .{ .message = try allocPrintZ(
+                "Missing value to go with key when converting \"{s}\" to a dictionary.",
+                .{try shim.current().getString()},
+            ) };
             return error.BadDict;
         }
 
@@ -2006,7 +1980,7 @@ pub const Dictionary = struct {
 
         const old_items = list.items;
         const old_capacity = list.capacity;
-        const obj = list.asHead();
+        const obj = shim.current().asPtr().?;
         obj.vtable = &vtable;
         const as_dict = obj.castTo(Dictionary);
         as_dict.* = .{
@@ -2017,45 +1991,45 @@ pub const Dictionary = struct {
         return as_dict;
     }
 
-    pub fn get(self: *Dictionary, key: Value) !OptionalValue {
+    pub fn getNoFollow(self: *const Dictionary, key: Value) !OptionalValue {
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
         if (self.table.get(key)) |idx| return self.items[idx].asOptional();
         return .none;
     }
 
-    pub fn getPtr(self: *Dictionary, key: Value) !?*Value {
+    pub fn getPtrNoFollow(self: *const Dictionary, key: Value) !?*Value {
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
         if (self.table.get(key)) |idx| return &self.items[idx];
         return .none;
     }
 
-    pub fn put(det: ?*ErrorDetails, mut: *Mutable, key: Value, value: Value) !usize {
-        const result = try putInner(det, mut, key, value);
-        if (mut.current().asPtr()) |obj| obj.invalidateString();
+    /// `dict` must be mutable.
+    pub fn put(dict: *Dictionary, key: Value, value: Value) !usize {
+        assert(dict.asHead().canMutate());
+        const result = try dict.putInner(key, value, true);
+        dict.asHead().invalidateString();
         return result;
     }
 
-    /// Does not invalidate the string.
-    pub fn putInner(det: ?*ErrorDetails, mut: *Mutable, key: Value, value: Value) !usize {
+    /// Does not invalidate the string. Used in cases where a `put` operation doesn't affect
+    /// how the string is generated, such as switching out a shimmered hash reference.
+    pub fn putInner(dict: *Dictionary, key: Value, value: Value, remove_duplicates: bool) !usize {
+        assert(!dict.asHead().metadata.cross_thread);
+
         // Ensure the key already has a hash, since the table requires everything used
         // to have a precomputed hash.
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
-
-        try mut.prepareToMutate();
-        const dict = try Dictionary.shimmerFrom(det, mut.asShimmerable());
 
         if (dict.table.get(key)) |existing_value_index| {
             // Key exists, so replace the value in place.
             const old = dict.items[existing_value_index];
             dict.items[existing_value_index] = value.borrow();
-            errdefer {
-                dict.items[existing_value_index].release();
-                dict.items[existing_value_index] = old;
-            }
-
-            const shifted_index = removeDuplicates(dict, existing_value_index);
             old.release();
-            return shifted_index.?;
+
+            if (remove_duplicates) {
+                const shifted_index = removeDuplicates(dict, existing_value_index).?;
+                return shifted_index;
+            } else return existing_value_index;
         } else {
             // New item, so we need to expand the dict.
 
@@ -2072,28 +2046,24 @@ pub const Dictionary = struct {
             dict.items[new_key_index] = key.borrow();
             dict.items[new_value_index] = value.borrow();
 
-            const shifted_index = removeDuplicates(dict, new_value_index);
-            return shifted_index.?;
+            if (remove_duplicates) {
+                const shifted_index = removeDuplicates(dict, new_value_index);
+                return shifted_index.?;
+            } else return new_value_index;
         }
     }
 
-    pub fn resolveParentDict(det: ?*ErrorDetails, shim: *Shimmerable) error{ LinkLookupFailed, OutOfMemory }!?*Dictionary {
-        var dict = Dictionary.shimmerFrom(det, shim) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadDict => return error.LinkLookupFailed,
-        };
+    /// Dict must be shimmerable.
+    pub fn resolveParentDict(dict: *Dictionary, det: ?*ErrorDetails) error{ LinkLookupFailed, OutOfMemory }!?*const Dictionary {
+        assert(dict.asHead().canShimmer());
 
         const tilde_parent = interned_tilde_parent.value();
-        if ((try dict.get(tilde_parent)).asValue()) |hash_ref| {
+        if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
             var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
             defer hash_ref_shim.discardChanges();
             const parent_dict = try HashReference.resolveAsDictionary(det, &hash_ref_shim);
-            if (hash_ref_shim.takeShimmered().asValue()) |new_hash_ref| {
-                defer new_hash_ref.release();
-                _ = putInner(det, shim.asMutable(), tilde_parent, new_hash_ref) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => unreachable,
-                };
+            if (hash_ref_shim.shimmered.asValue()) |new_hash_ref| {
+                _ = try dict.putInner(tilde_parent, new_hash_ref, false);
             }
             return parent_dict;
         }
@@ -2103,11 +2073,9 @@ pub const Dictionary = struct {
 
     /// Remove all pairs with key `key`. Returns true if any were removed, and
     /// keeps the table live (clearing and re-putting into the same allocation).
-    pub fn remove(det: ?*ErrorDetails, mut: *Mutable, key: Value) !bool {
+    pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) !bool {
+        assert(dict.asHead().canMutate());
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
-
-        try mut.prepareToMutate();
-        var dict = try Dictionary.shimmerFrom(det, mut.asShimmerable());
 
         // Locate the first key. We have to do a scan instead of using `dict.get`, since
         // `dict.get` only returns the last key.
@@ -2129,47 +2097,19 @@ pub const Dictionary = struct {
         // "5" as the value of "a", instead of returning none. So we have to flatten
         // the linked dictionaries into a singular dictionary so we can remove "a"
         // without resolving to a parent.
-        const tilde_parent = interned_tilde_parent.value();
-        if ((try dict.get(tilde_parent)).asValue()) |parent_hash_ref| {
-            // This dictionary has a parent link, so we need to see if any of the parents
-            // contain `key`. This requires a decent bit of shimmering, since at any point
-            // we could have strings instead of internal representations.
-            var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
-            defer parent_hash_ref_shim.discardChanges();
-            const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
-            var parent_shim: Shimmerable = .{ .original = parent.asValue() };
-            defer parent_shim.discardChanges();
-            // We've finally hash reference and resolved it to its dictionary, so we'll now
-            // see if the key is in any of the linked parents.
-            const key_in_parent = (try getFollowingLinks(det, &parent_shim, key)) != .none;
+        const parent_dict = try dict.resolveParentDict(det);
+        if (parent_dict) |parent| if (parent.table.contains(key)) {
+            // Key was found in the parent, so we do need to flatten.
+            try dict.flatten(det);
 
-            if (parent_shim.takeShimmered().asValue()) |new_parent| {
-                // Write back the shimmered value to the dictionary.
-                const ref_to_new_parent = (try HashReference.new(new_parent.asPtr().?)).asHead();
-                defer ref_to_new_parent.release();
-                _ = try putInner(det, mut, tilde_parent, ref_to_new_parent.asValue());
-            } else if (parent_hash_ref_shim.takeShimmered().asValue()) |new_hash_ref| {
-                defer new_hash_ref.release();
-                _ = try putInner(det, mut, tilde_parent, new_hash_ref);
+            // Flattening may change indicies, so we need to rescan for the first key.
+            first_key_index = 0;
+            while (first_key_index < dict.items.len) : (first_key_index += 2) {
+                if (key.equals(dict.items[first_key_index]) catch unreachable) break;
+            } else {
+                return false; // No matching key.
             }
-
-            // Reload `dict` after potential modifications.
-            dict = mut.current().asType(Dictionary).?;
-
-            if (key_in_parent) {
-                // Key was found in the parent, so we do need to flatten.
-                try flatten(det, mut);
-                dict = mut.current().asType(Dictionary).?;
-
-                // Flattening may change indicies, so we need to rescan for the first key.
-                first_key_index = 0;
-                while (first_key_index < dict.items.len) : (first_key_index += 2) {
-                    if (key.equals(dict.items[first_key_index]) catch unreachable) break;
-                } else {
-                    return false; // No matching key.
-                }
-            }
-        }
+        };
 
         // Remove the key from the table before shifting everything around.
         _ = dict.table.remove(key);
@@ -2192,10 +2132,9 @@ pub const Dictionary = struct {
         }
         dict.items.len -= pairs_removed * 2;
 
-        // Rebuild the table in place. Pretty sure this will be faster in most cases
-        // compared to updating all the hash table indexes. If we use swap removal
-        // this would be a lot easier, but I do like having dictionaries preserve
-        // their ordering.
+        // Rebuild the table in place. If we use swap removal this would be a
+        // lot easier, but I do like having dictionaries preserve their
+        // ordering.
         dict.table.clearRetainingCapacity();
         item_index = 0;
         while (item_index < dict.items.len) : (item_index += 2) {
@@ -2212,6 +2151,8 @@ pub const Dictionary = struct {
     /// Remove earlier duplicate pairs, keeping the last value for each key. If
     /// `to_track` is given, returns its new index (or null if it was removed).
     fn removeDuplicates(dict: *Dictionary, to_track: ?usize) ?usize {
+        assert(dict.asHead().canMutate());
+
         const orig_len = dict.items.len;
         if (dict.table.count() * 2 == orig_len) return to_track; // No duplicates.
 
@@ -2251,41 +2192,49 @@ pub const Dictionary = struct {
         if (shift > 0) {
             std.mem.copyForwards(Value, dict.items[0..new_len], dict.items[shift..orig_len]);
             if (to_track_new_location) |loc| to_track_new_location = loc - shift;
-            var it = dict.table.iterator();
-            while (it.next()) |entry| entry.value_ptr.* -= shift;
+            var table_iter = dict.table.valueIterator();
+            while (table_iter.next()) |entry| entry.* -= shift;
         }
         dict.items.len = new_len;
 
         return to_track_new_location;
     }
 
-    pub fn flatten(det: ?*ErrorDetails, mut: *Mutable) !void {
-        const dict = try shimmerFrom(det, mut.asShimmerable());
-        const flattened = try flattenInner(det, dict);
-        if (flattened) |new_dict| mut.mutated.swap(new_dict.asHead().asValue());
+    pub fn flatten(dict: *Dictionary, det: ?*ErrorDetails) !void {
+        assert(dict.asHead().canMutate());
+        if (try dict.flattenInner(det)) |new_dict| {
+            // Steal the values from `new_dict` directly.
+            freeInternalRep(dict.asHead());
+            dict.* = .{
+                .items = new_dict.items,
+                .capacity = new_dict.capacity,
+                .table = new_dict.table,
+            };
+            new_dict.asHead().freeBacking();
+            dict.asHead().invalidateString();
+        }
     }
 
     /// Remove all links from a dict and combine them into one dict.
-    pub fn flattenInner(det: ?*ErrorDetails, original: *Dictionary) !?*Dictionary {
-        if ((try original.get(interned_tilde_parent.value())).asValue()) |parent_hash_ref| {
+    pub fn flattenInner(dict: *const Dictionary, det: ?*ErrorDetails) !?*Dictionary {
+        if ((try dict.getNoFollow(interned_tilde_parent.value())).asValue()) |parent_hash_ref| {
             var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
             defer parent_hash_ref_shim.discardChanges();
             const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
             var parent_shim: Shimmerable = .{ .original = parent.asValue() };
-            errdefer parent_shim.discardChanges();
+            defer parent_shim.discardChanges();
             const parent_as_dict = try shimmerFrom(det, &parent_shim);
 
-            const new_dict = try flattenInner(det, parent_as_dict);
-            const to_add_to = if (new_dict) |val| val.asHead() else try parent.duplicate();
-            var to_add_to_mut: Mutable = .{ .original = to_add_to.asValue() };
-            errdefer to_add_to_mut.deinit();
+            const new_dict = try parent_as_dict.flattenInner(det);
+            const to_add_to = if (new_dict) |val| val else (try parent_shim.current().duplicate()).asType(Dictionary).?;
+            errdefer to_add_to.asHead().release();
 
             var pair_index: u32 = 0;
-            while (pair_index < original.items.len) : (pair_index += 2) {
-                _ = try put(det, &to_add_to_mut, original.items[pair_index], original.items[pair_index + 1]);
+            while (pair_index < dict.items.len) : (pair_index += 2) {
+                _ = try to_add_to.put(dict.items[pair_index], dict.items[pair_index + 1]);
             }
 
-            return to_add_to_mut.consume().asType(Dictionary).?;
+            return to_add_to;
         } else {
             return null; // We've reached the end, so no need to flatten.
         }
@@ -2294,26 +2243,39 @@ pub const Dictionary = struct {
     pub fn getFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LinkLookupFailed }!OptionalValue {
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
 
-        const dict = shimmerFrom(det, shim) catch |err| switch (err) {
+        var dict = shimmerFrom(det, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadDict => return error.LinkLookupFailed,
         };
 
         // See if it's immediately in this dictionary.
-        if ((try dict.get(key)).asValue()) |val| return val.asOptional();
+        if ((try dict.getNoFollow(key)).asValue()) |val| return val.asOptional();
 
         // Wasn't in this dictionary, so check if it's in a parent dict.
         const tilde_parent = interned_tilde_parent.value();
-        if (try Dictionary.resolveParentDict(det, shim)) |parent_dict| {
-            var parent_shim: Shimmerable = .{ .original = parent_dict.asHead().asValue() };
+        const parent_dict: ?*const Dictionary = blk: {
+            if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
+                var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
+                defer hash_ref_shim.discardChanges();
+                const parent_dict = try HashReference.resolveAsDictionary(det, &hash_ref_shim);
+                if (hash_ref_shim.shimmered.asValue()) |new_hash_ref| {
+                    try shim.ensureShimmerable();
+                    const as_shimmerable_dict = shim.current().asType(Dictionary).?;
+                    _ = try as_shimmerable_dict.putInner(tilde_parent, new_hash_ref, false);
+                    dict = as_shimmerable_dict;
+                }
+                break :blk parent_dict;
+            } else break :blk null;
+        };
+
+        if (parent_dict) |parent| {
+            var parent_shim: Shimmerable = .{ .original = @constCast(parent).asHead().asValue() };
             defer parent_shim.discardChanges();
             const looked_up = try getFollowingLinks(det, &parent_shim, key);
-            if (parent_shim.takeShimmered().asValue()) |value| {
-                defer value.release();
-                _ = putInner(det, shim.asMutable(), tilde_parent, value) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => return error.LinkLookupFailed,
-                };
+            if (parent_shim.shimmered.asValue()) |value| {
+                try shim.ensureShimmerable();
+                const as_shimmerable_dict = shim.current().asType(Dictionary).?;
+                _ = try as_shimmerable_dict.putInner(tilde_parent, value, false);
             }
             return looked_up;
         }
@@ -2330,10 +2292,11 @@ pub const Dictionary = struct {
             var child_shim: Shimmerable = .{ .original = child_dict };
             defer child_shim.discardChanges();
             const child_result = try getRecursively(det, &child_shim, context.sliceAfter(1));
-            if (child_shim.takeShimmered().asValue()) |new_child| {
-                defer new_child.release();
+            if (child_shim.shimmered.asValue()) |new_child| {
+                try shim.ensureShimmerable();
                 // The child dict changed, propagate back up.
-                _ = try putInner(det, shim.asMutable(), context.get(0), new_child);
+                const as_dict = shim.current().asType(Dictionary).?;
+                _ = try as_dict.putInner(context.get(0), new_child, false);
             }
             return child_result;
         } else {
@@ -2341,71 +2304,76 @@ pub const Dictionary = struct {
         }
     }
 
-    pub fn putRecursively(det: ?*ErrorDetails, mut: *Mutable, context: anytype, value: Value) !Value {
-        const dict = try shimmerFrom(det, mut.asShimmerable());
-
+    pub fn putRecursively(dict: *Dictionary, det: ?*ErrorDetails, context: anytype, value: Value) !void {
+        assert(dict.asHead().canMutate());
         assert(context.len() > 0);
+
         if (context.len() == 1) {
-            const inserted_at = try put(det, mut, context.get(0), value);
-            return mut.current().asType(Dictionary).?.items[inserted_at];
+            _ = try dict.put(context.get(0), value);
+            return;
         }
 
         // Find/create the child dict.
         const child_dict = blk: {
-            if ((try dict.get(context.get(0))).asValue()) |existing_dict| {
+            if ((try dict.getNoFollow(context.get(0))).asValue()) |existing_dict| {
                 break :blk existing_dict;
             } else {
                 // Create a new child dictionary.
                 const new_child_dict = (try new(&.{})).asHead().asValue();
                 defer new_child_dict.release();
 
-                _ = try put(det, mut, context.get(0), new_child_dict);
+                _ = try dict.put(context.get(0), new_child_dict);
                 break :blk new_child_dict;
             }
         };
 
-        var child_wb: Mutable = .{ .original = child_dict };
-        defer child_wb.discardChanges();
-        const child_put_result = try putRecursively(det, &child_wb, context.sliceAfter(1), value);
-        if (child_wb.takeMutated().asValue()) |new_child| {
-            // The child dict changed, so we need to update ours.
-            defer new_child.release();
-            _ = try put(det, mut, context.get(0), new_child);
+        var child_dict_shim: Shimmerable = .{ .original = child_dict };
+        _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
+        if (child_dict_shim.shimmered == .none and child_dict_shim.original.canMutate()) {
+            // Mutate in place, if possible.
+            const as_dict = child_dict_shim.original.asType(Dictionary).?;
+            try as_dict.putRecursively(det, context.sliceAfter(1), value);
+        } else {
+            const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
+            defer child_dict_mut.asHead().release();
+            try child_dict_mut.putRecursively(det, context.sliceAfter(1), value);
+            _ = try dict.put(context.get(0), child_dict_mut.asHead().asValue());
         }
 
-        mut.current().asPtr().?.invalidateString();
-
-        return child_put_result;
+        dict.asHead().invalidateString();
     }
 
-    pub fn removeRecursively(det: ?*ErrorDetails, mut: *Mutable, context: anytype) !bool {
-        var dict = try shimmerFrom(det, mut.asShimmerable());
-
+    pub fn removeRecursively(dict: *Dictionary, det: ?*ErrorDetails, context: anytype) !bool {
+        assert(dict.asHead().canMutate());
         assert(context.len() > 0);
-        if (context.len() == 1) return try remove(det, mut, context.get(0));
+        if (context.len() == 1) return try dict.remove(det, context.get(0));
 
-        if ((try dict.get(context.get(0))).asValue()) |child_dict| {
-            var child_mut: Mutable = .{ .original = child_dict };
-            defer child_mut.discardChanges();
+        if ((try dict.getNoFollow(context.get(0))).asValue()) |child_dict| {
+            var child_dict_shim: Shimmerable = .{ .original = child_dict };
+            _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
 
-            const did_remove = try removeRecursively(det, &child_mut, context.sliceAfter(1));
-            if (child_mut.takeMutated().asValue()) |new_child| {
-                defer new_child.release();
-                _ = try put(det, mut, context.get(0), new_child);
-            }
+            const did_remove = blk: {
+                if (child_dict_shim.shimmered == .none and child_dict_shim.original.canMutate()) {
+                    // Mutate in place, if possible.
+                    const as_dict = child_dict_shim.original.asType(Dictionary).?;
+                    break :blk try as_dict.removeRecursively(det, context.sliceAfter(1));
+                } else {
+                    const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
+                    defer child_dict_mut.asHead().release();
+                    const did_remove = try child_dict_mut.removeRecursively(det, context.sliceAfter(1));
+                    _ = try dict.put(context.get(0), child_dict_mut.asHead().asValue());
+                    break :blk did_remove;
+                }
+            };
 
-            mut.current().asPtr().?.invalidateString();
+            dict.asHead().invalidateString();
 
             return did_remove;
         } else {
-            if (det) |details| details.* = .{
-                .message = try std.fmt.allocPrintSentinel(
-                    heap.global_gpa,
-                    "key \"{s}\" not known in dictionary \"{s}\"",
-                    .{ try context.get(0).getString(), try mut.current().getString() },
-                    0,
-                ),
-            };
+            if (det) |details| details.* = .{ .message = try allocPrintZ(
+                "key \"{s}\" not known in dictionary \"{s}\"",
+                .{ try context.get(0).getString(), try dict.asHead().getString() },
+            ) };
             return error.PathNonexistent;
         }
     }
@@ -2428,7 +2396,7 @@ pub const Dictionary = struct {
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const as_dict = src.castToConst(Dictionary);
+        const as_dict = src.constCastTo(Dictionary);
         const new_obj = try Object.newObjectUninitialized(Dictionary);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
@@ -2467,24 +2435,15 @@ pub const Dictionary = struct {
     fn updateString(obj: *Object) !void {
         const as_dict = obj.castTo(Dictionary);
         const bytes = try quoteValues(heap.global_gpa, as_dict.items);
-        try obj.setStringConsuming(bytes);
+        try obj.setStringIgnoreRace(bytes);
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const list = obj.castToConst(Dictionary);
-        if (list.items.len == 0) return;
+        const as_dict = obj.constCastTo(Dictionary);
+        if (as_dict.items.len == 0) return;
 
-        const items_info: StructIterator.NodeInfo = .{
-            .node = @ptrCast(list.items.ptr),
-            .parent_info = info,
-            .enumerate_struct = null, // `[]Value` has no walking function.
-            .type_name = @typeName([]Value),
-            .as_string = null,
-        };
-        try ctx.vtable.visit_node(ctx, &items_info, "items");
-
-        const items_helper: ChildWalkHelper = .{ .ctx = ctx, .info = &items_info };
-        for (list.items) |item| try items_helper.followValue("items", item);
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValueSlice("items", as_dict.items);
     }
 
     pub const vtable: Object.VTable = .{
@@ -2493,7 +2452,7 @@ pub const Dictionary = struct {
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = "dict",
+        .name = @typeName(Dictionary),
     };
 };
 
@@ -2520,20 +2479,20 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const bad_key = try String.newValue("bogus");
     defer bad_key.release();
 
-    try testing.expectEqualStrings("1", try (try dict1.get(good_key)).asValue().?.getString());
-    try testing.expectEqual(OptionalValue.none, try dict1.get(bad_key));
+    try testing.expectEqualStrings("1", try (try dict1.getNoFollow(good_key)).asValue().?.getString());
+    try testing.expectEqual(OptionalValue.none, try dict1.getNoFollow(bad_key));
 
     // Dict with duplicate entries.
-    var dup_wb: Mutable = .{ .original = try String.newValue("foo 5 bar 10 foo 15") };
-    defer dup_wb.deinit();
-    const dup_dict = try Dictionary.shimmerFrom(&det, dup_wb.asShimmerable());
-    try testing.expectEqual(@as(usize, 3), dup_dict.items.len / 2);
+    var dup_shim: Shimmerable = .{ .original = try String.newValue("foo 5 bar 10 foo 15") };
+    defer dup_shim.deinit();
+    const dup_dict = try Dictionary.shimmerFrom(&det, &dup_shim);
+    try testing.expectEqual(3, dup_dict.items.len / 2);
     // A duplicate key maps to its last value.
-    try testing.expectEqualStrings("15", try (try dup_dict.get(key_foo)).asValue().?.getString());
+    try testing.expectEqualStrings("15", try (try dup_dict.getNoFollow(key_foo)).asValue().?.getString());
 
-    const as_dict = try Dictionary.shimmerFrom(null, dup_wb.asShimmerable());
-    _ = Dictionary.removeDuplicates(as_dict, null);
-    try testing.expectEqual(@as(usize, 2), as_dict.items.len / 2);
+    const as_dict_mut = dup_shim.current().asType(Dictionary).?;
+    _ = as_dict_mut.removeDuplicates(null);
+    try testing.expectEqual(2, as_dict_mut.items.len / 2);
 
     // Dict put.
     const dict_for_put = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
@@ -2543,66 +2502,39 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const value3 = try String.newValue("3");
     defer value3.release();
 
-    var put_wb: Mutable = .{ .original = dict_for_put.asHead().asValue() };
-    defer put_wb.discardChanges();
-    try testing.expectEqual(@as(usize, 2), put_wb.current().asType(Dictionary).?.items.len / 2);
+    try testing.expectEqual(2, dict_for_put.items.len / 2);
     // Replace an existing key's value; pair count stays the same.
     // `put` borrows the value into the dict, so the caller retains its handle
     // (released by `defer value3.release()` above) -- no extra `.borrow()` or
     // the call leaks a ref.
-    _ = try Dictionary.put(null, &put_wb, key_bar, value3);
-    try testing.expectEqual(@as(usize, 2), put_wb.current().asType(Dictionary).?.items.len / 2);
+    _ = try dict_for_put.put(key_bar, value3);
+    try testing.expectEqual(2, dict_for_put.items.len / 2);
     // Add a new key; pair count grows.
-    _ = try Dictionary.put(null, &put_wb, key3, value3);
-    try testing.expectEqual(@as(usize, 3), put_wb.current().asType(Dictionary).?.items.len / 2);
-    try testing.expectEqualStrings(
-        "3",
-        try (try put_wb.current().asType(Dictionary).?.get(key3)).asValue().?.getString(),
-    );
+    _ = try dict_for_put.put(key3, value3);
+    try testing.expectEqual(@as(usize, 3), dict_for_put.items.len / 2);
+    try testing.expectEqualStrings("3", try (try dict_for_put.getNoFollow(key3)).asValue().?.getString());
 
     // Dict remove. Tcl removes all matching keys, so both "foo" pairs go.
-    var remove_wb: Mutable = .{
-        .original = (try Dictionary.new(&.{ key_foo, value1, key_bar, value2, key_foo, value3 })).asHead().asValue(),
-    };
-    defer remove_wb.deinit();
-    try testing.expect(try Dictionary.remove(null, &remove_wb, key_foo));
-    try testing.expectEqualStrings("bar 2", try remove_wb.current().getString());
+    const dict_for_remove = try Dictionary.new(&.{ key_foo, value1, key_bar, value2, key_foo, value3 });
+    defer dict_for_remove.asHead().deinit();
+    try testing.expect(try dict_for_remove.remove(null, key_foo));
+    try testing.expectEqualStrings("bar 2", try dict_for_remove.asHead().getString());
 
     // Edge cases: using internal objects as keys and values.
-    const edge_dict = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
-    defer edge_dict.asHead().release();
-    var edge_wb: Mutable = .{ .original = edge_dict.asHead().asValue() };
-    defer edge_wb.discardChanges();
+    const dict_edge_cases = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
+    defer dict_edge_cases.asHead().release();
 
     // Use a value as a key, and a key as the value.
-    {
-        const cur = edge_wb.current().asType(Dictionary).?;
-        _ = try Dictionary.put(null, &edge_wb, cur.items[1], cur.items[2]);
-    }
-    try testing.expectEqualStrings(
-        "bar",
-        try (try edge_wb.current().asType(Dictionary).?.get(value1)).asValue().?.getString(),
-    );
+    _ = try dict_edge_cases.put(dict_edge_cases.items[1], dict_edge_cases.items[2]);
+    try testing.expectEqualStrings("bar", try (try dict_edge_cases.getNoFollow(value1)).asValue().?.getString());
 
     // Alias a key by using it as both key and value.
-    {
-        const cur = edge_wb.current().asType(Dictionary).?;
-        _ = try Dictionary.put(null, &edge_wb, cur.items[0], cur.items[0]);
-    }
-    try testing.expectEqualStrings(
-        "foo",
-        try (try edge_wb.current().asType(Dictionary).?.get(key_foo)).asValue().?.getString(),
-    );
+    _ = try dict_edge_cases.put(dict_edge_cases.items[0], dict_edge_cases.items[0]);
+    try testing.expectEqualStrings("foo", try (try dict_edge_cases.getNoFollow(key_foo)).asValue().?.getString());
 
     // Alias a value by using it as both key and value.
-    {
-        const cur = edge_wb.current().asType(Dictionary).?;
-        _ = try Dictionary.put(null, &edge_wb, cur.items[3], cur.items[3]);
-    }
-    try testing.expectEqualStrings(
-        "2",
-        try (try edge_wb.current().asType(Dictionary).?.get(value2)).asValue().?.getString(),
-    );
+    _ = try dict_edge_cases.put(dict_edge_cases.items[3], dict_edge_cases.items[3]);
+    try testing.expectEqualStrings("2", try (try dict_edge_cases.getNoFollow(value2)).asValue().?.getString());
 }
 
 test "dicts" {
@@ -2632,51 +2564,42 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
     const inner_dict = try Dictionary.new(&.{ key_bar, value2 });
     defer inner_dict.asHead().release();
     const outer_dict = try Dictionary.new(&.{ key_foo, inner_dict.asHead().asValue() });
-    var rec_wb: Mutable = .{ .original = outer_dict.asHead().asValue() };
-    defer rec_wb.deinit();
+    defer outer_dict.asHead().release();
+    var outer_shim: Shimmerable = .{ .original = outer_dict.asHead().asValue() };
+    defer outer_shim.discardChanges();
 
     // getRecursively walks a {b 2} and reads b.
     const path_foo_bar = ValueSliceContext{ .items = &.{ key_foo, key_bar } };
     try testing.expectEqualStrings(
         "2",
-        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bar)).asValue().?.getString(),
+        try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).asValue().?.getString(),
     );
 
     // A missing leaf, and a missing top-level key, both yield none.
     const path_foo_bogus = ValueSliceContext{ .items = &.{ key_foo, bad_key } };
-    try testing.expectEqual(OptionalValue.none, try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bogus));
+    try testing.expectEqual(.none, try Dictionary.getRecursively(null, &outer_shim, path_foo_bogus));
     const path_bogus = ValueSliceContext{ .items = &.{bad_key} };
-    try testing.expectEqual(OptionalValue.none, try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_bogus));
+    try testing.expectEqual(.none, try Dictionary.getRecursively(null, &outer_shim, path_bogus));
 
     // putRecursively into an existing nested key creates a new leaf beside the old one.
     const path_foo_baz = ValueSliceContext{ .items = &.{ key_foo, key_baz } };
-    _ = try Dictionary.putRecursively(null, &rec_wb, path_foo_baz, value3);
-    try testing.expectEqualStrings(
-        "3",
-        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_baz)).asValue().?.getString(),
-    );
+    _ = try outer_dict.putRecursively(null, path_foo_baz, value3);
+    try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_baz)).asValue().?.getString());
     // The pre-existing sibling is untouched.
-    try testing.expectEqualStrings(
-        "2",
-        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bar)).asValue().?.getString(),
-    );
+    try testing.expectEqualStrings("2", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).asValue().?.getString());
 
     // putRecursively creating a wholly new child dict at a fresh top-level key.
     const path_qux_baz = ValueSliceContext{ .items = &.{ key_qux, key_baz } };
-    _ = try Dictionary.putRecursively(null, &rec_wb, path_qux_baz, value3);
-    try testing.expectEqualStrings(
-        "3",
-        try (try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_qux_baz)).asValue().?.getString(),
-    );
+    _ = try outer_dict.putRecursively(null, path_qux_baz, value3);
+    try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_qux_baz)).asValue().?.getString());
 
     // removeRecursively drops the nested leaf.
-    try testing.expect(try Dictionary.removeRecursively(null, &rec_wb, path_foo_bar));
-    try testing.expectEqual(OptionalValue.none, try Dictionary.getRecursively(null, rec_wb.asShimmerable(), path_foo_bar));
+    try testing.expect(try outer_dict.removeRecursively(null, path_foo_bar));
+    try testing.expectEqual(.none, try Dictionary.getRecursively(null, &outer_shim, path_foo_bar));
 
-    // removeRecursively on a missing intermediate key errors. With no `det`, the
-    // error path does no allocation, so this is deterministic under OOM injection.
+    // removeRecursively on a missing intermediate key errors.
     const path_bogus_baz = ValueSliceContext{ .items = &.{ bad_key, key_baz } };
-    try testing.expectError(error.PathNonexistent, Dictionary.removeRecursively(null, &rec_wb, path_bogus_baz));
+    try testing.expectError(error.PathNonexistent, outer_dict.removeRecursively(null, path_bogus_baz));
 }
 
 test "dict recursive" {
