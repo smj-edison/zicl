@@ -383,12 +383,21 @@ test "leak" {
     try heap.testStart(testing.allocator, testing.io);
     defer heap.testFinish();
 
-    // Leak a String on purpose; `testFinish` calls `dumpLeaks`, which should
-    // dump the leak graph to stderr as dot.
+    // Leak a String on purpose, then check the leak dump for the leaked pointer.
     const obj = try objects.String.newObject("hello");
-    try dumpLeaks();
-    // const rendered_ptr = try std.fmt.allocPrint(testing.allocator, "{x}", .{@intFromPtr(obj)});
-    // rendered_ptr
-    // try testing.expect(std.mem.indexOf(comptime T: type, haystack: []const T, needle: []const T))
-    obj.release();
+    defer obj.release(); // Note, we do the leak check before this gets released.
+
+    var leaked = try captureLeaks();
+    defer leaked.deinit();
+
+    var aw = std.Io.Writer.Allocating.init(heap.global_gpa);
+    defer aw.deinit();
+    try leaked.dumpDot(&aw.writer);
+    try leaked.dumpDetails(&aw.writer);
+    const rendered = try aw.toOwnedSlice();
+    defer heap.global_gpa.free(rendered);
+
+    const needle = try std.fmt.allocPrint(heap.global_gpa, "\"{x}\"", .{@intFromPtr(obj)});
+    defer heap.global_gpa.free(needle);
+    try testing.expect(std.mem.indexOf(u8, rendered, needle) != null);
 }

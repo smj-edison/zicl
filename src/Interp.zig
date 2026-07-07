@@ -181,7 +181,7 @@ pub const VariableValue = union(enum) {
     },
     /// Variable in a parent scope. Immutable.
     lexical_variable: struct {
-        target: *Value,
+        target: Value,
     },
 };
 /// Resolves to the variable's value, if any. Does not account for dict sugar.
@@ -191,6 +191,8 @@ fn resolveVariable(
     var_call_frame: u32,
     var_name: Value,
 ) error{ OutOfMemory, LinkLookupFailed, BadVariableName }!?VariableValue {
+    if (var_name.asPtr()) |obj| _ = try obj.getString();
+
     if (try var_name.equalsString("~parent")) {
         if (det) |details| details.* = .{
             .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "bad variable name: \"{f}\"", .{var_name}, 0),
@@ -203,7 +205,7 @@ fn resolveVariable(
 
     // Check the variables dictionary. Don't follow refs here so the
     // cached index points at the dict slot, not the ref target.
-    if (try var_dict.getPtr(var_name)) |local_var| {
+    if (try var_dict.getPtrNoFollow(var_name)) |local_var| {
         return .{ .local_variable = .{
             .target = local_var,
         } };
@@ -211,36 +213,18 @@ fn resolveVariable(
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
     if (maybe_scope_hash_ref.*) |*scope_hash_ref| {
-        var scope_dict_shim: Shimmerable = .{ .original = scope_hash_ref.*.ref };
-        defer scope_dict_shim.discardChanges();
-        const scope_dict: *objects.Dictionary = objects.Dictionary.shimmerFrom(null, &scope_dict_shim) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadDict => {
-                if (det) |details| details.* = .{
-                    .message = try heap.global_gpa.dupeSentinel(u8, "hash lookup resolved to a bad dictionary", 0),
-                };
-                return error.LinkLookupFailed;
-            },
-        };
+        var dict_shim: Shimmerable = .{ .original = scope_hash_ref.*.ref.asValue() };
+        const in_linked_scope = try objects.Dictionary.getFollowingLinks(det, &dict_shim, var_name);
 
-        if (scope_dict_shim.takeShimmered().toValue()) |new_dict| {
-            const new_hash_ref = try objects.HashReference.new(new_dict);
-            scope_hash_ref.*.asHead().release();
+        if (dict_shim.shimmered.asValue()) |new_hash_ref_raw| {
+            const new_hash_ref = new_hash_ref_raw.asType(objects.HashReference).?;
+            const old = scope_hash_ref.*;
             scope_hash_ref.* = new_hash_ref;
+            old.asHead().release();
         }
 
-        var scope_shim: Shimmerable = .{ .original = scope_dict };
-        defer scope_shim.discardChanges();
-        const in_linked_scope = try objects.Dictionary.lookup(det, &scope_shim, var_name);
-        if (scope_shim.takeShimmered().toValue()) |new_dict| {
-            const new_hash_ref = try objects.HashReference.new(new_dict);
-            scope_hash_ref.*.asHead().release();
-            scope_hash_ref.* = new_hash_ref;
-        }
-        if (in_linked_scope.toValue()) |val| {
-            return .{ .lexical_variable = .{
-                .target = val,
-            } };
+        if (in_linked_scope.asValue()) |val| {
+            return .{ .lexical_variable = .{ .target = val } };
         }
     }
 
