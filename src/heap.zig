@@ -453,18 +453,6 @@ pub const Value = enum(ValueBacking) {
         return true;
     }
 
-    /// Must be shimmerable.
-    pub fn prepareToShimmer(value: Value) !void {
-        assert(value.canShimmer());
-        // Make sure the object has a string rep before we free its body. That is, if
-        // it has a string rep. `.none` objects are brand new, so they obviously don't
-        // have a string rep yet.
-        if (value.asType(objects.None) == null) _ = try value.getString();
-        if (value.asPtr()) |val| val.invalidateInternalRep();
-
-        value.trace("Prepared to shimmer", .{});
-    }
-
     pub fn incrRefCount(value: Value) void {
         if (value.asPtr()) |obj| obj.incrRefCount();
     }
@@ -488,6 +476,14 @@ pub const Value = enum(ValueBacking) {
 
     pub inline fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
         leak_check.globalTrace(.other, value, fmt, args);
+    }
+
+    pub fn duplicateAsBoxed(value: Value) !*Object {
+        if (value.asPtr()) |obj| {
+            return (try obj.duplicate()).asValue();
+        } else {
+            return try value.box();
+        }
     }
 
     /// Must be a primitive.
@@ -979,11 +975,11 @@ pub const Object = struct {
         const str_metadata = if (obj.metadata.cross_thread)
             obj.string_metadata.load(.acquire)
         else
-            obj.string_metadata.load(.unordered);
+            obj.string_metadata.raw;
         const str_value = if (obj.metadata.cross_thread)
             obj.string.load(.monotonic)
         else
-            obj.string.load(.unordered);
+            obj.string.raw;
 
         // We check `has_value` instead of `current_str`, since only `string_metadata` is
         // acquired. We could potentially read `current_str` with a value, but read
@@ -1194,7 +1190,7 @@ pub const Object = struct {
     }
 
     pub fn invalidateString(obj: *Object) void {
-        assert(!obj.metadata.cross_thread);
+        assert(obj.canShimmer());
         switch (obj.getStringDetails()) {
             .special => |special| obj.asValue().trace("Invalidate string (was {s})", .{special.getString()}),
             .normal => |bytes| obj.asValue().trace("Invalidate string (was {s})", .{bytes}),
@@ -1272,6 +1268,14 @@ pub const Object = struct {
         }
 
         dest.ref_count = 1;
+    }
+
+    pub fn duplicateStringOnly(src: *const Object) !*Object {
+        const new_obj = try newObjectUninitialized(objects.None);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+
+        return new_obj.head;
     }
 };
 

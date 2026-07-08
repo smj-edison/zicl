@@ -61,16 +61,14 @@ pub const Shimmerable = extern struct {
     }
 
     pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
-        if (self.current().asPtr() != null and !self.current().canShimmer()) {
-            self.shimmered.swap(try self.current().duplicate());
+        switch (self.current().expandedValue()) {
+            .ptr => |ptr| if (!ptr.canShimmer()) self.shimmered.swap((try ptr.duplicate()).asValue()),
+            else => self.shimmered.swap((try self.current().box()).asValue()),
         }
     }
 
     pub fn prepareToShimmer(self: *Shimmerable) !*Object {
-        switch (self.current().expandedValue()) {
-            .ptr => try self.ensureShimmerable(),
-            else => self.shimmered.swap((try self.current().box()).asValue()),
-        }
+        self.ensureShimmerable();
 
         // We know that this must be an object, since we boxed it if
         // it was a primitive.
@@ -187,6 +185,10 @@ pub const None = struct {
         try new_obj.head.setStringLocalObject(duped);
 
         return new_obj.body;
+    }
+
+    pub fn asHead(self: *None) *Object {
+        return Object.from(None, self);
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -511,233 +513,6 @@ pub const Source = struct {
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
         .name = @typeName(Source),
-    };
-};
-
-pub const ClosureValues = struct {
-    /// Argument list of the procedure.
-    args: []Value,
-    /// Default values of optional arguments.
-    optional_values: []Value,
-    /// Value for the script's body.
-    body: Value,
-    /// We do our best to track the closure's name.
-    name: OptionalValue,
-    /// Hash reference pointing to the scope.
-    scope_hash_ref: ?*HashReference,
-    /// Whether `args` is provided as an argument name. `args`, if present, is always
-    /// the last argument name.
-    has_args_parameter: bool,
-    /// Whether this is a method. If so, `self` is injected as the first variable at call time.
-    is_method: bool,
-    /// Unique identifier for cache keying.
-    cache_id: u64,
-
-    pub fn requiredArity(closure: *const ClosureValues) usize {
-        return closure.args.len - closure.optional_values.len - if (closure.has_args_parameter) 1 else 0;
-    }
-
-    pub fn duplicate(closure: *const ClosureValues) !ClosureValues {
-        const duplicated_args = try heap.global_gpa.dupe(Value, closure.args);
-        errdefer heap.global_gpa.free(duplicated_args);
-        const duplicated_optional_values = try heap.global_gpa.dupe(Value, closure.optional_values);
-        for (duplicated_args) |arg| arg.incrRefCount();
-        for (duplicated_optional_values) |value| value.incrRefCount();
-
-        const borrowed_hash_ref = closure.scope_hash_ref;
-        if (borrowed_hash_ref) |obj| obj.asHead().incrRefCount();
-
-        return .{
-            .args = duplicated_args,
-            .optional_values = duplicated_optional_values,
-            .body = closure.body.borrow(),
-            .name = closure.name.borrow(),
-            .scope_hash_ref = borrowed_hash_ref,
-            .has_args_parameter = closure.has_args_parameter,
-            .is_method = closure.is_method,
-            .cache_id = closure.cache_id,
-        };
-    }
-
-    pub fn deinit(closure: *ClosureValues) void {
-        for (closure.args) |arg| arg.release();
-        heap.global_gpa.free(closure.args);
-        for (closure.optional_values) |value| value.release();
-        heap.global_gpa.free(closure.optional_values);
-
-        closure.body.release();
-        closure.name.release();
-        if (closure.scope_hash_ref) |val| val.asHead().release();
-    }
-
-    pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const closure: *const ClosureValues = @ptrCast(@alignCast(info.node));
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.followValueSlice("args", closure.args);
-        try helper.followValueSlice("optional_values", closure.optional_values);
-        try helper.followValue("body", closure.body);
-        try helper.followOptionalValue("name", closure.name);
-        try helper.followOptional(Object, "scope_hash_ref", if (closure.scope_hash_ref) |val| val.asHead() else null);
-        try helper.addField(bool, "has_args_parameter", "{}", closure.has_args_parameter);
-        try helper.addField(bool, "is_method", "{}", closure.is_method);
-        try helper.addField(u64, "cache_id", "{}", closure.cache_id);
-    }
-};
-
-pub const Closure = struct {
-    closure: *ClosureValues,
-
-    fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(Closure);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj.head);
-        errdefer new_obj.head.invalidateString();
-
-        const new_closure = try heap.global_gpa.create(ClosureValues);
-        errdefer heap.global_gpa.destroy(new_closure);
-        new_closure.* = try src.constCastTo(Closure).closure.duplicate();
-
-        new_obj.body.* = .{ .closure = new_closure };
-
-        return new_obj.head;
-    }
-
-    fn freeInternalRep(src: *Object) void {
-        const as_closure = src.castTo(Closure);
-        as_closure.closure.deinit();
-        heap.global_gpa.destroy(as_closure.closure);
-    }
-
-    fn updateString(obj: *Object) !void {
-        const as_closure = obj.castTo(Closure);
-        const closure = as_closure.closure;
-        const required = closure.requiredArity();
-        const optional = closure.optional_values.len;
-
-        // Step 1: Rebuild the arguments list from required and optional args.
-
-        var rebuilt_args = try heap.local_arena.alloc([]const u8, closure.args.len);
-
-        // Get all the strings (we'll overwrite the strings for the optional arguments).
-        for (closure.args, &rebuilt_args) |arg, *str| str.* = try arg.getString();
-
-        // Next, copy over the optional args.
-        var optional_written: usize = 0;
-        while (optional_written < optional) : (optional_written += 1) {
-            const name_and_value: [2][]const u8 = .{
-                try closure.args[required + optional_written].getString(), // Argument name.
-                try closure.optional_values[optional_written].getString(), // Default value.
-            };
-            const bytes = try strutil.quoteStrings(heap.local_arena, name_and_value);
-            rebuilt_args[required + optional_written] = bytes;
-        }
-
-        // Combine all the arguments together to get the args string.
-        const args_as_string = try strutil.quoteStrings(heap.local_arena, rebuilt_args);
-
-        // Step 2: build the closure string from its parts.
-
-        // Build the closure: fn|method ?name <name>? impl <impl> ?scope <scope>?
-        var backing: [7][]const u8 = undefined;
-        var result = std.ArrayList([]const u8).initBuffer(&backing);
-
-        result.appendAssumeCapacity(if (closure.is_method) "method" else "fn");
-
-        if (closure.name.asValue()) |val| {
-            result.appendAssumeCapacity("name");
-            result.appendAssumeCapacity(try val.getString());
-        }
-
-        // `impl` is a two element list: {args body}.
-        const args_and_body: [2][]const u8 = .{ args_as_string, try closure.body.getString() };
-        result.appendAssumeCapacity("impl");
-        result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, args_and_body));
-
-        if (closure.scope_hash_ref) |hash_ref| {
-            result.appendAssumeCapacity("scope");
-            result.appendAssumeCapacity(try hash_ref.asHead().getString());
-        }
-
-        try obj.setStringDuplicating(try strutil.quoteStrings(heap.local_arena, result.items));
-    }
-
-    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const closure = obj.constCastTo(Closure);
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.follow(ClosureValues, "closure", closure.closure);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = duplicate,
-        .free_internal_rep = freeInternalRep,
-        .update_string = updateString,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(Closure),
-    };
-};
-
-pub const UpvarLink = struct {
-    /// An object containing the name of the variable in the linked
-    /// scope. Whenever someone shimmers this to a variable, they should
-    /// always do it in `call_frame`.
-    linked_name: Value,
-    /// The call frame the linked variable lives in.
-    call_frame: u32,
-
-    fn freeInternalRep(src: *Object) void {
-        src.castTo(UpvarLink).linked_name.release();
-    }
-
-    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const upvar: *const UpvarLink = @ptrCast(@alignCast(info.node));
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.followValue("linked_name", upvar.linked_name);
-        try helper.addField(u32, "call_frame", "{}", upvar.call_frame);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = null,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(UpvarLink),
-    };
-};
-
-/// `dict_name` points  to an object that contains the name of the dictionary
-/// (and most likely specializes to whatever type of variable caching is necessary),
-/// while `dict_path` points to a list containing all parts of the path. For
-/// example, `foo::bar::baz` would turn into roughly
-/// ```
-/// dict_name: foo
-/// dict_path: {bar baz}
-/// ```
-pub const DictSugar = struct {
-    dict_name: Value,
-    dict_path: *List,
-
-    fn freeInternalRep(src: *Object) void {
-        const as_dict_sugar = src.castTo(DictSugar);
-        as_dict_sugar.dict_name.release();
-        as_dict_sugar.dict_path.asHead().release();
-    }
-
-    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const dict_sugar: *const DictSugar = @ptrCast(@alignCast(info.node));
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.followValue("dict_name", dict_sugar.dict_name);
-        try helper.follow(Object, "dict_path", dict_sugar.dict_path.asHead());
-    }
-
-    pub const vtable: Object.VTable = .{
-        .name = @typeName(DictSugar),
-        .duplicate = Object.duplicateStringOnly,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
     };
 };
 
@@ -1520,37 +1295,6 @@ pub const BoxedBoolean = struct {
     };
 };
 
-pub const CachedLocalVar = struct {
-    ref: *const Value,
-    call_epoch: u64,
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = Object.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = null,
-        .make_crossthread = null,
-        // TODO it would be nice to be able to walk the cached local var,
-        // but we'd need the call epoch invalidation logic embedded in it.
-        .enumerate_struct = null,
-        .name = @typeName(CachedLocalVar),
-    };
-};
-
-pub const CachedLexicalVar = struct {
-    ref: *const Value,
-    call_epoch: u64,
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = Object.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = null,
-        .make_crossthread = null,
-        // TODO same as `CachedLocalVar.vtable`.
-        .enumerate_struct = null,
-        .name = @typeName(CachedLexicalVar),
-    };
-};
-
 pub const ParsedScriptCommand = struct {
     line: u32,
     word_count: u32,
@@ -2073,7 +1817,7 @@ pub const Dictionary = struct {
 
     /// Remove all pairs with key `key`. Returns true if any were removed, and
     /// keeps the table live (clearing and re-putting into the same allocation).
-    pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) !bool {
+    pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) error{ OutOfMemory, LinkLookupFailed }!bool {
         assert(dict.asHead().canMutate());
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
 
@@ -2097,8 +1841,11 @@ pub const Dictionary = struct {
         // "5" as the value of "a", instead of returning none. So we have to flatten
         // the linked dictionaries into a singular dictionary so we can remove "a"
         // without resolving to a parent.
-        const parent_dict = try dict.resolveParentDict(det);
-        if (parent_dict) |parent| if (parent.table.contains(key)) {
+        var dict_shim: Shimmerable = .{ .original = dict.asHead().asValue() };
+        const in_parent_dict = try getFollowingLinks(det, &dict_shim, key);
+        assert(dict_shim.shimmered == .none); // We already checked that `dict` is mutable.
+
+        if (in_parent_dict != .none) {
             // Key was found in the parent, so we do need to flatten.
             try dict.flatten(det);
 
@@ -2109,7 +1856,7 @@ pub const Dictionary = struct {
             } else {
                 return false; // No matching key.
             }
-        };
+        }
 
         // Remove the key from the table before shifting everything around.
         _ = dict.table.remove(key);
