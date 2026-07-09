@@ -68,7 +68,7 @@ pub const Shimmerable = extern struct {
     }
 
     pub fn prepareToShimmer(self: *Shimmerable) !*Object {
-        self.ensureShimmerable();
+        try self.ensureShimmerable();
 
         // We know that this must be an object, since we boxed it if
         // it was a primitive.
@@ -100,6 +100,48 @@ pub const Shimmerable = extern struct {
         return (try self.current().duplicate()).asType(T).?;
     }
 };
+
+/// `T` must never mutate after this point, but it can shimmer.
+pub fn AlwaysType(T: type) type {
+    return struct {
+        const Self = @This();
+
+        inner: *Object,
+
+        pub fn init(value: *T) Self {
+            return .{ .inner = Object.from(T, value).borrow() };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.inner.release();
+            self.* = undefined;
+        }
+
+        pub fn duplicate(self: *const Self) Self {
+            self.inner.incrRefCount();
+            return self.*;
+        }
+
+        pub fn get(self: *Self) error{OutOfMemory}!*const T {
+            var shim: Shimmerable = .{ .original = self.inner.asValue() };
+            const result: T = T.shimmerFrom(null, &shim) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
+            if (shim.shimmered.asValue()) |val| {
+                // Got a new value, probably since `inner` became crossthread.
+                if (val.asPtr()) |obj| {
+                    const old = self.inner;
+                    self.inner = obj;
+                    old.release();
+                } else {
+                    // We can safely drop the new value, since it's a primitive.
+                }
+            }
+            return result;
+        }
+    };
+}
 
 /// Helpers to work with struct iteration, used for walking the heap if a leak occured.
 pub const IterHelper = struct {
@@ -220,6 +262,19 @@ pub const String = struct {
         const duped_bytes = try heap.global_gpa.dupeSentinel(u8, bytes, 0);
         errdefer heap.global_gpa.free(duped_bytes);
         try new_obj.head.setStringLocalObject(duped_bytes);
+
+        new_obj.body.* = .{};
+
+        return new_obj.body;
+    }
+
+    /// Frees `bytes` in error cases.
+    pub fn newOwning(bytes: [:0]u8) !*String {
+        errdefer heap.global_gpa.free(bytes);
+
+        const new_obj = try Object.newObjectUninitialized(String);
+        errdefer new_obj.head.freeBacking();
+        try new_obj.head.setStringLocalObject(bytes);
 
         new_obj.body.* = .{};
 
@@ -454,16 +509,6 @@ pub const ParsedScript = struct {
     }
 };
 
-// pub const ParsedExpression = struct {
-//     root_node: expr_parse.Node.Index,
-//     nodes: std.MultiArrayList(expr_parse.Node),
-//
-//     pub fn deinit(expr: *ParsedExpression) void {
-//         expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
-//         expr.* = undefined;
-//     }
-// };
-
 pub const Source = struct {
     file_name: OptionalValue,
     line_no: u32,
@@ -542,7 +587,7 @@ pub const HashReference = struct {
             };
             return error.NotHashReference;
         };
-        const target = heap.registered_hashes.get(hash) orelse {
+        const target = heap.registered_hashes.getAndBorrow(hash) orelse {
             if (det) |details| details.* = .{
                 .message = try std.fmt.allocPrintSentinel(
                     heap.global_gpa,
@@ -557,7 +602,7 @@ pub const HashReference = struct {
         const obj = try shim.prepareToShimmer();
         obj.vtable = &vtable;
         const as_hash_ref = obj.castTo(HashReference);
-        as_hash_ref.* = .{ .ref = target.borrow() };
+        as_hash_ref.* = .{ .ref = target };
         return as_hash_ref;
     }
 
@@ -604,7 +649,7 @@ pub const HashReference = struct {
 
     fn updateString(obj: *Object) !void {
         const as_hash_ref = obj.castTo(HashReference);
-        const target_hash = try as_hash_ref.ref.getHash();
+        const target_hash = try as_hash_ref.ref.getHashRegistering();
         var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
         _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
         @memcpy(encoded[0..hashutil.hash_prepend.len], hashutil.hash_prepend);
@@ -1262,25 +1307,29 @@ test "subcommand parser" {
     try testing.expectError(error.WrongUsage, Parser.parse(null, &args2));
 }
 
-pub const BoxedBoolean = struct {
+pub const Boolean = struct {
     value: bool,
 
-    pub fn new(value: bool) !*BoxedBoolean {
-        const new_obj = try Object.newObject(BoxedBoolean);
+    pub fn newBoxed(value: bool) !*Boolean {
+        const new_obj = try Object.newObject(Boolean);
         new_obj.body.value = value;
         return new_obj.body;
     }
 
+    pub fn new(value: bool) Value {
+        return Value.newBool(value);
+    }
+
     fn updateString(obj: *Object) !void {
-        try obj.setStringDuplicatingIgnoreRace(if (obj.castTo(BoxedBoolean).value) "true" else "false");
+        try obj.setStringDuplicatingIgnoreRace(if (obj.castTo(Boolean).value) "true" else "false");
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(BoxedBoolean);
+        const new_obj = try Object.newObjectUninitialized(Boolean);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.value = src.constCastTo(BoxedBoolean).value;
+        new_obj.body.value = src.constCastTo(Boolean).value;
 
         return new_obj.head;
     }
@@ -1291,7 +1340,7 @@ pub const BoxedBoolean = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = null,
-        .name = @typeName(BoxedBoolean),
+        .name = @typeName(Boolean),
     };
 };
 
@@ -1313,11 +1362,6 @@ pub const ParsedScriptCommand = struct {
         .enumerate_struct = enumerateStruct,
         .name = @typeName(ParsedScriptCommand),
     };
-
-    pub fn castFrom(obj: *Object) *ParsedScriptCommand {
-        assert(obj.vtable == &vtable);
-        return @ptrCast(obj);
-    }
 };
 
 fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
@@ -1847,7 +1891,10 @@ pub const Dictionary = struct {
 
         if (in_parent_dict != .none) {
             // Key was found in the parent, so we do need to flatten.
-            try dict.flatten(det);
+            dict.flatten(det) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadDict, error.NotHashReference, error.HashLookupFailed => return error.LinkLookupFailed,
+            };
 
             // Flattening may change indicies, so we need to rescan for the first key.
             first_key_index = 0;
@@ -1978,6 +2025,7 @@ pub const Dictionary = struct {
 
             var pair_index: u32 = 0;
             while (pair_index < dict.items.len) : (pair_index += 2) {
+                if (try dict.items[pair_index].equalsString("~parent")) continue;
                 _ = try to_add_to.put(dict.items[pair_index], dict.items[pair_index + 1]);
             }
 

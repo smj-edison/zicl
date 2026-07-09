@@ -650,13 +650,17 @@ pub fn LruCache(comptime K: type, comptime V: type, comptime Context: type) type
             self.last = null;
         }
 
-        pub fn get(self: *Self, key: K) ?V {
+        pub fn getPtr(self: *Self, key: K) ?*V {
             const value = self.mapping.get(key);
 
             if (value) |val_index| {
                 self.moveToFirst(val_index);
-                return self.pool.items[val_index].item;
+                return &self.pool.items[val_index].item;
             } else return null;
+        }
+
+        pub fn get(self: *Self, key: K) ?V {
+            return if (self.getPtr(key)) |ptr| ptr.* else null;
         }
 
         /// Returns an old value if it was evicted.

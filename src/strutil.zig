@@ -869,10 +869,9 @@ pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escap
     }
 }
 
-/// Note: this assumes `arena` is an arena that is periodically cleaned up, since
-/// this function does not clean up any internal state allocated on `arena`.
-pub fn quoteStrings(arena: std.mem.Allocator, items: []const []const u8) ![:0]u8 {
-    var quoting_types = try arena.alloc(QuotingType, items.len);
+pub fn quoteStrings(gpa: std.mem.Allocator, items: []const []const u8) ![:0]u8 {
+    var quoting_types = try gpa.alloc(QuotingType, items.len);
+    defer gpa.free(quoting_types);
 
     var upper_bound_len: usize = 0;
     for (0.., items, quoting_types) |i, item, *quote_type| {
@@ -888,7 +887,8 @@ pub fn quoteStrings(arena: std.mem.Allocator, items: []const []const u8) ![:0]u8
         upper_bound_len += 1; // Space between each element.
     }
 
-    var unfinished_str = try arena.alloc(u8, upper_bound_len + 1);
+    var unfinished_str = try gpa.alloc(u8, upper_bound_len + 1);
+    errdefer gpa.free(unfinished_str);
     var written: usize = 0;
 
     for (0.., items, quoting_types) |i, item, quote_type| {
@@ -902,5 +902,7 @@ pub fn quoteStrings(arena: std.mem.Allocator, items: []const []const u8) ![:0]u8
 
     // Slap a nul on the end.
     unfinished_str[written] = 0x00;
+    unfinished_str = try gpa.realloc(unfinished_str, written + 1);
+
     return unfinished_str[0..written :0];
 }

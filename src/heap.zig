@@ -184,13 +184,13 @@ pub const HashRegistry = struct {
         }
     }, 80) = .empty,
 
-    pub fn get(registry: *HashRegistry, hash: u256) ?*Object {
+    pub fn getAndBorrow(registry: *HashRegistry, hash: u256) ?*Object {
         registry.rw_lock.lockSharedUncancelable(global_io);
         defer registry.rw_lock.unlockShared(global_io);
 
         if (registry.entries.getPtr(hash)) |entry| {
             assert(entry.instances.load(.monotonic) > 0);
-            return entry.representative;
+            return entry.representative.borrow(); // Borrow while still locked.
         } else return null;
     }
 
@@ -199,7 +199,7 @@ pub const HashRegistry = struct {
         obj.makeCrossthread();
 
         if (registry.entries.getPtr(key)) |entry| {
-            if (obj.metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire)) |_| {
+            if (obj.hash_metadata.fetchOr(.{ .hash_registered = true }, .acq_rel).hash_registered == true) {
                 // Someone else registered this already, so no need to do anything.
             } else {
                 // We were the ones to successfully set `value` as registered.
@@ -217,30 +217,30 @@ pub const HashRegistry = struct {
 
         const new_entry = try registry.entries.getOrPut(global_gpa, key);
         if (new_entry.found_existing) {
-            if (obj.metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire)) |_| {
+            if (obj.hash_metadata.fetchOr(.{ .hash_registered = true }, .acq_rel).hash_registered == true) {
                 // Someone registered it in-between upgrading the shared lock to an exclusive lock.
             } else {
                 // We successfully marked it as registered, so we can increment the instances count.
                 _ = new_entry.value_ptr.instances.fetchAdd(1, .monotonic);
             }
-            return;
+        } else {
+            new_entry.key_ptr.* = key;
+            new_entry.value_ptr.* = .{
+                .representative = obj.borrow(),
+                .instances = .init(1),
+            };
+
+            // We have an exclusive lock on rw_lock, so nobody else could have registered this value.
+            const expected: Object.HashMetadata = .{ .hash_registered = false, .is_representative = false };
+            assert(obj.hash_metadata.fetchOr(.{ .hash_registered = true, .is_representative = true }, .acq_rel) == expected);
         }
-
-        new_entry.key_ptr.* = key;
-        new_entry.value_ptr.* = .{
-            .representative = obj.borrow(),
-            .instances = .init(1),
-        };
-
-        // We have an exclusive lock on rw_lock, so nobody else could have registered this value.
-        assert(obj.metadata.cmpxchgStrongHashRegistered(false, true, .release, .acquire) == null);
     }
 
     pub fn unregister(registry: *HashRegistry, key: u256, obj: *Object) void {
         registry.rw_lock.lockSharedUncancelable(global_io);
 
         if (registry.entries.getPtr(key)) |entry| {
-            if (obj.metadata.cmpxchgStrongHashRegistered(true, false, .release, .acquire)) |_| {
+            if (obj.hash_metadata.fetchAnd(.{ .is_representative = true }, .acq_rel).hash_registered == false) {
                 // Someone else unregistered this already, so no need to do anything.
                 registry.rw_lock.unlockShared(global_io);
             } else {
@@ -255,13 +255,22 @@ pub const HashRegistry = struct {
                     // The entry should still exist here, as we were the ones who set instances
                     // to 0. It could have moved locations though, when upgrading to an exclusive
                     // lock.
-                    const entry_second_check = registry.entries.getPtr(key).?.*;
+                    const entry_second_check = registry.entries.getPtr(key).?;
+                    const entry_derefed = entry_second_check.*;
+                    if (entry_second_check.instances.load(.monotonic) != 0) {
+                        // Someone was able to re-register this value when upgrading
+                        // to an exclusive lock.
+                        registry.rw_lock.unlock(global_io);
+                        return;
+                    }
+
+                    entry_derefed.representative.hash_metadata.fetchAdd(.{}, .acq_rel);
                     assert(registry.entries.remove(key));
                     registry.rw_lock.unlock(global_io);
 
                     // Make sure to `decrRefCount` only after unlocking the mutex, to avoid
                     // recursive locking.
-                    entry_second_check.representative.release();
+                    entry_derefed.representative.release();
                 } else {
                     registry.rw_lock.unlockShared(global_io);
                 }
@@ -495,12 +504,12 @@ pub const Value = enum(ValueBacking) {
                 return Object.from(objects.Integer, obj);
             },
             .false => {
-                const obj = try objects.BoxedBoolean.new(false);
-                return Object.from(objects.BoxedBoolean, obj);
+                const obj = try objects.Boolean.newBoxed(false);
+                return Object.from(objects.Boolean, obj);
             },
             .true => {
-                const obj = try objects.BoxedBoolean.new(true);
-                return Object.from(objects.BoxedBoolean, obj);
+                const obj = try objects.Boolean.newBoxed(true);
+                return Object.from(objects.Boolean, obj);
             },
             .interned => |bytes| {
                 const obj = try Object.newObject(objects.String);
@@ -713,7 +722,7 @@ pub const SpecialString = struct {
     /// Length has not been determined if == `maxInt(u64)`.
     utf8_length: std.atomic.Value(u64) = .init(math.maxInt(u64)),
 
-    hashes: []HashAndInfo,
+    tracked_hashes: []HashAndInfo,
     hash: std.atomic.Value(?*u256),
     ref_count: std.atomic.Value(u32) = .init(1),
 
@@ -724,7 +733,9 @@ pub const SpecialString = struct {
                 global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
             },
         }
-        for (self.hashes) |hash| if (hash.value) |val| val.release();
+        for (self.tracked_hashes) |hash| if (hash.value) |val| val.release();
+        global_gpa.free(self.tracked_hashes);
+        if (self.hash.load(.monotonic)) |hash| global_gpa.destroy(hash);
 
         global_gpa.destroy(self);
     }
@@ -793,27 +804,13 @@ pub const Object = struct {
 
     pub const Metadata = packed struct(u8) {
         cross_thread: bool = false,
-        hash_registered: bool = false,
-        padding: u6 = 0,
+        padding: u7 = 0,
+    };
 
-        pub fn cmpxchgStrongHashRegistered(
-            metadata: *Metadata,
-            expected_registered_value: bool,
-            new_registered_value: bool,
-            comptime success_order: std.builtin.AtomicOrder,
-            comptime fail_order: std.builtin.AtomicOrder,
-        ) ?bool {
-            var current = @atomicLoad(Metadata, metadata, fail_order);
-            while (current.hash_registered == expected_registered_value) {
-                var new_value = current;
-                new_value.hash_registered = new_registered_value;
-                const result = @cmpxchgWeak(Metadata, metadata, current, new_value, success_order, fail_order);
-                if (result) |val| {
-                    current = val; // Failed load was done with `fail_order`.
-                } else return null; // Success!
-            }
-            return current.hash_registered;
-        }
+    pub const HashMetadata = packed struct(u8) {
+        hash_registered: bool = false,
+        is_representative: bool = false,
+        padding: u6 = 0,
     };
 
     pub const StringMetadata = packed struct(u32) {
@@ -828,6 +825,7 @@ pub const Object = struct {
     string: std.atomic.Value(?*anyopaque),
     string_metadata: std.atomic.Value(StringMetadata),
     metadata: Metadata,
+    hash_metadata: std.atomic.Value(HashMetadata),
 
     vtable: *const VTable,
     ref_count: u32,
@@ -873,6 +871,7 @@ pub const Object = struct {
     }
 
     pub fn canMutate(obj: *const Object) bool {
+        if (obj.getRefCount() > 1) return false;
         // Cross thread objects can't be mutated, even if the ref count is 1, because
         // objects can be indirectly accessed by traversing lists. Imagine thread 1
         // is traversing a list, while thread 2 is modifying the list elements.
@@ -882,9 +881,9 @@ pub const Object = struct {
         // objects are never safe to modify, or even shimmer.
         if (obj.metadata.cross_thread) return false;
         // If the hash is registered, it means it is considered frozen. We can't very
-        // well mutate something that has a fixed value.
-        if (obj.metadata.hash_registered) return false;
-        if (obj.getRefCount() > 1) return false;
+        // well mutate something that has a fixed value. Note we can load this as
+        // unordered, since it's not a crossthread object, as we just checked above.
+        if (obj.hash_metadata.load(.unordered).hash_registered) return false;
         return true;
     }
 
@@ -901,6 +900,7 @@ pub const Object = struct {
         obj.vtable = &T.vtable;
         obj.ref_count = 1;
         obj.metadata = .{};
+        obj.hash_metadata = .init(.{});
 
         leak_check.globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{@typeName(T)});
 
@@ -927,6 +927,7 @@ pub const Object = struct {
 
     pub fn makeCrossthread(obj: *Object) void {
         if (obj.vtable.make_crossthread) |make_crossthread_fn| make_crossthread_fn(obj);
+        obj.metadata.cross_thread = true;
     }
 
     pub fn enumerateStruct(
@@ -1060,7 +1061,6 @@ pub const Object = struct {
     pub fn setStringOwning(obj: *Object, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
         const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
-        for (hashes) |hash| if (hash.value) |val| val.incrRefCount();
         errdefer for (hashes) |hash| if (hash.value) |val| val.release();
 
         if (hashes.len > 0 or bytes.len > 1024) {
@@ -1069,7 +1069,7 @@ pub const Object = struct {
 
             special_string.* = .{
                 .value = .{ .normal = bytes },
-                .hashes = hashes,
+                .tracked_hashes = hashes,
                 .hash = .init(null),
             };
 
@@ -1105,12 +1105,12 @@ pub const Object = struct {
         obj.asValue().trace("Set string to \"{s}\"", .{bytes});
     }
 
+    /// Takes ownership of `bytes`.
     pub fn setStringLocalObject(obj: *Object, bytes: [:0]u8) error{OutOfMemory}!void {
         assert(obj.metadata.cross_thread == false);
 
         const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
-        for (hashes) |hash| if (hash.value) |val| val.incrRefCount();
         errdefer for (hashes) |hash| if (hash.value) |val| val.release();
 
         if (hashes.len > 0 or bytes.len > 1024) {
@@ -1119,7 +1119,7 @@ pub const Object = struct {
 
             special_string.* = .{
                 .value = .{ .normal = bytes },
-                .hashes = hashes,
+                .tracked_hashes = hashes,
                 .hash = .init(null),
             };
 
@@ -1169,14 +1169,23 @@ pub const Object = struct {
         // are owned by the hash registry, so there's a circular reference. But, hash representatives
         // can be safely freed if nobody else references them, so this is the needed logic to deal
         // with the circular reference created by the hash registry.
-        if (new_ref_count <= 1 and @atomicLoad(Object.Metadata, &obj.metadata, .monotonic).hash_registered) {
-            // It's impossible for this to not have a string, since if the hash
-            // was registered, we know that it has a string.
-            const hash = obj.getHashNoRegister() catch unreachable;
-            registered_hashes.unregister(hash, obj);
-        }
+        if (new_ref_count <= 1) {
+            const metadata = obj.hash_metadata.load(.monotonic);
+            if (metadata.is_representative) {
+                // It's impossible for this to not have a string, since if the hash
+                // was registered, we know that it has a string.
+                const hash = obj.getHashNoRegister() catch unreachable;
+                registered_hashes.unregister(hash, obj);
+            }
 
-        if (new_ref_count == 0) obj.deinit();
+            if (new_ref_count == 0) {
+                if (metadata.hash_registered) {
+                    const hash = obj.getHashNoRegister() catch unreachable;
+                    registered_hashes.unregister(hash, obj);
+                }
+                obj.deinit();
+            }
+        }
     }
 
     fn freeStringInner(obj: *Object) void {
@@ -1232,7 +1241,7 @@ pub const Object = struct {
         return hashutil.hashBytes(try obj.getString());
     }
 
-    pub fn getHash(obj: *Object) !u256 {
+    pub fn getHashRegistering(obj: *Object) !u256 {
         const hash = try obj.getHashNoRegister();
         try registered_hashes.register(hash, obj); // Idempotent.
         return hash;
@@ -1242,8 +1251,11 @@ pub const Object = struct {
         dest.vtable = src.vtable;
         dest.metadata = .{
             .cross_thread = false,
-            .hash_registered = false,
         };
+        dest.hash_metadata = .init(.{
+            .hash_registered = false,
+            .is_representative = false,
+        });
 
         switch (src.getStringDetails()) {
             .normal => |normal| {
@@ -1346,7 +1358,7 @@ pub const hashutil = struct {
             for (found_hashes.items, resolved_hashes) |found_hash, *resolved_hash| {
                 resolved_hash.* = .{
                     .str_index = found_hash.index,
-                    .value = if (registered_hashes.entries.get(found_hash.hash)) |resolved| resolved.representative else null,
+                    .value = if (registered_hashes.entries.get(found_hash.hash)) |resolved| resolved.representative.borrow() else null,
                 };
             }
         }
