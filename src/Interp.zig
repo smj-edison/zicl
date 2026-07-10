@@ -437,6 +437,8 @@ pub const ClosureValues = struct {
         closure.body.release();
         closure.name.release();
         if (closure.scope_hash_ref) |ref| ref.deinit();
+
+        closure.* = undefined;
     }
 
     pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
@@ -483,19 +485,22 @@ pub const Closure = struct {
         const required = closure.requiredArity();
         const optional = closure.optional_values.len;
 
+        const args = try closure.args.get();
+        const optional_values = if (closure.optional_values) |val| try val.get() else null;
+
         // Step 1: Rebuild the arguments list from required and optional args.
 
         var rebuilt_args = try heap.local_arena.alloc([]const u8, closure.args.len);
 
         // Get all the strings (we'll overwrite the strings for the optional arguments).
-        for (closure.args, &rebuilt_args) |arg, *str| str.* = try arg.getString();
+        for ((try closure.args.get()).items, &rebuilt_args) |arg, *str| str.* = try arg.getString();
 
         // Next, copy over the optional args.
         var optional_written: usize = 0;
         while (optional_written < optional) : (optional_written += 1) {
             const name_and_value: [2][]const u8 = .{
-                try closure.args[required + optional_written].getString(), // Argument name.
-                try closure.optional_values[optional_written].getString(), // Default value.
+                try args.items[required + optional_written].getString(), // Argument name.
+                try optional_values.?.items[optional_written].getString(), // Default value.
             };
             const bytes = try strutil.quoteStrings(heap.local_arena, name_and_value);
             rebuilt_args[required + optional_written] = bytes;
@@ -1828,35 +1833,28 @@ pub fn currentEvalFrame(interp: *Interp) *EvalFrame {
 }
 
 fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const ClosureValues) !u32 {
-    if (signature.scope_hash_ref) |hash_ref| {}
+    var variables = try Dictionary.new(&.{});
+    errdefer variables.asHead().release();
 
-    if (borrowed_signature.scope_hash_ref.toHandle()) |scope_hash_ref| {
-        var vars_handle_wb: Mutable = .{ .original = vars_handle };
-        assert(scope_hash_ref.tag() == .hash_reference);
-        // Safe since vars_handle is freshly allocated.
-        _ = try objutil.dictPutObject(
-            &vars_handle_wb,
-            Heap.local_heap.getInternedString(.@"^parent"),
-            scope_hash_ref.peek().body.hash_reference.hashReference(),
-        );
-        vars_handle.swapIfNew(vars_handle_wb.mutated);
+    if (signature.scope_hash_ref) |scope_hash_ref| {
+        try variables.put(objects.interned_tilde_parent.get(), scope_hash_ref.inner.asValue());
     }
 
     const new_call_frame_idx = interp.call_frames.items.len;
-    try interp.call_frames.append(Heap.global_gpa, .{
+    try interp.call_frames.append(heap.global_gpa, .{
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
-        .signature = if (signature.scope_hash_ref) |hash_ref| hash_ref.asHead().borrow().castTo(objects.HashReference) else null,
+        .signature = if (signature.scope_hash_ref) |hash_ref| hash_ref.duplicate() else null,
         // TODO PERF recycle variable hash table if possible.
-        .variables = vars_handle,
+        .variables = variables,
         .tailcall = null,
     });
 
     return @intCast(new_call_frame_idx);
 }
 
-fn pushEvalFrame(interp: *Interp, call_frame: u32, script: Handle) !u32 {
-    try interp.eval_frames.append(Heap.global_gpa, .{
+fn pushEvalFrame(interp: *Interp, call_frame: u32, script: Value) !u32 {
+    try interp.eval_frames.append(heap.global_gpa, .{
         .call_frame = call_frame,
         .args = &.{},
         .current_line = 0,
@@ -1870,14 +1868,14 @@ fn popEvalFrame(interp: *Interp) void {
 }
 
 /// Caller should release return value when they're done.
-fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) !Handle {
+fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !Value {
     switch (tag) {
         .simple_string => {
             return value.borrow();
         },
         .variable_subst => {
             var det: ErrorDetails = undefined;
-            const var_target: Handle = try interp.wrapError(
+            const var_target: Value = try interp.wrapError(
                 &det,
                 interp.getVariableOrErrorInner(&det, interp.callFrameIdx(), value),
             );
@@ -1900,20 +1898,16 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Handle) 
 fn interpolateTokens(
     interp: *Interp,
     tags: []const Tokenizer.Token.Tag,
-    value_list: Handle,
+    value_list: []const Value,
     value_start: u32,
     value_len: u32,
-) !Handle {
-    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
-    const tokens_alloc = sf.get();
-
-    var new_values = try std.ArrayList(Handle).initCapacity(tokens_alloc, value_len);
-    defer new_values.deinit(tokens_alloc);
+) !Value {
+    var new_values = try std.ArrayList(Value).initCapacity(heap.local_arena, value_len);
     defer for (new_values.items) |value| value.decrRefCount();
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len)) |tag, value_index| {
-        if (interp.substituteOneToken(tag, objutil.listItem(value_list, @intCast(value_index)))) |new_value| {
+        if (interp.substituteOneToken(tag, value_list[value_index])) |new_value| {
             new_values.appendAssumeCapacity(new_value);
         } else |err| switch (err) {
             error.Break => {
@@ -1933,10 +1927,10 @@ fn interpolateTokens(
         new_str_len += (try new_value.getString()).len;
     }
 
-    if (new_str_len == 0) return Heap.local_heap.emptyHandle();
+    if (new_str_len == 0) return objects.interned_empty_string.get();
 
-    var new_bytes = try Heap.global_gpa.alloc(u8, new_str_len);
-    defer Heap.global_gpa.free(new_bytes);
+    var new_bytes = try heap.global_gpa.alloc(u8, new_str_len);
+    errdefer heap.global_gpa.free(new_bytes);
     var written: usize = 0;
     for (new_values.items) |new_value| {
         const value_str = try new_value.getString();
@@ -1944,7 +1938,7 @@ fn interpolateTokens(
         written += value_str.len;
     }
 
-    return try objutil.newString(new_bytes);
+    return (try String.newOwning(new_bytes)).asHead().asValue();
 }
 
 const CommandOrClosure = union(enum) {
@@ -1952,12 +1946,11 @@ const CommandOrClosure = union(enum) {
     command: *NativeCommand,
 };
 
-/// `name` must be from the threadlocal heap.
 fn getCommandInner(
     interp: *Interp,
     det: ?*ErrorDetails,
     call_frame: u32,
-    name: Handle,
+    name: *Shimmerable,
     can_be_method: bool,
 ) !CommandOrClosure {
     if (interp.getVariableOrErrorInner(det, call_frame, name)) |var_val| {
@@ -1975,7 +1968,7 @@ fn getCommandInner(
             }
 
             // Command not registered locally, so check the shared lazy-init registry.
-            if (Heap.nativefn_registry.get(cmd_name)) |init_fn| {
+            if (heap.nativefn_registry.get(cmd_name)) |init_fn| {
                 init_fn(@ptrCast(interp));
                 // Retry after initialization.
                 if (interp.global_commands.getPtr(cmd_name)) |command| {
@@ -1984,7 +1977,7 @@ fn getCommandInner(
             }
 
             if (det) |details| details.* = .{
-                .message = try objutil.newStringFmt("invalid native command name \"{s}\"", .{cmd_name}),
+                .message = try allocPrintZ("invalid native command name \"{s}\"", .{cmd_name}),
             };
             return error.CommandNotFound;
         } else {
@@ -1997,9 +1990,9 @@ fn getCommandInner(
         error.BadVariableName => return error.BadVariableName,
         error.VariableNotFound, error.BadDict => {
             if (det) |details| {
-                details.message.decrRefCount();
+                heap.global_gpa.free(details.message);
                 details.* = .{
-                    .message = try objutil.newStringFmt("invalid command name \"{f}\"", .{name}),
+                    .message = try allocPrintZ("invalid command name \"{f}\"", .{name}),
                 };
             }
             return error.CommandNotFound;
@@ -2044,14 +2037,11 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     interp.unknown_depth += 1;
     defer interp.unknown_depth -= 1;
 
-    var new_args = std.ArrayList(Shimmerable).empty;
-    defer new_args.deinit(Heap.global_gpa);
-    try new_args.append(Heap.global_gpa, .{ .original = interp.unknown_str });
-    assert(new_args.items.len == 1);
-    defer new_args.items[0].discardChanges();
-    try new_args.appendSlice(Heap.global_gpa, args[1..]);
+    var new_args = try heap.local_arena.alloc(Shimmerable, args.len);
+    new_args[0] = .{ .original = interp.unknown_str };
+    @memcpy(new_args[1..], args[1..]);
 
-    try interp.invokeCommand(unknown_cmd, new_args.items);
+    try interp.invokeCommand(unknown_cmd, new_args);
 }
 
 const CommandError = Error || error{InfiniteRecursion};
@@ -2067,7 +2057,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
     // Loop the calling section, as there may be a tailcall.
     var current_args = args;
     var tailcall_info: ?Tailcall = null;
-    defer if (tailcall_info) |info| Heap.global_gpa.free(info.args);
+    defer if (tailcall_info) |info| heap.global_gpa.free(info.args);
     while (true) {
         interp.currentEvalFrame().args = args;
         // TODO implement tracing.
@@ -2097,7 +2087,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
                 // Be sure to free the previous tailcall.
                 if (tailcall_info) |prev_tailcall| {
                     for (prev_tailcall.args) |*arg| arg.deinit();
-                    Heap.global_gpa.free(prev_tailcall.args);
+                    heap.global_gpa.free(prev_tailcall.args);
                 }
 
                 tailcall_info = tailcall;
@@ -2122,16 +2112,16 @@ pub const IntegerOrFloat = union(enum) {
     int: i64,
     float: f64,
 };
-pub fn getIntegerOrFloat(interp: *Interp, wb: *Shimmerable) !IntegerOrFloat {
-    if (wb.tag() == .integer) {
-        return .{ .int = wb.peek().body.integer };
-    } else if (wb.tag() == .float) {
-        return .{ .float = wb.peek().body.float };
+pub fn getIntegerOrFloat(interp: *Interp, shim: *Shimmerable) !IntegerOrFloat {
+    if (shim.tag() == .integer) {
+        return .{ .int = shim.peek().body.integer };
+    } else if (shim.tag() == .float) {
+        return .{ .float = shim.peek().body.float };
     }
 
-    const int_result = objutil.integerGet(null, wb) catch |err| switch (err) {
+    const int_result = objects.Integer.shimmerFrom(null, shim) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .float = try interp.getFloat(wb) },
+        else => return .{ .float = try interp.getFloat(shim) },
     };
 
     return .{ .int = int_result };
