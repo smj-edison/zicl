@@ -1072,6 +1072,20 @@ pub fn nextNumberToken(self: *Tokenizer) !Token {
     }
 }
 
+pub fn convertTokenizerError(gpa: std.mem.Allocator, err: Tokenizer.Error) error{OutOfMemory}![:0]u8 {
+    return switch (err) {
+        error.CharactersAfterCloseBrace => try gpa.dupeSentinel(u8, "extra characters after close-brace", 0),
+        error.MissingCloseBrace => try gpa.dupeSentinel(u8, "missing close-brace", 0),
+        error.MissingCloseBracket => try gpa.dupeSentinel(u8, "unmatched \"[\"", 0),
+        error.MissingCloseQuote => try gpa.dupeSentinel(u8, "missing quote", 0),
+        error.TrailingBackslash => try gpa.dupeSentinel(u8, "no character after \\", 0),
+        error.FunctionMissingParentheses => try gpa.dupeSentinel(u8, "function missing parentheses", 0),
+        error.NotOperator => try gpa.dupeSentinel(u8, "not operator", 0),
+        error.NotNumber => try gpa.dupeSentinel(u8, "not number", 0),
+        error.NotVariable => unreachable,
+    };
+}
+
 /// Initializes `.start`. Caller must initialize all other fields.
 fn newToken(self: *Tokenizer) Token {
     return .{

@@ -17,6 +17,8 @@ const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
 const objects = @import("objects.zig");
+const vartypes = @import("vartypes.zig");
+const expr_parse = @import("expr_parse.zig");
 const allocPrintZ = objects.allocPrintZ;
 const Shimmerable = objects.Shimmerable;
 const ErrorDetails = objects.ErrorDetails;
@@ -97,12 +99,12 @@ const FullHashContext = struct {
         return a == b;
     }
 };
-const ParsedScripts = memutil.LruCache(u256, struct { script: objects.ParsedScript }, FullHashContext);
-const ParsedExpressions = memutil.LruCache(u256, struct { expr: ParsedExpression }, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, struct { closure: ClosureValues }, FullHashContext);
+const ParsedScripts = memutil.LruCache(u256, *Script, FullHashContext);
+const ParsedExpressions = memutil.LruCache(u256, *Expression, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, ClosureValues, FullHashContext);
 pub const Substitution = struct {
-    subst: objects.ParsedScript,
-    /// Mainly used for integrity checks.
+    subst: *Script,
+    /// Currently only used for integrity checks.
     flags: Tokenizer.SubstFlags,
 };
 const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
@@ -184,210 +186,212 @@ pub fn wrapError(interp: *Interp, det: *objects.ErrorDetails, result: anytype) w
     };
 }
 
-pub const CachedLocalVar = struct {
-    dictionary_in: *objects.Dictionary,
-    index: usize,
-    call_epoch: u64,
+/// This is the script object internal representation. It is an array
+/// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
+///
+/// For example the script:
+///
+/// puts hello
+/// set $i $x$y [foo]BAR
+///
+/// will produce a ParsedScript with the following token/object pairs:
+///
+/// | .start_of_command  | 2     |
+/// | .simple_string     | puts  |
+/// | .simple_string     | hello |
+/// | .start_of_command  | 4     |
+/// | .simple_string     | set   |
+/// | .variable_subst    | i     |
+/// | .start_of_word     | 2     |
+/// | .variable_subst    | x     |
+/// | .variable_subst    | y     |
+/// | .start_of_word     | 2     |
+/// | .command_subst     | foo   |
+/// | .simple_string     | BAR   |
+///
+/// "puts hello" has two args (.start_of_command 2), composed of single tokens.
+/// (Note that the .start_of_command token is omitted for the common case of a
+/// single token.)
+///
+/// "set $i $x$y [foo]BAR" has four (.start_of_command 4) args, the first word
+/// has 1 token (.simple_string set), and the last has two tokens
+/// (.start_of_word 2 .command_subst foo .simple_string BAR)
+///
+/// The precomputation of the command structure makes eval() faster,
+/// and simpler because there aren't dynamic lengths / allocations.
+///
+/// -- {*} handling --
+///
+/// Expand is handled in a special way.
+///
+///   If a "word" begins with {*}, the corrisponding object type is ".none".
+///
+/// For example the command:
+///
+/// list {*}{a b}
+///
+/// Will produce the following pairs:
+///
+/// | .start_of_command | 2     |
+/// | .simple_string | list  |
+/// | .start_of_word | .none |
+/// | .braced_string | a b   |
+///
+/// Note that the '.start_of_command' token also contains the source information
+/// for the first word of the line for error reporting purposes
+///
+/// -- the substFlags field of the structure --
+///
+/// The `scriptObj` structure is used to represent both "script" objects
+/// and "subst" objects. In the second case, there are no `LIN` and `WRD`
+/// tokens. Instead `SEP` and `EOL` tokens are added as-is.
+/// In addition, the field `substFlags` is used to represent the flags used to turn
+/// the string into the internal representation.
+/// If these flags do not match what the application requires,
+/// the scriptObj is created again. For example the script:
+///
+/// subst -nocommands $string
+/// subst -novariables $string
+///
+/// Will (re)create the internal representation of the $string object
+/// two times.
+///
+pub const Script = struct {
+    ref_count: usize = 1,
+    /// Tokens array.
+    tags: std.ArrayList(Tokenizer.Token.Tag),
+    /// The associated values for their corresponding tokens.
+    values: []Value,
 
-    pub fn asHead(self: *CachedLocalVar) *Object {
-        return Object.from(CachedLocalVar, self);
+    pub fn printTokens(script: *const Script) void {
+        const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
+
+        var line: u64 = 0;
+        for (script.tags.items, script.values, 0..) |token, value, i| {
+            switch (token) {
+                .start_of_command => {
+                    const command_details = value.asType(objects.ParsedScriptCommand).?;
+                    line = command_details.line;
+                    ioutil.debug(
+                        formatting ++ "line: {}, word count: {}\n",
+                        .{ i, line, @tagName(token), command_details.line, command_details.word_count },
+                    );
+                },
+                .start_of_word => ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
+                else => {
+                    const str = value.getString() catch "<oom string>";
+                    ioutil.debug(formatting ++ "{s}\n", .{ i, line, @tagName(token), str });
+                },
+            }
+        }
     }
 
-    fn makeCrossthread(obj: *Object) void {
-        obj.vtable = &objects.None.vtable;
+    pub fn deinit(parsed: *Script) void {
+        parsed.tags.deinit(heap.global_gpa);
+        for (parsed.values) |value| value.release();
     }
 
-    pub fn getCurrentValue(self: *const CachedLocalVar) Value {
-        return self.dictionary_in.items[self.index];
+    pub fn borrow(script: *Script) *Script {
+        script.ref_count += 1;
+        return script;
     }
 
-    pub const vtable: Object.VTable = .{
-        .duplicate = Object.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = null,
-        .make_crossthread = makeCrossthread,
-        // TODO it would be nice to be able to walk the cached local var,
-        // but we'd need the call epoch invalidation logic embedded in it.
-        .enumerate_struct = null,
-        .name = @typeName(CachedLocalVar),
-    };
+    pub fn release(script: *Script) void {
+        script.ref_count -= 1;
+        if (script.ref_count == 0) heap.global_gpa.free(script);
+    }
 };
 
-pub const CachedLexicalVar = struct {
-    ref: Value,
-    /// We still need to track the call epoch for the cached lexical var, since it's
-    /// possible that this was shadowed by a local variable.
-    call_epoch: u64,
+pub const Expression = struct {
+    ref_count: u32,
+    root_node: expr_parse.Node.Index,
+    nodes: std.MultiArrayList(expr_parse.Node),
 
-    pub fn asHead(self: *CachedLexicalVar) *Object {
-        return Object.from(CachedLexicalVar, self);
-    }
+    pub fn parse(det: ?*ErrorDetails, value: Value) !*Expression {
+        const file_name: OptionalValue = if (value.asType(objects.Source)) |val| val.file_name.borrow() else .none;
+        const line_no: u32 = if (value.asType(objects.Source)) |val| val.line_no else 1;
 
-    fn makeCrossthread(obj: *Object) void {
-        obj.vtable = &objects.None.vtable;
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = Object.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = null,
-        .make_crossthread = makeCrossthread,
-        // TODO same issue as `CachedLocalVar.vtable`.
-        .enumerate_struct = null,
-        .name = @typeName(CachedLexicalVar),
-    };
-};
-
-pub const UpvarLink = struct {
-    /// An object containing the name of the variable in the linked
-    /// scope. Whenever someone shimmers this to a variable, they should
-    /// always do it in `call_frame`.
-    linked_name: Value,
-    /// The call frame the linked variable lives in.
-    call_frame: u32,
-
-    fn freeInternalRep(src: *Object) void {
-        src.castTo(UpvarLink).linked_name.release();
-    }
-
-    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const upvar: *const UpvarLink = @ptrCast(@alignCast(info.node));
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.followValue("linked_name", upvar.linked_name);
-        try helper.addField(u32, "call_frame", "{}", upvar.call_frame);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = null,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(UpvarLink),
-    };
-};
-
-/// `dict_name` points  to an object that contains the name of the dictionary
-/// (and most likely specializes to whatever type of variable caching is necessary),
-/// while `dict_path` points to a list containing all parts of the path. For
-/// example, `foo::bar::baz` would turn into roughly
-/// ```
-/// dict_name: foo
-/// dict_path: {bar baz}
-/// ```
-pub const DictSugar = struct {
-    dict_name: Value,
-    dict_path: *objects.List,
-
-    pub fn isValidDictSugar(var_name: [:0]const u8) error{BadVariableName}!bool {
-        // Can't start with `~parent`.
-        if (std.mem.startsWith(u8, var_name[0..], "~parent")) return error.BadVariableName;
-
-        const double_colons = std.mem.indexOf(u8, var_name, "::");
-        // Must have at least one set of double colons.
-        const start_at = if (double_colons) |val| val else return false;
-
-        // Can't have dict sugar start with colons.
-        if (start_at == 0) return false;
-        // Also can't end with colons.
-        const ending_colons = std.mem.lastIndexOf(u8, var_name, "::").?;
-        if (ending_colons == var_name.len - 2) return false;
-
-        return true;
-    }
-
-    pub fn parseDictSugar(var_name: [:0]const u8) error{ BadVariableName, OutOfMemory }!?struct {
-        dict_name: Value,
-        dict_path: *objects.List,
-    } {
-        if (!(try isValidDictSugar(var_name))) return null;
-
-        const start_at = std.mem.indexOf(u8, var_name, "::").?;
-        const dict_name = try objects.String.newValue(var_name[0..start_at]);
-        errdefer dict_name.release();
-
-        var dict_path: *objects.List = try objects.List.new(&.{});
-        errdefer dict_path.asHead().release();
-
-        var last_path_start: ?usize = null;
-        var i = start_at;
-        while (i <= var_name.len) : (i += 1) {
-            if (i == var_name.len or (var_name[i] == ':' and var_name[i + 1] == ':')) {
-                if (last_path_start) |val| {
-                    const path_section = var_name[val..i];
-                    const path_section_value = try objects.String.newValue(path_section);
-                    defer path_section_value.release();
-                    try dict_path.append(path_section_value);
+        // Parse all the tokens of the expr, handling any errors that come up.
+        const bytes = try value.getString();
+        var tokenizer = Tokenizer.init(bytes, line_no);
+        var tokens = std.MultiArrayList(Tokenizer.Token).empty;
+        defer tokens.deinit(heap.global_gpa);
+        while (true) {
+            const next_token = tokenizer.nextExpressionToken();
+            if (next_token) |token| {
+                try tokens.append(heap.global_gpa, token);
+                if (token.tag == .end_of_file) break;
+            } else |err| if (det) |details| {
+                details.* = try Tokenizer.convertTokenizerError(heap.global_gpa, err);
+                if (tokenizer.error_details) |parser_details| {
+                    details.index = parser_details.index;
                 }
-
-                // Keep advancing until we've passed the colon(s).
-                while (i < var_name.len and var_name[i + 1] == ':') i += 1;
-                last_path_start = i + 1;
+                return err;
             }
         }
 
-        return .{ .dict_name = dict_name, .dict_path = dict_path };
+        if (tokens.len == 0) {
+            if (det) |details| details.* = .{
+                .message = try heap.global_gpa.dupeSentinel(u8, "empty expression", 0),
+            };
+            return error.ParseError;
+        }
+
+        // Next, go ahead and parse the expression from the tokens.
+        var parser = expr_parse.Parse.init(file_name, bytes, tokens.slice());
+        errdefer parser.deinit();
+        if (parser.parseExpr()) |root_node| {
+            const new_expr = try heap.global_gpa.create(Expression);
+            // Note we don't deinit parser here, since we take ownership.
+            new_expr.* = .{ .nodes = parser.node, .root_node = root_node.? };
+            return new_expr;
+        } else |err| {
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ParseError => {
+                    if (det) |details| {
+                        var aw = std.Io.Writer.Allocating.init(heap.global_gpa);
+                        errdefer aw.deinit();
+                        const err_details = parser.err.?;
+                        parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
+
+                        details.* = .{
+                            .message = aw.toOwnedSlice(),
+                            .index = err_details.sourceIndex(&parser),
+                        };
+                    }
+                    return error.ParseError;
+                },
+            }
+        }
     }
 
-    /// This should only ever be called if you know that this variable is in dict sugar form.
-    pub fn shimmerAssumeValid(name: *Shimmerable) error{OutOfMemory}!*const DictSugar {
-        if (name.current().asType(DictSugar)) |dict_sugar| return dict_sugar;
+    pub fn get(interp: *Interp, value: Value, cache_key: u256) !*Expression {
+        if (interp.parsed_exprs.get(cache_key)) |parsed| {
+            return parsed;
+        } else {
+            var det: objects.ErrorDetails = undefined;
+            const new_expr = try wrapError(&det, parse(&det, value));
+            if (interp.parsed_scripts.put(cache_key, new_expr)) |ejected| ejected.release();
 
-        const maybe_dict_sugar = parseDictSugar(try name.current().getString()) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadVariableName => unreachable,
-        };
-        const dict_sugar = maybe_dict_sugar.?;
-        errdefer dict_sugar.dict_name.release();
-        errdefer dict_sugar.dict_path.asHead().release();
-
-        const obj = try name.prepareToShimmer();
-        obj.vtable = &vtable;
-        const as_dict_sugar = obj.castTo(DictSugar);
-        as_dict_sugar.* = .{
-            .dict_name = dict_sugar.dict_name,
-            .dict_path = dict_sugar.dict_path,
-        };
-
-        return as_dict_sugar;
+            return new_expr;
+        }
     }
 
-    fn freeInternalRep(src: *Object) void {
-        const as_dict_sugar = src.castTo(DictSugar);
-        as_dict_sugar.dict_name.release();
-        as_dict_sugar.dict_path.asHead().release();
+    pub fn deinit(expr: *Expression) void {
+        expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
+        expr.* = undefined;
     }
 
-    fn makeCrossthread(obj: *Object) void {
-        freeInternalRep(obj);
-        obj.vtable = &objects.None.vtable;
+    pub fn borrow(script: *Script) *Script {
+        script.ref_count += 1;
+        return script;
     }
 
-    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const dict_sugar: *const DictSugar = @ptrCast(@alignCast(info.node));
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.followValue("dict_name", dict_sugar.dict_name);
-        try helper.follow(Object, "dict_path", dict_sugar.dict_path.asHead());
+    pub fn release(script: *Script) void {
+        script.ref_count -= 1;
+        if (script.ref_count == 0) heap.global_gpa.free(script);
     }
-
-    pub const vtable: Object.VTable = .{
-        .name = @typeName(DictSugar),
-        .duplicate = Object.duplicateStringOnly,
-        .free_internal_rep = freeInternalRep,
-        .update_string = null,
-        .make_crossthread = makeCrossthread,
-        .enumerate_struct = enumerateStruct,
-    };
-};
-
-pub const ParsedExpression = struct {
-    // root_node: expr_parse.Node.Index,
-    // nodes: std.MultiArrayList(expr_parse.Node),
-
-    // pub fn deinit(expr: *ParsedExpression) void {
-    //     expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
-    //     expr.* = undefined;
-    // }
 };
 
 pub const ClosureValues = struct {
@@ -551,596 +555,6 @@ pub const Closure = struct {
     };
 };
 
-const VariableLookupResult = enum { not_found, dict_sugar, normal };
-pub const VariableValue = union(enum) {
-    local_variable: struct {
-        dictionary_in: *objects.Dictionary,
-        index: usize,
-    },
-    /// Variable in a parent scope. Immutable.
-    lexical_variable: Value,
-};
-
-/// Resolves to the variable's value, if any. Does not account for dict sugar.
-fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, var_name: Value) error{
-    OutOfMemory,
-    LinkLookupFailed,
-    BadVariableName,
-}!?VariableValue {
-    if (var_name.asPtr()) |obj| _ = try obj.getString();
-
-    if (try var_name.equalsString("~parent")) {
-        if (det) |details| details.* = .{
-            .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "bad variable name: \"{f}\"", .{var_name}, 0),
-        };
-        return error.BadVariableName;
-    }
-
-    const var_dict = interp.call_frames.items[var_call_frame].variables;
-    const maybe_scope_hash_ref = &interp.call_frames.items[var_call_frame].signature.scope_hash_ref;
-
-    // Check the variables dictionary. Don't follow refs here so the
-    // cached index points at the dict slot, not the ref target.
-    if (try var_dict.table.get(var_name)) |local_var| {
-        return .{
-            .dictionary_in = var_dict,
-            .index = local_var,
-        };
-    }
-
-    // Wasn't in the variables, maybe it's in a parent scope instead?
-    if (maybe_scope_hash_ref.*) |*scope_hash_ref| {
-        var dict_shim: Shimmerable = .{ .original = scope_hash_ref.*.ref.asValue() };
-        defer dict_shim.discardChanges();
-        const in_linked_scope = try objects.Dictionary.getFollowingLinks(det, &dict_shim, var_name);
-
-        if (dict_shim.shimmered.asValue()) |new_dict_raw| {
-            const new_hash_ref = try objects.HashReference.new(new_dict_raw.asPtr().?);
-            const old = scope_hash_ref.*;
-            scope_hash_ref.* = new_hash_ref;
-            old.asHead().release();
-        }
-
-        if (in_linked_scope.asValue()) |val| {
-            return .{ .lexical_variable = val };
-        }
-    }
-
-    return null;
-}
-
-/// This always recalculates the variable. You probably should be using `ensureValidVariableType`.
-fn reshimmerToVariable(
-    interp: *Interp,
-    det: ?*ErrorDetails,
-    var_call_frame: u32,
-    name: *Shimmerable,
-) error{ OutOfMemory, LinkLookupFailed, BadVariableName }!VariableLookupResult {
-    const call_frame = &interp.call_frames.items[var_call_frame];
-    if (try interp.resolveVariable(det, var_call_frame, name.current())) |var_value| {
-        switch (var_value) {
-            .local_variable => |local_var| {
-                const obj = try name.prepareToShimmer();
-                obj.vtable = &CachedLocalVar.vtable;
-                obj.castTo(CachedLocalVar).* = .{
-                    .dictionary_in = local_var.dictionary_in,
-                    .index = local_var.index,
-                    .call_epoch = call_frame.call_epoch,
-                };
-                return .normal;
-            },
-            .lexical_variable => |lexical_var| {
-                const obj = try name.prepareToShimmer();
-                obj.vtable = &CachedLexicalVar.vtable;
-                obj.castTo(CachedLexicalVar).* = .{
-                    .ref = lexical_var,
-                    .call_epoch = call_frame.call_epoch,
-                };
-                return .normal;
-            },
-        }
-    } else {
-        return .not_found;
-    }
-}
-
-/// Ensures that this is a valid variable or upvar. If not, it'll shimmer it to whichever one applies.
-/// Returns an error if it's DictSugar, since that requires special handling and there's not a good
-/// way to handle it in the general case.
-fn ensureValidVariableType(
-    interp: *Interp,
-    det: ?*ErrorDetails,
-    var_call_frame: u32,
-    name: *Shimmerable,
-) error{ OutOfMemory, LinkLookupFailed, BadVariableName }!VariableLookupResult {
-    const call_frame = interp.call_frames.items[var_call_frame];
-
-    if (name.current().asType(CachedLocalVar)) |cached_var| {
-        // Fast case: if we're in the same epoch as last time, so we don't
-        // need to do anything.
-        if (cached_var.call_epoch == call_frame.call_epoch) {
-            return .normal;
-        } else {
-            // Need to re-resolve the variable in the current call frame.
-            // `name` will be valid after this function completes.
-            return try interp.reshimmerToVariable(det, var_call_frame, name);
-        }
-    } else if (name.current().asType(CachedLexicalVar)) |lexical_var| {
-        // Fast case: if we're in the same epoch as last time, we don't need
-        // to do anything.
-        if (lexical_var.call_epoch == call_frame.call_epoch) {
-            return .normal;
-        } else {
-            // Since this is a lexical value lookup, and the lexical scopes are immutable,
-            // the only case where this lookup becomes invalid is if it were shadowed by
-            // a local variable.
-            if ((try call_frame.variables.getNoFollow(name.current())).asValue()) |_| {
-                // Shadowed, so we need to look up again.
-                return try interp.reshimmerToVariable(det, var_call_frame, name);
-            } else {
-                // Wasn't shadowed, so be sure to update its epoch so we don't do
-                // this expensive lookup again.
-                lexical_var.call_epoch = call_frame.call_epoch;
-                return .normal;
-            }
-        }
-    } else if (name.current().asType(objects.DictSugar)) |_| {
-        return .dict_sugar;
-    }
-
-    // We don't know whether this is a normal variable or dict sugar yet.
-    const var_name = try name.current().getString();
-    if (try DictSugar.isValidDictSugar(var_name)) return .dict_sugar;
-
-    // Make sure the variable exists.
-    return try interp.reshimmerToVariable(det, var_call_frame, name);
-}
-
-// Must be called with a heap-native variable name. Does not account for dict sugar.
-fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, value: Value) !void {
-    const call_frame = &interp.call_frames.items[call_frame_idx];
-    call_frame.call_epoch = interp.nextCallEpoch();
-
-    // Add variable.
-    const index = try call_frame.variables.put(name.current(), value);
-
-    const obj = try name.prepareToShimmer();
-    obj.vtable = &CachedLocalVar.vtable;
-    obj.castTo(CachedLocalVar).* = .{
-        .call_epoch = call_frame.call_epoch,
-        .dictionary_in = call_frame.variables,
-        .index = index,
-    };
-}
-
-/// Must be called with a heap-native name.
-pub fn setVariableInner(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, name: *Shimmerable, value: Value) error{
-    OutOfMemory,
-    LinkLookupFailed,
-    BadVariableName,
-}!void {
-    switch (try interp.ensureValidVariableType(det, call_frame_idx, name)) {
-        .not_found => {
-            try createVariable(interp, call_frame_idx, name, value);
-        },
-        .dict_sugar => {
-            const dict_sugar = try DictSugar.shimmerAssumeValid(name);
-            var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
-            defer dict_name.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
-
-            const resolved_dict = blk: {
-                const resolved_dict = interp.getVariableInner(det, call_frame_idx, &dict_name) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.LinkLookupFailed => return error.LinkLookupFailed,
-                    error.BadVariableName => return error.BadVariableName,
-                    error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
-                };
-                // If it doesn't exist, we'll create it.
-                break :blk if (resolved_dict) |dict| dict.borrow() else (try Dictionary.new(&.{})).asHead().asValue();
-            };
-            defer resolved_dict.release();
-            var resolved_dict_shim: Shimmerable = .{ .original = resolved_dict };
-            defer resolved_dict_shim.discardChanges();
-            _ = try Dictionary.shimmerFrom(det, &resolved_dict_shim);
-
-            if (resolved_dict_shim.current().canMutate()) {
-                const as_dict_mut = resolved_dict_shim.current().asType(Dictionary).?;
-                try as_dict_mut.putRecursively(det, objects.ValueSliceContext{ .items = dict_sugar.dict_path.items }, value);
-                interp.call_frames.items[call_frame_idx].variables.asHead().invalidateString();
-            } else {
-                const new_dict = try resolved_dict_shim.getMutable(Dictionary, det);
-                errdefer new_dict.asHead().release();
-                try new_dict.putRecursively(det, objects.ValueSliceContext{ .items = dict_sugar.dict_path.items }, value);
-                try interp.setVariableInner(det, call_frame_idx, &dict_name, new_dict.asHead().asValue());
-            }
-        },
-        .normal => {
-            if (name.current().asType(CachedLocalVar)) |local_var| {
-                const current_value = &local_var.dictionary_in.items[local_var.index];
-                if (current_value.asType(UpvarLink)) |link| {
-                    var name_shim: Shimmerable = .{ .original = link.linked_name };
-                    defer name_shim.discardChanges();
-                    // Set the value through the linked name in the linked frame.
-                    try interp.setVariableInner(det, link.call_frame, &name_shim, value);
-                } else {
-                    current_value.swap(value.borrow());
-                    local_var.dictionary_in.asHead().invalidateString();
-                }
-            } else if (name.current().asType(CachedLexicalVar)) |_| {
-                // We can't mutate a lexical var, so we instead shadow it in the local scope.
-                try createVariable(interp, call_frame_idx, name, value);
-            } else unreachable;
-        },
-    }
-}
-
-pub fn setVariableUpvarInner(
-    interp: *Interp,
-    det: ?*ErrorDetails,
-    call_frame_idx: u32,
-    name: *Shimmerable,
-    target_call_frame_idx: u32,
-    target_name: Value,
-) !void {
-    try name.ensureShimmerable();
-
-    switch (try interp.ensureValidVariableType(null, call_frame_idx, name)) {
-        .normal => {
-            if (name.current().asType(CachedLocalVar) != null) {
-                // Variable already exists.
-                if (det) |details| details.* = .{ .message = try allocPrintZ(
-                    "variable \"{s}\" already exists",
-                    .{try name.current().getString()},
-                ) };
-                return error.VariableAlreadyExists;
-            }
-            // Else fall through, as we can shadow a lexical variable.
-        },
-        .not_found => {
-            // Fall through.
-        },
-        .dict_sugar => {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("cannot create an upvar name that has dict sugar"),
-            };
-            return error.DictSugarInUpvarName;
-        },
-    }
-
-    // Check for cycles (only possible with `upvar 0`, such as `upvar 0 x y; upvar 0 y x`).
-    if (call_frame_idx == target_call_frame_idx) {
-        // Traverse the upvar chain until either we reach the end of the chain
-        // or we find ourselves.
-        var obj_currently_checking = target_name;
-        while (true) {
-            if (try name.current().equals(obj_currently_checking)) {
-                // We'd create a circular reference at this point, since
-                // we managed to find ourselves when traversing the upvar
-                // chain. Obviously, we can't let this happen.
-                if (det) |details| details.* = .{
-                    .message = try allocPrintZ("can't upvar from variable to itself"),
-                };
-                return error.CircularUpvar;
-            }
-
-            // See what kind of variable this is, so we can determine whether it has
-            // the potential for a cycle.
-            const ensure_result = interp.ensureValidVariableType(
-                det,
-                target_call_frame_idx,
-                obj_currently_checking,
-            ) catch |err| switch (err) {
-                error.LinkLookupFailed => return error.LinkLookupFailed,
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadVariableName => {
-                    // If the target var doesn't exist, then of course the var name != nothing,
-                    // so it's not equal to itself.
-                    break;
-                },
-            };
-            switch (ensure_result) {
-                .dict_sugar => {
-                    // `name` can never be dict sugar, which means we can never have circular dict
-                    // sugar to dict sugar. Hence, it's safe to conclude there's no cycle here.
-                    break;
-                },
-                .not_found => {
-                    // If the target var doesn't exist, then of course the var name != nothing,
-                    // so it's not equal to itself.
-                    break;
-                },
-                .normal => {
-                    // Can't use `getVariableInner` here, as it follows upvars.
-                    if (obj_currently_checking.asType(CachedLocalVar)) |local_var| {
-                        if (local_var.getCurrentValue().asType(UpvarLink)) |upvar_link| {
-                            // Keep traversing.
-                            obj_currently_checking = upvar_link.linked_name;
-                        } else {
-                            break; // Not upvar, so chain is broken.
-                        }
-                    } else {
-                        break; // It's not a variable in the local scope, so the chain is broken.
-                    }
-                },
-            }
-        }
-    }
-
-    const target_name_duped = try target_name.duplicateAsBoxed();
-    defer target_name_duped.release();
-    const link = try Object.newObject(UpvarLink);
-    defer link.head.release();
-    link.body.* = .{
-        .call_frame = target_call_frame_idx,
-        .linked_name = target_name_duped.borrow(),
-    };
-
-    try interp.setVariableInner(det, call_frame_idx, name, link.head.asValue());
-}
-
-pub fn unsetVariableInner(
-    interp: *Interp,
-    det: ?*ErrorDetails,
-    call_frame_idx: u32,
-    name: *Shimmerable,
-) !void {
-    switch (try interp.ensureValidVariableType(det, call_frame_idx, name)) {
-        .not_found => {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("can't unset \"{s}\": no such variable", .{try name.current().getString()}),
-            };
-            return error.VariableNotFound;
-        },
-        .dict_sugar => {
-            const dict_sugar = try DictSugar.shimmerAssumeValid(name);
-            var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
-            defer dict_name.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
-
-            const resolved_dict = try interp.getVariableInner(null, call_frame_idx, dict_sugar.dict_name) orelse {
-                if (det) |details| details.* = .{
-                    .message = try allocPrintZ("can't unset \"{f}\": no such element in dictionary", .{name}),
-                };
-                return error.VariableNotFound;
-            };
-            var resolved_dict_shim: Shimmerable = .{ .original = resolved_dict };
-            defer resolved_dict_shim.discardChanges();
-            _ = try Dictionary.shimmerFrom(det, &resolved_dict_shim);
-
-            const dict_items = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
-            const did_remove = blk: {
-                if (resolved_dict_shim.current().canMutate()) {
-                    const as_dict_mut = resolved_dict_shim.current().asType(Dictionary).?;
-                    const did_remove = as_dict_mut.removeRecursively(null, dict_items) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => {
-                            if (det) |details| details.* = .{ .message = try allocPrintZ(
-                                "can't unset \"{s}\": no such element in dictionary",
-                                .{try name.current().getString()},
-                            ) };
-                            return error.VariableNotFound;
-                        },
-                    };
-                    interp.call_frames.items[call_frame_idx].variables.asHead().invalidateString();
-                    break :blk did_remove;
-                } else {
-                    const new_dict = try resolved_dict_shim.getMutable(Dictionary, det);
-                    errdefer new_dict.asHead().release();
-                    const did_remove = new_dict.removeRecursively(det, dict_items) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => {
-                            if (det) |details| details.* = .{ .message = try allocPrintZ(
-                                "can't unset \"{s}\": no such element in dictionary",
-                                .{try name.current().getString()},
-                            ) };
-                            return error.VariableNotFound;
-                        },
-                    };
-                    try interp.setVariableInner(null, call_frame_idx, &dict_name, new_dict.asHead().asValue());
-                    break :blk did_remove;
-                }
-            };
-
-            if (!did_remove) {
-                if (det) |details| details.* = .{ .message = try allocPrintZ(
-                    "can't unset \"{s}\": no such element in dictionary",
-                    .{try name.getString()},
-                ) };
-                return error.VariableNotFound;
-            }
-            return;
-        },
-        .normal => {
-            // Fall through.
-        },
-    }
-
-    if (name.current().asType(CachedLocalVar)) |local_var| {
-        // If this local variable is an upvar link, unset through the link rather
-        // than removing the link itself from this scope.
-        const current_value = &local_var.dictionary_in.items[local_var.index];
-        if (current_value.asType(UpvarLink)) |link| {
-            var name_shim: Shimmerable = .{ .original = link.linked_name };
-            defer name_shim.discardChanges();
-            try interp.unsetVariableInner(det, link.call_frame, &name_shim);
-            return;
-        }
-
-        const call_frame = &interp.call_frames.items[call_frame_idx];
-        const did_remove = try call_frame.variables.remove(det, name.current());
-        if (!did_remove) {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("can't unset \"{s}\": no such variable", .{try name.current().getString()}),
-            };
-            return error.VariableNotFound;
-        }
-        call_frame.call_epoch = interp.nextCallEpoch();
-    } else if (name.current().asType(CachedLexicalVar)) |_| {
-        // A lexical variable lives in a parent scope, not this frame's
-        // variables dictionary, so there's no local slot to remove.
-        if (det) |details| details.* = .{
-            .message = try allocPrintZ("can't unset \"{s}\": no such variable", .{try name.current().getString()}),
-        };
-        return error.VariableNotFound;
-    } else unreachable;
-}
-
-/// Resolves to the variable's value.
-pub fn getVariableInner(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, name: *Shimmerable) error{
-    OutOfMemory,
-    LinkLookupFailed,
-    BadDict,
-    BadVariableName,
-}!?Value {
-    switch (try interp.ensureValidVariableType(det, call_frame_idx, name)) {
-        .not_found => return null,
-        .dict_sugar => {
-            const dict_sugar = try DictSugar.shimmerAssumeValid(name);
-
-            var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
-            defer dict_name.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
-            const resolved_dict = try interp.getVariableInner(det, call_frame_idx, &dict_name) orelse return null;
-            var resolved_dict_shim: Shimmerable = .{ .original = resolved_dict };
-            defer resolved_dict_shim.discardChanges();
-            const lookup_ctx = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
-            const result = Dictionary.getRecursively(null, &resolved_dict_shim, lookup_ctx) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    if (det) |details| details.* = .{ .message = try allocPrintZ(
-                        "variable \"{s}\" is not a valid dictionary",
-                        .{try dict_sugar.dict_name.getString()},
-                    ) };
-                    return error.BadDict;
-                },
-            };
-
-            if (resolved_dict_shim.shimmered.asValue()) |new| {
-                try interp.setVariableInner(det, call_frame_idx, &dict_name, new);
-            }
-
-            return result.asValue();
-        },
-        .normal => {
-            // Fall through.
-        },
-    }
-
-    if (name.current().asType(CachedLocalVar)) |local_var| {
-        const resolved = local_var.dictionary_in.items[local_var.index];
-        if (resolved.asType(UpvarLink)) |upvar_link| {
-            // Recursively follow upvar.
-            var name_in_other_scope: Shimmerable = .{ .original = upvar_link.linked_name };
-            defer name_in_other_scope.discardChanges();
-            return try interp.getVariableInner(det, upvar_link.call_frame, &name_in_other_scope);
-        } else {
-            return local_var.dictionary_in.items[local_var.index];
-        }
-    } else if (name.current().asType(CachedLexicalVar)) |lexical_var| {
-        return lexical_var.ref;
-    } else unreachable;
-}
-
-pub fn getVariableOrErrorInner(
-    interp: *Interp,
-    det: ?*ErrorDetails,
-    call_frame_idx: u32,
-    name: *Shimmerable,
-) error{ VariableNotFound, OutOfMemory, LinkLookupFailed, BadDict, BadVariableName }!Value {
-    return try getVariableInner(interp, det, call_frame_idx, name) orelse {
-        if (det) |details| details.* = .{
-            .message = try allocPrintZ("can't read \"{s}\": no such variable", .{try name.current().getString()}),
-        };
-        return error.VariableNotFound;
-    };
-}
-
-pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !void {
-    if (actual_error_union) |_| {
-        try testing.expectError(expected_error, actual_error_union);
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => try testing.expectError(expected_error, actual_error_union),
-    }
-}
-fn testVariables(ta: std.mem.Allocator) !void {
-    defer heap.testFinish();
-    try heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
-    defer interp.deinit();
-
-    var str_foo: Shimmerable = .{ .original = try objects.String.newValue("foo") };
-    defer str_foo.deinit();
-
-    // Make sure it doesn't resolve to anything.
-    try testing.expectEqual(null, interp.resolveVariable(null, 0, str_foo.current()));
-
-    const str_value = try objects.String.newValue("value");
-    defer str_value.release();
-    try interp.setVariableTo(&str_foo, str_value);
-
-    const cached_lookup = (try interp.resolveVariable(null, 0, str_foo.current())).?.local_variable;
-    const cached_lookup_value = cached_lookup.dictionary_in.items[cached_lookup.index];
-    try testing.expectEqualStrings("value", try cached_lookup_value.getString());
-    // Also try resolving the value from a new string.
-    const str2_foo = try objects.String.newValue("foo");
-    defer str2_foo.release();
-    const lookup = (try interp.resolveVariable(null, 0, str2_foo)).?.local_variable;
-    const lookup_value = lookup.dictionary_in.items[lookup.index];
-    try testing.expectEqualStrings("value", try lookup_value.getString());
-
-    // Next, we test dict sugar.
-    var str_foo_bar: Shimmerable = .{ .original = try objects.String.newValue("foo::bar") };
-    defer str_foo_bar.deinit();
-    const str_baz = try objects.String.newValue("baz");
-    defer str_baz.release();
-
-    // Make sure trying to read a dict value fails when it's not a dict.
-    try expectErrorOrOom(error.BadDict, interp.getVariableInner(null, 0, &str_foo_bar));
-
-    // Clear foo so we can set it to a dictionary.
-    try interp.setVariableInner(null, 0, &str_foo, objects.interned_empty_string.value());
-    try interp.setVariableInner(null, 0, &str_foo_bar, str_baz);
-    try testing.expectEqual(str_baz, (try interp.getVariableInner(null, 0, &str_foo_bar)).?);
-}
-
-test "variable basics" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariables, .{});
-}
-
-fn testVariableLink(ta: std.mem.Allocator) !void {
-    defer heap.testFinish();
-    try heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
-    defer interp.deinit();
-
-    // Create a variable `foo` containing `value`, then upvar `bar` to `foo`.
-    var str_foo: Shimmerable = .{ .original = try objects.String.newValue("foo") };
-    defer str_foo.deinit();
-
-    try testing.expectEqual(null, interp.resolveVariable(null, 0, str_foo.current()));
-    const str_value = try objects.String.newValue("value");
-    defer str_value.release();
-    try interp.setVariableTo(&str_foo, str_value);
-
-    var str_bar: Shimmerable = .{ .original = try objects.String.newValue("bar") };
-    defer str_bar.deinit();
-    try interp.setVariableUpvarInner(null, 0, &str_bar, 0, str_foo.current());
-
-    // Make sure we can get the value of `foo` through `bar`.
-    var lookup_value = (try interp.getVariableInner(null, 0, &str_bar)).?;
-    try testing.expectEqualStrings("value", try lookup_value.getString());
-
-    // Modify `foo` through `bar`.
-    const str_new_value = try objects.String.newValue("new value");
-    defer str_new_value.release();
-    try interp.setVariableInner(null, 0, &str_bar, str_new_value);
-    lookup_value = (try interp.getVariableInner(null, 0, &str_foo)).?;
-    try testing.expectEqualStrings("new value", try lookup_value.getString());
-}
-
-test "variable link" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariableLink, .{});
-}
-
 pub const NativeCommand = struct {
     description: ?[]const u8 = "",
     min_arity: usize = 0,
@@ -1264,9 +678,9 @@ pub fn parseClosure(det: ?*ErrorDetails, bytes: []const u8) !ClosureValues {
     };
     defer as_dict.asHead().release();
 
-    const maybe_name = try as_dict.getNoFollow(interned_name.value());
-    const maybe_impl = try as_dict.getNoFollow(interned_impl.value());
-    const maybe_scope = try as_dict.getNoFollow(interned_scope.value());
+    const maybe_name = try as_dict.getNoFollow(interned_name.get());
+    const maybe_impl = try as_dict.getNoFollow(interned_impl.get());
+    const maybe_scope = try as_dict.getNoFollow(interned_scope.get());
 
     const args, const body = blk: {
         if (maybe_impl.asValue()) |impl| {
@@ -1632,7 +1046,7 @@ fn callNative(interp: *Interp, command: *NativeCommand, args: []Shimmerable) !vo
 
 fn freeLastResult(interp: *Interp) void {
     interp.result.release();
-    interp.result = objects.interned_empty_string.value();
+    interp.result = objects.interned_empty_string.get();
 }
 
 pub fn setResult(interp: *Interp, value: Value) void {
@@ -1770,7 +1184,7 @@ pub fn captureScope(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32) !
     // Make sure there's no upvars, or if there are, resolve them to their values.
     var i: usize = 1;
     while (i < new_dict.items.len) : (i += 2) {
-        if (new_dict.items[i].asType(UpvarLink)) |link| {
+        if (new_dict.items[i].asType(vartypes.UpvarLink)) |link| {
             var name_shim: Shimmerable = .{ .original = link.linked_name };
             defer name_shim.discardChanges();
             if (try interp.getVariableInner(det, link.call_frame, &name_shim)) |linked_value| {
@@ -1837,7 +1251,7 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure
     errdefer variables.asHead().release();
 
     if (signature.scope_hash_ref) |scope_hash_ref| {
-        try variables.put(objects.interned_tilde_parent.get(), scope_hash_ref.inner.asValue());
+        try variables.put(objects.interned_tilde_parent.bytesPtr(), scope_hash_ref.inner.asValue());
     }
 
     const new_call_frame_idx = interp.call_frames.items.len;
@@ -1927,7 +1341,7 @@ fn interpolateTokens(
         new_str_len += (try new_value.getString()).len;
     }
 
-    if (new_str_len == 0) return objects.interned_empty_string.get();
+    if (new_str_len == 0) return objects.interned_empty_string.bytesPtr();
 
     var new_bytes = try heap.global_gpa.alloc(u8, new_str_len);
     errdefer heap.global_gpa.free(new_bytes);
@@ -2108,111 +1522,63 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
     }
 }
 
-pub const IntegerOrFloat = union(enum) {
-    int: i64,
-    float: f64,
-};
-pub fn getIntegerOrFloat(interp: *Interp, shim: *Shimmerable) !IntegerOrFloat {
-    if (shim.tag() == .integer) {
-        return .{ .int = shim.peek().body.integer };
-    } else if (shim.tag() == .float) {
-        return .{ .float = shim.peek().body.float };
-    }
-
-    const int_result = objects.Integer.shimmerFrom(null, shim) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .float = try interp.getFloat(shim) },
-    };
-
-    return .{ .int = int_result };
-}
-
-pub fn getIntegerOrFloatInPlace(interp: *Interp, ref: *Handle) !IntegerOrFloat {
-    var ref_wb: Shimmerable = .{ .original = ref.* };
-    const result = interp.getIntegerOrFloat(&ref_wb);
-    ref.* = ref_wb.consume();
-    return result;
-}
-
-fn exprResultAsBool(interp: *Interp, result: *ExprResult) !bool {
-    switch (result.*) {
-        .int => |int| return int != 0,
-        .float => |float| {
-            try interp.setResultFormatted("expected boolean but got \"{}\"", .{float});
-            return error.BadBoolean;
-        },
-        .owned_handle => |string| return try interp.getBooleanInPlace(string),
-        .stack_handle => |*string| return try interp.getBooleanInPlace(string),
-    }
-}
-
-fn boolToExprResult(value: bool) ExprResult {
-    return .{ .int = @intFromBool(value) };
-}
-
-fn exprResultAsNumber(interp: *Interp, result: *ExprResult) !ExprResult {
-    switch (result.*) {
-        .int, .float => return result.*,
-        .owned_handle => |string| {
-            switch (try interp.getIntegerOrFloatInPlace(string)) {
-                .int => |val| return .{ .int = val },
-                .float => |val| return .{ .float = val },
-            }
-        },
-        .stack_handle => |*string| {
-            switch (try interp.getIntegerOrFloatInPlace(string)) {
-                .int => |val| return .{ .int = val },
-                .float => |val| return .{ .float = val },
-            }
-        },
-    }
-}
-
-pub const negative_denom_message = "negative denominator";
+pub const negative_denom_message = heap.createInternedString("negative denominator");
+pub const division_by_zero_message = heap.createInternedString("division by zero");
 fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
     var det: ErrorDetails = undefined;
     return switch (oper) {
         .mul => blk: {
             break :blk std.math.mul(i64, lhs, rhs) catch {
-                const rendered = std.math.mulWide(i64, lhs, rhs);
-                return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, rendered));
+                const widened = std.math.mulWide(i64, lhs, rhs);
+                return objects.Integer.overflowError(i128, &det, widened);
             };
         },
         .div => std.math.divFloor(i64, lhs, rhs) catch |err| switch (err) {
             error.Overflow => {
-                return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
+                const widened = std.math.divFloor(i65, lhs, rhs) catch unreachable;
+                return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
             },
             error.DivisionByZero => {
-                interp.setResultInterned(.@"division by zero");
+                interp.setResultOwning(division_by_zero_message.get());
                 return error.DivisionByZero;
             },
         },
         .mod => std.math.mod(i64, lhs, rhs) catch |err| switch (err) {
             error.NegativeDenominator => {
-                try interp.setResultString(negative_denom_message);
+                try interp.setResultOwning(negative_denom_message.get());
                 return error.NegativeDenominator;
             },
             error.DivisionByZero => {
-                interp.setResultInterned(.@"division by zero");
+                interp.setResultOwning(division_by_zero_message.get());
                 return error.DivisionByZero;
             },
         },
-        .sub => std.math.sub(i64, lhs, rhs) catch return interp.wrapError(&det, objutil.integerOverflowError(&det, null)),
-        .add => std.math.add(i64, lhs, rhs) catch return interp.wrapError(&det, objutil.integerOverflowError(&det, null)),
+        .sub => std.math.sub(i64, lhs, rhs) catch {
+            const widened = std.math.sub(i65, lhs, rhs) catch unreachable;
+            return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
+        },
+        .add => std.math.add(i64, lhs, rhs) catch {
+            const widened = std.math.add(i65, lhs, rhs) catch unreachable;
+            return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
+        },
         .shiftl => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            if (rhs > 63) break :blk 0;
+            const rhs_constrained: u6 = @intCast(rhs);
             break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) << rhs_constrained));
         },
         .shiftr => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            if (rhs > 63) break :blk 0;
+            const rhs_constrained: u6 = @intCast(rhs);
             break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) >> rhs_constrained));
         },
         .rotl => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            if (rhs > 63) break :blk 0;
+            const rhs_constrained: u6 = @intCast(rhs);
             break :blk @as(i64, @bitCast(std.math.rotl(u64, @bitCast(lhs), rhs_constrained)));
         },
         .rotr => blk: {
-            const rhs_constrained: u6 = @intCast(std.math.clamp(rhs, 0, 64));
+            if (rhs > 63) break :blk 0;
+            const rhs_constrained: u6 = @intCast(rhs);
             break :blk @as(i64, @bitCast(std.math.rotr(u64, @bitCast(lhs), rhs_constrained)));
         },
         .less_than => @intFromBool(lhs < rhs),
@@ -2227,85 +1593,67 @@ fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i6
         .bool_and => @intFromBool((lhs != 0) and (rhs != 0)),
         .bool_or => @intFromBool((lhs != 0) or (rhs != 0)),
         .pow => std.math.powi(i64, lhs, rhs) catch {
-            // Report overflow for both underflow and overflow. Maybe I should report both?
-            return interp.wrapError(&det, objutil.integerOverflowError(&det, null));
+            // Report overflow for both underflow and overflow. Maybe I should report separately?
+            if (det) |details| details.* = .{
+                .message = try allocPrintZ("integer value too big to be represented", .{}),
+            };
+            return error.IntegerOverflow;
         },
         else => unreachable,
     };
 }
 
-fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !ExprResult {
+fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !Value {
     return switch (oper) {
-        .mul => .{ .float = lhs * rhs },
+        .mul => Value.newFloat(lhs * rhs),
         .div => blk: {
             if (rhs == 0.0) {
-                interp.setResultInterned(.@"division by zero");
+                interp.setResultOwning(division_by_zero_message.get());
                 return error.DivisionByZero;
             } else {
                 break :blk .{ .float = lhs / rhs };
             }
         },
-        .mod => .{
-            .float = std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
-                error.DivisionByZero => {
-                    interp.setResultInterned(.@"division by zero");
-                    return error.DivisionByZero;
-                },
-                error.NegativeDenominator => {
-                    try interp.setResultString(negative_denom_message);
-                    return error.NegativeDenominator;
-                },
+        .mod => Value.newFloat(std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
+            error.DivisionByZero => {
+                interp.setResultOwning(division_by_zero_message.get());
+                return error.DivisionByZero;
             },
-        },
-        .sub => .{ .float = lhs - rhs },
-        .add => .{ .float = lhs + rhs },
+            error.NegativeDenominator => {
+                try interp.setResultOwning(negative_denom_message.get());
+                return error.NegativeDenominator;
+            },
+        }),
+        .sub => Value.newFloat(lhs - rhs),
+        .add => Value.newFloat(lhs + rhs),
         .shiftl, .shiftr, .rotl, .rotr => {
             try interp.setResultFormatted("cannot bit shift on floats {} and {}", .{ lhs, rhs });
             return error.BadInteger;
         },
-        .less_than => boolToExprResult(lhs < rhs),
-        .greater_than => boolToExprResult(lhs > rhs),
-        .less_or_equal => boolToExprResult(lhs <= rhs),
-        .greater_or_equal => boolToExprResult(lhs >= rhs),
-        .equal => boolToExprResult(lhs == rhs),
-        .not_equal => boolToExprResult(lhs != rhs),
+        .less_than => Value.newBool(lhs < rhs),
+        .greater_than => Value.newBool(lhs > rhs),
+        .less_or_equal => Value.newBool(lhs <= rhs),
+        .greater_or_equal => Value.newBool(lhs >= rhs),
+        .equal => Value.newBool(lhs == rhs),
+        .not_equal => Value.newBool(lhs != rhs),
         .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or => {
             try interp.setResultFormatted("cannot do bitwise operations on floats {} and {}", .{ lhs, rhs });
             return error.BadInteger;
         },
-        .pow => .{ .float = std.math.pow(f64, lhs, rhs) },
+        .pow => Value.newFloat(std.math.pow(f64, lhs, rhs)),
         else => unreachable,
     };
 }
 
-const ExprResult = union(enum) {
-    int: i64,
-    float: f64,
-    /// An owned handle is owned by the expression. It can be shimmered, replaced, etc.
-    owned_handle: *Handle,
-    /// A temp handle is on the stack, so it needs to be referenced every time.
-    stack_handle: Handle,
+pub fn getIntOrFloatInPlace(interp: *Interp, ref: *Value) !objects.Number {
+    var ref_shim: Shimmerable = .{ .original = ref.* };
+    var det: objects.ErrorDetails = undefined;
+    const result = interp.wrapError(&det, objects.Number.getAsIntOrFloat(&det, &ref_shim));
+    ref.* = ref_shim.consume();
+    return result;
+}
 
-    pub fn release(result: ExprResult) void {
-        switch (result) {
-            .stack_handle => |handle| handle.decrRefCount(),
-            .owned_handle => {
-                // Owned by the expr, so no need to decr ref count.
-            },
-            .int, .float => {},
-        }
-    }
-
-    pub fn toObject(result: ExprResult) !Handle {
-        switch (result) {
-            .int => |int| return try objutil.newInteger(int),
-            .float => |float| return try objutil.newFloat(float),
-            .owned_handle => |handle| return handle.borrow(),
-            .stack_handle => |handle| return handle,
-        }
-    }
-};
-fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !ExprResult {
+fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !Value {
     const node_tag = nodes.items(.tag)[@intFromEnum(node_index)];
     const node_data: *expr_parse.Node.Data = &nodes.items(.data)[@intFromEnum(node_index)];
     switch (node_tag) {
@@ -2336,39 +1684,24 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             defer lhs_value.release();
             var rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
             defer rhs_value.release();
-            const lhs_tag = std.meta.activeTag(lhs_value);
-            const rhs_tag = std.meta.activeTag(rhs_value);
 
             // Fast case, both integers, or both floats.
-            if (lhs_tag == .int and rhs_tag == .int) {
-                return .{
-                    .int = try interp.exprBinaryOperatorInteger(node_tag, lhs_value.int, rhs_value.int),
-                };
-            } else if (lhs_tag == .float and rhs_tag == .float) {
-                return try interp.exprBinaryOperatorFloat(node_tag, lhs_value.float, rhs_value.float);
-            }
+            if (lhs_value.asInt()) |lhs| if (rhs_value.asInt()) |rhs| {
+                return try objects.Integer.new(try interp.exprBinaryOperatorInteger(node_tag, lhs, rhs.int));
+            };
+            if (lhs_value.asFloat()) |lhs| if (rhs_value.asFloat()) |rhs| {
+                return Value.newFloat(try interp.exprBinaryOperatorFloat(node_tag, lhs, rhs));
+            };
 
-            // Slow case: 1. try to get both as integers, 2. try getting both as floats, 3. error.
-            const lhs_converted: ExprResult = try interp.exprResultAsNumber(&lhs_value);
-            const rhs_converted: ExprResult = try interp.exprResultAsNumber(&rhs_value);
+            // Slow case: 1. try to get both as integers, 2. try getting/coercing both to floats, 3. error.
+            const lhs_converted = try interp.getIntOrFloatInPlace(&lhs_value);
+            const rhs_converted = try interp.getIntOrFloatInPlace(&rhs_value);
 
-            if (std.meta.activeTag(lhs_converted) == .int and std.meta.activeTag(rhs_converted) == .int) {
-                return .{
-                    .int = try interp.exprBinaryOperatorInteger(node_tag, lhs_converted.int, rhs_converted.int),
-                };
-            } else {
-                const lhs_as_float: f64 = switch (lhs_converted) {
-                    .int => |int| @floatFromInt(int),
-                    .float => |float| float,
-                    .owned_handle, .stack_handle => unreachable,
-                };
-                const rhs_as_float: f64 = switch (rhs_converted) {
-                    .int => |int| @floatFromInt(int),
-                    .float => |float| float,
-                    .owned_handle, .stack_handle => unreachable,
-                };
-                return try interp.exprBinaryOperatorFloat(node_tag, lhs_as_float, rhs_as_float);
-            }
+            if (lhs_converted.asInt()) |lhs| if (rhs_converted.asInt()) |rhs| {
+                return Value.newInt(try interp.exprBinaryOperatorInteger(node_tag, lhs, rhs));
+            };
+
+            return try interp.exprBinaryOperatorFloat(node_tag, lhs_converted.asFloat(), rhs_converted.asFloat());
         },
         .string_equal,
         .string_not_equal,
@@ -2390,16 +1723,16 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             const lhs_string = switch (lhs_value) {
                 .float => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
                 .int => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_handle => |val| (try val.*.getString())[0..],
-                .stack_handle => |val| (try val.getString())[0..],
+                .owned_value => |val| (try val.*.getString())[0..],
+                .stack_value => |val| (try val.getString())[0..],
             };
             var rhs_buffer: [50]u8 = @splat(0);
             var rhs_alloc = std.heap.FixedBufferAllocator.init(rhs_buffer[0..]);
             const rhs_string = switch (rhs_value) {
                 .float => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
                 .int => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_handle => |val| (try val.*.getString())[0..],
-                .stack_handle => |val| (try val.getString())[0..],
+                .owned_value => |val| (try val.*.getString())[0..],
+                .stack_value => |val| (try val.getString())[0..],
             };
 
             const result = switch (node_tag) {
@@ -2419,26 +1752,21 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .ternary_conditional => {
             const children = node_data.ternary;
             var condition = try interp.evalExpressionNode(nodes, children.@"0");
+            const condition_as_bool = try interp.getBooleanInPlace(interp, &condition);
 
-            if (try exprResultAsBool(interp, &condition)) {
+            if (condition_as_bool) {
                 return interp.evalExpressionNode(nodes, children.@"1");
             } else {
                 return interp.evalExpressionNode(nodes, children.@"2");
             }
         },
-        .string => {
-            const obj = &node_data.object;
-            obj.incrRefCount();
-            return .{ .owned_handle = obj };
-        },
-        .integer => return .{ .int = node_data.integer },
-        .float => return .{ .float = node_data.float },
+        .value => return node_data.value.borrow(),
         .command_subst => {
             const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node_data.object.getHashNoRegister();
             const result = interp.evalObjectInner(interp.callFrameIdx(), node_data.object, nested_cache_key);
 
             if (result) {
-                return .{ .stack_handle = interp.result.borrow() };
+                return .{ .stack_value = interp.result.borrow() };
             } else |err| {
                 return err;
             }
@@ -2448,10 +1776,8 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             var det: ErrorDetails = undefined;
             const var_value = try interp.wrapError(&det, interp.getVariableOrErrorInner(&det, interp.callFrameIdx(), node_data.object));
 
-            return .{ .stack_handle = var_value.borrow() };
+            return .{ .stack_value = var_value.borrow() };
         },
-        .value_false => return .{ .int = 0 },
-        .value_true => return .{ .int = 1 },
         .bool_not => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
@@ -2466,10 +1792,10 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
                     try interp.setResultFormatted("cannot bit invert on float {}", .{val});
                     return error.BadInteger;
                 },
-                .owned_handle => |val| blk: {
+                .owned_value => |val| blk: {
                     break :blk try interp.getIntegerInPlace(val);
                 },
-                .stack_handle => |*val| blk: {
+                .stack_value => |*val| blk: {
                     break :blk try interp.getIntegerInPlace(val);
                 },
             };
@@ -2479,22 +1805,22 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         .identity => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            return try interp.exprResultAsNumber(&result);
+            return try interp.getIntOrFloatInPlace(&result);
         },
         .negation => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
+            const value = try interp.getIntOrFloatInPlace(&result);
             switch (value) {
                 .int => |int| return .{ .int = -int },
                 .float => |float| return .{ .float = -float },
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             }
         },
         .to_int, .to_wide => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
+            const value = try interp.getIntOrFloatInPlace(&result);
             switch (value) {
                 .int => |int| return .{ .int = int },
                 .float => |float| {
@@ -2507,44 +1833,44 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
                     try interp.setResultFormatted("could not convert float \"{}\" to integer", .{float});
                     return error.BadInteger;
                 },
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             }
         },
         .abs => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
+            const value = try interp.getIntOrFloatInPlace(&result);
             switch (value) {
                 .int => |int| {
                     if (@abs(int) > std.math.maxInt(i64)) {
                         var det: ErrorDetails = undefined;
-                        return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, @abs(int)));
+                        return interp.wrapError(&det, objects.Integer.overflowError(u64, &det, @abs(int)));
                     } else {
-                        return .{ .int = @intCast(@abs(int)) };
+                        return Value.newInt(@intCast(@abs(int)));
                     }
                 },
                 .float => |float| return .{ .float = @abs(float) },
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             }
         },
         .to_double => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
+            const value = try interp.getIntOrFloatInPlace(&result);
             switch (value) {
                 .int => |int| return .{ .float = @floatFromInt(int) },
                 .float => return value,
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             }
         },
         .round => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
+            const value = try interp.getIntOrFloatInPlace(&result);
             switch (value) {
                 .float => |float| return .{ .float = @round(float) },
                 .int => return value,
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             }
         },
         .rand => {
@@ -2559,8 +1885,8 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
                     try interp.setResultFormatted("cannot seed random with {}", .{val});
                     return error.BadInteger;
                 },
-                .owned_handle => |val| try interp.getIntegerInPlace(val),
-                .stack_handle => |*val| try interp.getIntegerInPlace(val),
+                .owned_value => |val| try interp.getIntegerInPlace(val),
+                .stack_value => |*val| try interp.getIntegerInPlace(val),
             };
 
             interp.prng.seed(@bitCast(value));
@@ -2585,11 +1911,11 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
         => {
             var result = try interp.evalExpressionNode(nodes, node_data.unary);
             defer result.release();
-            const value = try interp.exprResultAsNumber(&result);
+            const value = try interp.getIntOrFloatInPlace(&result);
             const as_float: f64 = switch (value) {
                 .int => |int| @floatFromInt(int),
                 .float => |float| float,
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             };
 
             const computed = switch (node_tag) {
@@ -2618,17 +1944,17 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
             defer lhs_result.release();
             var rhs_result = try interp.evalExpressionNode(nodes, node_data.binary.@"0");
             defer rhs_result.release();
-            const lhs_number = try interp.exprResultAsNumber(&lhs_result);
-            const rhs_number = try interp.exprResultAsNumber(&rhs_result);
+            const lhs_number = try interp.getIntOrFloatInPlace(&lhs_result);
+            const rhs_number = try interp.getIntOrFloatInPlace(&rhs_result);
             const lhs: f64 = switch (lhs_number) {
                 .int => |int| @floatFromInt(int),
                 .float => |float| float,
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             };
             const rhs: f64 = switch (rhs_number) {
                 .int => |int| @floatFromInt(int),
                 .float => |float| float,
-                .owned_handle, .stack_handle => unreachable,
+                .owned_value, .stack_value => unreachable,
             };
 
             const computed = switch (node_tag) {
@@ -2643,57 +1969,50 @@ fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node
     }
 }
 
-pub fn evalExpression(interp: *Interp, handle: Handle) !ExprResult {
-    // Combine the signature's cache id with the expression's content
-    // hash, so identical expressions at different call sites get their
-    // own cached variable lookups.
+pub fn evalExpression(interp: *Interp, value: Value) !Value {
+    // Combine the signature's cache id with the expression's content hash, so
+    // identical expressions at different call sites get their own cached
+    // variable lookups.
     var det: ErrorDetails = undefined;
-    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try handle.getHashNoRegister();
-    const expr: Heap.ParsedExpression = try interp.wrapError(&det, objutil.getExpression(&det, handle, cache_key));
+    const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
+    const expr: *Expression = try interp.wrapError(&det, Expression.get(&det, value, cache_key));
 
     return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => {
             // Give the caller some context for what failed.
-            try interp.setResultFormatted("error occured when evaluating expression {f}: {f}", .{ handle, interp.result });
+            try interp.setResultFormatted(
+                "error occured when evaluating expression {s}: {s}",
+                .{ try value.getString(), try interp.result.getString() },
+            );
             return error.EvalError;
         },
     };
 }
 
-pub fn getBoolFromExpression(interp: *Interp, handle: Handle) !bool {
-    var expr_result = try interp.evalExpression(handle);
-    defer expr_result.release();
-    const value = interp.exprResultAsBool(&expr_result) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => error.EvalError,
-    };
-    return value;
-}
-
 test "eval expression" {
-    defer Heap.testFinish();
-    try Heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, testing.io);
+    defer heap.testFinish();
     var interp = try Interp.init();
     defer interp.deinit();
 
-    var expr = try objutil.newString("5 + 10");
-    defer expr.decrRefCount();
+    var expr = try String.newValue("5 + 10");
+    defer expr.release();
     const result = try interp.evalExpression(expr);
-    try testing.expectEqual(ExprResult{ .int = 15 }, result);
+    try testing.expectEqual(Value.newInt(15), result);
 }
 
-pub fn evalSubstitution(interp: *Interp, handle: Handle, flags: Tokenizer.SubstFlags) !Handle {
-    var cache_key: u256 = try handle.getHashNoRegister();
-    // Combine the signature's cache id with the expression's content
-    // hash, so identical expressions at different call sites get their
-    // own cached variable lookups.
+pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFlags) !Value {
+    var cache_key: u256 = try value.getHashNoRegister();
+    // Combine the signature's cache id with the expression's content hash, so
+    // identical expressions at different call sites get their own cached
+    // variable lookups.
     cache_key ^= @as(u256, interp.callFrame().signature.cache_id);
     // Also make sure to include the flags in the cache id.
     cache_key ^= @as(u256, @as(u3, @bitCast(flags))) << @sizeOf(@TypeOf(interp.callFrame().signature.cache_id));
 
     var det: ErrorDetails = undefined;
-    const subst: Heap.Substitution = try interp.wrapError(&det, objutil.getSubstitution(&det, handle, cache_key, flags));
+    const subst: Substitution = try interp.wrapError(&det, Substitution.get(&det, handle, cache_key, flags));
     assert(subst.flags == flags); // Integrity check.
 
     return try interp.interpolateTokens(subst.subst.tags.items, subst.subst.values, 0, @intCast(subst.subst.tags.items.len));
@@ -3027,7 +2346,8 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Handle, parsed: Heap.Pa
 pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_key: u256) EvalError!void {
     // Try to get the script, parsing if necessary.
     var det: ErrorDetails = undefined;
-    const parsed: Heap.ParsedScript = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key));
+    const parsed: Script = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key)).borrow();
+    defer parsed.release();
     // Don't evaluate empty scripts.
     if (parsed.tags.items.len <= 1) return;
 
@@ -3318,14 +2638,16 @@ pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
 }
 
 /// Shimmers `wb` to `.bool`. Returns the `bool` value.
-pub fn getBoolean(interp: *Interp, wb: *objutil.Shimmerable) !bool {
+pub fn getBoolean(interp: *Interp, wb: *Shimmerable) !bool {
     try interp.wrapShimmerFn(wb, objutil.shimmerToBoolean);
     return wb.peek().body.bool.data;
 }
 
-pub fn getBooleanInPlace(interp: *Interp, ref: *Handle) !bool {
-    try interp.wrapShimmerInPlaceFn(ref, objutil.shimmerToBoolean);
-    return ref.peek().body.bool.data;
+pub fn getBooleanInPlace(interp: *Interp, ref: *Value) !bool {
+    if (ref.asBool()) |as_bool| return as_bool;
+    var det: ErrorDetails = undefined;
+    const as_bool = try interp.wrapError(&det, objects.Boolean.fromString(&det, try ref.getString()));
+    ref.swap(Value.newBool(as_bool));
 }
 
 /// Shimmers `wb` to `.index`. Returns the `Heap.ListIndex` value.
@@ -3398,12 +2720,9 @@ pub fn setVariableSilent(interp: *Interp, name: *Shimmerable, handle: Handle) !v
     try interp.setVariableInner(null, interp.callFrameIdx(), name.*, handle.dupOrRef());
 }
 
-pub fn setVariableTo(interp: *Interp, name: *Shimmerable, handle: Value) !void {
-    try name.ensureShimmerable();
+pub fn setVariable(interp: *Interp, name: *Shimmerable, value: Value) !void {
     var det: ErrorDetails = undefined;
-    // `setVariableInner` borrows `handle` (it takes its own ref before storing),
-    // so we pass it straight through and let the caller keep owning `handle`.
-    try interp.wrapError(&det, interp.setVariableInner(&det, interp.callFrameIdx(), name, handle));
+    try interp.wrapError(&det, variables.setVariable(interp, &det, interp.callFrameIdx(), name, value));
 }
 
 pub fn getVariable(interp: *Interp, name: *Shimmerable) !OptionalHandle {

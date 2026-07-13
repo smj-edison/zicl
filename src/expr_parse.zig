@@ -4,10 +4,10 @@ const Writer = std.Io.Writer;
 
 const Tokenizer = @import("Tokenizer.zig");
 // Used to store parsed strings.
-const Heap = @import("Heap.zig");
-const Handle = Heap.Handle;
-const OptionalHandle = Heap.OptionalHandle;
-const objutil = @import("objutil.zig");
+const heap = @import("heap.zig");
+const Value = heap.Value;
+const OptionalValue = heap.OptionalValue;
+const objects = @import("objects.zig");
 const Token = Tokenizer.Token;
 
 const TokenIndex = u32;
@@ -24,9 +24,7 @@ pub const Node = struct {
         unary: Index,
         binary: struct { Index, Index },
         ternary: struct { Index, Index, Index },
-        object: Handle,
-        integer: i64,
-        float: f64,
+        value: Value,
     };
 
     pub const Tag = enum(u8) {
@@ -64,13 +62,9 @@ pub const Node = struct {
         // Ternary
         ternary_conditional,
         // Value
-        string,
-        integer,
-        float,
+        value,
         command_subst,
         variable_subst,
-        value_false,
-        value_true,
         // Unary operators
         bool_not,
         bit_not,
@@ -184,7 +178,7 @@ pub const Parse = struct {
 
     gpa: std.mem.Allocator,
     source: []const u8,
-    source_file_name: OptionalHandle,
+    source_file_name: OptionalValue,
     tokens: Tokens,
     nodes: std.MultiArrayList(Node),
     err: ?Error,
@@ -360,22 +354,17 @@ pub const Parse = struct {
             },
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try objutil.newString(p.source[loc.start..loc.end]);
-                errdefer handle.decrRefCount();
+                const str = try objects.String.newValue(p.source[loc.start..loc.end]);
+                errdefer str.release();
 
                 return try p.addNode(.{
                     .tag = .string,
-                    .data = .{ .object = handle },
+                    .data = .{ .object = str },
                 });
             },
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try Heap.createObject();
-                errdefer handle.decrRefCount();
-                objutil.setStringFromEscaped(handle, p.source[loc.start..loc.end]) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.OtherThreadSet => unreachable,
-                };
+                const handle = try objects.String.newFromEscaped(p.source[loc.start..loc.end]);
 
                 return try p.addNode(.{
                     .tag = .string,
@@ -384,18 +373,13 @@ pub const Parse = struct {
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                const command_handle = try objutil.newString(p.source[loc.start..loc.end]);
-                errdefer command_handle.decrRefCount();
-
-                // Be sure to save the source info.
-                try objutil.setSourceInfo(command_handle, .{
-                    .file_name = p.source_file_name,
-                    .line_no = loc.line_no,
-                });
+                const command_obj = (try objects.Source.new(p.source_file_name, loc.line_no)).asHead();
+                errdefer command_obj.release();
+                try command_obj.setStringDuplicating(p.source[loc.start..loc.end]);
 
                 return try p.addNode(.{
                     .tag = .command_subst,
-                    .data = .{ .object = command_handle },
+                    .data = .{ .value = command_obj.asValue() },
                 });
             },
             .variable_subst,
@@ -403,8 +387,8 @@ pub const Parse = struct {
             .keyword_true,
             => {
                 const loc = p.tokenLoc(p.nextToken());
-                var string_handle = try objutil.newString(p.source[loc.start..loc.end]);
-                errdefer string_handle.decrRefCount();
+                var string_handle = try objects.String.newValue(p.source[loc.start..loc.end]);
+                errdefer string_handle.release();
 
                 return try p.addNode(.{
                     .tag = switch (token) {
@@ -413,7 +397,7 @@ pub const Parse = struct {
                         .keyword_true => .value_true,
                         inline else => unreachable,
                     },
-                    .data = .{ .object = string_handle },
+                    .data = .{ .value = string_handle },
                 });
             },
             .end_of_file => return null,
@@ -546,10 +530,9 @@ pub const Parse = struct {
         return p.parseExprPrecedence(0, .{});
     }
 
-    /// Does not borrow source_file_name.
-    pub fn init(source_file_name: OptionalHandle, source: []const u8, tokens: Tokens) Parse {
+    pub fn init(source_file_name: OptionalValue, source: []const u8, tokens: Tokens) Parse {
         return .{
-            .gpa = Heap.global_gpa,
+            .gpa = heap.global_gpa,
             .source = source,
             .source_file_name = source_file_name,
             .tokens = tokens,
@@ -777,14 +760,7 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
     for (0..nodes.len) |i| {
         const node = nodes.get(i);
         switch (node.tag) {
-            .variable_subst,
-            .value_false,
-            .value_true,
-            .command_subst,
-            .string,
-            => {
-                node.data.object.decrRefCount();
-            },
+            .variable_subst, .command_subst, .value => node.data.value.release(),
             else => {},
         }
     }
@@ -793,8 +769,8 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
 }
 
 test "expr parsing" {
-    defer Heap.testFinish();
-    try Heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, testing.Io);
+    defer heap.testFinish();
 
     // Left associativity.
     try testExprParse("1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");

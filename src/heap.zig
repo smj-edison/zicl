@@ -264,7 +264,7 @@ pub const HashRegistry = struct {
                         return;
                     }
 
-                    entry_derefed.representative.hash_metadata.fetchAdd(.{}, .acq_rel);
+                    _ = entry_derefed.representative.hash_metadata.fetchAnd(.{}, .acq_rel);
                     assert(registry.entries.remove(key));
                     registry.rw_lock.unlock(global_io);
 
@@ -433,6 +433,14 @@ pub const Value = enum(ValueBacking) {
         }
     }
 
+    pub fn asBool(value: Value) ?bool {
+        return switch (value.expandedValue()) {
+            .false => false,
+            .true => true,
+            else => null,
+        };
+    }
+
     pub fn asType(value: Value, T: type) ?*T {
         const obj = value.asPtr() orelse return null;
         if (obj.vtable == &T.vtable) return obj.castTo(T);
@@ -562,6 +570,8 @@ pub const Value = enum(ValueBacking) {
 
     pub fn newFloat(value: f64) Value {
         const rep: ValueRep = @bitCast(value);
+        // TODO instead of asserting here, it might be better to mask out the bits
+        // after the value.
         if (rep.head.nan_value == 0x0FFF) assert(rep.head.tag == .canonical_nan);
         return @enumFromInt(@as(ValueBacking, @bitCast(value)));
     }
@@ -680,13 +690,13 @@ pub fn createInternedString(comptime bytes: []const u8) type {
         const interned_str = combined;
 
         /// Pointer to the bytes (just past the length prefix), NUL-terminated.
-        pub fn get() [*:0]const u8 {
+        pub fn bytesPtr() [*:0]const u8 {
             const s = interned_str.ptr[@sizeOf(usize)..(interned_str.len - 1) :0];
             return s.ptr;
         }
 
-        pub fn value() Value {
-            const ptr = get();
+        pub fn get() Value {
+            const ptr = bytesPtr();
             return Value.fromRep(.{
                 .head = .{ .tag = .interned },
                 .value = .{ .interned = @intCast(@intFromPtr(ptr)) },

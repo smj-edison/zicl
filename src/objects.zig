@@ -24,6 +24,7 @@ pub const interned_tilde_parent = heap.createInternedString("~parent");
 
 pub const ErrorDetails = struct {
     message: [:0]u8,
+    index: ?u32 = null,
 };
 
 pub const Shimmerable = extern struct {
@@ -216,8 +217,6 @@ pub fn allocPrintZ(comptime fmt: []const u8, args: anytype) error{OutOfMemory}![
     return try std.fmt.allocPrintSentinel(heap.global_gpa, fmt, args, 0);
 }
 
-// Start of objects. //
-
 pub const None = struct {
     pub fn new(bytes: [:0]const u8) !*None {
         const new_obj = try Object.newObjectUninitialized(None);
@@ -404,111 +403,6 @@ test "object test string" {
     try testing.checkAllAllocationFailures(testing.allocator, testString, .{});
 }
 
-/// This is the script object internal representation. It is an array
-/// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
-///
-/// For example the script:
-///
-/// puts hello
-/// set $i $x$y [foo]BAR
-///
-/// will produce a ParsedScript with the following token/object pairs:
-///
-/// | .start_of_command  | 2     |
-/// | .simple_string     | puts  |
-/// | .simple_string     | hello |
-/// | .start_of_command  | 4     |
-/// | .simple_string     | set   |
-/// | .variable_subst    | i     |
-/// | .start_of_word     | 2     |
-/// | .variable_subst    | x     |
-/// | .variable_subst    | y     |
-/// | .start_of_word     | 2     |
-/// | .command_subst     | foo   |
-/// | .simple_string     | BAR   |
-///
-/// "puts hello" has two args (.start_of_command 2), composed of single tokens.
-/// (Note that the .start_of_command token is omitted for the common case of a
-/// single token.)
-///
-/// "set $i $x$y [foo]BAR" has four (.start_of_command 4) args, the first word
-/// has 1 token (.simple_string set), and the last has two tokens
-/// (.start_of_word 2 .command_subst foo .simple_string BAR)
-///
-/// The precomputation of the command structure makes eval() faster,
-/// and simpler because there aren't dynamic lengths / allocations.
-///
-/// -- {*} handling --
-///
-/// Expand is handled in a special way.
-///
-///   If a "word" begins with {*}, the corrisponding object type is ".none".
-///
-/// For example the command:
-///
-/// list {*}{a b}
-///
-/// Will produce the following pairs:
-///
-/// | .start_of_command | 2     |
-/// | .simple_string | list  |
-/// | .start_of_word | .none |
-/// | .braced_string | a b   |
-///
-/// Note that the '.start_of_command' token also contains the source information
-/// for the first word of the line for error reporting purposes
-///
-/// -- the substFlags field of the structure --
-///
-/// The `scriptObj` structure is used to represent both "script" objects
-/// and "subst" objects. In the second case, there are no `LIN` and `WRD`
-/// tokens. Instead `SEP` and `EOL` tokens are added as-is.
-/// In addition, the field `substFlags` is used to represent the flags used to turn
-/// the string into the internal representation.
-/// If these flags do not match what the application requires,
-/// the scriptObj is created again. For example the script:
-///
-/// subst -nocommands $string
-/// subst -novariables $string
-///
-/// Will (re)create the internal representation of the $string object
-/// two times.
-///
-pub const ParsedScript = struct {
-    /// Tokens array.
-    tags: std.ArrayList(Tokenizer.Token.Tag),
-    /// The associated values for their corresponding tokens.
-    values: []Value,
-
-    pub fn printTokens(script: *const ParsedScript) void {
-        const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
-
-        var line: u64 = 0;
-        for (script.tags.items, script.values, 0..) |token, value, i| {
-            switch (token) {
-                .start_of_command => {
-                    const command_details = ParsedScriptCommand.castFrom(value.asPtr().?);
-                    line = command_details.line;
-                    ioutil.debug(
-                        formatting ++ "line: {}, word count: {}\n",
-                        .{ i, line, @tagName(token), command_details.line, command_details.word_count },
-                    );
-                },
-                .start_of_word => ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
-                else => {
-                    const str = value.getString() catch "<oom string>";
-                    ioutil.debug(formatting ++ "{s}\n", .{ i, line, @tagName(token), str });
-                },
-            }
-        }
-    }
-
-    pub fn deinit(parsed: *ParsedScript) void {
-        parsed.tags.deinit(heap.global_gpa);
-        for (parsed.values) |value| value.release();
-    }
-};
-
 pub const Source = struct {
     file_name: OptionalValue,
     line_no: u32,
@@ -520,6 +414,10 @@ pub const Source = struct {
         new_obj.body.line_no = line;
 
         return new_obj.body;
+    }
+
+    pub fn asHead(self: *Source) *Object {
+        return Object.from(Source, self);
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -948,9 +846,9 @@ pub const Integer = struct {
         return Object.from(String, self);
     }
 
-    pub fn integerOverflowError(det: ?*ErrorDetails, rendered_int: []const u8) error{ OutOfMemory, IntegerOverflow } {
+    pub fn overflowError(IntType: type, det: ?*ErrorDetails, rendered_int: IntType) error{ OutOfMemory, IntegerOverflow } {
         if (det) |details| details.* = .{
-            .message = try std.fmt.allocPrint("integer value \"{s}\" too big to be represented", .{rendered_int}),
+            .message = try std.fmt.allocPrint("integer value \"{}\" too big to be represented", .{rendered_int}),
         };
         return error.IntegerOverflow;
     }
@@ -966,7 +864,7 @@ pub const Integer = struct {
                 return error.BadInteger;
             },
             error.Overflow => {
-                return integerOverflowError(det, bytes);
+                return overflowError(det, bytes);
             },
         }
     }
@@ -1022,6 +920,37 @@ pub const Integer = struct {
         .enumerate_struct = null,
         .name = @typeName(Integer),
     };
+};
+
+/// Generic helper functions to deal with numbers.
+pub const Number = union(enum) {
+    integer: i64,
+    float: f64,
+
+    pub fn getAsIntOrFloat(det: ?*ErrorDetails, shim: *Shimmerable) !Number {
+        if (shim.current().asInt()) |int| return .{ .integer = int };
+        if (shim.current().asFloat()) |float| return .{ .float = float };
+
+        const as_int = Integer.shimmerFrom(null, shim) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .float = try Float.shimmer(det, shim) },
+        };
+        return .{ .integer = as_int };
+    }
+
+    pub fn asInt(number: Number) ?i64 {
+        return switch (number) {
+            .integer => |int| int,
+            else => null,
+        };
+    }
+
+    pub fn asFloat(number: Number) f64 {
+        return switch (number) {
+            .float => |float| float,
+            .int => |int| @floatFromInt(int),
+        };
+    }
 };
 
 /// Enum names joined by ", "
@@ -1308,40 +1237,31 @@ test "subcommand parser" {
 }
 
 pub const Boolean = struct {
-    value: bool,
-
-    pub fn newBoxed(value: bool) !*Boolean {
-        const new_obj = try Object.newObject(Boolean);
-        new_obj.body.value = value;
-        return new_obj.body;
-    }
-
     pub fn new(value: bool) Value {
         return Value.newBool(value);
     }
 
-    fn updateString(obj: *Object) !void {
-        try obj.setStringDuplicatingIgnoreRace(if (obj.castTo(Boolean).value) "true" else "false");
+    pub fn fromString(det: ?*ErrorDetails, bytes: []const u8) !bool {
+        if (std.mem.eql(u8, bytes, "true")) {
+            return true;
+        } else if (std.mem.eql(u8, bytes, "false")) {
+            return false;
+        }
+
+        if (det) |details| details.* = .{
+            .message = try allocPrintZ("expected boolean but got \"{s}\"", .{bytes}),
+        };
+        return error.BadBoolean;
     }
 
-    fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(Boolean);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj.head);
-
-        new_obj.body.value = src.constCastTo(Boolean).value;
-
-        return new_obj.head;
+    pub fn getFromValue(det: ?*ErrorDetails, value: Value) !Value {
+        return try fromString(det, try value.getString());
     }
 
-    pub const vtable: Object.VTable = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-        .update_string = updateString,
-        .make_crossthread = null,
-        .enumerate_struct = null,
-        .name = @typeName(Boolean),
-    };
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !bool {
+        const as_bool = try fromString(det, try shim.current().getString());
+        shim.shimmered.swap(Value.newBool(as_bool));
+    }
 };
 
 pub const ParsedScriptCommand = struct {
@@ -1511,7 +1431,7 @@ pub const List = struct {
 
         while (true) {
             const next_token = parser.nextListToken() catch |err| {
-                if (det) |details| details.* = .{ .message = try convertTokenizerError(err) };
+                if (det) |details| details.* = .{ .message = try Tokenizer.convertTokenizerError(err) };
                 return error.BadList;
             };
             switch (next_token.tag) {
@@ -1551,20 +1471,6 @@ pub const List = struct {
         return as_list;
     }
 
-    fn convertTokenizerError(err: Tokenizer.Error) error{OutOfMemory}![:0]u8 {
-        return switch (err) {
-            error.CharactersAfterCloseBrace => try heap.global_gpa.dupeSentinel(u8, "extra characters after close-brace", 0),
-            error.MissingCloseBrace => try heap.global_gpa.dupeSentinel(u8, "missing close-brace", 0),
-            error.MissingCloseBracket => try heap.global_gpa.dupeSentinel(u8, "unmatched \"[\"", 0),
-            error.MissingCloseQuote => try heap.global_gpa.dupeSentinel(u8, "missing quote", 0),
-            error.TrailingBackslash => try heap.global_gpa.dupeSentinel(u8, "no character after \\", 0),
-            error.FunctionMissingParentheses => try heap.global_gpa.dupeSentinel(u8, "function missing parentheses", 0),
-            error.NotOperator => try heap.global_gpa.dupeSentinel(u8, "not operator", 0),
-            error.NotNumber => try heap.global_gpa.dupeSentinel(u8, "not number", 0),
-            error.NotVariable => unreachable,
-        };
-    }
-
     pub fn asHead(self: *List) *Object {
         return Object.from(List, self);
     }
@@ -1599,6 +1505,7 @@ pub const List = struct {
     }
 
     fn makeCrossthread(obj: *Object) void {
+        if (obj.metadata.cross_thread) return;
         const as_list = obj.castTo(List);
         for (as_list.items) |item| item.makeCrossthread();
     }
@@ -1845,7 +1752,7 @@ pub const Dictionary = struct {
     pub fn resolveParentDict(dict: *Dictionary, det: ?*ErrorDetails) error{ LinkLookupFailed, OutOfMemory }!?*const Dictionary {
         assert(dict.asHead().canShimmer());
 
-        const tilde_parent = interned_tilde_parent.value();
+        const tilde_parent = interned_tilde_parent.get();
         if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
             var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
             defer hash_ref_shim.discardChanges();
@@ -2011,7 +1918,7 @@ pub const Dictionary = struct {
 
     /// Remove all links from a dict and combine them into one dict.
     pub fn flattenInner(dict: *const Dictionary, det: ?*ErrorDetails) !?*Dictionary {
-        if ((try dict.getNoFollow(interned_tilde_parent.value())).asValue()) |parent_hash_ref| {
+        if ((try dict.getNoFollow(interned_tilde_parent.get())).asValue()) |parent_hash_ref| {
             var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
             defer parent_hash_ref_shim.discardChanges();
             const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
@@ -2047,7 +1954,7 @@ pub const Dictionary = struct {
         if ((try dict.getNoFollow(key)).asValue()) |val| return val.asOptional();
 
         // Wasn't in this dictionary, so check if it's in a parent dict.
-        const tilde_parent = interned_tilde_parent.value();
+        const tilde_parent = interned_tilde_parent.get();
         const parent_dict: ?*const Dictionary = blk: {
             if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
                 var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
