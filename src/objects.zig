@@ -19,7 +19,6 @@ const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
 // const expr_parse = @import("expr_parse.zig");
 
-pub const interned_empty_string = heap.createInternedString("");
 pub const interned_tilde_parent = heap.createInternedString("~parent");
 
 pub const ErrorDetails = struct {
@@ -103,7 +102,7 @@ pub const Shimmerable = extern struct {
 };
 
 /// `T` must never mutate after this point, but it can shimmer.
-pub fn AlwaysType(T: type) type {
+pub fn AlwaysCanBeType(T: type) type {
     return struct {
         const Self = @This();
 
@@ -111,6 +110,10 @@ pub fn AlwaysType(T: type) type {
 
         pub fn init(value: *T) Self {
             return .{ .inner = Object.from(T, value).borrow() };
+        }
+
+        pub fn initOwning(value: *T) Self {
+            return .{ .inner = Object.from(T, value) };
         }
 
         pub fn deinit(self: *Self) void {
@@ -125,21 +128,40 @@ pub fn AlwaysType(T: type) type {
 
         pub fn get(self: *Self) error{OutOfMemory}!*const T {
             var shim: Shimmerable = .{ .original = self.inner.asValue() };
-            const result: T = T.shimmerFrom(null, &shim) catch |err| switch (err) {
+            const result: *const T = T.shimmerFrom(null, &shim) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
             if (shim.shimmered.asValue()) |val| {
                 // Got a new value, probably since `inner` became crossthread.
-                if (val.asPtr()) |obj| {
-                    const old = self.inner;
-                    self.inner = obj;
-                    old.release();
-                } else {
-                    // We can safely drop the new value, since it's a primitive.
-                }
+                if (val.asPtr()) |obj| Object.swap(&self.inner, obj);
+                // If `shim.shimmered` is a primitive, we can safely drop it.
             }
             return result;
+        }
+
+        pub fn getMutable(self: *Self) error{OutOfMemory}!*T {
+            if (self.inner.canMutate()) {
+                // Since we own it, we know it should never have changed types.
+                return self.inner.castTo(T);
+            } else {
+                const duped = try self.inner.duplicate();
+                errdefer duped.release();
+                var shim: Shimmerable = .{ .original = duped.asValue() };
+                defer shim.discardChanges();
+
+                // Duplicated objects may not always have the same type, so we
+                // need to shimmer it to the type the caller is expecting.
+                _ = T.shimmerFrom(null, &shim) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable,
+                };
+
+                if (shim.shimmered.asValue()) |val| if (val.asPtr()) |obj| Object.swap(&self.inner, obj);
+
+                assert(self.inner.canMutate());
+                return self.inner.castTo(T);
+            }
         }
     };
 }
@@ -299,12 +321,15 @@ pub const String = struct {
     }
 
     pub fn newFromEscaped(escaped: []const u8) !*String {
-        // Unescaped will be equal or shorter than escaped version.
-        const unescaped = try heap.global_gpa.alloc(u8, escaped.len);
+        // Unescaped will be equal or shorter than escaped version (including null).
+        var unescaped = try heap.global_gpa.alloc(u8, escaped.len + 1);
         defer heap.global_gpa.free(unescaped);
         const written = strutil.removeEscaping(escaped, unescaped);
 
-        return try new(unescaped[0..written]);
+        unescaped = try heap.global_gpa.realloc(unescaped, written + 1);
+        unescaped[written] = 0x00;
+
+        return try newOwning(unescaped[0..written :0]);
     }
 
     pub fn newWithCodepointLength(bytes: []const u8, codepoint_len: usize) !*String {
@@ -408,12 +433,30 @@ pub const Source = struct {
     line_no: u32,
     hash: std.atomic.Value(?*u256),
 
-    pub fn new(file_name: OptionalValue, line: u32) !*Source {
-        const new_obj = try Object.newObject(Source);
-        new_obj.body.file_name = file_name.borrow();
-        new_obj.body.line_no = line;
+    pub fn new(bytes: []const u8, file_name: OptionalValue, line: u32) !*Source {
+        const obj = try String.newObject(bytes);
 
-        return new_obj.body;
+        obj.vtable = vtable;
+        const as_source = obj.castTo(Source);
+        as_source.* = .{
+            .file_name = file_name.borrow(),
+            .line_no = line,
+        };
+
+        return obj;
+    }
+
+    pub fn newFromEscaped(escaped: []const u8, file_name: OptionalValue, line: u32) !*Source {
+        const obj = (try String.newFromEscaped(escaped)).asHead();
+
+        obj.vtable = vtable;
+        const as_source = obj.castTo(Source);
+        as_source.* = .{
+            .file_name = file_name.borrow(),
+            .line_no = line,
+        };
+
+        return as_source;
     }
 
     pub fn asHead(self: *Source) *Object {
@@ -1264,26 +1307,6 @@ pub const Boolean = struct {
     }
 };
 
-pub const ParsedScriptCommand = struct {
-    line: u32,
-    word_count: u32,
-
-    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const command = obj.constCastTo(ParsedScriptCommand);
-        try ctx.addField(u32, info, "line", "{}", command.line);
-        try ctx.addField(u32, info, "word_count", "{}", command.word_count);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = null,
-        .update_string = null,
-        .free_internal_rep = null,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(ParsedScriptCommand),
-    };
-};
-
 fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
     var fallback = std.heap.stackFallback(64, gpa);
     // `stackFallback.get()` asserts it's called once, so reuse the stored allocator for both alloc and free.
@@ -1366,11 +1389,15 @@ pub const List = struct {
 
     /// `list` must be mutable.
     pub fn append(list: *List, value: Value) !void {
-        assert(list.asHead().canMutate());
         if (list.capacity < list.items.len + 1) try list.ensureCapacity(@max(4, list.capacity * 2));
+        list.appendAssumeCapacity(value);
+    }
+
+    pub fn appendAssumeCapacity(list: *List, value: Value) void {
+        assert(list.asHead().canMutate());
 
         const old_len = list.items.len;
-        list.items = list.items.ptr[0..(old_len + 1)];
+        list.items = list.backingSlice()[0..(old_len + 1)];
         list.items[old_len] = value.borrow();
     }
 

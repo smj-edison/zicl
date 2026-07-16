@@ -318,6 +318,7 @@ const ValueRep = packed struct(ValueBacking) {
     };
 };
 
+pub const interned_empty_string = createInternedString("");
 pub const OptionalValue = enum(ValueBacking) {
     none = @bitCast(ValueRep.none_value),
     _,
@@ -354,6 +355,10 @@ pub const OptionalValue = enum(ValueBacking) {
 
     pub fn orElse(optional: OptionalValue, otherwise: Value) Value {
         return optional.asValue() orelse otherwise;
+    }
+
+    pub fn orEmpty(optional: OptionalValue) Value {
+        return optional.orElse(interned_empty_string.get());
     }
 
     pub fn swap(ref: *OptionalValue, new: Value) void {
@@ -1196,6 +1201,12 @@ pub const Object = struct {
                 obj.deinit();
             }
         }
+    }
+
+    pub fn swap(ref: **Object, new: *Object) void {
+        const old = ref.*;
+        ref.* = new;
+        old.release();
     }
 
     fn freeStringInner(obj: *Object) void {

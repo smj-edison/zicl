@@ -698,7 +698,7 @@ pub fn getVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
     } else unreachable;
 }
 
-pub fn getVariableOrErrorInner(
+pub fn getVariableOrError(
     interp: *Interp,
     det: ?*ErrorDetails,
     call_frame_idx: u32,

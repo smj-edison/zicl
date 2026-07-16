@@ -6,26 +6,29 @@ const assert = std.debug.assert;
 
 const pcre2 = @import("pcre2");
 
+const strutil = @import("strutil.zig");
 const ioutil = @import("ioutil.zig");
 const memutil = @import("memutil.zig");
 const StructIterator = memutil.StructIterator;
-const strutil = @import("strutil.zig");
+const Tokenizer = @import("Tokenizer.zig");
 const heap = @import("heap.zig");
 const hashutil = heap.hashutil;
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
-const Tokenizer = @import("Tokenizer.zig");
 const objects = @import("objects.zig");
 const vartypes = @import("vartypes.zig");
-const expr_parse = @import("expr_parse.zig");
 const allocPrintZ = objects.allocPrintZ;
 const Shimmerable = objects.Shimmerable;
 const ErrorDetails = objects.ErrorDetails;
-const IterHelper = objects.IterHelper;
 const Dictionary = objects.Dictionary;
 const String = objects.String;
 const List = objects.List;
+const evaltypes = @import("evaltypes.zig");
+const Closure = evaltypes.Closure;
+const ReturnCode = evaltypes.ReturnCode;
+const Script = evaltypes.Script;
+const Expression = evaltypes.Expression;
 
 const Interp = @This();
 /// The result from a procedure or eval call
@@ -52,7 +55,7 @@ max_call_depth: usize,
 /// Depth of [unknown] calls. Used to catch infinite recursion.
 unknown_depth: usize,
 /// String containing `unknown`. Used to cache unknown lookup.
-unknown_str: Value = heap.makeInterned("unknown"),
+unknown_str: Value = heap.createInternedString("unknown").get(),
 /// If this is greater than 0, it means we're catching and handling
 /// signals. Otherwise signals are ignored. This gets incremented
 /// when running [catch -signal].
@@ -68,7 +71,7 @@ loop_propagate: u32 = 0,
 /// Used for propagating a return code up multiple eval levels.
 return_propagate: struct {
     left_to_go: u32 = 0,
-    return_at_end: ?EvalError = null,
+    return_at_end: ?evaltypes.EvalError = null,
 } = .{},
 /// Stack trace captured at the error site.
 stack_trace: OptionalValue,
@@ -99,39 +102,23 @@ const FullHashContext = struct {
         return a == b;
     }
 };
-const ParsedScripts = memutil.LruCache(u256, *Script, FullHashContext);
+const ParsedScripts = memutil.LruCache(u256, *evaltypes.Script, FullHashContext);
 const ParsedExpressions = memutil.LruCache(u256, *Expression, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, ClosureValues, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, evaltypes.ClosureValues, FullHashContext);
 pub const Substitution = struct {
-    subst: *Script,
+    subst: *evaltypes.Script,
     /// Currently only used for integrity checks.
     flags: Tokenizer.SubstFlags,
 };
 const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
 
-pub const CommandHashTable = std.StringArrayHashMapUnmanaged(NativeCommand);
-pub const CommandFn = fn (interp: *Interp, args: []Shimmerable) Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Shimmerable) callconv(.c) ReturnCode;
-
-pub const EvalError = error{
-    OutOfMemory,
-    EvalError,
-    PropagateResult,
-    Break,
-    Continue,
-    Signal,
-    Exit,
-};
-pub const Error = EvalError || error{
-    WrongUsage,
-    Tailcall,
-};
+pub const CommandHashTable = std.StringArrayHashMapUnmanaged(evaltypes.NativeCommand);
 
 const interned_name = heap.createInternedString("name");
 const interned_impl = heap.createInternedString("impl");
 const interned_scope = heap.createInternedString("scope");
 
-pub fn narrowError(err: anyerror) EvalError {
+pub fn narrowError(err: anyerror) evaltypes.EvalError {
     return switch (err) {
         error.Break => error.Break,
         error.Continue => error.Continue,
@@ -144,7 +131,7 @@ pub fn narrowError(err: anyerror) EvalError {
 }
 pub fn narrowToEvalError(result: anytype) blk: {
     const info = @typeInfo(@TypeOf(result));
-    break :blk if (info == .error_set) EvalError else EvalError!info.error_union.payload;
+    break :blk if (info == .error_set) evaltypes.EvalError else evaltypes.EvalError!info.error_union.payload;
 } {
     if (@typeInfo(@TypeOf(result)) == .error_set) {
         return narrowError(result);
@@ -166,7 +153,7 @@ fn wrapErrorDetailsReturnType(ResultType: type) type {
 }
 /// Used to convert from an object error to an interpreter error (e.g. putting
 /// it in the interpreter result, instead of det)
-pub fn wrapError(interp: *Interp, det: *objects.ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
+pub fn wrapError(interp: *Interp, det: *ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
     if (comptime std.meta.activeTag(@typeInfo(@TypeOf(result))) == .error_set) {
         if (result == error.OutOfMemory) {
             return error.OutOfMemory;
@@ -186,454 +173,7 @@ pub fn wrapError(interp: *Interp, det: *objects.ErrorDetails, result: anytype) w
     };
 }
 
-/// This is the script object internal representation. It is an array
-/// of Tokenizer.Tokens alongside a heap-stored list for all tokens' values.
-///
-/// For example the script:
-///
-/// puts hello
-/// set $i $x$y [foo]BAR
-///
-/// will produce a ParsedScript with the following token/object pairs:
-///
-/// | .start_of_command  | 2     |
-/// | .simple_string     | puts  |
-/// | .simple_string     | hello |
-/// | .start_of_command  | 4     |
-/// | .simple_string     | set   |
-/// | .variable_subst    | i     |
-/// | .start_of_word     | 2     |
-/// | .variable_subst    | x     |
-/// | .variable_subst    | y     |
-/// | .start_of_word     | 2     |
-/// | .command_subst     | foo   |
-/// | .simple_string     | BAR   |
-///
-/// "puts hello" has two args (.start_of_command 2), composed of single tokens.
-/// (Note that the .start_of_command token is omitted for the common case of a
-/// single token.)
-///
-/// "set $i $x$y [foo]BAR" has four (.start_of_command 4) args, the first word
-/// has 1 token (.simple_string set), and the last has two tokens
-/// (.start_of_word 2 .command_subst foo .simple_string BAR)
-///
-/// The precomputation of the command structure makes eval() faster,
-/// and simpler because there aren't dynamic lengths / allocations.
-///
-/// -- {*} handling --
-///
-/// Expand is handled in a special way.
-///
-///   If a "word" begins with {*}, the corrisponding object type is ".none".
-///
-/// For example the command:
-///
-/// list {*}{a b}
-///
-/// Will produce the following pairs:
-///
-/// | .start_of_command | 2     |
-/// | .simple_string | list  |
-/// | .start_of_word | .none |
-/// | .braced_string | a b   |
-///
-/// Note that the '.start_of_command' token also contains the source information
-/// for the first word of the line for error reporting purposes
-///
-/// -- the substFlags field of the structure --
-///
-/// The `scriptObj` structure is used to represent both "script" objects
-/// and "subst" objects. In the second case, there are no `LIN` and `WRD`
-/// tokens. Instead `SEP` and `EOL` tokens are added as-is.
-/// In addition, the field `substFlags` is used to represent the flags used to turn
-/// the string into the internal representation.
-/// If these flags do not match what the application requires,
-/// the scriptObj is created again. For example the script:
-///
-/// subst -nocommands $string
-/// subst -novariables $string
-///
-/// Will (re)create the internal representation of the $string object
-/// two times.
-///
-pub const Script = struct {
-    ref_count: usize = 1,
-    /// Tokens array.
-    tags: std.ArrayList(Tokenizer.Token.Tag),
-    /// The associated values for their corresponding tokens.
-    values: []Value,
-
-    pub fn printTokens(script: *const Script) void {
-        const formatting = "[{: >3}@{: >3}]  .{s: <20}  ";
-
-        var line: u64 = 0;
-        for (script.tags.items, script.values, 0..) |token, value, i| {
-            switch (token) {
-                .start_of_command => {
-                    const command_details = value.asType(objects.ParsedScriptCommand).?;
-                    line = command_details.line;
-                    ioutil.debug(
-                        formatting ++ "line: {}, word count: {}\n",
-                        .{ i, line, @tagName(token), command_details.line, command_details.word_count },
-                    );
-                },
-                .start_of_word => ioutil.debug(formatting ++ "{}\n", .{ i, line, @tagName(token), value.body.integer }),
-                else => {
-                    const str = value.getString() catch "<oom string>";
-                    ioutil.debug(formatting ++ "{s}\n", .{ i, line, @tagName(token), str });
-                },
-            }
-        }
-    }
-
-    pub fn deinit(parsed: *Script) void {
-        parsed.tags.deinit(heap.global_gpa);
-        for (parsed.values) |value| value.release();
-    }
-
-    pub fn borrow(script: *Script) *Script {
-        script.ref_count += 1;
-        return script;
-    }
-
-    pub fn release(script: *Script) void {
-        script.ref_count -= 1;
-        if (script.ref_count == 0) heap.global_gpa.free(script);
-    }
-};
-
-pub const Expression = struct {
-    ref_count: u32,
-    root_node: expr_parse.Node.Index,
-    nodes: std.MultiArrayList(expr_parse.Node),
-
-    pub fn parse(det: ?*ErrorDetails, value: Value) !*Expression {
-        const file_name: OptionalValue = if (value.asType(objects.Source)) |val| val.file_name.borrow() else .none;
-        const line_no: u32 = if (value.asType(objects.Source)) |val| val.line_no else 1;
-
-        // Parse all the tokens of the expr, handling any errors that come up.
-        const bytes = try value.getString();
-        var tokenizer = Tokenizer.init(bytes, line_no);
-        var tokens = std.MultiArrayList(Tokenizer.Token).empty;
-        defer tokens.deinit(heap.global_gpa);
-        while (true) {
-            const next_token = tokenizer.nextExpressionToken();
-            if (next_token) |token| {
-                try tokens.append(heap.global_gpa, token);
-                if (token.tag == .end_of_file) break;
-            } else |err| if (det) |details| {
-                details.* = try Tokenizer.convertTokenizerError(heap.global_gpa, err);
-                if (tokenizer.error_details) |parser_details| {
-                    details.index = parser_details.index;
-                }
-                return err;
-            }
-        }
-
-        if (tokens.len == 0) {
-            if (det) |details| details.* = .{
-                .message = try heap.global_gpa.dupeSentinel(u8, "empty expression", 0),
-            };
-            return error.ParseError;
-        }
-
-        // Next, go ahead and parse the expression from the tokens.
-        var parser = expr_parse.Parse.init(file_name, bytes, tokens.slice());
-        errdefer parser.deinit();
-        if (parser.parseExpr()) |root_node| {
-            const new_expr = try heap.global_gpa.create(Expression);
-            // Note we don't deinit parser here, since we take ownership.
-            new_expr.* = .{ .nodes = parser.node, .root_node = root_node.? };
-            return new_expr;
-        } else |err| {
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ParseError => {
-                    if (det) |details| {
-                        var aw = std.Io.Writer.Allocating.init(heap.global_gpa);
-                        errdefer aw.deinit();
-                        const err_details = parser.err.?;
-                        parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
-
-                        details.* = .{
-                            .message = aw.toOwnedSlice(),
-                            .index = err_details.sourceIndex(&parser),
-                        };
-                    }
-                    return error.ParseError;
-                },
-            }
-        }
-    }
-
-    pub fn get(interp: *Interp, value: Value, cache_key: u256) !*Expression {
-        if (interp.parsed_exprs.get(cache_key)) |parsed| {
-            return parsed;
-        } else {
-            var det: objects.ErrorDetails = undefined;
-            const new_expr = try wrapError(&det, parse(&det, value));
-            if (interp.parsed_scripts.put(cache_key, new_expr)) |ejected| ejected.release();
-
-            return new_expr;
-        }
-    }
-
-    pub fn deinit(expr: *Expression) void {
-        expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
-        expr.* = undefined;
-    }
-
-    pub fn borrow(script: *Script) *Script {
-        script.ref_count += 1;
-        return script;
-    }
-
-    pub fn release(script: *Script) void {
-        script.ref_count -= 1;
-        if (script.ref_count == 0) heap.global_gpa.free(script);
-    }
-};
-
-pub const ClosureValues = struct {
-    /// Argument list of the procedure.
-    args: objects.AlwaysType(List),
-    /// Default values of optional arguments.
-    optional_values: ?objects.AlwaysType(List),
-    /// Value for the script's body.
-    body: Value,
-    /// We do our best to track the closure's name.
-    name: OptionalValue,
-    /// Hash reference pointing to the scope.
-    scope_hash_ref: ?objects.AlwaysType(objects.HashReference),
-    /// Whether `args` is provided as an argument name. `args`, if present, is always
-    /// the last argument name.
-    has_args_parameter: bool,
-    /// Whether this is a method. If so, `self` is injected as the first variable at call time.
-    is_method: bool,
-    /// Unique identifier for cache keying.
-    cache_id: u64,
-
-    pub fn requiredArity(closure: *const ClosureValues) usize {
-        return closure.args.len - closure.optional_values.len - if (closure.has_args_parameter) 1 else 0;
-    }
-
-    pub fn duplicate(closure: *const ClosureValues) ClosureValues {
-        const borrowed_args = closure.args.duplicate();
-        const borrowed_optional_values = if (closure.optional_values) |val| val.duplicate() else null;
-        const borrowed_hash_ref = if (closure.scope_hash_ref) |val| val.duplicate() else null;
-
-        return .{
-            .args = borrowed_args,
-            .optional_values = borrowed_optional_values,
-            .body = closure.body.borrow(),
-            .name = closure.name.borrow(),
-            .scope_hash_ref = borrowed_hash_ref,
-            .has_args_parameter = closure.has_args_parameter,
-            .is_method = closure.is_method,
-            .cache_id = closure.cache_id,
-        };
-    }
-
-    pub fn deinit(closure: *ClosureValues) void {
-        closure.args.deinit();
-        if (closure.optional_values) |vals| vals.deinit();
-
-        closure.body.release();
-        closure.name.release();
-        if (closure.scope_hash_ref) |ref| ref.deinit();
-
-        closure.* = undefined;
-    }
-
-    pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const closure: *const ClosureValues = @ptrCast(@alignCast(info.node));
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.follow(Object, "args", closure.args.inner);
-        try helper.followOptional(Object, "optional_values", if (closure.optional_values) |val| val.inner else null);
-        try helper.followValue("body", closure.body);
-        try helper.followOptionalValue("name", closure.name);
-        try helper.followOptional(Object, "scope_hash_ref", if (closure.scope_hash_ref) |val| val.inner else null);
-        try helper.addField(bool, "has_args_parameter", "{}", closure.has_args_parameter);
-        try helper.addField(bool, "is_method", "{}", closure.is_method);
-        try helper.addField(u64, "cache_id", "{}", closure.cache_id);
-    }
-};
-
-pub const Closure = struct {
-    closure: *ClosureValues,
-
-    fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(Closure);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj.head);
-        errdefer new_obj.head.invalidateString();
-
-        const new_closure = try heap.global_gpa.create(ClosureValues);
-        errdefer heap.global_gpa.destroy(new_closure);
-        new_closure.* = try src.constCastTo(Closure).closure.duplicate();
-
-        new_obj.body.* = .{ .closure = new_closure };
-
-        return new_obj.head;
-    }
-
-    fn freeInternalRep(src: *Object) void {
-        const as_closure = src.castTo(Closure);
-        as_closure.closure.deinit();
-        heap.global_gpa.destroy(as_closure.closure);
-    }
-
-    fn updateString(obj: *Object) !void {
-        const as_closure = obj.castTo(Closure);
-        const closure = as_closure.closure;
-        const required = closure.requiredArity();
-        const optional = closure.optional_values.len;
-
-        const args = try closure.args.get();
-        const optional_values = if (closure.optional_values) |val| try val.get() else null;
-
-        // Step 1: Rebuild the arguments list from required and optional args.
-
-        var rebuilt_args = try heap.local_arena.alloc([]const u8, closure.args.len);
-
-        // Get all the strings (we'll overwrite the strings for the optional arguments).
-        for ((try closure.args.get()).items, &rebuilt_args) |arg, *str| str.* = try arg.getString();
-
-        // Next, copy over the optional args.
-        var optional_written: usize = 0;
-        while (optional_written < optional) : (optional_written += 1) {
-            const name_and_value: [2][]const u8 = .{
-                try args.items[required + optional_written].getString(), // Argument name.
-                try optional_values.?.items[optional_written].getString(), // Default value.
-            };
-            const bytes = try strutil.quoteStrings(heap.local_arena, name_and_value);
-            rebuilt_args[required + optional_written] = bytes;
-        }
-
-        // Combine all the arguments together to get the args string.
-        const args_as_string = try strutil.quoteStrings(heap.local_arena, rebuilt_args);
-
-        // Step 2: build the closure string from its parts.
-
-        // Build the closure: fn|method ?name <name>? impl <impl> ?scope <scope>?
-        var backing: [7][]const u8 = undefined;
-        var result = std.ArrayList([]const u8).initBuffer(&backing);
-
-        result.appendAssumeCapacity(if (closure.is_method) "method" else "fn");
-
-        if (closure.name.asValue()) |val| {
-            result.appendAssumeCapacity("name");
-            result.appendAssumeCapacity(try val.getString());
-        }
-
-        // `impl` is a two element list: {args body}.
-        const args_and_body: [2][]const u8 = .{ args_as_string, try closure.body.getString() };
-        result.appendAssumeCapacity("impl");
-        result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, args_and_body));
-
-        if (closure.scope_hash_ref) |hash_ref| {
-            result.appendAssumeCapacity("scope");
-            result.appendAssumeCapacity(try hash_ref.asHead().getString());
-        }
-
-        try obj.setStringDuplicating(try strutil.quoteStrings(heap.local_arena, result.items));
-    }
-
-    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const closure = obj.constCastTo(Closure);
-        const helper: IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.follow(ClosureValues, "closure", closure.closure);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = duplicate,
-        .free_internal_rep = freeInternalRep,
-        .update_string = updateString,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(Closure),
-    };
-};
-
-pub const NativeCommand = struct {
-    description: ?[]const u8 = "",
-    min_arity: usize = 0,
-    max_arity: ?usize = null,
-    /// If the command argument length needs to be a multiple of some
-    /// amount, set this. A good example is `dict create`, as it needs
-    /// an even number of arguments.
-    multiple_of: ?usize = null,
-
-    call_info: union(enum) {
-        zig: *const CommandFn,
-        c: *const CCommandFn,
-    },
-
-    /// Returns a string containing all the usage information. Allocates the string
-    /// onto `gpa`. Produces something like `cmd ...`, or `cmd arg1 arg2 ?arg3?`
-    pub fn getUsageInfo(command: *NativeCommand, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
-        var aw = std.Io.Writer.Allocating.init(gpa);
-        defer aw.deinit();
-
-        // Write command name.
-        aw.writer.writeAll(command_name) catch return error.OutOfMemory;
-
-        if (command.description) |description| {
-            aw.writer.print(" {s}", .{description}) catch return error.OutOfMemory;
-        } else {
-            aw.writer.writeAll(" ...") catch return error.OutOfMemory;
-        }
-
-        return try aw.toOwnedSlice();
-    }
-
-    pub fn minArity(command: NativeCommand) usize {
-        switch (command.call_info) {
-            .zig => |info| return info.min_arity,
-            .c => |info| return @intCast(info.min_arity),
-        }
-    }
-
-    pub fn maxArity(command: NativeCommand) ?usize {
-        switch (command.call_info) {
-            .zig => |info| return info.max_arity,
-            .c => |info| if (info.max_arity >= 0) {
-                return @intCast(info.max_arity);
-            } else return null,
-        }
-    }
-
-    pub fn multipleOf(command: NativeCommand) ?usize {
-        switch (command.call_info) {
-            .zig => |info| return info.multiple_of,
-            .c => |info| if (info.multiple_of >= 0) {
-                return @intCast(info.multiple_of);
-            } else return null,
-        }
-    }
-};
-
-fn getClosureUsage(closure: *const ClosureValues, command_name: []const u8) ![]u8 {
-    var aw = std.Io.Writer.Allocating.init(heap.local_arena);
-    aw.writer.writeAll(command_name) catch return error.OutOfMemory;
-
-    const optional_start = if (closure.has_args_parameter) closure.required_arity - 1 else closure.required_arity;
-    for (0..closure.args.len) |i| {
-        const var_name = try closure.args[i].getString();
-
-        if (i == closure.args.len - 1 and closure.has_args_parameter) {
-            aw.writer.writeAll(" ?arg ...?") catch return error.OutOfMemory;
-        } else if (i >= optional_start) {
-            aw.writer.print(" ?{s}?", .{var_name}) catch return error.OutOfMemory;
-        } else {
-            aw.writer.print(" {s}", .{var_name}) catch return error.OutOfMemory;
-        }
-    }
-
-    return try aw.toOwnedSlice();
-}
-
-pub fn registerCommand(interp: *Interp, name: []const u8, command: NativeCommand) !void {
+pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.NativeCommand) !void {
     try interp.global_commands.put(heap.global_gpa, name, command);
 
     const as_nativefn = try strutil.quoteStrings(heap.global_gpa, &.{ "nativefn", name });
@@ -651,258 +191,8 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: NativeCommand
     _ = interp.nextProcedureEpoch();
 }
 
-var closure_cache_id: std.atomic.Value(u64) = .init(0);
-pub fn parseClosure(det: ?*ErrorDetails, bytes: []const u8) !ClosureValues {
-    const is_method, const prefix_len = blk: {
-        if (bytes.len > 3 and std.mem.eql(u8, bytes[0..3], "fn "))
-            break :blk .{ false, @as(usize, 3) };
-        if (bytes.len > 7 and std.mem.eql(u8, bytes[0..7], "method "))
-            break :blk .{ true, @as(usize, 7) };
-        if (det) |details| details.* = .{
-            .message = try allocPrintZ("not a valid function: \"{s}\"", .{bytes}),
-        };
-        return error.BadClosure;
-    };
-
-    var closure_value: Shimmerable = .{ .original = try String.newValue(bytes[prefix_len..]) };
-    defer closure_value.deinit();
-
-    const as_dict = Dictionary.shimmerFrom(null, &closure_value) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("not a valid function: \"{s}\"", .{bytes}),
-            };
-            return error.BadClosure;
-        },
-    };
-    defer as_dict.asHead().release();
-
-    const maybe_name = try as_dict.getNoFollow(interned_name.get());
-    const maybe_impl = try as_dict.getNoFollow(interned_impl.get());
-    const maybe_scope = try as_dict.getNoFollow(interned_scope.get());
-
-    const args, const body = blk: {
-        if (maybe_impl.asValue()) |impl| {
-            var impl_wb: Shimmerable = .{ .original = impl };
-            defer impl_wb.discardChanges();
-            const as_list = List.shimmerFrom(null, &impl_wb) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    if (det) |details| details.* = .{
-                        .message = try allocPrintZ("not a valid function implementation: \"{s}\"", .{bytes}),
-                    };
-                    return error.BadClosure;
-                },
-            };
-
-            if (as_list.items.len != 2) {
-                if (det) |details| details.* = .{
-                    .message = try allocPrintZ("not a valid function implementation: \"{s}\"", .{bytes}),
-                };
-                return error.BadClosure;
-            }
-
-            break :blk .{
-                as_list.items[0].borrow(),
-                as_list.items[1].borrow(),
-            };
-        } else {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("function missing implementation: \"{s}\"", .{bytes}),
-            };
-            return error.BadClosure;
-        }
-    };
-    defer args.release();
-    errdefer body.release();
-
-    var args_shim: Shimmerable = .{ .original = args };
-    defer args_shim.discardChanges();
-    const args_as_list = try List.shimmerFrom(null, &args_shim) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("function args is not a valid list: \"{f}\"", .{args}),
-            };
-            return error.BadClosure;
-        },
-    };
-
-    // Scope must always be a hash reference.
-    var scope_hash_ref: ?*objects.HashReference = null;
-    if (maybe_scope.asValue()) |scope| {
-        var scope_wb: Shimmerable = .{ .original = scope };
-        defer scope_wb.discardChanges();
-        const hash_ref = try objects.HashReference.shimmerFrom(det, &scope_wb);
-        hash_ref.asHead().borrow();
-        scope_hash_ref = hash_ref;
-    }
-    errdefer if (scope_hash_ref) |ref| ref.asHead().release();
-
-    const parsed_args = try parseClosureArgList(args_as_list);
-
-    return .{
-        .args = parsed_args.arg_names,
-        .optional_values = parsed_args.optional_values,
-        .body = body,
-        .name = maybe_name.borrow(),
-        .scope_hash_ref = scope_hash_ref,
-        .has_args_parameter = parsed_args.has_args_parameter,
-        .is_method = is_method,
-        .cache_id = closure_cache_id.fetchAdd(1, .monotonic),
-    };
-}
-
-const ParsedArgList = struct {
-    arg_names: []Value,
-    optional_values: []Value,
-    has_args_parameter: bool,
-
-    pub fn deinit(self: *ParsedArgList) void {
-        for (self.arg_names) |val| val.release();
-        heap.global_gpa.free(self.arg_names);
-        for (self.optional_values) |val| val.release();
-        heap.global_gpa.free(self.optional_values);
-        self.* = undefined;
-    }
-};
-
-/// Validates a closure argument list and extracts arity information.
-pub fn parseClosureArgList(det: ?*ErrorDetails, args: *List) !ParsedArgList {
-    var arg_names = try List.new(&.{});
-    defer arg_names.asHead().release();
-    var optional_values: ?*List = null;
-    defer if (optional_values) |val| val.asHead().release();
-
-    var args_parameter_found = false;
-    for (0..args.items.len) |i| {
-        if (args_parameter_found) {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("parameter after 'args' not allowed"),
-            };
-            return error.BadClosure;
-        }
-
-        var arg_shim: Shimmerable = .{ .original = args.items[i] };
-        defer arg_shim.discardChanges();
-        const arg_as_list = List.shimmerFrom(null, &arg_shim) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                if (det) |details| details.* = .{ .message = try allocPrintZ(
-                    "malformed argument name \"{s}\"",
-                    .{try arg_shim.current().getString()},
-                ) };
-                return error.BadClosure;
-            },
-        };
-
-        if (arg_as_list.items.len == 0) {
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("argument with no name", .{}),
-            };
-            return error.BadClosure;
-        } else if (arg_as_list.items.len > 2) {
-            if (det) |details| details.* = .{ .message = try allocPrintZ(
-                "too many fields in argument specifier \"{f}\"",
-                .{arg_shim.current()},
-            ) };
-            return error.BadClosure;
-        } else if (arg_as_list.items.len == 2) {
-            // Optional parameter.
-            if (optional_values == null) {
-                // We haven't created a list for optional args yet, so we'll go ahead and init it.
-                optional_values = try List.new(&.{});
-            }
-
-            if (try arg_as_list.items[0].equalsString("args")) {
-                if (det) |details| details.* = .{
-                    .message = try allocPrintZ("\"args\" must be a required parameter", .{}),
-                };
-                return error.BadClosure;
-            }
-
-            // Add the optional parameter onto the optional parameters list.
-            try optional_values.?.append(arg_as_list.items[1]);
-
-            // Pull out the name from the default list (`{name default}`).
-            try arg_names.append(arg_as_list.items[0]);
-        } else {
-            if (optional_values != null) {
-                if (det) |details| details.* = .{
-                    .message = try allocPrintZ("required parameter after optional parameter not allowed", .{}),
-                };
-                return error.BadClosure;
-            }
-
-            if (arg_as_list.items[0].equalsString("args")) {
-                args_parameter_found = true;
-            }
-
-            try arg_names.append(arg_as_list.items[0]);
-        }
-    }
-
-    const arg_names_slice = try heap.global_gpa.dupe(Value, arg_names.items);
-    errdefer heap.global_gpa.free(arg_names_slice);
-    for (arg_names_slice) |val| val.incrRefCount();
-    errdefer for (arg_names_slice) |val| val.release();
-
-    var optional_values_slice: []Value = &.{};
-    if (optional_values) |opt_values| {
-        const duped = try heap.global_gpa.dupe(Value, opt_values);
-        errdefer heap.global_gpa.free(duped);
-        for (duped) |val| val.incrRefCount();
-        optional_values_slice = duped;
-    }
-
-    return .{
-        .arg_names = arg_names_slice,
-        .optional_values = optional_values_slice,
-        .has_args_parameter = args_parameter_found,
-    };
-}
-
-const ClosureAndCacheKey = struct {
-    closure: *const ClosureValues,
-    cache_key: u256,
-};
-/// Caller is responsible for borrowing the returned closure
-/// if they intend to use it beyond temporarily.
-pub fn getClosure(interp: *Interp, det: ?*ErrorDetails, value: Value, can_be_method: bool) !ClosureAndCacheKey {
-    const closure_and_key: ClosureAndCacheKey = blk: {
-        if (value.asType(Closure)) |closure| {
-            break :blk .{ .closure = &closure.closure, .cache_key = @as(u256, closure.closure.cache_id) };
-        }
-
-        const cache_key = try value.getHashNoRegister();
-
-        if (interp.parsed_closures.getPtr(cache_key)) |cached| {
-            break :blk .{ .closure = &cached.closure, .cache_key = cache_key };
-        } else {
-            // We need to parse the closure.
-            const closure = try parseClosure(det, try value.getString());
-            if (interp.parsed_closures.put(cache_key, .{ .closure = closure })) |old_value| {
-                var old = old_value;
-                old.closure.deinit();
-            }
-            const cached = interp.parsed_closures.getPtr(cache_key).?;
-            break :blk .{ .closure = cached.closure, .cache_key = cache_key };
-        }
-    };
-
-    if (!can_be_method and closure_and_key.closure.is_method) {
-        if (det) |details| details.* = .{
-            .message = try allocPrintZ("method cannot be invoked as function"),
-        };
-        return error.CannotBeMethod;
-    }
-
-    return closure_and_key;
-}
-
 /// If called with a closure, this will _modify_ `args[1]`, not just shimmer it.
-pub fn callClosure(interp: *Interp, closure: *const ClosureValues, cache_key: u256, args: []Shimmerable) !void {
+pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: u256, args: []Shimmerable) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -911,7 +201,7 @@ pub fn callClosure(interp: *Interp, closure: *const ClosureValues, cache_key: u2
     const too_many_arguments: bool = !has_args and arg_count > closure.required_arity + closure.optional_arity;
     if (too_few_arguments or too_many_arguments) {
         // Wrong argument count, error accordingly.
-        const command_usage = try getClosureUsage(heap.local_arena, try args[0].current().getString());
+        const command_usage = try closure.getUsage(heap.local_arena, try args[0].current().getString());
         interp.setResultFormatted("wrong # args: should be \"{s}\"", .{command_usage});
         return error.WrongUsage;
     }
@@ -1001,7 +291,7 @@ pub fn callClosure(interp: *Interp, closure: *const ClosureValues, cache_key: u2
     }
 }
 
-fn callNative(interp: *Interp, command: *NativeCommand, args: []Shimmerable) !void {
+fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimmerable) !void {
     const arg_count = args.len - 1;
     wrong_arg_count: {
         // Check arg count.
@@ -1149,11 +439,11 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
 /// Call frame.
 const CallFrame = struct {
     /// Dictionary containing the frame's variables.
-    variables: *objects.Dictionary,
+    variables: objects.AlwaysCanBeType(Dictionary),
     /// Arguments of this procedure call. Lifetime managed by creator.
     args: []Shimmerable,
     /// Signature of this procedure.
-    signature: ClosureValues,
+    signature: Closure.Content,
     /// Call epoch. Used to invalidate previous variable lookups.
     call_epoch: u64,
     /// Set this during evaluation to trigger a tailcall.
@@ -1167,7 +457,7 @@ const CallFrame = struct {
 };
 
 pub fn callFrameIdx(interp: *Interp) u32 {
-    return interp.currentEvalFrame().call_frame;
+    return interp.evalFrame().call_frame;
 }
 
 pub fn callFrame(interp: *Interp) *CallFrame {
@@ -1238,15 +528,15 @@ pub const EvalFrame = struct {
     currently_evaluating: Value,
 };
 
-pub fn currentEvalFrameIndex(interp: *Interp) u32 {
+pub fn evalFrameIdx(interp: *Interp) u32 {
     return @intCast(interp.eval_frames.items.len - 1);
 }
 
-pub fn currentEvalFrame(interp: *Interp) *EvalFrame {
-    return &interp.eval_frames.items[interp.currentEvalFrameIndex()];
+pub fn evalFrame(interp: *Interp) *EvalFrame {
+    return &interp.eval_frames.items[interp.evalFrameIdx()];
 }
 
-fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const ClosureValues) !u32 {
+fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure.Content) !u32 {
     var variables = try Dictionary.new(&.{});
     errdefer variables.asHead().release();
 
@@ -1274,7 +564,7 @@ fn pushEvalFrame(interp: *Interp, call_frame: u32, script: Value) !u32 {
         .current_line = 0,
         .currently_evaluating = script,
     });
-    return interp.currentEvalFrameIndex();
+    return interp.evalFrameIdx();
 }
 
 fn popEvalFrame(interp: *Interp) void {
@@ -1313,8 +603,8 @@ fn interpolateTokens(
     interp: *Interp,
     tags: []const Tokenizer.Token.Tag,
     value_list: []const Value,
-    value_start: u32,
-    value_len: u32,
+    value_start: usize,
+    value_len: usize,
 ) !Value {
     var new_values = try std.ArrayList(Value).initCapacity(heap.local_arena, value_len);
     defer for (new_values.items) |value| value.decrRefCount();
@@ -1341,7 +631,7 @@ fn interpolateTokens(
         new_str_len += (try new_value.getString()).len;
     }
 
-    if (new_str_len == 0) return objects.interned_empty_string.bytesPtr();
+    if (new_str_len == 0) return heap.interned_empty_string.get();
 
     var new_bytes = try heap.global_gpa.alloc(u8, new_str_len);
     errdefer heap.global_gpa.free(new_bytes);
@@ -1355,9 +645,51 @@ fn interpolateTokens(
     return (try String.newOwning(new_bytes)).asHead().asValue();
 }
 
+pub fn getScript(interp: *Interp, det: ?*ErrorDetails, value: Value, cache_key: u256) !Script {
+    if (interp.parsed_scripts.get(cache_key)) |parsed| {
+        return parsed.script;
+    } else {
+        const new_script = try Script.parse(det, value);
+        if (interp.parsed_scripts.put(cache_key, new_script)) |ejected| ejected.release();
+        return new_script;
+    }
+}
+
+pub const ClosureAndCacheKey = struct {
+    closure: *Closure.Content,
+    cache_key: u256,
+};
+pub fn getClosure(interp: *Interp, det: ?*ErrorDetails, value: Value, can_be_method: bool) !ClosureAndCacheKey {
+    const closure_and_key: ClosureAndCacheKey = blk: {
+        if (value.asType(Closure)) |closure| {
+            break :blk .{ .closure = closure.closure, .cache_key = @as(u256, closure.closure.cache_id) };
+        }
+
+        const cache_key = try value.getHashNoRegister();
+
+        if (interp.parsed_closures.getPtr(cache_key)) |cached| {
+            break :blk .{ .closure = cached.closure, .cache_key = cache_key };
+        } else {
+            // We need to parse the closure.
+            const closure = try Closure.parse(det, try value.getString());
+            if (interp.parsed_closures.put(cache_key, closure)) |ejected| ejected.release();
+            break :blk .{ .closure = closure, .cache_key = cache_key };
+        }
+    };
+
+    if (!can_be_method and closure_and_key.closure.is_method) {
+        if (det) |details| details.* = .{
+            .message = try allocPrintZ("method cannot be invoked as function"),
+        };
+        return error.CannotBeMethod;
+    }
+
+    return closure_and_key;
+}
+
 const CommandOrClosure = union(enum) {
     closure: ClosureAndCacheKey,
-    command: *NativeCommand,
+    command: *evaltypes.NativeCommand,
 };
 
 fn getCommandInner(
@@ -1458,7 +790,7 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     try interp.invokeCommand(unknown_cmd, new_args);
 }
 
-const CommandError = Error || error{InfiniteRecursion};
+const CommandError = evaltypes.Error || error{InfiniteRecursion};
 fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Shimmerable) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
@@ -1473,7 +805,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
     var tailcall_info: ?Tailcall = null;
     defer if (tailcall_info) |info| heap.global_gpa.free(info.args);
     while (true) {
-        interp.currentEvalFrame().args = args;
+        interp.evalFrame().args = args;
         // TODO implement tracing.
 
         // Be sure to clear the previous result.
@@ -1522,450 +854,15 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
     }
 }
 
-pub const negative_denom_message = heap.createInternedString("negative denominator");
-pub const division_by_zero_message = heap.createInternedString("division by zero");
-fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
-    var det: ErrorDetails = undefined;
-    return switch (oper) {
-        .mul => blk: {
-            break :blk std.math.mul(i64, lhs, rhs) catch {
-                const widened = std.math.mulWide(i64, lhs, rhs);
-                return objects.Integer.overflowError(i128, &det, widened);
-            };
-        },
-        .div => std.math.divFloor(i64, lhs, rhs) catch |err| switch (err) {
-            error.Overflow => {
-                const widened = std.math.divFloor(i65, lhs, rhs) catch unreachable;
-                return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
-            },
-            error.DivisionByZero => {
-                interp.setResultOwning(division_by_zero_message.get());
-                return error.DivisionByZero;
-            },
-        },
-        .mod => std.math.mod(i64, lhs, rhs) catch |err| switch (err) {
-            error.NegativeDenominator => {
-                try interp.setResultOwning(negative_denom_message.get());
-                return error.NegativeDenominator;
-            },
-            error.DivisionByZero => {
-                interp.setResultOwning(division_by_zero_message.get());
-                return error.DivisionByZero;
-            },
-        },
-        .sub => std.math.sub(i64, lhs, rhs) catch {
-            const widened = std.math.sub(i65, lhs, rhs) catch unreachable;
-            return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
-        },
-        .add => std.math.add(i64, lhs, rhs) catch {
-            const widened = std.math.add(i65, lhs, rhs) catch unreachable;
-            return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
-        },
-        .shiftl => blk: {
-            if (rhs > 63) break :blk 0;
-            const rhs_constrained: u6 = @intCast(rhs);
-            break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) << rhs_constrained));
-        },
-        .shiftr => blk: {
-            if (rhs > 63) break :blk 0;
-            const rhs_constrained: u6 = @intCast(rhs);
-            break :blk @as(i64, @bitCast(@as(u64, @bitCast(lhs)) >> rhs_constrained));
-        },
-        .rotl => blk: {
-            if (rhs > 63) break :blk 0;
-            const rhs_constrained: u6 = @intCast(rhs);
-            break :blk @as(i64, @bitCast(std.math.rotl(u64, @bitCast(lhs), rhs_constrained)));
-        },
-        .rotr => blk: {
-            if (rhs > 63) break :blk 0;
-            const rhs_constrained: u6 = @intCast(rhs);
-            break :blk @as(i64, @bitCast(std.math.rotr(u64, @bitCast(lhs), rhs_constrained)));
-        },
-        .less_than => @intFromBool(lhs < rhs),
-        .greater_than => @intFromBool(lhs > rhs),
-        .less_or_equal => @intFromBool(lhs <= rhs),
-        .greater_or_equal => @intFromBool(lhs >= rhs),
-        .equal => @intFromBool(lhs == rhs),
-        .not_equal => @intFromBool(lhs != rhs),
-        .bit_and => lhs & rhs,
-        .bit_xor => lhs ^ rhs,
-        .bit_or => lhs | rhs,
-        .bool_and => @intFromBool((lhs != 0) and (rhs != 0)),
-        .bool_or => @intFromBool((lhs != 0) or (rhs != 0)),
-        .pow => std.math.powi(i64, lhs, rhs) catch {
-            // Report overflow for both underflow and overflow. Maybe I should report separately?
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("integer value too big to be represented", .{}),
-            };
-            return error.IntegerOverflow;
-        },
-        else => unreachable,
-    };
-}
+pub fn getExpression(interp: *Interp, value: Value, cache_key: u256) !*Expression {
+    if (interp.parsed_exprs.get(cache_key)) |parsed| {
+        return parsed;
+    } else {
+        var det: objects.ErrorDetails = undefined;
+        const new_expr = try interp.wrapError(&det, Expression.parse(&det, value));
+        if (interp.parsed_scripts.put(cache_key, new_expr)) |ejected| ejected.release();
 
-fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !Value {
-    return switch (oper) {
-        .mul => Value.newFloat(lhs * rhs),
-        .div => blk: {
-            if (rhs == 0.0) {
-                interp.setResultOwning(division_by_zero_message.get());
-                return error.DivisionByZero;
-            } else {
-                break :blk .{ .float = lhs / rhs };
-            }
-        },
-        .mod => Value.newFloat(std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
-            error.DivisionByZero => {
-                interp.setResultOwning(division_by_zero_message.get());
-                return error.DivisionByZero;
-            },
-            error.NegativeDenominator => {
-                try interp.setResultOwning(negative_denom_message.get());
-                return error.NegativeDenominator;
-            },
-        }),
-        .sub => Value.newFloat(lhs - rhs),
-        .add => Value.newFloat(lhs + rhs),
-        .shiftl, .shiftr, .rotl, .rotr => {
-            try interp.setResultFormatted("cannot bit shift on floats {} and {}", .{ lhs, rhs });
-            return error.BadInteger;
-        },
-        .less_than => Value.newBool(lhs < rhs),
-        .greater_than => Value.newBool(lhs > rhs),
-        .less_or_equal => Value.newBool(lhs <= rhs),
-        .greater_or_equal => Value.newBool(lhs >= rhs),
-        .equal => Value.newBool(lhs == rhs),
-        .not_equal => Value.newBool(lhs != rhs),
-        .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or => {
-            try interp.setResultFormatted("cannot do bitwise operations on floats {} and {}", .{ lhs, rhs });
-            return error.BadInteger;
-        },
-        .pow => Value.newFloat(std.math.pow(f64, lhs, rhs)),
-        else => unreachable,
-    };
-}
-
-pub fn getIntOrFloatInPlace(interp: *Interp, ref: *Value) !objects.Number {
-    var ref_shim: Shimmerable = .{ .original = ref.* };
-    var det: objects.ErrorDetails = undefined;
-    const result = interp.wrapError(&det, objects.Number.getAsIntOrFloat(&det, &ref_shim));
-    ref.* = ref_shim.consume();
-    return result;
-}
-
-fn evalExpressionNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !Value {
-    const node_tag = nodes.items(.tag)[@intFromEnum(node_index)];
-    const node_data: *expr_parse.Node.Data = &nodes.items(.data)[@intFromEnum(node_index)];
-    switch (node_tag) {
-        .mul,
-        .div,
-        .mod,
-        .sub,
-        .add,
-        .shiftl,
-        .shiftr,
-        .rotl,
-        .rotr,
-        .less_than,
-        .greater_than,
-        .less_or_equal,
-        .greater_or_equal,
-        .equal,
-        .not_equal,
-        .bit_and,
-        .bit_xor,
-        .bit_or,
-        .bool_and,
-        .bool_or,
-        .pow,
-        => {
-            const children = node_data.binary;
-            var lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
-            defer lhs_value.release();
-            var rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
-            defer rhs_value.release();
-
-            // Fast case, both integers, or both floats.
-            if (lhs_value.asInt()) |lhs| if (rhs_value.asInt()) |rhs| {
-                return try objects.Integer.new(try interp.exprBinaryOperatorInteger(node_tag, lhs, rhs.int));
-            };
-            if (lhs_value.asFloat()) |lhs| if (rhs_value.asFloat()) |rhs| {
-                return Value.newFloat(try interp.exprBinaryOperatorFloat(node_tag, lhs, rhs));
-            };
-
-            // Slow case: 1. try to get both as integers, 2. try getting/coercing both to floats, 3. error.
-            const lhs_converted = try interp.getIntOrFloatInPlace(&lhs_value);
-            const rhs_converted = try interp.getIntOrFloatInPlace(&rhs_value);
-
-            if (lhs_converted.asInt()) |lhs| if (rhs_converted.asInt()) |rhs| {
-                return Value.newInt(try interp.exprBinaryOperatorInteger(node_tag, lhs, rhs));
-            };
-
-            return try interp.exprBinaryOperatorFloat(node_tag, lhs_converted.asFloat(), rhs_converted.asFloat());
-        },
-        .string_equal,
-        .string_not_equal,
-        .string_in,
-        .string_not_in,
-        .string_less_than,
-        .string_greater_than,
-        .string_less_than_or_equal,
-        .string_greater_than_or_equal,
-        => {
-            const children = node_data.binary;
-            const lhs_value = try interp.evalExpressionNode(nodes, children.@"0");
-            const rhs_value = try interp.evalExpressionNode(nodes, children.@"1");
-            defer lhs_value.release();
-            defer rhs_value.release();
-
-            var lhs_buffer: [50]u8 = @splat(0);
-            var lhs_alloc = std.heap.FixedBufferAllocator.init(lhs_buffer[0..]);
-            const lhs_string = switch (lhs_value) {
-                .float => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .int => |val| std.fmt.allocPrint(lhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_value => |val| (try val.*.getString())[0..],
-                .stack_value => |val| (try val.getString())[0..],
-            };
-            var rhs_buffer: [50]u8 = @splat(0);
-            var rhs_alloc = std.heap.FixedBufferAllocator.init(rhs_buffer[0..]);
-            const rhs_string = switch (rhs_value) {
-                .float => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .int => |val| std.fmt.allocPrint(rhs_alloc.allocator(), "{}", .{val}) catch unreachable,
-                .owned_value => |val| (try val.*.getString())[0..],
-                .stack_value => |val| (try val.getString())[0..],
-            };
-
-            const result = switch (node_tag) {
-                .string_equal => std.mem.eql(u8, lhs_string, rhs_string),
-                .string_not_equal => !std.mem.eql(u8, lhs_string, rhs_string),
-                .string_in => std.mem.indexOf(u8, rhs_string, lhs_string) != null,
-                .string_not_in => std.mem.indexOf(u8, rhs_string, lhs_string) == null,
-                .string_less_than => std.mem.order(u8, rhs_string, lhs_string).compare(.lt),
-                .string_greater_than => std.mem.order(u8, rhs_string, lhs_string).compare(.gt),
-                .string_less_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.lte),
-                .string_greater_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.gte),
-                inline else => unreachable,
-            };
-
-            return if (result) .{ .int = 1 } else .{ .int = 0 };
-        },
-        .ternary_conditional => {
-            const children = node_data.ternary;
-            var condition = try interp.evalExpressionNode(nodes, children.@"0");
-            const condition_as_bool = try interp.getBooleanInPlace(interp, &condition);
-
-            if (condition_as_bool) {
-                return interp.evalExpressionNode(nodes, children.@"1");
-            } else {
-                return interp.evalExpressionNode(nodes, children.@"2");
-            }
-        },
-        .value => return node_data.value.borrow(),
-        .command_subst => {
-            const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node_data.object.getHashNoRegister();
-            const result = interp.evalObjectInner(interp.callFrameIdx(), node_data.object, nested_cache_key);
-
-            if (result) {
-                return .{ .stack_value = interp.result.borrow() };
-            } else |err| {
-                return err;
-            }
-        },
-        .variable_subst => {
-            // This should not change, since it should be a local heap object.
-            var det: ErrorDetails = undefined;
-            const var_value = try interp.wrapError(&det, interp.getVariableOrErrorInner(&det, interp.callFrameIdx(), node_data.object));
-
-            return .{ .stack_value = var_value.borrow() };
-        },
-        .bool_not => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const result_bool = try interp.exprResultAsBool(&result);
-            return .{ .int = if (result_bool) 0 else 1 };
-        },
-        .bit_not => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            const value = switch (result) {
-                .int => |val| val,
-                .float => |val| {
-                    try interp.setResultFormatted("cannot bit invert on float {}", .{val});
-                    return error.BadInteger;
-                },
-                .owned_value => |val| blk: {
-                    break :blk try interp.getIntegerInPlace(val);
-                },
-                .stack_value => |*val| blk: {
-                    break :blk try interp.getIntegerInPlace(val);
-                },
-            };
-
-            return .{ .int = ~value };
-        },
-        .identity => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            return try interp.getIntOrFloatInPlace(&result);
-        },
-        .negation => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.getIntOrFloatInPlace(&result);
-            switch (value) {
-                .int => |int| return .{ .int = -int },
-                .float => |float| return .{ .float = -float },
-                .owned_value, .stack_value => unreachable,
-            }
-        },
-        .to_int, .to_wide => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.getIntOrFloatInPlace(&result);
-            switch (value) {
-                .int => |int| return .{ .int = int },
-                .float => |float| {
-                    bad_int: {
-                        if (float > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :bad_int;
-                        if (float < @as(f64, @floatFromInt(std.math.minInt(i64)))) break :bad_int;
-                        if (std.math.isNan(float)) break :bad_int;
-                        return .{ .int = @intFromFloat(float) };
-                    }
-                    try interp.setResultFormatted("could not convert float \"{}\" to integer", .{float});
-                    return error.BadInteger;
-                },
-                .owned_value, .stack_value => unreachable,
-            }
-        },
-        .abs => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.getIntOrFloatInPlace(&result);
-            switch (value) {
-                .int => |int| {
-                    if (@abs(int) > std.math.maxInt(i64)) {
-                        var det: ErrorDetails = undefined;
-                        return interp.wrapError(&det, objects.Integer.overflowError(u64, &det, @abs(int)));
-                    } else {
-                        return Value.newInt(@intCast(@abs(int)));
-                    }
-                },
-                .float => |float| return .{ .float = @abs(float) },
-                .owned_value, .stack_value => unreachable,
-            }
-        },
-        .to_double => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.getIntOrFloatInPlace(&result);
-            switch (value) {
-                .int => |int| return .{ .float = @floatFromInt(int) },
-                .float => return value,
-                .owned_value, .stack_value => unreachable,
-            }
-        },
-        .round => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.getIntOrFloatInPlace(&result);
-            switch (value) {
-                .float => |float| return .{ .float = @round(float) },
-                .int => return value,
-                .owned_value, .stack_value => unreachable,
-            }
-        },
-        .rand => {
-            return .{ .float = interp.nextRandomFloat() };
-        },
-        .srand => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = switch (result) {
-                .int => |val| val,
-                .float => |val| {
-                    try interp.setResultFormatted("cannot seed random with {}", .{val});
-                    return error.BadInteger;
-                },
-                .owned_value => |val| try interp.getIntegerInPlace(val),
-                .stack_value => |*val| try interp.getIntegerInPlace(val),
-            };
-
-            interp.prng.seed(@bitCast(value));
-
-            return .{ .float = interp.nextRandomFloat() };
-        },
-        .sin,
-        .cos,
-        .tan,
-        .asin,
-        .acos,
-        .atan,
-        .sinh,
-        .cosh,
-        .tanh,
-        .ceil,
-        .floor,
-        .exp,
-        .log,
-        .log10,
-        .sqrt,
-        => {
-            var result = try interp.evalExpressionNode(nodes, node_data.unary);
-            defer result.release();
-            const value = try interp.getIntOrFloatInPlace(&result);
-            const as_float: f64 = switch (value) {
-                .int => |int| @floatFromInt(int),
-                .float => |float| float,
-                .owned_value, .stack_value => unreachable,
-            };
-
-            const computed = switch (node_tag) {
-                .sin => @sin(as_float),
-                .cos => @cos(as_float),
-                .tan => @tan(as_float),
-                .asin => std.math.asin(as_float),
-                .acos => std.math.acos(as_float),
-                .atan => std.math.atan(as_float),
-                .sinh => std.math.sinh(as_float),
-                .cosh => std.math.cosh(as_float),
-                .tanh => std.math.tanh(as_float),
-                .ceil => @ceil(as_float),
-                .floor => @floor(as_float),
-                .exp => @exp(as_float),
-                .log => @log(as_float),
-                .log10 => @log10(as_float),
-                .sqrt => @sqrt(as_float),
-                inline else => unreachable,
-            };
-
-            return .{ .float = computed };
-        },
-        .atan2, .fmod, .hypot => {
-            var lhs_result = try interp.evalExpressionNode(nodes, node_data.binary.@"0");
-            defer lhs_result.release();
-            var rhs_result = try interp.evalExpressionNode(nodes, node_data.binary.@"0");
-            defer rhs_result.release();
-            const lhs_number = try interp.getIntOrFloatInPlace(&lhs_result);
-            const rhs_number = try interp.getIntOrFloatInPlace(&rhs_result);
-            const lhs: f64 = switch (lhs_number) {
-                .int => |int| @floatFromInt(int),
-                .float => |float| float,
-                .owned_value, .stack_value => unreachable,
-            };
-            const rhs: f64 = switch (rhs_number) {
-                .int => |int| @floatFromInt(int),
-                .float => |float| float,
-                .owned_value, .stack_value => unreachable,
-            };
-
-            const computed = switch (node_tag) {
-                .atan2 => std.math.atan2(lhs, rhs),
-                .fmod => @mod(lhs, rhs),
-                .hypot => @sqrt(lhs * lhs + rhs + rhs),
-                inline else => unreachable,
-            };
-            return .{ .float = computed };
-        },
-        .none => unreachable,
+        return new_expr;
     }
 }
 
@@ -1975,9 +872,9 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
     // variable lookups.
     var det: ErrorDetails = undefined;
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
-    const expr: *Expression = try interp.wrapError(&det, Expression.get(&det, value, cache_key));
+    const expr: *Expression = try interp.wrapError(&det, getExpression(&det, value, cache_key));
 
-    return evalExpressionNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
+    return Expression.evalNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => {
             // Give the caller some context for what failed.
@@ -2012,7 +909,7 @@ pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFla
     cache_key ^= @as(u256, @as(u3, @bitCast(flags))) << @sizeOf(@TypeOf(interp.callFrame().signature.cache_id));
 
     var det: ErrorDetails = undefined;
-    const subst: Substitution = try interp.wrapError(&det, Substitution.get(&det, handle, cache_key, flags));
+    const subst: Substitution = try interp.wrapError(&det, getScript(&det, value, cache_key, flags));
     assert(subst.flags == flags); // Integrity check.
 
     return try interp.interpolateTokens(subst.subst.tags.items, subst.subst.values, 0, @intCast(subst.subst.tags.items.len));
@@ -2025,9 +922,9 @@ pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
 
 /// Builds the stack trace as a flat list of {name file line args} repeated once per call
 /// frame. The top (innermost) frame is emitted first.
-fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Handle {
-    var trace = try objutil.newListWithCapacity(@intCast(interp.eval_frames.items.len * 4));
-    errdefer trace.decrRefCount();
+fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
+    var trace = try objects.List.newWithCapacity(&.{}, interp.eval_frames.items.len * 4);
+    errdefer trace.asHead().release();
 
     var last_call_frame_idx: ?u32 = null;
 
@@ -2045,31 +942,29 @@ fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Handle {
         const call_frame = &interp.call_frames.items[eval_frame.call_frame];
         const closure_name = call_frame.signature.name.orEmpty();
 
-        const source_info = objutil.getSourceInfo(eval_frame.currently_evaluating);
-        const file_name = if (source_info) |info| info.file_name.orEmpty() else Heap.local_heap.emptyHandle();
+        const source_info = eval_frame.currently_evaluating.asType(objects.Source);
+        const file_name = if (source_info) |info| info.file_name.orEmpty() else heap.interned_empty_string.get();
         const base_line = if (source_info) |info| info.line_no else null;
 
         const base = if (base_line) |val| val else 1;
         const absolute_line = base + eval_frame.current_line;
 
-        const args_list = try objutil.newListWithCapacity(@intCast(eval_frame.args.len));
-        defer args_list.decrRefCount();
+        const args_list = try List.newWithCapacity(&.{}, eval_frame.args.len);
+        defer args_list.asHead().release();
 
-        for (eval_frame.args) |arg| {
-            objutil.listAppendAssumeCapacity(args_list, arg.original.reference());
-        }
+        for (eval_frame.args) |arg| args_list.appendAssumeCapacity(arg.original);
 
-        objutil.listAppendAssumeCapacity(trace, closure_name.dupOrRef());
-        objutil.listAppendAssumeCapacity(trace, file_name.dupOrRef());
-        objutil.listAppendAssumeCapacity(trace, objutil.integerObject(@intCast(absolute_line)));
-        objutil.listAppendAssumeCapacity(trace, args_list.dupOrRef());
+        trace.appendAssumeCapacity(closure_name);
+        trace.appendAssumeCapacity(file_name);
+        trace.appendAssumeCapacity(Value.newInt(absolute_line));
+        trace.appendAssumeCapacity(args_list.asHead().asValue());
     }
 
     return trace;
 }
 
 /// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
-fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { command: ?CommandOrClosure, self: OptionalHandle } {
+fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { command: ?CommandOrClosure, self: OptionalValue } {
     const command = interp.getCommand(interp.callFrameIdx(), &args[0], true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EvalError => return error.EvalError,
@@ -2090,43 +985,43 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         // `interp.getCommand` already made sure `args[0]` is a variable, so we can just
         // check if it's .dict_sugar.
         const method_dict_path = &args[0];
-        if (method_dict_path.tag() != .dict_sugar) {
+        const dict_sugar = method_dict_path.current().asType(vartypes.DictSugar) orelse {
             try interp.setResultFormatted("method \"{f}\" cannot be invoked as function", .{method_dict_path.current()});
             return error.EvalError;
-        }
-        const dict_sugar = method_dict_path.peek().body.dict_sugar;
+        };
 
         // Next, we need to find `self`, the second-to-last part of the dict path. For example, calling
         // foo::bar would have foo as `self`, or foo::bar::baz would have foo::bar as `self`.
-        const dict_name = method_dict_path.current().getHeap().getHandle(dict_sugar.dict_name_index);
-        const dict_resolved = interp.getVariableOrErrorInner(null, interp.callFrameIdx(), dict_name) catch |err| switch (err) {
+        const dict_resolved = vartypes.getVariable(
+            interp,
+            null,
+            interp.callFrameIdx(),
+            dict_sugar.dict_name,
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // This should always succeed, since when `interp.getCommand` was run earlier,
             // it ensured that the dict sugar resolved to something.
             else => unreachable,
         };
-        const dict_path = method_dict_path.current().getHeap().getHandle(dict_sugar.path_index);
 
-        var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
-        defer handles.deinit(Heap.global_gpa);
-        const all_but_last = handles.items[0..(handles.items.len - 1)];
+        // We modify the dictionary at the end of the path.
+        const all_but_last = dict_sugar.dict_path.items[0..(dict_sugar.dict_path.items - 1)];
+        const method_ctx = objects.ValueSliceContext{ .items = all_but_last };
 
-        var dict_wb: Shimmerable = .{ .original = dict_resolved };
-        const method_ctx = objutil.HandleSliceContext{ .items = all_but_last };
+        var dict_shim: Shimmerable = .{ .original = dict_resolved.? };
+        defer dict_shim.discardChanges();
         var det: ErrorDetails = undefined;
-        const maybe_self: OptionalHandle = try interp.wrapError(
-            &det,
-            objutil.dictLookupRecursively(&det, &dict_wb, method_ctx),
-        );
-        if (dict_wb.shimmered.toHandle()) |new_dict| {
-            det = undefined;
-            try interp.wrapError(&det, interp.setVariableInner(&det, interp.callFrameIdx(), dict_name, new_dict.referenceOwning()));
+        const maybe_self: OptionalValue = try interp.wrapError(&det, Dictionary.getRecursively(&det, &dict_shim, method_ctx));
+        if (dict_shim.shimmered.asValue()) |new_dict| {
+            var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
+            defer dict_name.discardChanges();
+            try interp.wrapError(&det, vartypes.setVariable(interp, &det, interp.callFrameIdx(), dict_name, new_dict));
         }
 
-        if (maybe_self.toHandle()) |self| {
-            return .{ .command = command, .self = self.borrow().toOptional() };
+        if (maybe_self.asValue()) |self| {
+            return .{ .command = command, .self = self.borrow() };
         } else {
-            const var_name = try method_dict_path.getString();
+            const var_name = try method_dict_path.current().getString();
             // Shave off the end, because we're looking up `self`, not the method in this case.
             var ending = std.mem.lastIndexOf(u8, var_name, "::").?;
             while (ending > 0 and var_name[ending - 1] == ':') ending -= 1;
@@ -2157,7 +1052,7 @@ fn invokeCommandMaybeMethod(
 
     // If the command ended up being a method, we move the command name to the
     // left, which opens up a hole for putting the `self` argument in.
-    if (maybe_self.toHandle()) |self| {
+    if (maybe_self.asValue()) |self| {
         args_raw[0] = args_raw[1]; // Move command name to the left.
         args_raw[1] = .{ .original = self };
         args = args_raw[0..]; // Include all the allocated args now.
@@ -2166,14 +1061,14 @@ fn invokeCommandMaybeMethod(
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
     try interp.invokeCommand(command, args);
 
-    if (maybe_self.toHandle()) |_| {
+    if (maybe_self.asValue()) |_| {
         // Be sure to write back `self`.
 
         const call_frame = interp.callFrameIdx();
         const method_dict_path = &args[0];
         // `self` is returned back through `args[1]`.
         const new_self = &args[1];
-        new_self.current().assert(new_self.asMutable().mutated != .none);
+        assert(new_self.shimmered != .none);
 
         // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
         var det: ErrorDetails = undefined;
@@ -2181,38 +1076,36 @@ fn invokeCommandMaybeMethod(
 
         const ensure_result = try interp.wrapError(
             &det,
-            interp.ensureValidVariableType(&det, call_frame, method_dict_path.current()),
+            vartypes.ensureValidVariableType(interp, &det, call_frame, method_dict_path.current()),
         );
-        switch (ensure_result) {
-            .not_found => {
-                try interp.setResultFormatted(
-                    "Could not update \"{f}\" as it was unset when calling method",
-                    .{objutil.listItem(command.closure.closure.args, 0)},
-                );
-                return error.EvalError;
-            },
-            .normal => unreachable,
-            .dict_sugar => {
-                // What we want.
-                try shimmerToDictSugarAssumeValid(method_dict_path.current());
-            },
-        }
+        const as_dict_sugar = blk: {
+            switch (ensure_result) {
+                .not_found => {
+                    const args_list = try command.closure.closure.args.get();
+                    const self_name = try args_list.items[0].getString();
+                    try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
+                    return error.EvalError;
+                },
+                .normal => unreachable,
+                .dict_sugar => {
+                    // What we want.
+                    break :blk try vartypes.DictSugar.shimmerAssumeValid(method_dict_path);
+                },
+            }
+        };
+        var dict_name: Shimmerable = .{ .original = as_dict_sugar.dict_name };
+        defer dict_name.discardChanges();
 
-        method_dict_path.current().assert(method_dict_path.tag() == .dict_sugar);
-        const dict_sugar = method_dict_path.peek().body.dict_sugar;
-
-        const dict_name = method_dict_path.current().getHeap().getHandle(dict_sugar.dict_name_index);
-        const dict_resolved = interp.getVariableOrErrorInner(&det, call_frame, dict_name) catch |err| switch (err) {
+        const dict_resolved = vartypes.getVariableOrError(interp, &det, call_frame, &dict_name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.LinkLookupFailed, error.VariableNotFound, error.BadDict, error.BadVariableName => {
-                interp.setResultOwning(det.message);
+                interp.setResultOwning((try objects.String.newOwning(det.message)).asHead().asValue());
                 return error.EvalError;
             },
         };
-        const dict_path = method_dict_path.current().getHeap().getHandle(dict_sugar.path_index);
 
-        if (objutil.listLength(dict_path) == 1) {
-            interp.setVariableInner(&det, call_frame, dict_name, new_self.current().reference()) catch |err| switch (err) {
+        if (as_dict_sugar.dict_path.items.len == 1) {
+            vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LinkLookupFailed, error.BadVariableName => {
                     interp.setResultOwning(det.message);
@@ -2220,21 +1113,22 @@ fn invokeCommandMaybeMethod(
                 },
             };
         } else {
-            var handles = try objutil.listToHandles(Heap.global_gpa, dict_path);
-            defer handles.deinit(Heap.global_gpa);
-            const all_but_last = handles.items[0..(handles.items.len - 1)];
+            const all_but_last = as_dict_sugar.dict_path.items[0..(as_dict_sugar.dict_path.items.len - 1)];
+            const put_ctx = objects.ValueSliceContext{ .items = all_but_last };
 
-            var dict_resolved_wb: Mutable = .{ .original = dict_resolved };
-            const put_ctx = objutil.HandleSliceContext{ .items = all_but_last };
-            _ = try interp.wrapError(&det, objutil.dictPutRecursively(
-                &det,
-                &dict_resolved_wb,
-                put_ctx,
-                new_self.current().reference(),
-            ));
+            const duplicate = if (dict_resolved.canMutate()) null else try dict_resolved.duplicate();
+            defer if (duplicate) |dup| dup.release();
+            const to_use = duplicate orelse dict_resolved;
 
-            if (dict_resolved_wb.mutated.toHandle()) |new_dict| {
-                interp.setVariableInner(&det, call_frame, dict_name, new_dict.referenceOwning()) catch |err| switch (err) {
+            var dict_resolved_shim: Shimmerable = .{ .original = to_use };
+            _ = try interp.wrapError(&det, Dictionary.shimmerFrom(&det, &dict_resolved_shim));
+            assert(dict_resolved_shim.shimmered == .none);
+            const as_mutable = dict_resolved_shim.current().asType(Dictionary).?;
+            try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
+            interp.callFrame().variables.inner.invalidateString();
+
+            if (duplicate) |dup| {
+                vartypes.setVariable(interp, &det, call_frame, &dict_name, dup) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.LinkLookupFailed, error.BadVariableName => {
                         interp.setResultOwning(det.message);
@@ -2246,29 +1140,21 @@ fn invokeCommandMaybeMethod(
     }
 }
 
-fn evalCommand(interp: *Interp, call_frame: u32, script: Handle, parsed: Heap.ParsedScript, command_token_i: *u32) !void {
+fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: evaltypes.Script, command_token_i: *u32) !void {
     _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
     const tags = parsed.tags.items;
-    const values = objutil.listItems(parsed.values);
 
     // First token of the command is always .parsed_script_command.
-    const first_token = objutil.listItemNoFollow(parsed.values, command_token_i.*);
-    first_token.assert(first_token.tag() == .parsed_script_command);
-    const command_info = first_token.peek().body.parsed_script_command;
+    const command_info = parsed.values[command_token_i.*].asType(evaltypes.ParsedScriptCommand).?;
     command_token_i.* += 1; // Skip .parsed_script_command.
-    interp.currentEvalFrame().current_line = command_info.line;
+    interp.evalFrame().current_line = command_info.line;
 
-    // `args_raw` has one extra space at the beginning that can be used to store the
-    // `self` param if needed later on. We don't do the shifting in this function though.
-    var sf = std.heap.stackFallback(@sizeOf(Handle) * 8, Heap.global_gpa);
-    var args_alloc = sf.get();
-    var args_raw = try args_alloc.alloc(Shimmerable, command_info.word_count + 1);
-    defer args_alloc.free(args_raw);
+    var args_raw = try heap.local_arena.alloc(Shimmerable, command_info.word_count + 1);
     // Contains what is considered to be the current arguments.
     var args = args_raw[1..];
-    args_raw[0] = .{ .original = Heap.local_heap.emptyHandle() };
+    args_raw[0] = .{ .original = heap.interned_empty_string.get() };
 
     {
         // This is not always the same as which word token we're on, as argument expansion
@@ -2282,20 +1168,17 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Handle, parsed: Heap.Pa
         // We don't know the length of each word, but we know there's `word_count` words,
         // so we advance `word_count` times.
         for (0..command_info.word_count) |_| {
-            var word_parts: u32 = 1;
+            var word_parts: usize = 1;
             const argument_expansion = tags[word_token_i] == .argument_expansion;
             if (tags[word_token_i] == .start_of_word or argument_expansion) {
-                word_parts = @intCast(values[word_token_i].body.integer);
+                word_parts = @intCast(parsed.values[word_token_i].body.integer);
                 word_token_i += 1;
             }
 
-            var resultant_word: Handle = blk: {
+            var resultant_word: Value = blk: {
                 if (word_parts == 1) {
                     // Simple one-to-one substitution, so an easy case.
-                    const res = try interp.substituteOneToken(
-                        tags[word_token_i],
-                        objutil.listItem(parsed.values, word_token_i),
-                    );
+                    const res = try interp.substituteOneToken(tags[word_token_i], parsed.values[word_token_i]);
                     word_token_i += 1;
                     break :blk res;
                 } else {
@@ -2314,8 +1197,8 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Handle, parsed: Heap.Pa
 
             if (argument_expansion) {
                 // Argument expansion, so we'll need to shimmer the result to a list.
-                const expansion_len = try interp.getListLengthInPlace(&resultant_word);
-                defer resultant_word.decrRefCount();
+                const as_list = try interp.getListInPlace(&resultant_word);
+                defer resultant_word.release();
 
                 if (expansion_len != 1) {
                     // Expanded into multiple tokens, so we'll need to resize args.
@@ -2421,58 +1304,6 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
         }
     }
 }
-
-/// Return code values matching Tcl's convention.
-pub const ReturnCode = enum(u8) {
-    ok = 0,
-    @"error" = 1,
-    @"return" = 2,
-    @"break" = 3,
-    @"continue" = 4,
-    signal = 5,
-    exit = 6,
-    oom = 7,
-    usage = 8,
-    tailcall = 9,
-
-    pub fn fromErrorUnion(value: Error!void) ReturnCode {
-        if (value) {
-            return .ok;
-        } else |err| {
-            return ReturnCode.fromError(err);
-        }
-    }
-
-    pub fn fromError(err: Error) ReturnCode {
-        return switch (err) {
-            error.EvalError => .@"error",
-            error.PropagateResult => .@"return",
-            error.Break => .@"break",
-            error.Continue => .@"continue",
-            error.Signal => .signal,
-            error.Exit => .exit,
-            error.OutOfMemory => .oom,
-            error.WrongUsage => .usage,
-            error.Tailcall => .tailcall,
-        };
-    }
-
-    pub fn toError(self: ReturnCode) Error!void {
-        switch (self) {
-            .ok => return,
-            .@"error" => return error.EvalError,
-            .@"return" => return error.PropagateResult,
-            .@"break" => return error.Break,
-            .@"continue" => return error.Continue,
-            .signal => return error.Signal,
-            .exit => return error.Exit,
-            .oom => return error.OutOfMemory,
-            .usage => return error.WrongUsage,
-            .tailcall => return error.Tailcall,
-        }
-    }
-};
-pub const ReturnCodeEnum = objutil.TclEnum(Interp.ReturnCode, "return code", true);
 
 pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
     // Reset the stack trace at each new top-level invocation.
@@ -2583,22 +1414,25 @@ pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMem
 
 pub fn wrapShimmerFn(
     interp: *Interp,
-    wb: *objutil.Shimmerable,
-    to_call: fn (?*ErrorDetails, *objutil.Shimmerable) anyerror!void,
-) !void {
+    ReturnType: type,
+    wb: *Shimmerable,
+    to_call: fn (?*ErrorDetails, *Shimmerable) anyerror!ReturnType,
+) !ReturnType {
     var det: ErrorDetails = undefined;
     try wrapError(interp, &det, to_call(&det, wb));
 }
 
 pub fn wrapShimmerInPlaceFn(
     interp: *Interp,
-    ref: *Handle,
-    to_call: fn (?*ErrorDetails, *objutil.Shimmerable) anyerror!void,
-) !void {
+    ReturnType: type,
+    ref: *Value,
+    to_call: fn (?*ErrorDetails, *Shimmerable) anyerror!*const ReturnType,
+) !ReturnType {
     var ref_wb: Shimmerable = .{ .original = ref.* };
     var det: ErrorDetails = undefined;
-    try wrapError(interp, &det, to_call(&det, &ref_wb));
+    const result = try wrapError(interp, &det, to_call(&det, &ref_wb));
     ref.* = ref_wb.consume();
+    return result;
 }
 
 pub fn wrapMutableFn(
@@ -2637,10 +1471,17 @@ pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
     return interp.wrapError(&det, objutil.floatGetNoShimmer(&det, handle));
 }
 
+pub fn getIntOrFloatInPlace(interp: *Interp, ref: *Value) !objects.Number {
+    var ref_shim: Shimmerable = .{ .original = ref.* };
+    var det: objects.ErrorDetails = undefined;
+    const result = interp.wrapError(&det, objects.Number.getAsIntOrFloat(&det, &ref_shim));
+    ref.* = ref_shim.consume();
+    return result;
+}
+
 /// Shimmers `wb` to `.bool`. Returns the `bool` value.
 pub fn getBoolean(interp: *Interp, wb: *Shimmerable) !bool {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToBoolean);
-    return wb.peek().body.bool.data;
+    return try interp.wrapShimmerFn(bool, wb, objects.Boolean.shimmerFrom);
 }
 
 pub fn getBooleanInPlace(interp: *Interp, ref: *Value) !bool {
@@ -2684,9 +1525,8 @@ pub fn getListLength(interp: *Interp, wb: *objutil.Shimmerable) !u32 {
     return wb.peek().body.list.len;
 }
 
-pub fn getListLengthInPlace(interp: *Interp, ref: *Handle) !u32 {
-    try interp.wrapShimmerInPlaceFn(ref, objutil.shimmerToList);
-    return ref.peek().body.list.len;
+pub fn getListInPlace(interp: *Interp, ref: *Value) !*const List {
+    return try interp.wrapShimmerInPlaceFn(List, ref, List.shimmerFrom);
 }
 
 /// Appends `item` to `wb` (which is shimmered to a list first). Returns a
