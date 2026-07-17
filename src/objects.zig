@@ -440,24 +440,26 @@ pub const Source = struct {
     pub fn new(bytes: []const u8, file_name: OptionalValue, line: u32) !*Source {
         const obj = try String.newObject(bytes);
 
-        obj.vtable = vtable;
+        obj.vtable = &vtable;
         const as_source = obj.castTo(Source);
         as_source.* = .{
             .file_name = file_name.borrow(),
             .line_no = line,
+            .hash = .init(null),
         };
 
-        return obj;
+        return as_source;
     }
 
     pub fn newFromEscaped(escaped: []const u8, file_name: OptionalValue, line: u32) !*Source {
         const obj = (try String.newFromEscaped(escaped)).asHead();
 
-        obj.vtable = vtable;
+        obj.vtable = &vtable;
         const as_source = obj.castTo(Source);
         as_source.* = .{
             .file_name = file_name.borrow(),
             .line_no = line,
+            .hash = .init(null),
         };
 
         return as_source;
@@ -683,7 +685,7 @@ pub const Index = struct {
         if (det) |details| details.* = .{
             .message = try std.fmt.allocPrintSentinel(
                 heap.global_gpa,
-                "bad index \"{f}\": must be intexpr or end?[+-]intexpr?",
+                "bad index \"{s}\": must be intexpr or end?[+-]intexpr?",
                 .{bytes},
                 0,
             ),
@@ -727,7 +729,7 @@ pub const Index = struct {
         // original purpose).
 
         switch (shim.current().expandedValue()) {
-            .int => |int| {
+            .inline_int => |int| {
                 return .{ .index = int, .is_relative = false };
             },
             else => return (try shimmerFrom(det, shim)).*,
@@ -802,22 +804,29 @@ pub const Float = struct {
         return new_obj.body;
     }
 
+    pub fn asFloat(value: Value) ?f64 {
+        if (value.asInlineFloat()) |float| return float;
+        if (value.asType(Float)) |float| return float.value;
+        return null;
+    }
+
     pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !f64 {
         if (std.fmt.parseFloat(f64, bytes)) |parsed| {
             return parsed;
         } else |_| {
             if (det) |details| details.* = .{
-                .message = try std.fmt.allocPrint("expected float but got \"{s}\"", .{bytes}),
+                .message = try allocPrintZ("expected float but got \"{s}\"", .{bytes}),
             };
             return error.BadFloat;
         }
     }
 
     pub fn shimmer(det: ?*ErrorDetails, shim: *Shimmerable) !void {
-        if (shim.current().asFloat() != null) return;
+        if (shim.current().asInlineFloat() != null) return;
         if (shim.current().asType(Float) != null) return;
 
-        const parsed = try parse(det, try shim.current().getString());
+        const bytes = try shim.current().getString();
+        const parsed = try parse(det, bytes);
 
         // Compare the original input string to the regenerated string, and
         // if identical, shimmer to an inline float value. This is because
@@ -826,22 +835,21 @@ pub const Float = struct {
         var buf: [350]u8 = undefined;
         const regenerated = renderFloat(parsed, &buf);
 
-        if (mem.eql(u8, parsed, regenerated)) {
+        if (mem.eql(u8, bytes, regenerated)) {
             // The two strings are identical, so we can use a float value.
             shim.shimmered.swap(Value.newFloat(parsed));
+            return;
         }
 
         const obj = try shim.prepareToShimmer();
         obj.vtable = &vtable;
-        const as_boxed_float = obj.castTo(Float);
-        as_boxed_float = .{ .value = parsed };
-        return as_boxed_float;
+        obj.castTo(Float).* = .{ .value = parsed };
     }
 
     pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !f64 {
         try shimmer(det, shim);
 
-        if (shim.current().asFloat()) |float| return float;
+        if (shim.current().asInlineFloat()) |float| return float;
         if (shim.current().asType(Float)) |boxed| return boxed.value;
         unreachable;
     }
@@ -893,16 +901,22 @@ pub const Integer = struct {
         return Object.from(Integer, self);
     }
 
+    pub fn asInt(value: Value) ?i64 {
+        if (value.asInlineInt()) |val| return val;
+        if (value.asType(Integer)) |val| return val.value;
+        return null;
+    }
+
     pub fn overflowErrorString(det: ?*ErrorDetails, rendered_int: []const u8) error{ OutOfMemory, IntegerOverflow } {
         if (det) |details| details.* = .{
-            .message = try std.fmt.allocPrint("integer value \"{s}\" too big to be represented", .{rendered_int}),
+            .message = try allocPrintZ("integer value \"{s}\" too big to be represented", .{rendered_int}),
         };
         return error.IntegerOverflow;
     }
 
     pub fn overflowError(IntType: type, det: ?*ErrorDetails, rendered_int: IntType) error{ OutOfMemory, IntegerOverflow } {
         if (det) |details| details.* = .{
-            .message = try std.fmt.allocPrint("integer value \"{}\" too big to be represented", .{rendered_int}),
+            .message = try allocPrintZ("integer value \"{}\" too big to be represented", .{rendered_int}),
         };
         return error.IntegerOverflow;
     }
@@ -913,7 +927,7 @@ pub const Integer = struct {
         } else |err| switch (err) {
             error.InvalidCharacter => {
                 if (det) |details| details.* = .{
-                    .message = try std.fmt.allocPrint("expected integer but got \"{s}\"", .{bytes}),
+                    .message = try allocPrintZ("expected integer but got \"{s}\"", .{bytes}),
                 };
                 return error.BadInteger;
             },
@@ -924,8 +938,7 @@ pub const Integer = struct {
     }
 
     pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
-        if (shim.current().asInt()) |int| return int;
-        if (shim.current().asType(Integer)) |boxed_int| return boxed_int.value;
+        if (asInt(shim.current())) |int| return int;
 
         const bytes = try shim.current().getString();
         const parsed = try parse(det, bytes);
@@ -984,9 +997,12 @@ pub const Number = union(enum) {
     integer: i64,
     float: f64,
 
+    pub const negative_denom_message = heap.createInternedString("negative denominator");
+    pub const division_by_zero_message = heap.createInternedString("division by zero");
+
     pub fn getAsIntOrFloat(det: ?*ErrorDetails, shim: *Shimmerable) !Number {
-        if (shim.current().asInt()) |int| return .{ .integer = int };
-        if (shim.current().asFloat()) |float| return .{ .float = float };
+        if (Integer.asInt(shim.current())) |int| return .{ .integer = int };
+        if (shim.current().asInlineFloat()) |float| return .{ .float = float };
 
         const as_int = Integer.shimmerFrom(null, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1005,7 +1021,7 @@ pub const Number = union(enum) {
     pub fn asFloat(number: Number) f64 {
         return switch (number) {
             .float => |float| float,
-            .int => |int| @floatFromInt(int),
+            .integer => |int| @floatFromInt(int),
         };
     }
 };
@@ -1293,21 +1309,15 @@ test "subcommand parser" {
     try testing.expectError(error.WrongUsage, Parser.parse(null, &args2));
 }
 
+/// `Boolean` is a namespace of helpers, not a heap object type. Bools are
+/// bijective with their canonical string rep ("true"/"false"), so they live
+/// entirely inline as the `.true`/`.false` `Value` tags -- there is never a
+/// reason to box one. When a bool primitive needs an `*Object` handle (to
+/// shimmer to another type), `Value.box` boxes it as a `String` instead. The
+/// functions below parse and produce inline bool values.
 pub const Boolean = struct {
-    value: bool,
-
     pub fn new(value: bool) Value {
         return Value.newBool(value);
-    }
-
-    pub fn newBoxed(value: bool) !*Boolean {
-        const new_obj = try Object.newObject(Boolean);
-        new_obj.body.value = value;
-        return new_obj.body;
-    }
-
-    pub fn asHead(self: *Boolean) *Object {
-        return Object.from(Boolean, self);
     }
 
     pub fn fromString(det: ?*ErrorDetails, bytes: []const u8) !bool {
@@ -1332,29 +1342,6 @@ pub const Boolean = struct {
         shim.shimmered.swap(Value.newBool(as_bool));
         return as_bool;
     }
-
-    fn updateString(obj: *Object) !void {
-        const as_bool = obj.castTo(Boolean);
-        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_bool.value}, 0);
-        try obj.setStringIgnoreRace(bytes);
-    }
-
-    fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObject(Boolean);
-        errdefer new_obj.head.deinit();
-        try src.duplicateHeadOnto(new_obj.head);
-        new_obj.body.value = src.constCastTo(Boolean).value;
-        return new_obj.head;
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = duplicate,
-        .free_internal_rep = null,
-        .update_string = updateString,
-        .make_crossthread = null,
-        .enumerate_struct = null,
-        .name = @typeName(Boolean),
-    };
 };
 
 fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {

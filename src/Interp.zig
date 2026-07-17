@@ -364,7 +364,7 @@ pub fn setResultFloat(interp: *Interp, value: f64) void {
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
-    interp.setResultOwning(try String.new(bytes));
+    interp.setResultOwning((try String.new(bytes)).asHead().asValue());
 }
 
 pub fn setResultStringOwning(interp: *Interp, bytes: [:0]u8) !void {
@@ -377,7 +377,7 @@ pub fn setResultBoolean(interp: *Interp, value: bool) void {
 
 pub fn setResultFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) !void {
     const fmt_handle = try allocPrintZ(fmt, args);
-    interp.setResultStringOwning(fmt_handle);
+    try interp.setResultStringOwning(fmt_handle);
 }
 
 pub fn setEmptyResult(interp: *Interp) void {
@@ -392,7 +392,11 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
     const first_file = stack_trace.items[1];
     const first_line = stack_trace.items[2];
 
-    try buf.print(heap.local_arena, "{f}:{f}: Error: {f}\n", .{ first_file, first_line, error_mesage });
+    try buf.print(heap.local_arena, "{s}:{s}: Error: {s}\n", .{
+        try first_file.getString(),
+        try first_line.getString(),
+        try error_mesage.getString(),
+    });
     try buf.print(heap.local_arena, "Traceback:\n", .{});
 
     if (stack_trace.items.len <= 4) {
@@ -514,7 +518,7 @@ fn nextProcedureEpoch(interp: *Interp) u64 {
 }
 
 var global_call_epoch: std.atomic.Value(u64) = .init(0);
-fn nextCallEpoch(interp: *Interp) u64 {
+pub fn nextCallEpoch(interp: *Interp) u64 {
     interp.current_call_epoch = global_call_epoch.fetchAdd(1, .monotonic) + 1;
     return interp.current_call_epoch;
 }
@@ -584,11 +588,9 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !
             return value.borrow();
         },
         .variable_subst => {
-            var det: ErrorDetails = undefined;
-            const var_target: Value = try interp.wrapError(
-                &det,
-                interp.getVariableOrErrorInner(&det, interp.callFrameIdx(), value),
-            );
+            var name_shim: Shimmerable = .{ .original = value };
+            defer name_shim.discardChanges();
+            const var_target: Value = try interp.getVariableOrError(&name_shim);
             return var_target.borrow();
         },
         .expression_sugar => {
@@ -613,7 +615,7 @@ fn interpolateTokens(
     value_len: usize,
 ) !Value {
     var new_values = try std.ArrayList(Value).initCapacity(heap.local_arena, value_len);
-    defer for (new_values.items) |value| value.decrRefCount();
+    defer for (new_values.items) |value| value.release();
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len)) |tag, value_index| {
@@ -744,7 +746,7 @@ fn getCommandInner(
             if (det) |details| {
                 heap.global_gpa.free(details.message);
                 details.* = .{
-                    .message = try allocPrintZ("invalid command name \"{f}\"", .{name}),
+                    .message = try allocPrintZ("invalid command name \"{s}\"", .{try name.getString()}),
                 };
             }
             return error.CommandNotFound;
@@ -775,7 +777,7 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // No [unknown] command exists, so we'll default to the "no command found" error.
-            try interp.setResultFormatted("invalid command name \"{f}\"", .{args[0].current()});
+            try interp.setResultFormatted("invalid command name \"{s}\"", .{try args[0].current().getString()});
             return error.EvalError;
         },
         error.EvalError => return error.EvalError,
@@ -917,7 +919,7 @@ pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFla
     const subst: Substitution = try interp.wrapError(&det, getScript(&det, value, cache_key, flags));
     assert(subst.flags == flags); // Integrity check.
 
-    return try interp.interpolateTokens(subst.subst.tags.items, subst.subst.values, 0, @intCast(subst.subst.tags.items.len));
+    return try interp.interpolateTokens(subst.subst.tags, subst.subst.values, 0, @intCast(subst.subst.tags.len));
 }
 
 pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
@@ -991,7 +993,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         // check if it's .dict_sugar.
         const method_dict_path = &args[0];
         const dict_sugar = method_dict_path.current().asType(vartypes.DictSugar) orelse {
-            try interp.setResultFormatted("method \"{f}\" cannot be invoked as function", .{method_dict_path.current()});
+            try interp.setResultFormatted("method \"{s}\" cannot be invoked as function", .{try method_dict_path.current().getString()});
             return error.EvalError;
         };
 
@@ -1149,7 +1151,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
-    const tags = parsed.tags.items;
+    const tags = parsed.tags;
 
     // First token of the command is always .parsed_script_command.
     const command_info = parsed.values[command_token_i.*].asType(evaltypes.ParsedScriptCommand).?;
@@ -1178,7 +1180,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
             var word_parts: usize = 1;
             const argument_expansion = tags[word_token_i] == .argument_expansion;
             if (tags[word_token_i] == .start_of_word or argument_expansion) {
-                word_parts = @intCast(parsed.values[word_token_i].body.integer);
+                word_parts = @intCast(objects.Integer.asInt(parsed.values[word_token_i]).?);
                 word_token_i += 1;
             }
 
@@ -1239,7 +1241,7 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
     const parsed = (try interp.getScript(script, cache_key)).borrow();
     defer parsed.release();
     // Don't evaluate empty scripts.
-    if (parsed.tags.items.len <= 1) return;
+    if (parsed.tags.len <= 1) return;
 
     // Reset the interpreter result. This is useful to return the empty result in the case of empty program.
     interp.setEmptyResult();
@@ -1250,7 +1252,7 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
     var command_token_i: u32 = 0;
 
     // Loop through the script's commands.
-    while (command_token_i < parsed.tags.items.len) {
+    while (command_token_i < parsed.tags.len) {
         const token_i_at_start = command_token_i;
 
         const command_result = interp.evalCommand(call_frame, script, parsed, &command_token_i);
@@ -1566,7 +1568,7 @@ pub fn getDictValueOrError(interp: *Interp, dict: *Shimmerable, key: Value) eval
     const result = try interp.getDictValue(dict, key);
     if (result) |val| return val;
 
-    try interp.setResultFormatted("could not find value for key \"{f}\"", .{key});
+    try interp.setResultFormatted("could not find value for key \"{s}\"", .{try key.getString()});
     return error.EvalError;
 }
 
@@ -1589,14 +1591,14 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, conte
 
     // Else, create a useful error message.
     if (context.len() == 1) {
-        try interp.setResultFormatted("could not find value for key \"{f}\"", .{context.get(0)});
+        try interp.setResultFormatted("could not find value for key \"{s}\"", .{try context.get(0).getString()});
     } else {
         // Create a list containing all the keys, so we can render the error message.
         const keys_list = try objects.List.newWithCapacity(&.{}, @intCast(context.len()));
         defer keys_list.asHead().release();
         for (0..context.len()) |i| keys_list.appendAssumeCapacity(context.get(i));
 
-        try interp.setResultFormatted("could not find value for keys \"{f}\"", .{keys_list.asHead().asValue()});
+        try interp.setResultFormatted("could not find value for keys \"{s}\"", .{try keys_list.asHead().asValue().getString()});
     }
 
     return error.EvalError;
@@ -1642,9 +1644,15 @@ test "recursive dict keys" {
     );
     try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.asHead().getString());
 
+    // `getDictValueRecursively` takes a *Shimmerable, so wrap `dict` in a
+    // read-only view. Pure gets never shimmer the top level, so `discardChanges`
+    // is a no-op here and `dict` keeps sole ownership.
+    var dict_shim: Shimmerable = .{ .original = dict.asHead().asValue() };
+    defer dict_shim.discardChanges();
+
     // Try taking ownership of one of the intermediate dictionaries.
     const to_take = (try interp.getDictValueRecursively(
-        dict,
+        &dict_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
     )).asValue().?;
 
@@ -1658,10 +1666,10 @@ test "recursive dict keys" {
 
     // Let's try some very cursed aliasing.
     try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, dict.items[0]);
-    try testing.expectEqualStrings("foo {bar foo}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar foo}", try dict.asHead().getString());
 
     const value_result = (try interp.getDictValueRecursively(
-        dict,
+        &dict_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
     )).asValue().?;
     try testing.expectEqualStrings("foo", try value_result.getString());
@@ -1691,13 +1699,13 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
         value_qux,
     );
 
-    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.asHead().getString());
     var did_remove = try interp.removeDictValueRecursively(
         dict,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
     );
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.asHead().getString());
 
     // Test 2: Try to remove the same key again (should return false).
     did_remove = try interp.removeDictValueRecursively(
@@ -1705,7 +1713,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
     );
     try testing.expect(!did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.asHead().getString());
 
     // Test 3: Remove a non-existent key from an existing intermediate dict.
     did_remove = try interp.removeDictValueRecursively(
@@ -1713,7 +1721,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_foo } },
     );
     try testing.expect(!did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.asHead().getString());
 
     // Test 4: Remove from a non-existent intermediate dict.
     try memutil.expectErrorOrOom(
@@ -1723,12 +1731,12 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings(
         \\key "bar" not known in dictionary "foo {bar {}}"
     , try interp.result.getString());
-    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.asHead().getString());
 
     // Test 5: Single-level removal (base case).
     did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{key_foo} });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("", try dict.current().getString());
+    try testing.expectEqualStrings("", try dict.asHead().getString());
 
     // Test 6: Two-level removal.
     try interp.putDictValueRecursively(
@@ -1736,28 +1744,32 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
         value_qux,
     );
-    try testing.expectEqualStrings("foo {bar qux}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar qux}", try dict.asHead().getString());
     did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {}", try dict.asHead().getString());
 
     // Test 7: Removal when intermediate dict is shared (copy-on-write).
-    var interm_test_dict: Shimmerable = .{ .original = (try objects.Dictionary.new(&.{})).asHead().asValue() };
-    defer interm_test_dict.deinit();
+    var interm_test_dict = try objects.Dictionary.new(&.{});
+    defer interm_test_dict.asHead().release();
     try interp.putDictValueRecursively(
-        &interm_test_dict,
+        interm_test_dict,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
         value_qux,
     );
     try interp.putDictValueRecursively(
-        &interm_test_dict,
+        interm_test_dict,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_foo } },
         value_qux,
     );
 
+    // Read-only view for the get calls below.
+    var interm_shim: Shimmerable = .{ .original = interm_test_dict.asHead().asValue() };
+    defer interm_shim.discardChanges();
+
     // Borrow the intermediate dict.
     const intermediate = (try interp.getDictValueRecursively(
-        &interm_test_dict,
+        &interm_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
     )).asValue().?;
     intermediate.asPtr().?.incrRefCount();
@@ -1768,7 +1780,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
 
     // Remove from the nested dict while it's owned elsewhere.
     did_remove = try interp.removeDictValueRecursively(
-        &interm_test_dict,
+        interm_test_dict,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
     );
     try testing.expect(did_remove);
@@ -1777,7 +1789,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
     // But the main dict should have a new copy without 'baz'.
     const foo_bar_result = (try interp.getDictValueRecursively(
-        &interm_test_dict,
+        &interm_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
     )).asValue().?;
     try testing.expectEqualStrings("foo qux", try foo_bar_result.getString());
@@ -1785,17 +1797,17 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqual(initial_refcount - 1, intermediate.asPtr().?.getRefCount());
 
     // Test 8: Remove multiple items from a nested dict.
-    dict.deinit();
-    dict = .{ .original = (try objects.Dictionary.new(&.{})).asHead().asValue() };
+    dict.asHead().release();
+    dict = try objects.Dictionary.new(&.{});
     try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, value_qux);
     try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } }, value_qux);
-    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict.asHead().getString());
     did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {baz qux}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {baz qux}", try dict.asHead().getString());
     did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try dict.current().getString());
+    try testing.expectEqualStrings("foo {}", try dict.asHead().getString());
 }
 
 test "recursive dict removal" {
@@ -1815,7 +1827,7 @@ pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []c
         try testing.expectEqualStrings(expected, try success.getString());
     } else |err| {
         ioutil.debug("Test failed with zig error {}", .{err});
-        ioutil.debug(" and error message \"{f}\"\n", .{interp.result});
+        ioutil.debug(" and error message \"{s}\"\n", .{try interp.result.getString()});
         return err;
     }
 }

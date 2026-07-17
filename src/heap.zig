@@ -391,20 +391,20 @@ pub const Value = enum(ValueBacking) {
 
     const Expanded = union(enum) {
         ptr: *Object,
-        int: i32,
+        inline_int: i32,
         false,
         true,
         interned: [:0]const u8,
-        float: f64,
+        inline_float: f64,
     };
     pub fn expandedValue(value: Value) Expanded {
         const rep = value.asRep();
-        if (value.isFloat()) return .{ .float = @bitCast(rep) };
+        if (value.isFloat()) return .{ .inline_float = @bitCast(rep) };
         switch (rep.head.tag) {
             .canonical_nan => unreachable, // Already handled by `.isFloat()`.
             .none => unreachable,
             .ptr => return .{ .ptr = @ptrFromInt(rep.value.ptr) },
-            .int => return .{ .int = rep.value.int.data },
+            .int => return .{ .inline_int = rep.value.int.data },
             .false => return .false,
             .true => return .true,
             .interned => {
@@ -424,16 +424,16 @@ pub const Value = enum(ValueBacking) {
         }
     }
 
-    pub fn asInt(value: Value) ?i32 {
+    pub fn asInlineInt(value: Value) ?i32 {
         switch (value.expandedValue()) {
-            .int => |val| return val,
+            .inline_int => |val| return val,
             else => return null,
         }
     }
 
-    pub fn asFloat(value: Value) ?f64 {
+    pub fn asInlineFloat(value: Value) ?f64 {
         switch (value.expandedValue()) {
-            .float => |val| return val,
+            .inline_float => |val| return val,
             else => return null,
         }
     }
@@ -512,17 +512,27 @@ pub const Value = enum(ValueBacking) {
     pub fn box(value: Value) !*Object {
         switch (value.expandedValue()) {
             .ptr => unreachable,
-            .int => |int| {
+            .inline_int => |int| {
                 const obj = try objects.Integer.newBoxed(int);
                 return Object.from(objects.Integer, obj);
             },
             .false => {
-                const obj = try objects.Boolean.newBoxed(false);
-                return Object.from(objects.Boolean, obj);
+                // Bools are bijective with "true"/"false", so there is no boxed
+                // Boolean type: box as a String carrying the canonical rep.
+                const obj = try Object.newObject(objects.String);
+                errdefer obj.head.freeBacking();
+                const duped = try global_gpa.dupeSentinel(u8, "false", 0);
+                errdefer global_gpa.free(duped);
+                try obj.head.setStringLocalObject(duped);
+                return obj.head;
             },
             .true => {
-                const obj = try objects.Boolean.newBoxed(true);
-                return Object.from(objects.Boolean, obj);
+                const obj = try Object.newObject(objects.String);
+                errdefer obj.head.freeBacking();
+                const duped = try global_gpa.dupeSentinel(u8, "true", 0);
+                errdefer global_gpa.free(duped);
+                try obj.head.setStringLocalObject(duped);
+                return obj.head;
             },
             .interned => |bytes| {
                 const obj = try Object.newObject(objects.String);
@@ -532,7 +542,7 @@ pub const Value = enum(ValueBacking) {
                 try obj.head.setStringLocalObject(duped);
                 return obj.head;
             },
-            .float => |float| {
+            .inline_float => |float| {
                 const obj = try objects.Float.newBoxed(float);
                 return Object.from(objects.Float, obj);
             },
@@ -589,13 +599,13 @@ pub const Value = enum(ValueBacking) {
 
     pub fn getString(value: Value) ![:0]const u8 {
         switch (value.expandedValue()) {
-            .float => |float| {
+            .inline_float => |float| {
                 var buf: [350]u8 = undefined;
                 const rendered = objects.Float.renderFloat(float, &buf);
                 return try local_arena.dupeSentinel(u8, rendered, 0);
             },
             .ptr => |obj| return try obj.getString(),
-            .int => |int| return try std.fmt.allocPrintSentinel(local_arena, "{}", .{int}, 0),
+            .inline_int => |int| return try std.fmt.allocPrintSentinel(local_arena, "{}", .{int}, 0),
             .false => return "false",
             .true => return "true",
             .interned => {
@@ -615,9 +625,9 @@ pub const Value = enum(ValueBacking) {
         comptime assert(std.fmt.count("{}", .{-std.math.floatMax(f64)}) + 1 <= 350);
 
         switch (value.expandedValue()) {
-            .float => |float| return objects.Float.renderFloat(float, buf),
+            .inline_float => |float| return objects.Float.renderFloat(float, buf),
             .ptr => |obj| return try obj.getString(),
-            .int => |int| return std.fmt.bufPrintSentinel(buf, "{}", .{int}, 0) catch unreachable,
+            .inline_int => |int| return std.fmt.bufPrintSentinel(buf, "{}", .{int}, 0) catch unreachable,
             .false => return "false",
             .true => return "true",
             .interned => {
@@ -636,11 +646,11 @@ pub const Value = enum(ValueBacking) {
         // If they're both primitives, we can compare their values directly. Note that we can't compare
         // interned string values directly, since they're not guaranteed to be unique.
         const is_a_primitive = switch (a.expandedValue()) {
-            .int, .false, .true, .interned, .float => true,
+            .inline_int, .false, .true, .interned, .inline_float => true,
             else => false,
         };
         const is_b_primitive = switch (b.expandedValue()) {
-            .int, .false, .true, .interned, .float => true,
+            .inline_int, .false, .true, .interned, .inline_float => true,
             else => false,
         };
         if (is_a_primitive and is_b_primitive) return a == b;

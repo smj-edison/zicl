@@ -376,9 +376,12 @@ pub const Parse = struct {
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                const command_obj = (try objects.Source.new(p.source_file_name, loc.line_no)).asHead();
+                const command_obj = (try objects.Source.new(
+                    p.source[loc.start..loc.end],
+                    p.source_file_name,
+                    loc.line_no,
+                )).asHead();
                 errdefer command_obj.release();
-                try command_obj.setStringDuplicating(p.source[loc.start..loc.end]);
 
                 return try p.addNode(.{
                     .tag = .command_subst,

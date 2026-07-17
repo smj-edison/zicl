@@ -80,7 +80,7 @@ pub const UpvarLink = struct {
         src.castTo(UpvarLink).linked_name.release();
     }
 
-    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+    fn enumerateStruct(_: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const upvar: *const UpvarLink = @ptrCast(@alignCast(info.node));
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followValue("linked_name", upvar.linked_name);
@@ -193,7 +193,7 @@ pub const DictSugar = struct {
         obj.vtable = &objects.None.vtable;
     }
 
-    fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+    fn enumerateStruct(_: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const dict_sugar: *const DictSugar = @ptrCast(@alignCast(info.node));
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followValue("dict_name", dict_sugar.dict_name);
@@ -230,20 +230,22 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
 
     if (try var_name.equalsString("~parent")) {
         if (det) |details| details.* = .{
-            .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "bad variable name: \"{f}\"", .{var_name}, 0),
+            .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "bad variable name: \"{s}\"", .{try var_name.getString()}, 0),
         };
         return error.BadVariableName;
     }
 
-    const var_dict = interp.call_frames.items[var_call_frame].variables;
+    const var_dict = interp.call_frames.items[var_call_frame].variables.inner.castTo(Dictionary);
     const maybe_scope_hash_ref = &interp.call_frames.items[var_call_frame].signature.scope_hash_ref;
 
     // Check the variables dictionary. Don't follow refs here so the
     // cached index points at the dict slot, not the ref target.
-    if (try var_dict.table.get(var_name)) |local_var| {
+    if (var_dict.table.get(var_name)) |local_var| {
         return .{
-            .dictionary_in = var_dict,
-            .index = local_var,
+            .local_variable = .{
+                .dictionary_in = var_dict,
+                .index = local_var,
+            },
         };
     }
 
@@ -333,7 +335,7 @@ fn ensureValidVariableType(
             // Since this is a lexical value lookup, and the lexical scopes are immutable,
             // the only case where this lookup becomes invalid is if it were shadowed by
             // a local variable.
-            if ((try call_frame.variables.getNoFollow(name.current())).asValue()) |_| {
+            if ((try call_frame.variables.inner.castTo(Dictionary).getNoFollow(name.current())).asValue()) |_| {
                 // Shadowed, so we need to look up again.
                 return try reshimmerToVariable(interp, det, var_call_frame, name);
             } else {
@@ -343,7 +345,7 @@ fn ensureValidVariableType(
                 return .normal;
             }
         }
-    } else if (name.current().asType(objects.DictSugar)) |_| {
+    } else if (name.current().asType(DictSugar)) |_| {
         return .dict_sugar;
     }
 
@@ -360,14 +362,16 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, valu
     const call_frame = &interp.call_frames.items[call_frame_idx];
     call_frame.call_epoch = interp.nextCallEpoch();
 
-    // Add variable.
-    const index = try call_frame.variables.put(name.current(), value);
+    // Add variable. `getMutable` duplicates the dict if it's shared (COW),
+    // so the returned pointer is the one we cache in the CachedLocalVar.
+    const dict = try call_frame.variables.getMutable();
+    const index = try dict.put(name.current(), value);
 
     const obj = try name.prepareToShimmer();
     obj.vtable = &CachedLocalVar.vtable;
     obj.castTo(CachedLocalVar).* = .{
         .call_epoch = call_frame.call_epoch,
-        .dictionary_in = call_frame.variables,
+        .dictionary_in = dict,
         .index = index,
     };
 }
@@ -557,7 +561,7 @@ pub fn unsetVariable(
 
             const resolved_dict = try getVariable(interp, null, call_frame_idx, dict_sugar.dict_name) orelse {
                 if (det) |details| details.* = .{
-                    .message = try allocPrintZ("can't unset \"{f}\": no such element in dictionary", .{name}),
+                    .message = try allocPrintZ("can't unset \"{s}\": no such element in dictionary", .{try name.current().getString()}),
                 };
                 return error.VariableNotFound;
             };
@@ -723,26 +727,26 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
 fn testVariables(ta: std.mem.Allocator) !void {
     defer heap.testFinish();
     try heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
+    var interp = try Interp.init(.{});
     defer interp.deinit();
 
     var str_foo: Shimmerable = .{ .original = try objects.String.newValue("foo") };
     defer str_foo.deinit();
 
     // Make sure it doesn't resolve to anything.
-    try testing.expectEqual(null, resolveVariable(interp, null, 0, str_foo.current()));
+    try testing.expectEqual(null, resolveVariable(&interp, null, 0, str_foo.current()));
 
     const str_value = try objects.String.newValue("value");
     defer str_value.release();
     try setVariable(interp, null, &str_foo, 0, str_value);
 
-    const cached_lookup = (try resolveVariable(interp, null, 0, str_foo.current())).?.local_variable;
+    const cached_lookup = (try resolveVariable(&interp, null, 0, str_foo.current())).?.local_variable;
     const cached_lookup_value = cached_lookup.dictionary_in.items[cached_lookup.index];
     try testing.expectEqualStrings("value", try cached_lookup_value.getString());
     // Also try resolving the value from a new string.
     const str2_foo = try objects.String.newValue("foo");
     defer str2_foo.release();
-    const lookup = (try resolveVariable(interp, null, 0, str2_foo)).?.local_variable;
+    const lookup = (try resolveVariable(&interp, null, 0, str2_foo)).?.local_variable;
     const lookup_value = lookup.dictionary_in.items[lookup.index];
     try testing.expectEqualStrings("value", try lookup_value.getString());
 
@@ -768,14 +772,14 @@ test "variable basics" {
 fn testVariableLink(ta: std.mem.Allocator) !void {
     defer heap.testFinish();
     try heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
+    var interp = try Interp.init(.{});
     defer interp.deinit();
 
     // Create a variable `foo` containing `value`, then upvar `bar` to `foo`.
     var str_foo: Shimmerable = .{ .original = try objects.String.newValue("foo") };
     defer str_foo.deinit();
 
-    try testing.expectEqual(null, resolveVariable(interp, null, 0, str_foo.current()));
+    try testing.expectEqual(null, resolveVariable(&interp, null, 0, str_foo.current()));
     const str_value = try objects.String.newValue("value");
     defer str_value.release();
     try setVariable(interp, &str_foo, 0, str_value);
