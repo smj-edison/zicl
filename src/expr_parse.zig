@@ -337,10 +337,12 @@ pub const Parse = struct {
             .integer => {
                 const loc = p.tokenLoc(p.nextToken());
                 const value = std.fmt.parseInt(i64, p.source[loc.start..loc.end], 10) catch unreachable;
+                const int_value = try objects.Integer.new(value);
+                errdefer int_value.release();
 
                 return try p.addNode(.{
-                    .tag = .integer,
-                    .data = .{ .integer = value },
+                    .tag = .value,
+                    .data = .{ .value = int_value },
                 });
             },
             .float => {
@@ -348,8 +350,8 @@ pub const Parse = struct {
                 const value = std.fmt.parseFloat(f64, p.source[loc.start..loc.end]) catch unreachable;
 
                 return try p.addNode(.{
-                    .tag = .float,
-                    .data = .{ .float = value },
+                    .tag = .value,
+                    .data = .{ .value = Value.newFloat(value) },
                 });
             },
             .simple_string => {
@@ -358,17 +360,18 @@ pub const Parse = struct {
                 errdefer str.release();
 
                 return try p.addNode(.{
-                    .tag = .string,
-                    .data = .{ .object = str },
+                    .tag = .value,
+                    .data = .{ .value = str },
                 });
             },
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try objects.String.newFromEscaped(p.source[loc.start..loc.end]);
+                const str = try objects.String.newFromEscaped(p.source[loc.start..loc.end]);
+                errdefer str.asHead().release();
 
                 return try p.addNode(.{
-                    .tag = .string,
-                    .data = .{ .object = handle },
+                    .tag = .value,
+                    .data = .{ .value = str.asHead().asValue() },
                 });
             },
             .command_subst => {
@@ -382,22 +385,23 @@ pub const Parse = struct {
                     .data = .{ .value = command_obj.asValue() },
                 });
             },
-            .variable_subst,
-            .keyword_false,
-            .keyword_true,
-            => {
+            .variable_subst => {
                 const loc = p.tokenLoc(p.nextToken());
                 var string_handle = try objects.String.newValue(p.source[loc.start..loc.end]);
                 errdefer string_handle.release();
 
                 return try p.addNode(.{
-                    .tag = switch (token) {
-                        .variable_subst => .variable_subst,
-                        .keyword_false => .value_false,
-                        .keyword_true => .value_true,
-                        inline else => unreachable,
-                    },
+                    .tag = .variable_subst,
                     .data = .{ .value = string_handle },
+                });
+            },
+            .keyword_false,
+            .keyword_true,
+            => {
+                _ = p.nextToken();
+                return try p.addNode(.{
+                    .tag = .value,
+                    .data = .{ .value = Value.newBool(token == .keyword_true) },
                 });
             },
             .end_of_file => return null,
@@ -707,13 +711,9 @@ pub const Parse = struct {
                 try writer.print(")", .{});
             },
             // Value
-            .string => try writer.print("\"{f}\"", .{data.object}),
-            .integer => try writer.print("{}", .{data.integer}),
-            .float => try writer.print("{}", .{data.float}),
-            .command_subst => try writer.print("[{f}]", .{data.object}),
-            .variable_subst => try writer.print("${f}", .{data.object}),
-            .value_false => try writer.print("false", .{}),
-            .value_true => try writer.print("true", .{}),
+            .value => try writer.writeAll(try data.value.getString()),
+            .command_subst => try writer.print("[{s}]", .{try data.value.getString()}),
+            .variable_subst => try writer.print("${s}", .{try data.value.getString()}),
             // Unary operators
             .bool_not,
             .bit_not,
@@ -769,7 +769,7 @@ pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) voi
 }
 
 test "expr parsing" {
-    try heap.testStart(testing.allocator, testing.Io);
+    try heap.testStart(testing.allocator, testing.io);
     defer heap.testFinish();
 
     // Left associativity.

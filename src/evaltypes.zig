@@ -231,7 +231,7 @@ pub const Script = struct {
                 }
             } else |err| {
                 if (det) |details| {
-                    details.* = try Tokenizer.convertTokenizerError(err);
+                    details.* = try Tokenizer.convertTokenizerError(heap.global_gpa, err);
                     if (parser.error_details) |parser_details| {
                         details.index = parser_details.index;
                     }
@@ -428,12 +428,12 @@ pub const Script = struct {
 
     pub fn release(script: *Script) void {
         script.ref_count -= 1;
-        if (script.ref_count == 0) heap.global_gpa.free(script);
+        if (script.ref_count == 0) heap.global_gpa.destroy(script);
     }
 };
 
 pub const Expression = struct {
-    ref_count: u32,
+    ref_count: u32 = 1,
     root_node: expr_parse.Node.Index,
     nodes: std.MultiArrayList(expr_parse.Node),
 
@@ -451,10 +451,12 @@ pub const Expression = struct {
             if (next_token) |token| {
                 try tokens.append(heap.global_gpa, token);
                 if (token.tag == .end_of_file) break;
-            } else |err| if (det) |details| {
-                details.* = try Tokenizer.convertTokenizerError(heap.global_gpa, err);
-                if (tokenizer.error_details) |parser_details| {
-                    details.index = parser_details.index;
+            } else |err| {
+                if (det) |details| {
+                    details.* = .{ .message = try Tokenizer.convertTokenizerError(heap.global_gpa, err) };
+                    if (tokenizer.error_details) |parser_details| {
+                        details.index = parser_details.index;
+                    }
                 }
                 return err;
             }
@@ -473,7 +475,7 @@ pub const Expression = struct {
         if (parser.parseExpr()) |root_node| {
             const new_expr = try heap.global_gpa.create(Expression);
             // Note we don't deinit parser here, since we take ownership.
-            new_expr.* = .{ .nodes = parser.node, .root_node = root_node.? };
+            new_expr.* = .{ .nodes = parser.nodes, .root_node = root_node.? };
             return new_expr;
         } else |err| {
             switch (err) {
@@ -486,7 +488,7 @@ pub const Expression = struct {
                         parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
 
                         details.* = .{
-                            .message = aw.toOwnedSlice(),
+                            .message = try aw.toOwnedSliceSentinel(0),
                             .index = err_details.sourceIndex(&parser),
                         };
                     }
@@ -718,7 +720,7 @@ pub const Expression = struct {
             .ternary_conditional => {
                 const children = node_data.ternary;
                 var condition = try evalNode(interp, nodes, children.@"0");
-                const condition_as_bool = try interp.getBooleanInPlace(interp, &condition);
+                const condition_as_bool = try interp.getBooleanInPlace(&condition);
 
                 if (condition_as_bool) {
                     return evalNode(interp, nodes, children.@"1");
@@ -944,14 +946,17 @@ pub const Expression = struct {
         expr.* = undefined;
     }
 
-    pub fn borrow(script: *Script) *Script {
-        script.ref_count += 1;
-        return script;
+    pub fn borrow(expr: *Expression) *Expression {
+        expr.ref_count += 1;
+        return expr;
     }
 
-    pub fn release(script: *Script) void {
-        script.ref_count -= 1;
-        if (script.ref_count == 0) heap.global_gpa.free(script);
+    pub fn release(expr: *Expression) void {
+        expr.ref_count -= 1;
+        if (expr.ref_count == 0) {
+            expr.deinit();
+            heap.global_gpa.destroy(expr);
+        }
     }
 };
 
@@ -985,7 +990,7 @@ pub const Closure = struct {
             return closure.args.len - closure.optional_values.len - if (closure.has_args_parameter) 1 else 0;
         }
 
-        pub fn borrow(closure: *const Content) Content {
+        pub fn duplicate(closure: *const Content) Content {
             const borrowed_args = closure.args.duplicate();
             const borrowed_optional_values = if (closure.optional_values) |val| val.duplicate() else null;
             const borrowed_hash_ref = if (closure.scope_hash_ref) |val| val.duplicate() else null;
@@ -1002,15 +1007,13 @@ pub const Closure = struct {
             };
         }
 
-        pub fn release(closure: *Content) void {
+        pub fn deinit(closure: *Content) void {
             closure.args.deinit();
-            if (closure.optional_values) |vals| vals.deinit();
+            if (closure.optional_values) |*vals| vals.deinit();
 
             closure.body.release();
             closure.name.release();
-            if (closure.scope_hash_ref) |ref| ref.deinit();
-
-            heap.global_gpa.destroy(closure);
+            if (closure.scope_hash_ref) |*ref| ref.deinit();
         }
 
         pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
@@ -1052,7 +1055,7 @@ pub const Closure = struct {
         }
     };
 
-    var closure_cache_id: std.atomic.Value(u64) = .init(0);
+    pub var closure_cache_id: std.atomic.Value(u64) = .init(0);
     pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !*Content {
         const is_method, const prefix_len = blk: {
             if (bytes.len > 3 and std.mem.eql(u8, bytes[0..3], "fn "))

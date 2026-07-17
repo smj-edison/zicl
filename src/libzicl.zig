@@ -256,7 +256,7 @@ export fn Zicl_CreateCommand(
 }
 
 export fn Zicl_GetScriptBeingEvaluated(interp: *Interp) callconv(.c) Handle {
-    return interp.currentEvalFrame().currently_evaluating;
+    return interp.evalFrame().currently_evaluating;
 }
 
 export fn Zicl_EvalObject(interp: *Interp, script: Handle) callconv(.c) Interp.ReturnCode {

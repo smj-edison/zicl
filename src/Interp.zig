@@ -26,11 +26,15 @@ const String = objects.String;
 const List = objects.List;
 const evaltypes = @import("evaltypes.zig");
 const Closure = evaltypes.Closure;
-const ReturnCode = evaltypes.ReturnCode;
 const Script = evaltypes.Script;
 const Expression = evaltypes.Expression;
 
+// We re-export these so callers only need to import Interp and not evaltypes.
+pub const ReturnCode = evaltypes.ReturnCode;
+pub const Error = evaltypes.Error;
+
 const Interp = @This();
+
 /// The result from a procedure or eval call
 result: Value,
 /// Eval frames are separate from call frames, as eval calls can be
@@ -55,7 +59,7 @@ max_call_depth: usize,
 /// Depth of [unknown] calls. Used to catch infinite recursion.
 unknown_depth: usize,
 /// String containing `unknown`. Used to cache unknown lookup.
-unknown_str: Value = heap.createInternedString("unknown").get(),
+unknown_str: Value,
 /// If this is greater than 0, it means we're catching and handling
 /// signals. Otherwise signals are ignored. This gets incremented
 /// when running [catch -signal].
@@ -104,7 +108,7 @@ const FullHashContext = struct {
 };
 const ParsedScripts = memutil.LruCache(u256, *evaltypes.Script, FullHashContext);
 const ParsedExpressions = memutil.LruCache(u256, *Expression, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, evaltypes.ClosureValues, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, *Closure.Content, FullHashContext);
 pub const Substitution = struct {
     subst: *evaltypes.Script,
     /// Currently only used for integrity checks.
@@ -117,6 +121,8 @@ pub const CommandHashTable = std.StringArrayHashMapUnmanaged(evaltypes.NativeCom
 const interned_name = heap.createInternedString("name");
 const interned_impl = heap.createInternedString("impl");
 const interned_scope = heap.createInternedString("scope");
+const interned_zicl_oom = heap.createInternedString("ZICL OOM");
+const interned_oom = heap.createInternedString("out of memory");
 
 pub fn narrowError(err: anyerror) evaltypes.EvalError {
     return switch (err) {
@@ -158,7 +164,7 @@ pub fn wrapError(interp: *Interp, det: *ErrorDetails, result: anytype) wrapError
         if (result == error.OutOfMemory) {
             return error.OutOfMemory;
         } else {
-            interp.setResultOwning(det.message);
+            try interp.setResultStringOwning(det.message);
             return error.EvalError;
         }
     }
@@ -167,7 +173,7 @@ pub fn wrapError(interp: *Interp, det: *ErrorDetails, result: anytype) wrapError
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             // This error should have error details, if it's not OOM.
-            interp.setResultOwning(det.message);
+            try interp.setResultStringOwning(det.message);
             return error.EvalError;
         },
     };
@@ -336,7 +342,7 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
 
 fn freeLastResult(interp: *Interp) void {
     interp.result.release();
-    interp.result = objects.interned_empty_string.get();
+    interp.result = heap.interned_empty_string.get();
 }
 
 pub fn setResult(interp: *Interp, value: Value) void {
@@ -451,7 +457,7 @@ const CallFrame = struct {
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
-        frame.variables.asHead().release();
+        frame.variables.deinit();
         frame.signature.deinit();
     }
 };
@@ -536,21 +542,21 @@ pub fn evalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.evalFrameIdx()];
 }
 
-fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure.Content) !u32 {
+fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: Closure.Content) !u32 {
     var variables = try Dictionary.new(&.{});
     errdefer variables.asHead().release();
 
     if (signature.scope_hash_ref) |scope_hash_ref| {
-        try variables.put(objects.interned_tilde_parent.bytesPtr(), scope_hash_ref.inner.asValue());
+        _ = try variables.put(objects.interned_tilde_parent.get(), scope_hash_ref.inner.asValue());
     }
 
     const new_call_frame_idx = interp.call_frames.items.len;
     try interp.call_frames.append(heap.global_gpa, .{
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
-        .signature = if (signature.scope_hash_ref) |hash_ref| hash_ref.duplicate() else null,
+        .signature = signature,
         // TODO PERF recycle variable hash table if possible.
-        .variables = variables,
+        .variables = .initOwning(variables),
         .tailcall = null,
     });
 
@@ -645,11 +651,12 @@ fn interpolateTokens(
     return (try String.newOwning(new_bytes)).asHead().asValue();
 }
 
-pub fn getScript(interp: *Interp, det: ?*ErrorDetails, value: Value, cache_key: u256) !Script {
+pub fn getScript(interp: *Interp, value: Value, cache_key: u256) !*Script {
     if (interp.parsed_scripts.get(cache_key)) |parsed| {
-        return parsed.script;
+        return parsed;
     } else {
-        const new_script = try Script.parse(det, value);
+        var det: ErrorDetails = undefined;
+        const new_script = try interp.wrapError(&det, Script.parse(&det, value));
         if (interp.parsed_scripts.put(cache_key, new_script)) |ejected| ejected.release();
         return new_script;
     }
@@ -659,7 +666,7 @@ pub const ClosureAndCacheKey = struct {
     closure: *Closure.Content,
     cache_key: u256,
 };
-pub fn getClosure(interp: *Interp, det: ?*ErrorDetails, value: Value, can_be_method: bool) !ClosureAndCacheKey {
+pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAndCacheKey {
     const closure_and_key: ClosureAndCacheKey = blk: {
         if (value.asType(Closure)) |closure| {
             break :blk .{ .closure = closure.closure, .cache_key = @as(u256, closure.closure.cache_id) };
@@ -667,20 +674,19 @@ pub fn getClosure(interp: *Interp, det: ?*ErrorDetails, value: Value, can_be_met
 
         const cache_key = try value.getHashNoRegister();
 
-        if (interp.parsed_closures.getPtr(cache_key)) |cached| {
-            break :blk .{ .closure = cached.closure, .cache_key = cache_key };
+        if (interp.parsed_closures.get(cache_key)) |cached| {
+            break :blk .{ .closure = cached, .cache_key = cache_key };
         } else {
             // We need to parse the closure.
-            const closure = try Closure.parse(det, try value.getString());
+            var det: ErrorDetails = undefined;
+            const closure = try interp.wrapError(&det, Closure.parse(&det, try value.getString()));
             if (interp.parsed_closures.put(cache_key, closure)) |ejected| ejected.release();
             break :blk .{ .closure = closure, .cache_key = cache_key };
         }
     };
 
     if (!can_be_method and closure_and_key.closure.is_method) {
-        if (det) |details| details.* = .{
-            .message = try allocPrintZ("method cannot be invoked as function"),
-        };
+        interp.setResultOwning(heap.createInternedString("method cannot be invoked as function").get());
         return error.CannotBeMethod;
     }
 
@@ -752,11 +758,11 @@ pub fn getCommand(interp: *Interp, call_frame_idx: u32, wb: *Shimmerable, can_be
     return interp.getCommandInner(&det, call_frame_idx, wb.current(), can_be_method) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
-            interp.setResultOwning(det.message);
+            try interp.setResultStringOwning(det.message);
             return error.CommandNotFound;
         },
         else => {
-            interp.setResultOwning(det.message);
+            try interp.setResultStringOwning(det.message);
             return error.EvalError;
         },
     };
@@ -860,7 +866,7 @@ pub fn getExpression(interp: *Interp, value: Value, cache_key: u256) !*Expressio
     } else {
         var det: objects.ErrorDetails = undefined;
         const new_expr = try interp.wrapError(&det, Expression.parse(&det, value));
-        if (interp.parsed_scripts.put(cache_key, new_expr)) |ejected| ejected.release();
+        if (interp.parsed_exprs.put(cache_key, new_expr)) |ejected| ejected.release();
 
         return new_expr;
     }
@@ -870,9 +876,8 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
     // Combine the signature's cache id with the expression's content hash, so
     // identical expressions at different call sites get their own cached
     // variable lookups.
-    var det: ErrorDetails = undefined;
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
-    const expr: *Expression = try interp.wrapError(&det, getExpression(&det, value, cache_key));
+    const expr: *Expression = try interp.getExpression(value, cache_key);
 
     return Expression.evalNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -890,7 +895,7 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
 test "eval expression" {
     try heap.testStart(testing.allocator, testing.io);
     defer heap.testFinish();
-    var interp = try Interp.init();
+    var interp = try Interp.init(.{});
     defer interp.deinit();
 
     var expr = try String.newValue("5 + 10");
@@ -1108,7 +1113,7 @@ fn invokeCommandMaybeMethod(
             vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LinkLookupFailed, error.BadVariableName => {
-                    interp.setResultOwning(det.message);
+                    try interp.setResultStringOwning(det.message);
                     return error.EvalError;
                 },
             };
@@ -1131,7 +1136,7 @@ fn invokeCommandMaybeMethod(
                 vartypes.setVariable(interp, &det, call_frame, &dict_name, dup) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.LinkLookupFailed, error.BadVariableName => {
-                        interp.setResultOwning(det.message);
+                        try interp.setResultStringOwning(det.message);
                         return error.EvalError;
                     },
                 };
@@ -1140,7 +1145,7 @@ fn invokeCommandMaybeMethod(
     }
 }
 
-fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: evaltypes.Script, command_token_i: *u32) !void {
+fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const evaltypes.Script, command_token_i: *u32) !void {
     _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
@@ -1151,6 +1156,8 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: evaltype
     command_token_i.* += 1; // Skip .parsed_script_command.
     interp.evalFrame().current_line = command_info.line;
 
+    // `args_raw` has one extra space at the beginning that can be used to store the
+    // `self` param if needed later on. We don't do the shifting in this function though.
     var args_raw = try heap.local_arena.alloc(Shimmerable, command_info.word_count + 1);
     // Contains what is considered to be the current arguments.
     var args = args_raw[1..];
@@ -1198,17 +1205,18 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: evaltype
             if (argument_expansion) {
                 // Argument expansion, so we'll need to shimmer the result to a list.
                 const as_list = try interp.getListInPlace(&resultant_word);
+                const expansion_len = as_list.items.len;
                 defer resultant_word.release();
 
                 if (expansion_len != 1) {
                     // Expanded into multiple tokens, so we'll need to resize args.
                     // Note: len == 0 means the word disappears, so we shrink by 1.
-                    args_raw = try args_alloc.realloc(args_raw, args_raw.len + expansion_len - 1);
+                    args_raw = try heap.local_arena.realloc(args_raw, args_raw.len + expansion_len - 1);
                     args = args_raw[1..];
                 }
 
                 for (0..expansion_len) |list_idx| {
-                    args[args_written] = .{ .original = objutil.listItem(resultant_word, @intCast(list_idx)).borrow() };
+                    args[args_written] = .{ .original = as_list.items[list_idx].borrow() };
                     args_written += 1;
                 }
             } else {
@@ -1226,10 +1234,9 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: evaltype
     try interp.invokeCommandMaybeMethod(args_raw);
 }
 
-pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_key: u256) EvalError!void {
+pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) evaltypes.EvalError!void {
     // Try to get the script, parsing if necessary.
-    var det: ErrorDetails = undefined;
-    const parsed: Script = try interp.wrapError(&det, objutil.getScript(&det, script, cache_key)).borrow();
+    const parsed = (try interp.getScript(script, cache_key)).borrow();
     defer parsed.release();
     // Don't evaluate empty scripts.
     if (parsed.tags.items.len <= 1) return;
@@ -1268,10 +1275,10 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
                 },
                 else => |narrowed_err| {
                     if (narrowed_err == error.OutOfMemory) {
-                        // In the case of OOM, the inside function almost certainly didn't
-                        // set a result, so we set it here.
-                        interp.setResultInterned(.@"out of memory");
-                        interp.pending_error_code.swap(Heap.local_heap.getInternedString(.@"ZICL OOM"));
+                        // In the case of OOM, the inside function almost certainly failed
+                        // to set a result, so we set it here.
+                        interp.setResult(interned_oom.get());
+                        interp.pending_error_code.swap(interned_zicl_oom.get());
                     }
 
                     if (narrowed_err == error.WrongUsage) {
@@ -1286,9 +1293,7 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
                             const frame = try interp.pushEvalFrame(call_frame, script);
                             defer interp.popEvalFrame();
 
-                            const first_token = objutil.listItem(parsed.values, token_i_at_start);
-                            first_token.assert(first_token.tag() == .parsed_script_command);
-                            const command_info = first_token.peek().body.parsed_script_command;
+                            const command_info = parsed.values[token_i_at_start].asType(evaltypes.ParsedScriptCommand).?;
 
                             interp.eval_frames.items[frame].current_line = command_info.line;
 
@@ -1305,18 +1310,18 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Handle, cache_k
     }
 }
 
-pub fn evalObject(interp: *Interp, script: Handle) EvalError!void {
+pub fn evalObject(interp: *Interp, script: Value) evaltypes.EvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHashNoRegister();
     return evalObjectInner(interp, interp.callFrameIdx(), script, cache_key);
 }
 
-pub fn evalFile(interp: *Interp, filename: []const u8) EvalError!void {
+pub fn evalFile(interp: *Interp, filename: []const u8) evaltypes.EvalError!void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(
-        Heap.global_io,
+        heap.global_io,
         filename,
-        Heap.global_gpa,
+        heap.global_gpa,
         .unlimited,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1325,26 +1330,22 @@ pub fn evalFile(interp: *Interp, filename: []const u8) EvalError!void {
             return;
         },
     };
-    defer Heap.global_gpa.free(bytes);
+    defer heap.global_gpa.free(bytes);
 
-    const filename_handle = try objutil.newString(filename);
-    defer filename_handle.decrRefCount();
-    const script = try objutil.newString(bytes);
-    defer script.decrRefCount();
-    try objutil.setSourceInfo(script, .{
-        .file_name = filename_handle.toOptional(),
-        .line_no = 1,
-    });
+    const filename_value = try objects.String.newValue(filename);
+    defer filename_value.release();
+    const source = try objects.Source.new(bytes, filename_value.asOptional(), 1);
+    defer source.asHead().release();
 
-    try interp.evalObject(script);
+    try interp.evalObject(source.asHead().asValue());
 }
 
-pub fn init() !Interp {
-    const unknown_str = try objutil.newString("unknown");
-    errdefer unknown_str.decrRefCount();
+pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
+    const unknown_str = try objects.String.newValue("unknown");
+    errdefer unknown_str.release();
 
     var new_interp: Interp = .{
-        .result = Heap.local_heap.emptyHandle(),
+        .result = heap.interned_empty_string.get(),
         .eval_frames = .empty,
         .call_frames = .empty,
         .current_call_epoch = global_call_epoch.fetchAdd(1, .monotonic) + 1,
@@ -1362,54 +1363,84 @@ pub fn init() !Interp {
         .signal = 0,
         // TODO: init per interpreter
         .prng = .init(0),
+        // Caches are initialized below.
+        .parsed_scripts = undefined,
+        .parsed_exprs = undefined,
+        .parsed_closures = undefined,
+        .parsed_substs = undefined,
     };
+    new_interp.parsed_scripts = try ParsedScripts.initWithCapacity(heap.global_gpa, cfg.cache_capacity);
+    errdefer new_interp.parsed_scripts.deinit(heap.global_gpa);
+    new_interp.parsed_exprs = try ParsedExpressions.initWithCapacity(heap.global_gpa, cfg.cache_capacity);
+    errdefer new_interp.parsed_exprs.deinit(heap.global_gpa);
+    new_interp.parsed_closures = try ParsedClosures.initWithCapacity(heap.global_gpa, cfg.cache_capacity);
+    errdefer new_interp.parsed_closures.deinit(heap.global_gpa);
+    new_interp.parsed_substs = try ParsedSubstitutions.initWithCapacity(heap.global_gpa, cfg.cache_capacity);
+    errdefer new_interp.parsed_substs.deinit(heap.global_gpa);
 
+    // Push root call frame.
     _ = try new_interp.pushCallFrame(&.{}, .{
-        .args = Heap.local_heap.emptyHandle(),
-        .body = Heap.local_heap.emptyHandle(),
+        .args = objects.AlwaysCanBeType(objects.List).initOwning(try objects.List.new(&.{})),
+        .optional_values = null,
+        .body = heap.interned_empty_string.get(),
         .name = .none,
-        .scope_hash_ref = .none,
-        .required_arity = 0,
-        .optional_arity = 0,
-        .optional_values = .none,
+        .scope_hash_ref = null,
         .has_args_parameter = false,
         .is_method = false,
-        .cache_id = Heap.nextCacheId(),
+        .cache_id = Closure.closure_cache_id.fetchAdd(1, .monotonic),
     });
-    errdefer new_interp.call_frames.deinit(Heap.global_gpa);
-    errdefer new_interp.call_frames.items[0].deinit();
+    errdefer new_interp.call_frames.deinit(heap.global_gpa);
+    errdefer new_interp.call_frames.items[0].deinit(); // Deinit root call frame on error.
 
-    _ = try new_interp.eval_frames.append(Heap.global_gpa, .{
+    _ = try new_interp.eval_frames.append(heap.global_gpa, .{
         .args = &.{},
         .call_frame = 0,
         .current_line = 0,
-        .currently_evaluating = Heap.local_heap.emptyHandle(),
+        .currently_evaluating = heap.interned_empty_string.get(),
     });
-    errdefer new_interp.eval_frames.deinit(Heap.global_gpa);
+    errdefer new_interp.eval_frames.deinit(heap.global_gpa);
 
     return new_interp;
 }
 
 pub fn deinit(interp: *Interp) void {
-    interp.result.decrRefCount();
-    interp.stack_trace.decrOptional();
-    interp.pending_error_code.decrOptional();
-    interp.unknown_str.decrRefCount();
-    interp.global_commands.deinit(Heap.global_gpa);
+    interp.result.release();
+    interp.stack_trace.swapWithNone();
+    interp.pending_error_code.swapWithNone();
+    interp.pending_error_during.swapWithNone();
+    interp.unknown_str.release();
+    interp.global_commands.deinit(heap.global_gpa);
 
     // Deinit all frames.
-    for (interp.call_frames.items) |*frame| {
-        frame.deinit();
-    }
-    interp.call_frames.deinit(Heap.global_gpa);
+    for (interp.call_frames.items) |*frame| frame.deinit();
+    interp.call_frames.deinit(heap.global_gpa);
+    interp.eval_frames.deinit(heap.global_gpa);
 
-    interp.eval_frames.deinit(Heap.global_gpa);
+    // Clean up caches as well.
+    var scripts = interp.parsed_scripts.valueIterator();
+    while (scripts.next()) |script| script.*.release();
+    interp.parsed_scripts.deinit(heap.global_gpa);
+
+    var exprs = interp.parsed_exprs.valueIterator();
+    while (exprs.next()) |expr| expr.*.release();
+    interp.parsed_exprs.deinit(heap.global_gpa);
+
+    var closures = interp.parsed_closures.valueIterator();
+    while (closures.next()) |closure| {
+        closure.*.deinit();
+        heap.global_gpa.destroy(closure.*);
+    }
+    interp.parsed_closures.deinit(heap.global_gpa);
+
+    var substs = interp.parsed_substs.valueIterator();
+    while (substs.next()) |subst| subst.subst.release();
+    interp.parsed_substs.deinit(heap.global_gpa);
 }
 
 // Export various utility functions with a nicer interface.
-pub fn integerOverflowError(interp: *Interp, value: ?[]const u8) error{ OutOfMemory, EvalError } {
+pub fn integerOverflowError(interp: *Interp, IntType: type, rendered_int: IntType) error{ OutOfMemory, EvalError } {
     var det: ErrorDetails = undefined;
-    interp.wrapError(&det, objutil.integerOverflowError(&det, value)) catch return error.EvalError;
+    return interp.wrapError(&det, objects.Integer.overflowError(IntType, &det, rendered_int));
 }
 
 pub fn wrapShimmerFn(
@@ -1419,14 +1450,14 @@ pub fn wrapShimmerFn(
     to_call: fn (?*ErrorDetails, *Shimmerable) anyerror!ReturnType,
 ) !ReturnType {
     var det: ErrorDetails = undefined;
-    try wrapError(interp, &det, to_call(&det, wb));
+    return try wrapError(interp, &det, to_call(&det, wb));
 }
 
 pub fn wrapShimmerInPlaceFn(
     interp: *Interp,
     ReturnType: type,
     ref: *Value,
-    to_call: fn (?*ErrorDetails, *Shimmerable) anyerror!*const ReturnType,
+    to_call: fn (?*ErrorDetails, *Shimmerable) anyerror!ReturnType,
 ) !ReturnType {
     var ref_wb: Shimmerable = .{ .original = ref.* };
     var det: ErrorDetails = undefined;
@@ -1435,40 +1466,16 @@ pub fn wrapShimmerInPlaceFn(
     return result;
 }
 
-pub fn wrapMutableFn(
-    interp: *Interp,
-    wb: *objutil.Mutable,
-    to_call: fn (?*ErrorDetails, *objutil.Mutable) anyerror!void,
-) !void {
-    var det: ErrorDetails = undefined;
-    try wrapError(interp, &det, to_call(&det, wb));
+pub fn getInteger(interp: *Interp, shim: *Shimmerable) !i64 {
+    return try interp.wrapShimmerFn(i64, shim, objects.Integer.shimmerFrom);
 }
 
-/// Shimmers `wb` to `.integer`. Returns the `i64` value.
-pub fn getInteger(interp: *Interp, wb: *objutil.Shimmerable) !i64 {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToInteger);
-    return wb.peek().body.integer;
+pub fn getIntegerInPlace(interp: *Interp, ref: *Value) !i64 {
+    return try interp.wrapShimmerInPlaceFn(i64, ref, objects.Integer.shimmerFrom);
 }
 
-pub fn getIntegerInPlace(interp: *Interp, ref: *Handle) !i64 {
-    try interp.wrapShimmerInPlaceFn(ref, objutil.shimmerToInteger);
-    return ref.peek().body.integer;
-}
-
-pub fn getIntegerNoShimmer(interp: *Interp, handle: Handle) Interp.Error!i64 {
-    var det: ErrorDetails = undefined;
-    return interp.wrapError(&det, objutil.integerGetNoShimmer(&det, handle));
-}
-
-/// Shimmers `wb` to `.float`. Returns the `f64` value.
-pub fn getFloat(interp: *Interp, wb: *objutil.Shimmerable) !f64 {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToFloat);
-    return wb.peek().body.float;
-}
-
-pub fn getFloatNoShimmer(interp: *Interp, handle: Handle) Interp.Error!f64 {
-    var det: ErrorDetails = undefined;
-    return interp.wrapError(&det, objutil.floatGetNoShimmer(&det, handle));
+pub fn getFloat(interp: *Interp, shim: *Shimmerable) !f64 {
+    return try interp.wrapShimmerFn(f64, shim, objects.Float.get);
 }
 
 pub fn getIntOrFloatInPlace(interp: *Interp, ref: *Value) !objects.Number {
@@ -1479,362 +1486,290 @@ pub fn getIntOrFloatInPlace(interp: *Interp, ref: *Value) !objects.Number {
     return result;
 }
 
-/// Shimmers `wb` to `.bool`. Returns the `bool` value.
-pub fn getBoolean(interp: *Interp, wb: *Shimmerable) !bool {
-    return try interp.wrapShimmerFn(bool, wb, objects.Boolean.shimmerFrom);
+pub fn getBoolean(interp: *Interp, shim: *Shimmerable) !bool {
+    return try interp.wrapShimmerFn(bool, shim, objects.Boolean.shimmerFrom);
 }
 
 pub fn getBooleanInPlace(interp: *Interp, ref: *Value) !bool {
-    if (ref.asBool()) |as_bool| return as_bool;
-    var det: ErrorDetails = undefined;
-    const as_bool = try interp.wrapError(&det, objects.Boolean.fromString(&det, try ref.getString()));
-    ref.swap(Value.newBool(as_bool));
+    return try interp.wrapShimmerInPlaceFn(bool, ref, objects.Boolean.shimmerFrom);
 }
 
-/// Shimmers `wb` to `.index`. Returns the `Heap.ListIndex` value.
-pub fn getIndex(interp: *Interp, wb: *objutil.Shimmerable) !Heap.ListIndex {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToIndex);
-    return wb.peek().body.index.data;
+pub fn getIndex(interp: *Interp, shim: *Shimmerable) !objects.Index {
+    return try interp.wrapShimmerFn(objects.Index, shim, objects.Index.get);
 }
 
-/// Shimmers `wb` to `.hash_reference`. Returns the resolved handle.
-pub fn resolveHash(interp: *Interp, wb: *objutil.Shimmerable) !Handle {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToHashReference);
-    return wb.peek().body.hash_reference;
+pub fn resolveHash(interp: *Interp, shim: *Shimmerable) !*const objects.HashReference {
+    return try interp.wrapShimmerFn(*const objects.HashReference, shim, objects.HashReference.shimmerFrom);
 }
 
-/// Shimmers a handle to a dict, updating it in place if a duplicate was
-/// created. Converts errors to EvalError via the interpreter result.
-pub fn shimmerToDict(interp: *Interp, wb: *objutil.Shimmerable) !void {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToDict);
-}
-
-/// Shimmers a handle to a list, updating it in place if a duplicate was
-/// created. Converts errors to EvalError via the interpreter result.
-pub fn shimmerToList(interp: *Interp, wb: *objutil.Shimmerable) !void {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToList);
-}
-
-pub fn shimmerToListInPlace(interp: *Interp, ref: *Handle) !void {
-    try interp.wrapShimmerInPlaceFn(ref, objutil.shimmerToList);
-}
-
-/// Shimmers `wb` to `.list` and returns the item count.
-pub fn getListLength(interp: *Interp, wb: *objutil.Shimmerable) !u32 {
-    try interp.wrapShimmerFn(wb, objutil.shimmerToList);
-    return wb.peek().body.list.len;
+pub fn getList(interp: *Interp, shim: *Shimmerable) !*const List {
+    return try interp.wrapShimmerFn(*const List, shim, List.shimmerFrom);
 }
 
 pub fn getListInPlace(interp: *Interp, ref: *Value) !*const List {
-    return try interp.wrapShimmerInPlaceFn(List, ref, List.shimmerFrom);
+    return try interp.wrapShimmerInPlaceFn(*const List, ref, List.shimmerFrom);
 }
 
-/// Appends `item` to `wb` (which is shimmered to a list first). Returns a
-/// non-owning handle to the appended item.
-pub fn listAppend(interp: *Interp, wb: *objutil.Mutable, item: Handle) !Handle {
-    var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToList(&det, wb.asShimmerable()));
-    return try interp.wrapError(&det, objutil.listAppend(&det, wb, item));
+pub fn getDict(interp: *Interp, shim: *Shimmerable) !*const Dictionary {
+    return try interp.wrapShimmerFn(*const List, shim, Dictionary.shimmerFrom);
 }
 
-pub fn listAppendInPlace(interp: *Interp, ref: *Handle, item: Handle) !Handle {
-    var wb: Mutable = .{ .original = ref.* };
-    const result = try interp.listAppend(&wb, item);
-    ref.* = wb.consume();
-    return result;
-}
-
-pub fn getCodepointLength(interp: *Interp, wb: *Shimmerable) !usize {
-    _ = interp;
-    return try objutil.getCodepointLength(wb);
-}
-
-pub fn setVariableToObject(interp: *Interp, name: *Shimmerable, obj: Heap.Object) !void {
-    try name.ensureShimmerable();
-    var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, interp.setVariableInner(&det, interp.callFrameIdx(), name.current(), obj));
-}
-
-pub fn setVariableSilent(interp: *Interp, name: *Shimmerable, handle: Handle) !void {
-    try name.ensureShimmerable();
-    try interp.setVariableInner(null, interp.callFrameIdx(), name.*, handle.dupOrRef());
+pub fn getDictInPlace(interp: *Interp, ref: *Value) !*const Dictionary {
+    return try interp.wrapShimmerInPlaceFn(*const List, ref, Dictionary.shimmerFrom);
 }
 
 pub fn setVariable(interp: *Interp, name: *Shimmerable, value: Value) !void {
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, variables.setVariable(interp, &det, interp.callFrameIdx(), name, value));
+    try interp.wrapError(&det, vartypes.setVariable(interp, &det, interp.callFrameIdx(), name, value));
 }
 
-pub fn getVariable(interp: *Interp, name: *Shimmerable) !OptionalHandle {
-    try name.ensureShimmerable();
+pub fn setVariableSilent(interp: *Interp, name: *Shimmerable, value: Value) !void {
+    try vartypes.setVariable(interp, null, interp.callFrameIdx(), name, value);
+}
 
+pub fn getVariable(interp: *Interp, name: *Shimmerable) !OptionalValue {
+    try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    const value = interp.getVariableInner(&det, interp.callFrameIdx(), name.current()) catch |err| switch (err) {
+    const value = interp.wrapError(&det, vartypes.getVariable(interp, &det, interp.callFrameIdx(), name)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.BadDict, error.LinkLookupFailed, error.BadVariableName => {
-            interp.setResultOwning(det.message);
+        else => {
+            try interp.setResultStringOwning(det.message);
             return error.EvalError;
         },
     };
-    return OptionalHandle.fromHandle(value);
+    return OptionalValue.fromValue(value);
 }
 
-pub fn getVariableOrError(interp: *Interp, name: *Shimmerable) !Handle {
+pub fn getVariableOrError(interp: *Interp, name: *Shimmerable) !Value {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, interp.getVariableInner(&det, interp.callFrameIdx(), name.current())) orelse {
-        try interp.setResultFormatted("can't read \"{f}\": no such variable", .{name.current()});
-        return error.EvalError;
-    };
+    return try interp.wrapError(&det, vartypes.getVariableOrError(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn unsetVariable(interp: *Interp, name: *Shimmerable) !void {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, interp.unsetVariableInner(&det, interp.callFrameIdx(), name.current()));
+    try interp.wrapError(&det, vartypes.unsetVariable(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn unsetVariableSilent(interp: *Interp, name: *Shimmerable) !void {
     try name.ensureShimmerable();
-    try interp.unsetVariableInner(null, interp.callFrameIdx(), name.current());
+    try vartypes.unsetVariable(interp, null, interp.callFrameIdx(), name);
 }
 
-pub fn getDictValue(interp: *Interp, dict: Handle, new_dict: OptionalHandle, key: Handle) Interp.Error!?Handle {
+pub fn getDictValue(interp: *Interp, dict: *Shimmerable, key: Value) evaltypes.Error!?Value {
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToDict(&det, dict));
-    return try interp.wrapError(det, objutil.dictLookupFollowLinks(det, new_dict.orElse(dict), new_dict, key));
+    return try interp.wrapError(&det, objects.Dictionary.getFollowingLinks(&det, dict, key));
 }
 
-pub fn getDictValueOrError(interp: *Interp, dict: Handle, new_dict: OptionalHandle, key: Handle) Interp.Error!?Handle {
-    const result = interp.getDictValue(dict, new_dict, key);
-    if (result.value) |val| {
-        return val;
-    } else {
-        try interp.setResultFormatted("could not find value for key \"{f}\"", .{key});
-        return error.EvalError;
-    }
+pub fn getDictValueOrError(interp: *Interp, dict: *Shimmerable, key: Value) evaltypes.Error!Value {
+    const result = try interp.getDictValue(dict, key);
+    if (result) |val| return val;
+
+    try interp.setResultFormatted("could not find value for key \"{f}\"", .{key});
+    return error.EvalError;
 }
 
-pub fn getDictValueInPlace(interp: *Interp, dict: *Handle, key: Handle) !?Handle {
-    var maybe_new_dict: OptionalHandle = .none;
-    const result = try interp.getDictValue(dict.*, &maybe_new_dict, key);
-    dict.swapIfNew(maybe_new_dict);
+pub fn getDictValueInPlace(interp: *Interp, dict: *Value, key: Value) !?Value {
+    var dict_shim: Shimmerable = .{ .original = dict.* };
+    errdefer dict_shim.discardChanges();
+    const result = try interp.getDictValue(&dict_shim, key);
+    dict.* = dict_shim.consume();
     return result;
 }
 
-pub fn getDictValueRecursively(interp: *Interp, wb: *Shimmerable, context: anytype) Interp.Error!OptionalHandle {
+pub fn getDictValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) evaltypes.Error!OptionalValue {
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, objutil.dictLookupRecursively(&det, wb, context));
+    return try interp.wrapError(&det, objects.Dictionary.getRecursively(&det, shim, context));
 }
 
-pub fn getDictValueRecursivelyOrError(interp: *Interp, wb: *Shimmerable, context: anytype) Interp.Error!Handle {
-    const result = try interp.getDictValueRecursively(wb, context);
-    if (result.toHandle()) |val| return val;
+pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, context: anytype) evaltypes.Error!Value {
+    const result = try interp.getDictValueRecursively(shim, context);
+    if (result.asValue()) |val| return val;
 
     // Else, create a useful error message.
     if (context.len() == 1) {
         try interp.setResultFormatted("could not find value for key \"{f}\"", .{context.get(0)});
     } else {
-        const keys_list = try objutil.newListWithCapacity(@intCast(context.len()));
-        defer keys_list.decrRefCount();
-        for (0..context.len()) |i| objutil.listAppendAssumeCapacity(keys_list, context.get(i).dupOrRef());
+        // Create a list containing all the keys, so we can render the error message.
+        const keys_list = try objects.List.newWithCapacity(&.{}, @intCast(context.len()));
+        defer keys_list.asHead().release();
+        for (0..context.len()) |i| keys_list.appendAssumeCapacity(context.get(i));
 
-        try interp.setResultFormatted("could not find value for keys \"{f}\"", .{keys_list});
+        try interp.setResultFormatted("could not find value for keys \"{f}\"", .{keys_list.asHead().asValue()});
     }
 
     return error.EvalError;
 }
 
-pub fn putDictValue(interp: *Interp, wb: *Mutable, key: Handle, value: Handle) Interp.Error!Handle {
+pub fn putDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype, value: Value) evaltypes.Error!void {
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToDict(&det, wb.asShimmerable()));
-    return try objutil.dictPut(wb, key, value);
-}
-
-/// Like `putDictValue`, but updates the dict handle in place when the dict
-/// has to be moved (e.g. because it was shared or inline).
-pub fn putDictValueInPlace(interp: *Interp, ref: *Handle, key: Handle, value: Handle) Interp.Error!Handle {
-    var ref_wb: Mutable = .{ .original = ref.* };
-    const result = try interp.putDictValue(&ref_wb, key, value);
-    ref.* = ref_wb.consume();
-    return result;
-}
-
-pub fn putDictValueRecursively(interp: *Interp, wb: *Mutable, context: anytype, value: Handle) Interp.Error!Handle {
-    var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, objutil.dictPutRecursively(&det, wb, context, value.dupOrRef()));
+    try interp.wrapError(&det, dict.putRecursively(&det, context, value));
 }
 
 /// Returns whether the value was removed.
-pub fn removeDictValue(interp: *Interp, original: Handle, new: *OptionalHandle, key: Handle) !bool {
-    errdefer new.swapWithNone();
-
+pub fn removeDictValue(interp: *Interp, dict: *Dictionary, key: Value) !bool {
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, objutil.shimmerToDict(&det, original, new));
-    return try interp.wrapError(&det, objutil.dictRemove(&det, original, new, key));
+    return try interp.wrapError(&det, dict.remove(&det, key));
 }
 
-pub fn removeDictValueRecursively(interp: *Interp, dict: *Mutable, context: anytype) Interp.Error!bool {
+pub fn removeDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype) evaltypes.Error!bool {
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, dict, context));
+    return try interp.wrapError(&det, dict.removeRecursively(&det, context));
 }
 
 test "recursive dict keys" {
-    defer Heap.testFinish();
-    try Heap.testStart(testing.allocator, testing.io);
-    var interp = try Interp.init();
+    defer heap.testFinish();
+    try heap.testStart(testing.allocator, testing.io);
+    var interp = try Interp.init(.{});
     defer interp.deinit();
 
-    var dict: Mutable = .{ .original = try objutil.newDict(&.{}) };
-    defer dict.deinit();
-    var key_foo = try objutil.newString("foo");
-    defer key_foo.decrRefCount();
-    var key_bar = try objutil.newString("bar");
-    defer key_bar.decrRefCount();
-    var key_baz = try objutil.newString("baz");
-    defer key_baz.decrRefCount();
-    const value_qux = try objutil.newString("qux");
-    defer value_qux.decrRefCount();
+    var dict = try objects.Dictionary.new(&.{});
+    defer dict.asHead().release();
+    var key_foo = try objects.String.newValue("foo");
+    defer key_foo.release();
+    var key_bar = try objects.String.newValue("bar");
+    defer key_bar.release();
+    var key_baz = try objects.String.newValue("baz");
+    defer key_baz.release();
+    const value_qux = try objects.String.newValue("qux");
+    defer value_qux.release();
 
-    _ = try interp.putDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+    try interp.putDictValueRecursively(
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
         value_qux,
     );
-    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.getString());
+    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.asHead().getString());
 
     // Try taking ownership of one of the intermediate dictionaries.
     const to_take = (try interp.getDictValueRecursively(
-        dict.asShimmerable(),
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).toHandle().?;
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
+    )).asValue().?;
 
     // See if setting still works correctly.
-    _ = try interp.putDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+    try interp.putDictValueRecursively(
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
         value_qux,
     );
-    try testing.expectEqual(1, to_take.getRefCount());
+    try testing.expectEqual(@as(u32, 1), to_take.asPtr().?.getRefCount());
 
     // Let's try some very cursed aliasing.
-    _ = try interp.putDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } },
-        objutil.dictItemNoFollow(dict.current(), 0),
-    );
-    try testing.expectEqualStrings("foo {bar foo}", try dict.getString());
+    try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, dict.items[0]);
+    try testing.expectEqualStrings("foo {bar foo}", try dict.current().getString());
 
     const value_result = (try interp.getDictValueRecursively(
-        dict.asShimmerable(),
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).toHandle().?;
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
+    )).asValue().?;
     try testing.expectEqualStrings("foo", try value_result.getString());
 }
 
 fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
-    defer Heap.testFinish();
-    try Heap.testStart(ta, testing.io);
-    var interp = try Interp.init();
+    defer heap.testFinish();
+    try heap.testStart(ta, testing.io);
+    var interp = try Interp.init(.{});
     defer interp.deinit();
 
-    var dict: Mutable = .{ .original = try objutil.newDict(&.{}) };
-    defer dict.deinit();
-    var key_foo = try objutil.newString("foo");
-    defer key_foo.decrRefCount();
-    var key_bar = try objutil.newString("bar");
-    defer key_bar.decrRefCount();
-    var key_baz = try objutil.newString("baz");
-    defer key_baz.decrRefCount();
-    const value_qux = try objutil.newString("qux");
-    defer value_qux.decrRefCount();
+    var dict = try objects.Dictionary.new(&.{});
+    defer dict.asHead().release();
+    var key_foo = try objects.String.newValue("foo");
+    defer key_foo.release();
+    var key_bar = try objects.String.newValue("bar");
+    defer key_bar.release();
+    var key_baz = try objects.String.newValue("baz");
+    defer key_baz.release();
+    const value_qux = try objects.String.newValue("qux");
+    defer value_qux.release();
 
     // Test 1: Remove a deeply nested value (3 levels).
-    _ = try interp.putDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+    try interp.putDictValueRecursively(
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
         value_qux,
     );
 
-    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.getString());
+    try testing.expectEqualStrings("foo {bar {baz qux}}", try dict.current().getString());
     var did_remove = try interp.removeDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
     );
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
 
     // Test 2: Try to remove the same key again (should return false).
     did_remove = try interp.removeDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
     );
     try testing.expect(!did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
 
-    // Test 3: Remove a non-existent key from an existing intermediate dict.objutil.HandleSliceContext{ .items =
+    // Test 3: Remove a non-existent key from an existing intermediate dict.
     did_remove = try interp.removeDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_foo } },
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_foo } },
     );
     try testing.expect(!did_remove);
-    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
 
     // Test 4: Remove from a non-existent intermediate dict.
     try memutil.expectErrorOrOom(
         error.EvalError,
-        interp.removeDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{ key_bar, key_baz, key_foo } }),
+        interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_bar, key_baz, key_foo } }),
     );
     try testing.expectEqualStrings(
         \\key "bar" not known in dictionary "foo {bar {}}"
     , try interp.result.getString());
-    try testing.expectEqualStrings("foo {bar {}}", try dict.getString());
+    try testing.expectEqualStrings("foo {bar {}}", try dict.current().getString());
 
     // Test 5: Single-level removal (base case).
-    did_remove = try interp.removeDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{key_foo} });
+    did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{key_foo} });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("", try dict.getString());
+    try testing.expectEqualStrings("", try dict.current().getString());
 
     // Test 6: Two-level removal.
-    _ = try interp.putDictValueRecursively(
-        &dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } },
+    try interp.putDictValueRecursively(
+        dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
         value_qux,
     );
-    try testing.expectEqualStrings("foo {bar qux}", try dict.getString());
-    did_remove = try interp.removeDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } });
+    try testing.expectEqualStrings("foo {bar qux}", try dict.current().getString());
+    did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try dict.getString());
+    try testing.expectEqualStrings("foo {}", try dict.current().getString());
 
     // Test 7: Removal when intermediate dict is shared (copy-on-write).
-    var interm_test_dict: Mutable = .{ .original = try objutil.newDict(&.{}) };
+    var interm_test_dict: Shimmerable = .{ .original = (try objects.Dictionary.new(&.{})).asHead().asValue() };
     defer interm_test_dict.deinit();
-    _ = try interp.putDictValueRecursively(
+    try interp.putDictValueRecursively(
         &interm_test_dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
         value_qux,
     );
-    _ = try interp.putDictValueRecursively(
+    try interp.putDictValueRecursively(
         &interm_test_dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_foo } },
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_foo } },
         value_qux,
     );
 
     // Borrow the intermediate dict.
     const intermediate = (try interp.getDictValueRecursively(
-        interm_test_dict.asShimmerable(),
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).toHandle().?;
-    intermediate.incrRefCount();
-    defer intermediate.decrRefCount();
+        &interm_test_dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
+    )).asValue().?;
+    intermediate.asPtr().?.incrRefCount();
+    defer intermediate.release();
 
-    const initial_refcount = intermediate.getRefCount();
+    const initial_refcount = intermediate.asPtr().?.getRefCount();
     try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
 
     // Remove from the nested dict while it's owned elsewhere.
     did_remove = try interp.removeDictValueRecursively(
         &interm_test_dict,
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
     );
     try testing.expect(did_remove);
 
@@ -1842,34 +1777,34 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
     // But the main dict should have a new copy without 'baz'.
     const foo_bar_result = (try interp.getDictValueRecursively(
-        interm_test_dict.asShimmerable(),
-        objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).toHandle().?;
+        &interm_test_dict,
+        objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
+    )).asValue().?;
     try testing.expectEqualStrings("foo qux", try foo_bar_result.getString());
     // Reference count should drop by 1 since the parent no longer references it.
-    try testing.expectEqual(initial_refcount - 1, intermediate.getRefCount());
+    try testing.expectEqual(initial_refcount - 1, intermediate.asPtr().?.getRefCount());
 
     // Test 8: Remove multiple items from a nested dict.
     dict.deinit();
-    dict = .{ .original = try objutil.newDict(&.{}) };
-    _ = try interp.putDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } }, value_qux);
-    _ = try interp.putDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{ key_foo, key_baz } }, value_qux);
-    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict.getString());
-    did_remove = try interp.removeDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{ key_foo, key_bar } });
+    dict = .{ .original = (try objects.Dictionary.new(&.{})).asHead().asValue() };
+    try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, value_qux);
+    try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } }, value_qux);
+    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict.current().getString());
+    did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {baz qux}", try dict.getString());
-    did_remove = try interp.removeDictValueRecursively(&dict, objutil.HandleSliceContext{ .items = &.{ key_foo, key_baz } });
+    try testing.expectEqualStrings("foo {baz qux}", try dict.current().getString());
+    did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try dict.getString());
+    try testing.expectEqualStrings("foo {}", try dict.current().getString());
 }
 
 test "recursive dict removal" {
     try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDictRemoval, .{});
 }
 
-pub fn testRunScript(interp: *Interp, script: []const u8) !Handle {
-    var script_handle = try objutil.newString(script);
-    defer script_handle.decrRefCount();
+pub fn testRunScript(interp: *Interp, script: []const u8) !Value {
+    var script_handle = try objects.String.newValue(script);
+    defer script_handle.release();
     try interp.evalObject(script_handle);
     return interp.result;
 }
@@ -1905,11 +1840,11 @@ pub fn checkSignal(interp: *Interp) bool {
     return interp.signal_depth > 0 and interp.signal != 0;
 }
 
-// Maps signal numbers to their interned name handle. Only includes signals
+// Maps signal numbers to their interned name string. Only includes signals
 // available on the current platform.
 const signal_name_map = blk: {
     const SIG = std.posix.SIG;
-    const Entry = struct { num: u6, name: Heap.InternedString };
+    const Entry = struct { num: u6, name: []const u8 };
     const candidates = .{
         .{ "HUP", .SIGHUP },       .{ "INT", .SIGINT },   .{ "QUIT", .SIGQUIT },
         .{ "ILL", .SIGILL },       .{ "TRAP", .SIGTRAP }, .{ "ABRT", .SIGABRT },
@@ -1925,23 +1860,23 @@ const signal_name_map = blk: {
     var entries: []const Entry = &.{};
     for (candidates) |pair| {
         if (@hasDecl(SIG, pair[0])) {
-            entries = entries ++ &[_]Entry{.{ .num = @field(SIG, pair[0]), .name = pair[1] }};
+            entries = entries ++ &[_]Entry{.{ .num = @field(SIG, pair[0]), .name = pair[0] }};
         }
     }
     break :blk entries;
 };
 
 /// Build a list of signal name strings for each signal bit set in `mask`.
-pub fn signalMaskToList(mask: u64) !Handle {
-    const list = try objutil.newListWithCapacity(@popCount(mask));
-    errdefer list.decrRefCount();
+pub fn signalMaskToList(mask: u64) !Value {
+    const list = try objects.List.newWithCapacity(&.{}, @popCount(mask));
+    errdefer list.asHead().release();
     inline for (signal_name_map) |entry| {
         if (mask & (@as(u64, 1) << entry.num) != 0) {
-            const str = Heap.local_heap.getInternedString(entry.name);
-            objutil.listAppendAssumeCapacity(list, str.peek().*);
+            const str = heap.createInternedString(entry.name).get();
+            list.appendAssumeCapacity(str);
         }
     }
-    return list;
+    return list.asHead().asValue();
 }
 
 pub fn nextRandomFloat(interp: *Interp) f64 {

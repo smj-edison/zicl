@@ -293,6 +293,10 @@ pub const String = struct {
     pub fn newOwning(bytes: [:0]u8) !*String {
         errdefer heap.global_gpa.free(bytes);
 
+        return try newOwningNoFree(bytes);
+    }
+
+    pub fn newOwningNoFree(bytes: [:0]u8) !*String {
         const new_obj = try Object.newObjectUninitialized(String);
         errdefer new_obj.head.freeBacking();
         try new_obj.head.setStringLocalObject(bytes);
@@ -323,13 +327,13 @@ pub const String = struct {
     pub fn newFromEscaped(escaped: []const u8) !*String {
         // Unescaped will be equal or shorter than escaped version (including null).
         var unescaped = try heap.global_gpa.alloc(u8, escaped.len + 1);
-        defer heap.global_gpa.free(unescaped);
+        errdefer heap.global_gpa.free(unescaped);
         const written = strutil.removeEscaping(escaped, unescaped);
 
         unescaped = try heap.global_gpa.realloc(unescaped, written + 1);
         unescaped[written] = 0x00;
 
-        return try newOwning(unescaped[0..written :0]);
+        return try newOwningNoFree(unescaped[0..written :0]);
     }
 
     pub fn newWithCodepointLength(bytes: []const u8, codepoint_len: usize) !*String {
@@ -788,8 +792,8 @@ pub const Float = struct {
         }
     }
 
-    pub fn asHead(self: *Integer) *Object {
-        return Object.from(Integer, self);
+    pub fn asHead(self: *Float) *Object {
+        return Object.from(Float, self);
     }
 
     pub fn newBoxed(value: f64) !*Float {
@@ -815,12 +819,12 @@ pub const Float = struct {
 
         const parsed = try parse(det, try shim.current().getString());
 
-        // Compare the parsed version to the regenerated version, and if identical,
-        // shimmer to a float value. This way, we don't lose a string representation
-        // if it wouldn't be regenerated the same way.
-        var buf: [32]u8 = undefined;
-        const written = std.fmt.bufPrint(&buf, parsed);
-        const regenerated = buf[0..written];
+        // Compare the original input string to the regenerated string, and
+        // if identical, shimmer to an inline float value. This is because
+        // float parsing is not bijective, since something like "1e3" and
+        // "1000.0" will both generate 1000.0.
+        var buf: [350]u8 = undefined;
+        const regenerated = renderFloat(parsed, &buf);
 
         if (mem.eql(u8, parsed, regenerated)) {
             // The two strings are identical, so we can use a float value.
@@ -834,7 +838,7 @@ pub const Float = struct {
         return as_boxed_float;
     }
 
-    pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
+    pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !f64 {
         try shimmer(det, shim);
 
         if (shim.current().asFloat()) |float| return float;
@@ -886,7 +890,14 @@ pub const Integer = struct {
     }
 
     pub fn asHead(self: *Integer) *Object {
-        return Object.from(String, self);
+        return Object.from(Integer, self);
+    }
+
+    pub fn overflowErrorString(det: ?*ErrorDetails, rendered_int: []const u8) error{ OutOfMemory, IntegerOverflow } {
+        if (det) |details| details.* = .{
+            .message = try std.fmt.allocPrint("integer value \"{s}\" too big to be represented", .{rendered_int}),
+        };
+        return error.IntegerOverflow;
     }
 
     pub fn overflowError(IntType: type, det: ?*ErrorDetails, rendered_int: IntType) error{ OutOfMemory, IntegerOverflow } {
@@ -907,7 +918,7 @@ pub const Integer = struct {
                 return error.BadInteger;
             },
             error.Overflow => {
-                return overflowError(det, bytes);
+                return overflowErrorString(det, bytes);
             },
         }
     }
@@ -916,17 +927,20 @@ pub const Integer = struct {
         if (shim.current().asInt()) |int| return int;
         if (shim.current().asType(Integer)) |boxed_int| return boxed_int.value;
 
-        const parsed = try parse(det, try shim.current().getString());
+        const bytes = try shim.current().getString();
+        const parsed = try parse(det, bytes);
 
         if (parsed >= math.minInt(i32) and parsed <= math.maxInt(i32)) {
-            // Compare the parsed version to the regenerated version, and if identical,
-            // shimmer to an integer value. TODO PERF if we have our own int parser,
-            // we could see if it was a normal parse, and bypass the byte comparsion.
+            // Compare the original input string to the regenerated string, and
+            // if identical, shimmer to an inline int value. This is because
+            // integer parsing is not bijective, since something like "10" and
+            // "0xA" will both generate 10. TODO PERF if we have our own int
+            // parser, we could see if it was a normal parse, and bypass the
+            // byte comparison.
             var buf: [32]u8 = undefined;
-            const written = std.fmt.bufPrint(&buf, parsed);
-            const regenerated = buf[0..written];
+            const regenerated = std.fmt.bufPrint(&buf, "{d}", .{parsed}) catch unreachable;
 
-            if (mem.eql(u8, parsed, regenerated)) {
+            if (mem.eql(u8, bytes, regenerated)) {
                 // The two strings are identical, so we can use an int value.
                 shim.shimmered.swap(Value.newInt(@intCast(parsed)));
             }
@@ -937,7 +951,7 @@ pub const Integer = struct {
         obj.vtable = &vtable;
         const as_boxed_int = obj.castTo(Integer);
         as_boxed_int.* = .{ .value = parsed };
-        return obj.asValue();
+        return parsed;
     }
 
     fn updateString(obj: *Object) !void {
@@ -1280,8 +1294,20 @@ test "subcommand parser" {
 }
 
 pub const Boolean = struct {
+    value: bool,
+
     pub fn new(value: bool) Value {
         return Value.newBool(value);
+    }
+
+    pub fn newBoxed(value: bool) !*Boolean {
+        const new_obj = try Object.newObject(Boolean);
+        new_obj.body.value = value;
+        return new_obj.body;
+    }
+
+    pub fn asHead(self: *Boolean) *Object {
+        return Object.from(Boolean, self);
     }
 
     pub fn fromString(det: ?*ErrorDetails, bytes: []const u8) !bool {
@@ -1304,7 +1330,31 @@ pub const Boolean = struct {
     pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !bool {
         const as_bool = try fromString(det, try shim.current().getString());
         shim.shimmered.swap(Value.newBool(as_bool));
+        return as_bool;
     }
+
+    fn updateString(obj: *Object) !void {
+        const as_bool = obj.castTo(Boolean);
+        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_bool.value}, 0);
+        try obj.setStringIgnoreRace(bytes);
+    }
+
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObject(Boolean);
+        errdefer new_obj.head.deinit();
+        try src.duplicateHeadOnto(new_obj.head);
+        new_obj.body.value = src.constCastTo(Boolean).value;
+        return new_obj.head;
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .free_internal_rep = null,
+        .update_string = updateString,
+        .make_crossthread = null,
+        .enumerate_struct = null,
+        .name = @typeName(Boolean),
+    };
 };
 
 fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
@@ -1458,27 +1508,19 @@ pub const List = struct {
 
         while (true) {
             const next_token = parser.nextListToken() catch |err| {
-                if (det) |details| details.* = .{ .message = try Tokenizer.convertTokenizerError(err) };
+                if (det) |details| details.* = .{ .message = try Tokenizer.convertTokenizerError(heap.global_gpa, err) };
                 return error.BadList;
             };
             switch (next_token.tag) {
                 .simple_string, .escaped_string => {
                     const token_value = bytes[next_token.loc.start..next_token.loc.end];
-                    const str = if (next_token.tag == .escaped_string)
-                        try String.newFromEscaped(token_value)
+                    const source = if (next_token.tag == .escaped_string)
+                        try Source.newFromEscaped(token_value, file_name.borrow(), line_no)
                     else
-                        try String.new(token_value);
-                    const obj = str.asHead();
-                    errdefer obj.release();
+                        try Source.new(token_value, file_name.borrow(), line_no);
+                    defer source.asHead().release();
 
-                    obj.vtable = &Source.vtable;
-                    obj.castTo(Source).* = .{
-                        .file_name = file_name.borrow(),
-                        .line_no = line_no,
-                        .hash = .init(null),
-                    };
-
-                    try new_items.append(heap.global_gpa, obj.asValue());
+                    try new_items.append(heap.global_gpa, source.asHead().asValue());
                 },
                 .end_of_file => break,
                 else => {
