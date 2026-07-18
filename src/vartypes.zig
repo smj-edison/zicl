@@ -223,7 +223,7 @@ pub const VariableValue = union(enum) {
 /// Resolves to the variable's value, if any. Does not account for dict sugar.
 fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, var_name: Value) error{
     OutOfMemory,
-    LinkLookupFailed,
+    LookupFailed,
     BadVariableName,
 }!?VariableValue {
     if (var_name.asPtr()) |obj| _ = try obj.getString();
@@ -251,15 +251,16 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
     if (maybe_scope_hash_ref.*) |*scope_hash_ref| {
-        var dict_shim: Shimmerable = .{ .original = scope_hash_ref.*.ref.asValue() };
+        const hash_ref = scope_hash_ref.*.inner.castTo(objects.HashReference);
+        var dict_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
         defer dict_shim.discardChanges();
         const in_linked_scope = try objects.Dictionary.getFollowingLinks(det, &dict_shim, var_name);
 
         if (dict_shim.shimmered.asValue()) |new_dict_raw| {
             const new_hash_ref = try objects.HashReference.new(new_dict_raw.asPtr().?);
-            const old = scope_hash_ref.*;
-            scope_hash_ref.* = new_hash_ref;
-            old.asHead().release();
+            const old_inner = scope_hash_ref.*.inner;
+            scope_hash_ref.*.inner = new_hash_ref.asHead();
+            old_inner.release();
         }
 
         if (in_linked_scope.asValue()) |val| {
@@ -276,7 +277,7 @@ fn reshimmerToVariable(
     det: ?*ErrorDetails,
     var_call_frame: u32,
     name: *Shimmerable,
-) error{ OutOfMemory, LinkLookupFailed, BadVariableName }!VariableLookupResult {
+) error{ OutOfMemory, LookupFailed, BadVariableName }!VariableLookupResult {
     const call_frame = &interp.call_frames.items[var_call_frame];
     if (try resolveVariable(interp, det, var_call_frame, name.current())) |var_value| {
         switch (var_value) {
@@ -308,12 +309,12 @@ fn reshimmerToVariable(
 /// Ensures that this is a valid variable or upvar. If not, it'll shimmer it to whichever one applies.
 /// Returns an error if it's DictSugar, since that requires special handling and there's not a good
 /// way to handle it in the general case.
-fn ensureValidVariableType(
+pub fn ensureValidVariableType(
     interp: *Interp,
     det: ?*ErrorDetails,
     var_call_frame: u32,
     name: *Shimmerable,
-) error{ OutOfMemory, LinkLookupFailed, BadVariableName }!VariableLookupResult {
+) error{ OutOfMemory, LookupFailed, BadVariableName }!VariableLookupResult {
     const call_frame = interp.call_frames.items[var_call_frame];
 
     if (name.current().asType(CachedLocalVar)) |cached_var| {
@@ -378,7 +379,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, valu
 
 pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, name: *Shimmerable, value: Value) error{
     OutOfMemory,
-    LinkLookupFailed,
+    LookupFailed,
     BadVariableName,
 }!void {
     switch (try ensureValidVariableType(interp, det, call_frame_idx, name)) {
@@ -391,28 +392,48 @@ pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
             defer dict_name.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
 
             const resolved_dict = blk: {
-                const resolved_dict = getVariable(interp, det, call_frame_idx, &dict_name) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.LinkLookupFailed => return error.LinkLookupFailed,
-                    error.BadVariableName => return error.BadVariableName,
-                    error.BadDict => unreachable, // `dict_name` can't be .dict_sugar.
-                };
+                const resolved_dict = try getVariable(interp, det, call_frame_idx, &dict_name);
                 // If it doesn't exist, we'll create it.
                 break :blk if (resolved_dict) |dict| dict.borrow() else (try Dictionary.new(&.{})).asHead().asValue();
             };
             defer resolved_dict.release();
             var resolved_dict_shim: Shimmerable = .{ .original = resolved_dict };
             defer resolved_dict_shim.discardChanges();
-            _ = try Dictionary.shimmerFrom(det, &resolved_dict_shim);
+            _ = Dictionary.shimmerFrom(det, &resolved_dict_shim) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadDict => return error.LookupFailed,
+            };
 
             if (resolved_dict_shim.current().canMutate()) {
                 const as_dict_mut = resolved_dict_shim.current().asType(Dictionary).?;
-                try as_dict_mut.putRecursively(det, objects.ValueSliceContext{ .items = dict_sugar.dict_path.items }, value);
-                interp.call_frames.items[call_frame_idx].variables.asHead().invalidateString();
+                const as_mutable = try interp.call_frames.items[call_frame_idx].variables.getMutable();
+                as_dict_mut.putRecursively(
+                    det,
+                    objects.ValueSliceContext{ .items = dict_sugar.dict_path.items },
+                    value,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => return error.LookupFailed,
+                };
+                // We've modified the dictionary in place, so nothing fallible can occur next without breaking
+                // atomicity.
+                errdefer comptime unreachable;
+                // Invalidate the variable's string, since one of its children mutated in-place.
+                as_mutable.asHead().invalidateString();
             } else {
-                const new_dict = try resolved_dict_shim.getMutable(Dictionary, det);
+                const new_dict = resolved_dict_shim.getMutable(Dictionary, det) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => return error.LookupFailed,
+                };
                 errdefer new_dict.asHead().release();
-                try new_dict.putRecursively(det, objects.ValueSliceContext{ .items = dict_sugar.dict_path.items }, value);
+                new_dict.putRecursively(
+                    det,
+                    objects.ValueSliceContext{ .items = dict_sugar.dict_path.items },
+                    value,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadDict => return error.LookupFailed,
+                };
                 try setVariable(interp, det, call_frame_idx, &dict_name, new_dict.asHead().asValue());
             }
         },
@@ -463,7 +484,7 @@ pub fn setVariableUpvar(
         },
         .dict_sugar => {
             if (det) |details| details.* = .{
-                .message = try allocPrintZ("cannot create an upvar name that has dict sugar"),
+                .message = try allocPrintZ("cannot create an upvar name that has dict sugar", .{}),
             };
             return error.DictSugarInUpvarName;
         },
@@ -480,20 +501,22 @@ pub fn setVariableUpvar(
                 // we managed to find ourselves when traversing the upvar
                 // chain. Obviously, we can't let this happen.
                 if (det) |details| details.* = .{
-                    .message = try allocPrintZ("can't upvar from variable to itself"),
+                    .message = try allocPrintZ("can't upvar from variable to itself", .{}),
                 };
                 return error.CircularUpvar;
             }
 
             // See what kind of variable this is, so we can determine whether it has
             // the potential for a cycle.
+            var obj_currently_checking_shim: Shimmerable = .{ .original = obj_currently_checking };
+            defer obj_currently_checking_shim.discardChanges();
             const ensure_result = ensureValidVariableType(
                 interp,
                 det,
                 target_call_frame_idx,
-                obj_currently_checking,
+                &obj_currently_checking_shim,
             ) catch |err| switch (err) {
-                error.LinkLookupFailed => return error.LinkLookupFailed,
+                error.LookupFailed => return error.LookupFailed,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadVariableName => {
                     // If the target var doesn't exist, then of course the var name != nothing,
@@ -535,7 +558,7 @@ pub fn setVariableUpvar(
     defer link.head.release();
     link.body.* = .{
         .call_frame = target_call_frame_idx,
-        .linked_name = target_name_duped.borrow(),
+        .linked_name = target_name_duped.borrow().asValue(),
     };
 
     try setVariable(interp, det, call_frame_idx, name, link.head.asValue());
@@ -650,8 +673,7 @@ pub fn unsetVariable(
 /// Resolves to the variable's value.
 pub fn getVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, name: *Shimmerable) error{
     OutOfMemory,
-    LinkLookupFailed,
-    BadDict,
+    LookupFailed,
     BadVariableName,
 }!?Value {
     switch (try ensureValidVariableType(interp, det, call_frame_idx, name)) {
@@ -672,7 +694,7 @@ pub fn getVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
                         "variable \"{s}\" is not a valid dictionary",
                         .{try dict_sugar.dict_name.getString()},
                     ) };
-                    return error.BadDict;
+                    return error.LookupFailed;
                 },
             };
 
@@ -707,7 +729,7 @@ pub fn getVariableOrError(
     det: ?*ErrorDetails,
     call_frame_idx: u32,
     name: *Shimmerable,
-) error{ VariableNotFound, OutOfMemory, LinkLookupFailed, BadDict, BadVariableName }!Value {
+) error{ VariableNotFound, OutOfMemory, LookupFailed, BadVariableName }!Value {
     return try getVariable(interp, det, call_frame_idx, name) orelse {
         if (det) |details| details.* = .{
             .message = try allocPrintZ("can't read \"{s}\": no such variable", .{try name.current().getString()}),
@@ -738,7 +760,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
 
     const str_value = try objects.String.newValue("value");
     defer str_value.release();
-    try setVariable(interp, null, &str_foo, 0, str_value);
+    try setVariable(&interp, null, 0, &str_foo, str_value);
 
     const cached_lookup = (try resolveVariable(&interp, null, 0, str_foo.current())).?.local_variable;
     const cached_lookup_value = cached_lookup.dictionary_in.items[cached_lookup.index];
@@ -757,12 +779,12 @@ fn testVariables(ta: std.mem.Allocator) !void {
     defer str_baz.release();
 
     // Make sure trying to read a dict value fails when it's not a dict.
-    try expectErrorOrOom(error.BadDict, getVariable(interp, null, 0, &str_foo_bar));
+    try expectErrorOrOom(error.BadDict, getVariable(&interp, null, 0, &str_foo_bar));
 
     // Clear foo so we can set it to a dictionary.
-    try setVariable(interp, null, 0, &str_foo, objects.interned_empty_string.get());
-    try setVariable(interp, null, 0, &str_foo_bar, str_baz);
-    try testing.expectEqual(str_baz, (try getVariable(interp, null, 0, &str_foo_bar)).?);
+    try setVariable(&interp, null, 0, &str_foo, heap.interned_empty_string.get());
+    try setVariable(&interp, null, 0, &str_foo_bar, str_baz);
+    try testing.expectEqual(str_baz, (try getVariable(&interp, null, 0, &str_foo_bar)).?);
 }
 
 test "variable basics" {
@@ -782,21 +804,21 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
     try testing.expectEqual(null, resolveVariable(&interp, null, 0, str_foo.current()));
     const str_value = try objects.String.newValue("value");
     defer str_value.release();
-    try setVariable(interp, &str_foo, 0, str_value);
+    try setVariable(&interp, null, 0, &str_foo, str_value);
 
     var str_bar: Shimmerable = .{ .original = try objects.String.newValue("bar") };
     defer str_bar.deinit();
-    try setVariableUpvar(interp, null, 0, &str_bar, 0, str_foo.current());
+    try setVariableUpvar(&interp, null, 0, &str_bar, 0, str_foo.current());
 
     // Make sure we can get the value of `foo` through `bar`.
-    var lookup_value = (try getVariable(interp, null, 0, &str_bar)).?;
+    var lookup_value = (try getVariable(&interp, null, 0, &str_bar)).?;
     try testing.expectEqualStrings("value", try lookup_value.getString());
 
     // Modify `foo` through `bar`.
     const str_new_value = try objects.String.newValue("new value");
     defer str_new_value.release();
-    try setVariable(interp, null, 0, &str_bar, str_new_value);
-    lookup_value = (try getVariable(interp, null, 0, &str_foo)).?;
+    try setVariable(&interp, null, 0, &str_bar, str_new_value);
+    lookup_value = (try getVariable(&interp, null, 0, &str_foo)).?;
     try testing.expectEqualStrings("new value", try lookup_value.getString());
 }
 

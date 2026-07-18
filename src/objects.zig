@@ -554,17 +554,17 @@ pub const HashReference = struct {
     }
 
     /// Helper function, as hash references are often resolved to dictionaries.
-    pub fn resolveAsDictionary(det: ?*ErrorDetails, shim: *Shimmerable) error{ LinkLookupFailed, OutOfMemory }!*const Dictionary {
+    pub fn resolveAsDictionary(det: ?*ErrorDetails, shim: *Shimmerable) error{ LookupFailed, OutOfMemory }!*const Dictionary {
         const as_hash_ref = shimmerFrom(det, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.LinkLookupFailed,
+            else => return error.LookupFailed,
         };
         const resolved = as_hash_ref.ref;
         var resolved_shim: Shimmerable = .{ .original = resolved.asValue() };
         defer resolved_shim.discardChanges();
         const dict = Dictionary.shimmerFrom(det, &resolved_shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.BadDict => return error.LinkLookupFailed,
+            error.BadDict => return error.LookupFailed,
         };
 
         if (resolved_shim.shimmered.asValue()) |new_dict| {
@@ -1006,7 +1006,7 @@ pub const Number = union(enum) {
 
         const as_int = Integer.shimmerFrom(null, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return .{ .float = try Float.shimmer(det, shim) },
+            else => return .{ .float = try Float.get(det, shim) },
         };
         return .{ .integer = as_int };
     }
@@ -1805,7 +1805,7 @@ pub const Dictionary = struct {
     }
 
     /// Dict must be shimmerable.
-    pub fn resolveParentDict(dict: *Dictionary, det: ?*ErrorDetails) error{ LinkLookupFailed, OutOfMemory }!?*const Dictionary {
+    pub fn resolveParentDict(dict: *Dictionary, det: ?*ErrorDetails) error{ LookupFailed, OutOfMemory }!?*const Dictionary {
         assert(dict.asHead().canShimmer());
 
         const tilde_parent = interned_tilde_parent.get();
@@ -1824,7 +1824,7 @@ pub const Dictionary = struct {
 
     /// Remove all pairs with key `key`. Returns true if any were removed, and
     /// keeps the table live (clearing and re-putting into the same allocation).
-    pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) error{ OutOfMemory, LinkLookupFailed }!bool {
+    pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) error{ OutOfMemory, LookupFailed }!bool {
         assert(dict.asHead().canMutate());
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
 
@@ -1856,7 +1856,7 @@ pub const Dictionary = struct {
             // Key was found in the parent, so we do need to flatten.
             dict.flatten(det) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict, error.NotHashReference, error.HashLookupFailed => return error.LinkLookupFailed,
+                error.BadDict, error.NotHashReference, error.HashLookupFailed => return error.LookupFailed,
             };
 
             // Flattening may change indicies, so we need to rescan for the first key.
@@ -1998,12 +1998,12 @@ pub const Dictionary = struct {
         }
     }
 
-    pub fn getFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LinkLookupFailed }!OptionalValue {
+    pub fn getFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LookupFailed }!OptionalValue {
         if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
 
         var dict = shimmerFrom(det, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.BadDict => return error.LinkLookupFailed,
+            error.BadDict => return error.LookupFailed,
         };
 
         // See if it's immediately in this dictionary.

@@ -438,7 +438,7 @@ pub const Value = enum(ValueBacking) {
         }
     }
 
-    pub fn asBool(value: Value) ?bool {
+    pub fn asInlineBool(value: Value) ?bool {
         return switch (value.expandedValue()) {
             .false => false,
             .true => true,
@@ -502,7 +502,7 @@ pub const Value = enum(ValueBacking) {
 
     pub fn duplicateAsBoxed(value: Value) !*Object {
         if (value.asPtr()) |obj| {
-            return (try obj.duplicate()).asValue();
+            return try obj.duplicate();
         } else {
             return try value.box();
         }

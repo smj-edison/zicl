@@ -108,7 +108,7 @@ const FullHashContext = struct {
 };
 const ParsedScripts = memutil.LruCache(u256, *evaltypes.Script, FullHashContext);
 const ParsedExpressions = memutil.LruCache(u256, *Expression, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, *Closure.Content, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, Closure.Content, FullHashContext);
 pub const Substitution = struct {
     subst: *evaltypes.Script,
     /// Currently only used for integrity checks.
@@ -198,7 +198,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
 }
 
 /// If called with a closure, this will _modify_ `args[1]`, not just shimmer it.
-pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: u256, args: []Shimmerable) !void {
+pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, args: []Shimmerable) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     // Check arity.
@@ -208,7 +208,7 @@ pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: 
     if (too_few_arguments or too_many_arguments) {
         // Wrong argument count, error accordingly.
         const command_usage = try closure.getUsage(heap.local_arena, try args[0].current().getString());
-        interp.setResultFormatted("wrong # args: should be \"{s}\"", .{command_usage});
+        try interp.setResultFormatted("wrong # args: should be \"{s}\"", .{command_usage});
         return error.WrongUsage;
     }
 
@@ -218,10 +218,10 @@ pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: 
         return error.InfiniteRecursion;
     }
 
-    const call_frame_idx = try interp.pushCallFrame(args, closure);
+    const call_frame_idx = try interp.pushCallFrame(args, closure.*);
     defer {
-        var frame = interp.call_frames.pop().?;
-        frame.deinit();
+        var frame_mut = interp.call_frames.pop().?;
+        frame_mut.deinit();
     }
 
     // Next, we'll populate the call frame.
@@ -231,42 +231,35 @@ pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: 
     // Where we are in the signature.
     var signature_idx: u32 = 0;
 
-    while (signature_idx < closure.args.len) : (signature_idx += 1) {
-        const var_name: Shimmerable = .{ .original = closure.args[signature_idx] };
+    const arg_names = (try closure.arg_names.get()).items;
+    const optional_values = if (closure.optional_values) |*vals| (try vals.get()).items else &.{};
+
+    while (signature_idx < arg_names.len) : (signature_idx += 1) {
+        var var_name: Shimmerable = .{ .original = arg_names[signature_idx] };
         defer var_name.discardChanges(); // TODO PERF write back here instead of deleting the temp object.
 
         // Are we at the last argument? If so, is it `args`?
-        if (signature_idx == closure.args.len - 1 and closure.has_args_parameter) {
+        if (signature_idx == arg_names.len - 1 and closure.has_args_parameter) {
             // Assign remaining arguments to `args`.
-            const list = try List.new(&.{});
+            const list = try List.newWithCapacity(&.{}, args.len - called_idx);
             defer list.asHead().release();
-            for (args[called_idx..]) |arg| try list.append(arg.current());
+            for (args[called_idx..]) |arg| list.appendAssumeCapacity(arg.current());
 
-            var det: ErrorDetails = undefined;
-            interp.setVariableInner(&det, call_frame_idx, &var_name, list.asHead().asValue()) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.LinkLookupFailed, error.BadVariableName => {
-                    try interp.setResultStringOwning(det.message);
-                    return error.EvalError;
-                },
-            };
+            try interp.setVariable(&var_name, list.asHead().asValue());
         } else if (signature_idx >= closure.required_arity) {
             // This is an optional argument.
 
             // Are there any remaining unassigned arguments?
             if (called_idx < args.len) {
-                var det: ErrorDetails = undefined;
-                try interp.wrapError(&det, interp.setVariableInner(&det, call_frame_idx, &var_name, args[called_idx].current()));
+                try interp.setVariable(&var_name, args[called_idx].current());
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
-                const default_value = closure.optional_values[signature_idx - closure.required_arity];
-                var det: ErrorDetails = undefined;
-                try interp.wrapError(&det, interp.setVariableInner(&det, call_frame_idx, &var_name, default_value));
+                const default_value = optional_values[signature_idx - closure.required_arity];
+                try interp.setVariable(&var_name, default_value);
             }
         } else {
-            var det: ErrorDetails = undefined;
-            try interp.wrapError(&det, interp.setVariableInner(&det, call_frame_idx, &var_name, args[called_idx].current().dupOrRef()));
+            try interp.setVariable(&var_name, args[called_idx].current());
             called_idx += 1;
         }
     }
@@ -276,9 +269,9 @@ pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: 
     // When called as a method, we write back `self` to `args[1]`, so that the
     // caller can update the new method.
     if (closure.is_method) {
-        var self_var_name: Shimmerable = .{ .original = closure.args[0] };
+        var self_var_name: Shimmerable = .{ .original = arg_names[0] };
         defer self_var_name.discardChanges(); // TODO PERF don't discard, write back.
-        if (interp.getVariableOrErrorInner(null, call_frame_idx, self_var_name)) |updated_self| {
+        if (vartypes.getVariableOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
             args[1].shimmered.swap(updated_self.borrow());
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -286,7 +279,7 @@ pub fn callClosure(interp: *Interp, closure: *const Closure.Content, cache_key: 
                 // This variable name was already checked when setting the arguments.
                 unreachable;
             },
-            error.VariableNotFound, error.LinkLookupFailed, error.BadDict => {
+            error.VariableNotFound, error.LookupFailed => {
                 try interp.setResultFormatted(
                     "{s} was removed while calling method",
                     .{try self_var_name.current().getString()},
@@ -335,7 +328,7 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
         return;
     }
 
-    const command_usage = try command.getUsageInfo(try args[0].current().getString());
+    const command_usage = try command.getUsageInfo(heap.local_arena, try args[0].current().getString());
     try interp.setResultFormatted("wrong # args: should be \"{s}\"", .{command_usage});
     return error.WrongUsage;
 }
@@ -364,7 +357,7 @@ pub fn setResultFloat(interp: *Interp, value: f64) void {
 }
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
-    interp.setResultOwning((try String.new(bytes)).asHead().asValue());
+    interp.setResultOwning(try String.newValue(bytes));
 }
 
 pub fn setResultStringOwning(interp: *Interp, bytes: [:0]u8) !void {
@@ -462,7 +455,7 @@ const CallFrame = struct {
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
         frame.variables.deinit();
-        frame.signature.deinit();
+        // Signature is also externally managed.
     }
 };
 
@@ -641,14 +634,17 @@ fn interpolateTokens(
 
     if (new_str_len == 0) return heap.interned_empty_string.get();
 
-    var new_bytes = try heap.global_gpa.alloc(u8, new_str_len);
-    errdefer heap.global_gpa.free(new_bytes);
-    var written: usize = 0;
-    for (new_values.items) |new_value| {
-        const value_str = try new_value.getString();
-        @memcpy(new_bytes[written..][0..value_str.len], value_str);
-        written += value_str.len;
-    }
+    const new_bytes = blk: {
+        var bytes = try heap.global_gpa.allocSentinel(u8, new_str_len, 0);
+        errdefer heap.global_gpa.free(bytes);
+        var written: usize = 0;
+        for (new_values.items) |new_value| {
+            const value_str = try new_value.getString();
+            @memcpy(bytes[written..][0..value_str.len], value_str);
+            written += value_str.len;
+        }
+        break :blk bytes;
+    };
 
     return (try String.newOwning(new_bytes)).asHead().asValue();
 }
@@ -665,13 +661,13 @@ pub fn getScript(interp: *Interp, value: Value, cache_key: u256) !*Script {
 }
 
 pub const ClosureAndCacheKey = struct {
-    closure: *Closure.Content,
+    closure: Closure.Content,
     cache_key: u256,
 };
 pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAndCacheKey {
     const closure_and_key: ClosureAndCacheKey = blk: {
         if (value.asType(Closure)) |closure| {
-            break :blk .{ .closure = closure.closure, .cache_key = @as(u256, closure.closure.cache_id) };
+            break :blk .{ .closure = closure.closure.*, .cache_key = @as(u256, closure.closure.cache_id) };
         }
 
         const cache_key = try value.getHashNoRegister();
@@ -682,7 +678,10 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
             // We need to parse the closure.
             var det: ErrorDetails = undefined;
             const closure = try interp.wrapError(&det, Closure.parse(&det, try value.getString()));
-            if (interp.parsed_closures.put(cache_key, closure)) |ejected| ejected.release();
+            if (interp.parsed_closures.put(cache_key, closure)) |ejected| {
+                var ejected_mut = ejected;
+                ejected_mut.deinit();
+            }
             break :blk .{ .closure = closure, .cache_key = cache_key };
         }
     };
@@ -698,82 +697,71 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
 const CommandOrClosure = union(enum) {
     closure: ClosureAndCacheKey,
     command: *evaltypes.NativeCommand,
+
+    pub fn deinit(self: *CommandOrClosure) void {
+        switch (self.*) {
+            .closure => |*closure| closure.closure.deinit(),
+            else => {},
+        }
+    }
 };
 
-fn getCommandInner(
-    interp: *Interp,
-    det: ?*ErrorDetails,
-    call_frame: u32,
-    name: *Shimmerable,
-    can_be_method: bool,
-) !CommandOrClosure {
-    if (interp.getVariableOrErrorInner(det, call_frame, name)) |var_val| {
-        if (var_val.tag() == .closure) {
-            return .{ .closure = try interp.getClosure(det, var_val, can_be_method) };
+/// If variant is `closure`, then the closure is returned borrowed.
+fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_method: bool) !CommandOrClosure {
+    var det: ErrorDetails = undefined;
+
+    const var_val_raw: ?Value = try interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame, name));
+    const var_val = var_val_raw orelse {
+        try interp.setResultFormatted("invalid command name \"{s}\"", .{try name.current().getString()});
+        return error.CommandNotFound;
+    };
+
+    if (var_val.asType(Closure)) |closure| {
+        return .{ .closure = .{
+            .closure = closure.closure.duplicate(),
+            .cache_key = @as(u256, closure.closure.cache_id),
+        } };
+    }
+
+    // TODO PERF probably should cache nativefn lookup.
+    const bytes = try var_val.getString();
+    if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
+        // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
+        const cmd_name = bytes[9..];
+        if (interp.global_commands.getPtr(cmd_name)) |command| {
+            return .{ .command = command };
         }
 
-        // TODO PERF probably should cache nativefn lookup.
-        const bytes = try var_val.getString();
-        if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
-            // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
-            const cmd_name = bytes[9..];
+        // Command not registered locally, so check the shared lazy-init registry.
+        if (heap.nativefn_registry.get(cmd_name)) |init_fn| {
+            init_fn(@ptrCast(interp));
+            // Retry after initialization.
             if (interp.global_commands.getPtr(cmd_name)) |command| {
                 return .{ .command = command };
             }
-
-            // Command not registered locally, so check the shared lazy-init registry.
-            if (heap.nativefn_registry.get(cmd_name)) |init_fn| {
-                init_fn(@ptrCast(interp));
-                // Retry after initialization.
-                if (interp.global_commands.getPtr(cmd_name)) |command| {
-                    return .{ .command = command };
-                }
-            }
-
-            if (det) |details| details.* = .{
-                .message = try allocPrintZ("invalid native command name \"{s}\"", .{cmd_name}),
-            };
-            return error.CommandNotFound;
-        } else {
-            const closure = try interp.getClosure(det, var_val, can_be_method);
-            return .{ .closure = closure };
         }
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.LinkLookupFailed => return error.LinkLookupFailed,
-        error.BadVariableName => return error.BadVariableName,
-        error.VariableNotFound, error.BadDict => {
-            if (det) |details| {
-                heap.global_gpa.free(details.message);
-                details.* = .{
-                    .message = try allocPrintZ("invalid command name \"{s}\"", .{try name.getString()}),
-                };
-            }
-            return error.CommandNotFound;
-        },
+
+        try interp.setResultFormatted("invalid native command name \"{s}\"", .{cmd_name});
+        return error.CommandNotFound;
+    } else {
+        const closure = try interp.getClosure(var_val, can_be_method);
+        return .{ .closure = closure };
     }
 }
 
-pub fn getCommand(interp: *Interp, call_frame_idx: u32, wb: *Shimmerable, can_be_method: bool) !CommandOrClosure {
-    try wb.ensureShimmerable();
-    var det: ErrorDetails = undefined;
-    return interp.getCommandInner(&det, call_frame_idx, wb.current(), can_be_method) catch |err| switch (err) {
+/// If variant is `closure`, then the closure is returned borrowed.
+pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandOrClosure {
+    return interp.getCommandInner(call_frame_idx, name, can_be_method) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.CommandNotFound => {
-            try interp.setResultStringOwning(det.message);
-            return error.CommandNotFound;
-        },
-        else => {
-            try interp.setResultStringOwning(det.message);
-            return error.EvalError;
-        },
+        error.CommandNotFound => return error.CommandNotFound,
+        else => return error.EvalError,
     };
 }
 
 fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     var unknown_str: Shimmerable = .{ .original = interp.unknown_str };
     defer unknown_str.discardChanges();
-    const unknown_cmd = interp.getCommand(0, &unknown_str, false) catch |err| switch (err) {
+    var unknown_cmd = interp.getCommand(0, &unknown_str, false) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // No [unknown] command exists, so we'll default to the "no command found" error.
@@ -782,6 +770,7 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
         },
         error.EvalError => return error.EvalError,
     };
+    defer unknown_cmd.deinit();
 
     if (interp.unknown_depth > 50) {
         try interp.setResultString("infinite recursion in [unknown]");
@@ -795,11 +784,11 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     new_args[0] = .{ .original = interp.unknown_str };
     @memcpy(new_args[1..], args[1..]);
 
-    try interp.invokeCommand(unknown_cmd, new_args);
+    try interp.invokeCommand(&unknown_cmd, new_args);
 }
 
 const CommandError = evaltypes.Error || error{InfiniteRecursion};
-fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []Shimmerable) CommandError!void {
+fn invokeCommand(interp: *Interp, command_or_closure: *CommandOrClosure, args: []Shimmerable) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.InfiniteRecursion;
@@ -820,12 +809,12 @@ fn invokeCommand(interp: *Interp, command_or_closure: CommandOrClosure, args: []
         interp.setEmptyResult();
 
         const result = blk: {
-            switch (command_or_closure) {
+            switch (command_or_closure.*) {
                 .command => |command| {
                     break :blk interp.callNative(command, current_args);
                 },
-                .closure => |closure| {
-                    break :blk interp.callClosure(closure.closure, closure.cache_key, current_args);
+                .closure => |*closure| {
+                    break :blk interp.callClosure(&closure.closure, closure.cache_key, current_args);
                 },
             }
         };
@@ -963,11 +952,11 @@ fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
 
         trace.appendAssumeCapacity(closure_name);
         trace.appendAssumeCapacity(file_name);
-        trace.appendAssumeCapacity(Value.newInt(absolute_line));
+        trace.appendAssumeCapacity(try objects.Integer.new(absolute_line));
         trace.appendAssumeCapacity(args_list.asHead().asValue());
     }
 
-    return trace;
+    return trace.asHead().asValue();
 }
 
 /// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
@@ -999,11 +988,13 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
 
         // Next, we need to find `self`, the second-to-last part of the dict path. For example, calling
         // foo::bar would have foo as `self`, or foo::bar::baz would have foo::bar as `self`.
+        var dict_name_shim: Shimmerable = .{ .original = dict_sugar.dict_name };
+        defer dict_name_shim.discardChanges();
         const dict_resolved = vartypes.getVariable(
             interp,
             null,
             interp.callFrameIdx(),
-            dict_sugar.dict_name,
+            &dict_name_shim,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // This should always succeed, since when `interp.getCommand` was run earlier,
@@ -1012,7 +1003,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         };
 
         // We modify the dictionary at the end of the path.
-        const all_but_last = dict_sugar.dict_path.items[0..(dict_sugar.dict_path.items - 1)];
+        const all_but_last = dict_sugar.dict_path.items[0..(dict_sugar.dict_path.items.len - 1)];
         const method_ctx = objects.ValueSliceContext{ .items = all_but_last };
 
         var dict_shim: Shimmerable = .{ .original = dict_resolved.? };
@@ -1022,11 +1013,11 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         if (dict_shim.shimmered.asValue()) |new_dict| {
             var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
             defer dict_name.discardChanges();
-            try interp.wrapError(&det, vartypes.setVariable(interp, &det, interp.callFrameIdx(), dict_name, new_dict));
+            try interp.wrapError(&det, vartypes.setVariable(interp, &det, interp.callFrameIdx(), &dict_name, new_dict));
         }
 
         if (maybe_self.asValue()) |self| {
-            return .{ .command = command, .self = self.borrow() };
+            return .{ .command = command, .self = self.borrow().asOptional() };
         } else {
             const var_name = try method_dict_path.current().getString();
             // Shave off the end, because we're looking up `self`, not the method in this case.
@@ -1051,10 +1042,11 @@ fn invokeCommandMaybeMethod(
     var args = args_raw[1..];
 
     const cmd_and_self = try interp.getCommandAndSelfParam(args);
-    const command = if (cmd_and_self.command) |val| val else {
+    var command: CommandOrClosure = cmd_and_self.command orelse {
         // [unknown] was invoked and terminated normally, so there's nothing else to do.
         return;
     };
+    defer command.deinit();
     const maybe_self = cmd_and_self.self;
 
     // If the command ended up being a method, we move the command name to the
@@ -1066,7 +1058,7 @@ fn invokeCommandMaybeMethod(
     }
 
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
-    try interp.invokeCommand(command, args);
+    try interp.invokeCommand(&command, args);
 
     if (maybe_self.asValue()) |_| {
         // Be sure to write back `self`.
@@ -1083,12 +1075,12 @@ fn invokeCommandMaybeMethod(
 
         const ensure_result = try interp.wrapError(
             &det,
-            vartypes.ensureValidVariableType(interp, &det, call_frame, method_dict_path.current()),
+            vartypes.ensureValidVariableType(interp, &det, call_frame, method_dict_path),
         );
         const as_dict_sugar = blk: {
             switch (ensure_result) {
                 .not_found => {
-                    const args_list = try command.closure.closure.args.get();
+                    const args_list = try command.closure.closure.arg_names.get();
                     const self_name = try args_list.items[0].getString();
                     try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
                     return error.EvalError;
@@ -1103,22 +1095,10 @@ fn invokeCommandMaybeMethod(
         var dict_name: Shimmerable = .{ .original = as_dict_sugar.dict_name };
         defer dict_name.discardChanges();
 
-        const dict_resolved = vartypes.getVariableOrError(interp, &det, call_frame, &dict_name) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.LinkLookupFailed, error.VariableNotFound, error.BadDict, error.BadVariableName => {
-                interp.setResultOwning((try objects.String.newOwning(det.message)).asHead().asValue());
-                return error.EvalError;
-            },
-        };
+        const dict_resolved = try interp.wrapError(&det, vartypes.getVariableOrError(interp, &det, call_frame, &dict_name));
 
         if (as_dict_sugar.dict_path.items.len == 1) {
-            vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.LinkLookupFailed, error.BadVariableName => {
-                    try interp.setResultStringOwning(det.message);
-                    return error.EvalError;
-                },
-            };
+            try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()));
         } else {
             const all_but_last = as_dict_sugar.dict_path.items[0..(as_dict_sugar.dict_path.items.len - 1)];
             const put_ctx = objects.ValueSliceContext{ .items = all_but_last };
@@ -1135,19 +1115,13 @@ fn invokeCommandMaybeMethod(
             interp.callFrame().variables.inner.invalidateString();
 
             if (duplicate) |dup| {
-                vartypes.setVariable(interp, &det, call_frame, &dict_name, dup) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.LinkLookupFailed, error.BadVariableName => {
-                        try interp.setResultStringOwning(det.message);
-                        return error.EvalError;
-                    },
-                };
+                try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, dup));
             }
         }
     }
 }
 
-fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const evaltypes.Script, command_token_i: *u32) !void {
+fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const evaltypes.Script, command_token_i: *usize) !void {
     _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
@@ -1173,7 +1147,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
 
         // Populate the arguments by looping through each word of the command and
         // substituting.
-        var word_token_i: u32 = command_token_i.*;
+        var word_token_i: usize = command_token_i.*;
         // We don't know the length of each word, but we know there's `word_count` words,
         // so we advance `word_count` times.
         for (0..command_info.word_count) |_| {
@@ -1249,7 +1223,7 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
     // TODO implement JIM_OPTIMIZATION speedups
 
     // Execute every command sequentially until the end of the script or an error occurs.
-    var command_token_i: u32 = 0;
+    var command_token_i: usize = 0;
 
     // Loop through the script's commands.
     while (command_token_i < parsed.tags.len) {
@@ -1382,8 +1356,10 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
 
     // Push root call frame.
     _ = try new_interp.pushCallFrame(&.{}, .{
-        .args = objects.AlwaysCanBeType(objects.List).initOwning(try objects.List.new(&.{})),
+        .arg_names = .initOwning(try objects.List.new(&.{})),
         .optional_values = null,
+        .required_arity = 0,
+        .optional_arity = 0,
         .body = heap.interned_empty_string.get(),
         .name = .none,
         .scope_hash_ref = null,
@@ -1428,10 +1404,7 @@ pub fn deinit(interp: *Interp) void {
     interp.parsed_exprs.deinit(heap.global_gpa);
 
     var closures = interp.parsed_closures.valueIterator();
-    while (closures.next()) |closure| {
-        closure.*.deinit();
-        heap.global_gpa.destroy(closure.*);
-    }
+    while (closures.next()) |closure| closure.deinit();
     interp.parsed_closures.deinit(heap.global_gpa);
 
     var substs = interp.parsed_substs.valueIterator();
@@ -1520,9 +1493,13 @@ pub fn getDictInPlace(interp: *Interp, ref: *Value) !*const Dictionary {
     return try interp.wrapShimmerInPlaceFn(*const List, ref, Dictionary.shimmerFrom);
 }
 
-pub fn setVariable(interp: *Interp, name: *Shimmerable, value: Value) !void {
+pub fn setVariableInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, value: Value) !void {
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, vartypes.setVariable(interp, &det, interp.callFrameIdx(), name, value));
+    try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame_idx, name, value));
+}
+
+pub fn setVariable(interp: *Interp, name: *Shimmerable, value: Value) !void {
+    try interp.setVariableInFrame(interp.callFrameIdx(), name, value);
 }
 
 pub fn setVariableSilent(interp: *Interp, name: *Shimmerable, value: Value) !void {

@@ -88,7 +88,7 @@ pub const ReturnCode = enum(u8) {
 pub const ReturnCodeEnum = objects.EnumConstructor(ReturnCode, true);
 
 pub const CommandFn = fn (interp: *Interp, args: []Shimmerable) Interp.Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Shimmerable) callconv(.c) Interp.ReturnCode;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Value) callconv(.c) Interp.ReturnCode;
 
 pub const ParsedScriptCommand = struct {
     line: u32,
@@ -521,7 +521,7 @@ pub const Expression = struct {
             },
             .mod => std.math.mod(i64, lhs, rhs) catch |err| switch (err) {
                 error.NegativeDenominator => {
-                    try interp.setResultOwning(negative_denom_message.get());
+                    interp.setResultOwning(negative_denom_message.get());
                     return error.NegativeDenominator;
                 },
                 error.DivisionByZero => {
@@ -570,9 +570,7 @@ pub const Expression = struct {
             .bool_or => @intFromBool((lhs != 0) or (rhs != 0)),
             .pow => std.math.powi(i64, lhs, rhs) catch {
                 // Report overflow for both underflow and overflow. Maybe I should report separately?
-                if (det) |details| details.* = .{
-                    .message = try allocPrintZ("integer value too big to be represented", .{}),
-                };
+                interp.setResultOwning(heap.createInternedString("integer value too big to be represented").get());
                 return error.IntegerOverflow;
             },
             else => unreachable,
@@ -596,7 +594,7 @@ pub const Expression = struct {
                     return error.DivisionByZero;
                 },
                 error.NegativeDenominator => {
-                    try interp.setResultOwning(negative_denom_message.get());
+                    interp.setResultOwning(negative_denom_message.get());
                     return error.NegativeDenominator;
                 },
             }),
@@ -787,8 +785,7 @@ pub const Expression = struct {
                         const abs_val: u64 = @abs(int);
                         if (abs_val > @as(u64, @intCast(std.math.maxInt(i64)))) {
                             var det: ErrorDetails = undefined;
-                            try interp.wrapError(&det, objects.Integer.overflowError(u64, &det, abs_val));
-                            unreachable; // `wrapError` always errors on overflow.
+                            return interp.wrapError(&det, objects.Integer.overflowError(u64, &det, abs_val));
                         }
                         break :blk try objects.Integer.new(@intCast(abs_val));
                     },
@@ -933,9 +930,11 @@ pub const Closure = struct {
 
     pub const Content = struct {
         /// Argument list of the procedure.
-        args: objects.AlwaysCanBeType(objects.List),
+        arg_names: objects.AlwaysCanBeType(objects.List),
         /// Default values of optional arguments.
         optional_values: ?objects.AlwaysCanBeType(objects.List),
+        required_arity: usize,
+        optional_arity: usize,
         /// Value for the script's body.
         body: Value,
         /// We do our best to track the closure's name.
@@ -950,40 +949,40 @@ pub const Closure = struct {
         /// Unique identifier for cache keying.
         cache_id: u64,
 
-        pub fn requiredArity(closure: *const Content) usize {
-            return closure.args.len - closure.optional_values.len - if (closure.has_args_parameter) 1 else 0;
-        }
-
-        pub fn duplicate(closure: *const Content) Content {
-            const borrowed_args = closure.args.duplicate();
-            const borrowed_optional_values = if (closure.optional_values) |val| val.duplicate() else null;
-            const borrowed_hash_ref = if (closure.scope_hash_ref) |val| val.duplicate() else null;
+        pub fn duplicate(content: *const Content) Content {
+            const borrowed_args = content.arg_names.duplicate();
+            const borrowed_optional_values = if (content.optional_values) |val| val.duplicate() else null;
+            const borrowed_hash_ref = if (content.scope_hash_ref) |val| val.duplicate() else null;
 
             return .{
-                .args = borrowed_args,
+                .arg_names = borrowed_args,
                 .optional_values = borrowed_optional_values,
-                .body = closure.body.borrow(),
-                .name = closure.name.borrow(),
+                .required_arity = content.required_arity,
+                .optional_arity = content.optional_arity,
+                .body = content.body.borrow(),
+                .name = content.name.borrow(),
                 .scope_hash_ref = borrowed_hash_ref,
-                .has_args_parameter = closure.has_args_parameter,
-                .is_method = closure.is_method,
-                .cache_id = closure.cache_id,
+                .has_args_parameter = content.has_args_parameter,
+                .is_method = content.is_method,
+                .cache_id = content.cache_id,
             };
         }
 
-        pub fn deinit(closure: *Content) void {
-            closure.args.deinit();
-            if (closure.optional_values) |*vals| vals.deinit();
+        pub fn deinit(content: *Content) void {
+            content.arg_names.inner.release();
+            if (content.optional_values) |vals| vals.inner.release();
 
-            closure.body.release();
-            closure.name.release();
-            if (closure.scope_hash_ref) |*ref| ref.deinit();
+            content.body.release();
+            content.name.release();
+            if (content.scope_hash_ref) |ref| ref.inner.release();
+
+            content.* = undefined;
         }
 
         pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
             const closure: *const Content = @ptrCast(@alignCast(info.node));
             const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
-            try helper.follow(Object, "args", closure.args.inner);
+            try helper.follow(Object, "args", closure.arg_names.inner);
             try helper.followOptional(Object, "optional_values", if (closure.optional_values) |val| val.inner else null);
             try helper.followValue("body", closure.body);
             try helper.followOptionalValue("name", closure.name);
@@ -993,13 +992,13 @@ pub const Closure = struct {
             try helper.addField(u64, "cache_id", "{}", closure.cache_id);
         }
 
-        pub fn getUsage(closure: *const Content, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
+        pub fn getUsage(closure: *Content, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
             var aw = std.Io.Writer.Allocating.init(gpa);
             defer aw.deinit();
 
             aw.writer.writeAll(command_name) catch return error.OutOfMemory;
 
-            const closure_args = (try closure.args.get()).items;
+            const closure_args = (try closure.arg_names.get()).items;
             const signature_len = closure_args.len;
             const optional_start = if (closure.has_args_parameter) closure.required_arity - 1 else closure.required_arity;
 
@@ -1020,7 +1019,7 @@ pub const Closure = struct {
     };
 
     pub var closure_cache_id: std.atomic.Value(u64) = .init(0);
-    pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !*Content {
+    pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !Content {
         const is_method, const prefix_len = blk: {
             if (bytes.len > 3 and std.mem.eql(u8, bytes[0..3], "fn "))
                 break :blk .{ false, @as(usize, 3) };
@@ -1044,7 +1043,6 @@ pub const Closure = struct {
                 return error.BadClosure;
             },
         };
-        defer as_dict.asHead().release();
 
         const maybe_name = try as_dict.getNoFollow(interned_name.get());
         const maybe_impl = try as_dict.getNoFollow(interned_impl.get());
@@ -1087,7 +1085,7 @@ pub const Closure = struct {
 
         var args_shim: Shimmerable = .{ .original = args };
         defer args_shim.discardChanges();
-        const args_as_list = try objects.List.shimmerFrom(null, &args_shim) catch |err| switch (err) {
+        const args_as_list = objects.List.shimmerFrom(null, &args_shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 if (det) |details| details.* = .{
@@ -1100,26 +1098,36 @@ pub const Closure = struct {
         // Scope must always be a hash reference.
         var scope_hash_ref: ?*objects.HashReference = null;
         if (maybe_scope.asValue()) |scope| {
-            var scope_wb: Shimmerable = .{ .original = scope };
-            defer scope_wb.discardChanges();
-            const hash_ref = try objects.HashReference.shimmerFrom(det, &scope_wb);
-            hash_ref.asHead().borrow();
+            var scope_shim: Shimmerable = .{ .original = scope };
+            defer scope_shim.discardChanges();
+            // We know we're the only ones who own it, so const cast won't violate any assumptions.
+            const hash_ref = @constCast(try objects.HashReference.shimmerFrom(det, &scope_shim));
+            hash_ref.asHead().incrRefCount();
             scope_hash_ref = hash_ref;
         }
         errdefer if (scope_hash_ref) |ref| ref.asHead().release();
 
-        const content_on_heap = try heap.global_gpa.create(Content);
-        errdefer content_on_heap.release();
+        var parsed_args = try parseArgList(det, args_as_list);
+        defer parsed_args.deinit();
 
-        const parsed_args = try parseArgList(args_as_list);
+        const has_args_param = parsed_args.has_args_parameter;
+        const optional_arity = parsed_args.optional_values.len;
+        const required_arity = args_as_list.items.len - optional_arity - @intFromBool(has_args_param);
 
-        content_on_heap.* = .{
-            .args = parsed_args.arg_names,
-            .optional_values = parsed_args.optional_values,
+        const arg_names_list = try objects.List.new(parsed_args.arg_names);
+        errdefer arg_names_list.asHead().release();
+        const optional_values_list = if (optional_arity > 0) try objects.List.new(parsed_args.optional_values) else null;
+        errdefer if (optional_values_list) |list| list.asHead().release();
+
+        return .{
+            .arg_names = .initOwning(arg_names_list),
+            .optional_values = if (optional_values_list) |val| .initOwning(val) else null,
+            .required_arity = required_arity,
+            .optional_arity = optional_arity,
             .body = body,
             .name = maybe_name.borrow(),
-            .scope_hash_ref = scope_hash_ref,
-            .has_args_parameter = parsed_args.has_args_parameter,
+            .scope_hash_ref = if (scope_hash_ref) |val| .initOwning(val) else null,
+            .has_args_parameter = has_args_param,
             .is_method = is_method,
             .cache_id = closure_cache_id.fetchAdd(1, .monotonic),
         };
@@ -1140,7 +1148,7 @@ pub const Closure = struct {
     };
 
     /// Validates a closure argument list and extracts arity information.
-    pub fn parseArgList(det: ?*ErrorDetails, args: *objects.List) !ParsedArgList {
+    pub fn parseArgList(det: ?*ErrorDetails, args: *const objects.List) !ParsedArgList {
         var arg_names = try objects.List.new(&.{});
         defer arg_names.asHead().release();
         var optional_values: ?*objects.List = null;
@@ -1150,7 +1158,7 @@ pub const Closure = struct {
         for (0..args.items.len) |i| {
             if (args_parameter_found) {
                 if (det) |details| details.* = .{
-                    .message = try allocPrintZ("parameter after 'args' not allowed"),
+                    .message = try allocPrintZ("parameter after 'args' not allowed", .{}),
                 };
                 return error.BadClosure;
             }
@@ -1206,9 +1214,7 @@ pub const Closure = struct {
                     return error.BadClosure;
                 }
 
-                if (arg_as_list.items[0].equalsString("args")) {
-                    args_parameter_found = true;
-                }
+                if (try arg_as_list.items[0].equalsString("args")) args_parameter_found = true;
 
                 try arg_names.append(arg_as_list.items[0]);
             }
@@ -1221,8 +1227,7 @@ pub const Closure = struct {
 
         var optional_values_slice: []Value = &.{};
         if (optional_values) |opt_values| {
-            const duped = try heap.global_gpa.dupe(Value, opt_values);
-            errdefer heap.global_gpa.free(duped);
+            const duped = try heap.global_gpa.dupe(Value, opt_values.items);
             for (duped) |val| val.incrRefCount();
             optional_values_slice = duped;
         }
@@ -1242,7 +1247,7 @@ pub const Closure = struct {
 
         const new_closure = try heap.global_gpa.create(Content);
         errdefer heap.global_gpa.destroy(new_closure);
-        new_closure.* = try src.constCastTo(Closure).closure.borrow();
+        new_closure.* = src.constCastTo(Closure).closure.duplicate();
 
         new_obj.body.* = .{ .closure = new_closure };
 
@@ -1251,34 +1256,34 @@ pub const Closure = struct {
 
     fn freeInternalRep(src: *Object) void {
         const as_closure = src.castTo(Closure);
-        as_closure.closure.release();
+        as_closure.closure.deinit();
         heap.global_gpa.destroy(as_closure.closure);
     }
 
     fn updateString(obj: *Object) !void {
         const as_closure = obj.castTo(Closure);
         const closure = as_closure.closure;
-        const required = closure.requiredArity();
-        const optional = closure.optional_values.len;
+        const required = closure.required_arity;
+        const optional = closure.optional_arity;
 
-        const args = try closure.args.get();
-        const optional_values = if (closure.optional_values) |val| try val.get() else null;
+        const arg_names = try closure.arg_names.get();
+        const optional_values = if (closure.optional_values) |*val| try val.get() else null;
 
         // Step 1: Rebuild the arguments list from required and optional args.
 
-        var rebuilt_args = try heap.local_arena.alloc([]const u8, closure.args.len);
+        var rebuilt_args = try heap.local_arena.alloc([]const u8, arg_names.items.len);
 
         // Get all the strings (we'll overwrite the strings for the optional arguments).
-        for ((try closure.args.get()).items, &rebuilt_args) |arg, *str| str.* = try arg.getString();
+        for (arg_names.items, rebuilt_args) |arg_name, *str| str.* = try arg_name.getString();
 
         // Next, copy over the optional args.
         var optional_written: usize = 0;
         while (optional_written < optional) : (optional_written += 1) {
             const name_and_value: [2][]const u8 = .{
-                try args.items[required + optional_written].getString(), // Argument name.
+                try arg_names.items[required + optional_written].getString(), // Argument name.
                 try optional_values.?.items[optional_written].getString(), // Default value.
             };
-            const bytes = try strutil.quoteStrings(heap.local_arena, name_and_value);
+            const bytes = try strutil.quoteStrings(heap.local_arena, &name_and_value);
             rebuilt_args[required + optional_written] = bytes;
         }
 
@@ -1301,11 +1306,11 @@ pub const Closure = struct {
         // `impl` is a two element list: {args body}.
         const args_and_body: [2][]const u8 = .{ args_as_string, try closure.body.getString() };
         result.appendAssumeCapacity("impl");
-        result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, args_and_body));
+        result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, &args_and_body));
 
         if (closure.scope_hash_ref) |hash_ref| {
             result.appendAssumeCapacity("scope");
-            result.appendAssumeCapacity(try hash_ref.asHead().getString());
+            result.appendAssumeCapacity(try hash_ref.inner.getString());
         }
 
         try obj.setStringDuplicating(try strutil.quoteStrings(heap.local_arena, result.items));
