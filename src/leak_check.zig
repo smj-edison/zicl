@@ -92,7 +92,7 @@ pub const LeakResult = struct {
     /// field-nodes render as scalar leaves.
     pub fn dumpDot(result: *const LeakResult, writer: *std.Io.Writer) !void {
         try writer.writeAll("digraph leaks {\n");
-        try writer.writeAll("  node [shape=box];\n");
+        try writer.writeAll("  node [shape=record];\n");
         try writer.writeAll("  rankdir=LR;\n");
 
         var it = result.nodes.iterator();
@@ -109,14 +109,12 @@ pub const LeakResult = struct {
             }
 
             // Object nodes carry the static `@typeName(Object)` literal; the
-            // runtime type comes from the live header's vtable. The pointer
-            // identity of the comptime literal is the tenuous-but-stable
-            // signal that this is an Object node.
-            if (node.type_name.ptr == @typeName(Object).ptr) {
+            // runtime type comes from the live header's vtable.
+            if (std.mem.eql(u8, node.type_name, @typeName(Object))) {
                 const obj: *const Object = @ptrCast(@alignCast(addr));
                 try writer.print(
-                    "  \"{x}\" [label=\"{s}\\nref={d}\",style=filled,fillcolor=lightgrey];\n",
-                    .{ id, obj.vtable.name, obj.getRefCount() },
+                    "  \"{x}\" [label=\"{s} | ref={d} | ptr=0x{x}\",style=filled,fillcolor=lightpink];\n",
+                    .{ id, obj.vtable.name, obj.getRefCount(), @intFromPtr(obj) },
                 );
                 continue;
             }
@@ -128,7 +126,7 @@ pub const LeakResult = struct {
             } else {
                 try writeEscaped(writer, node.type_name);
             }
-            try writer.writeAll("];\n");
+            try writer.writeAll(",style=filled,fillcolor=lightblue];\n");
         }
 
         for (result.edges.items) |edge| {
@@ -148,36 +146,37 @@ pub const LeakResult = struct {
     /// shows _why_ -- the sequence of refcount operations that left the object
     /// alive, each tagged with where it happened. The two together isolate
     /// refcounting bugs that a graph alone can't.
-    pub fn dumpDetails(result: *const LeakResult, writer: *std.Io.Writer) !void {
-        const terminal: std.Io.Terminal = .{ .writer = writer, .mode = .escape_codes };
+    pub fn dumpDetails(result: *const LeakResult, terminal: std.Io.Terminal) !void {
+        const writer = terminal.writer;
+
+        // We go through twice, once to print the summary, and the second time
+        // to print the details.
+        try writer.writeAll("==== Leak summary ====\n");
 
         var it = result.object_logs.iterator();
-        var printed: usize = 0;
         while (it.next()) |entry| {
             if (!entry.value_ptr.leaked) continue;
             const obj = entry.key_ptr.*;
-            printed += 1;
+            if (obj.maybeGetString()) |bytes| {
+                try writer.print("  leaked addr=0x{x} with value \"{s}\"\n", .{ @intFromPtr(obj), bytes });
+            } else {
+                try writer.print("  leaked addr=0x{x} (no string value)\n", .{@intFromPtr(obj)});
+            }
+        }
 
-            // Read the string rep only if it's already cached, generating one
-            // would mutate through the const object pointer, which a leak dump
-            // must never do. `getStringDetails` is const-safe.
-            const str: []const u8 = switch (obj.getStringDetails()) {
-                .special => |special| special.getString(),
-                .normal => |normal| normal,
-                .none => "<no string rep>",
-            };
-            try writer.print("== Trace for {s} ref={d} addr={x} \"{s}\" ==\n", .{
-                obj.vtable.name, obj.getRefCount(), @intFromPtr(obj), str,
-            });
+        try writer.writeAll("\n==== Leak details ====\n");
+
+        it = result.object_logs.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.leaked) continue;
+            const obj = entry.key_ptr.*;
 
             for (entry.value_ptr.entries.items) |log_entry| {
-                try writer.print("  [{s}] {s}\n", .{ @tagName(log_entry.category), log_entry.message });
-                std.debug.writeStackTrace(&log_entry.stack_trace, terminal) catch {};
+                try writer.print("\n\nTrace for addr=0x{x}: {s}\n", .{ @intFromPtr(obj), log_entry.message });
+                try std.debug.writeStackTrace(&log_entry.stack_trace, terminal);
             }
             try writer.writeAll("\n");
         }
-
-        if (printed == 0) try writer.writeAll("(no leaked objects with traces)\n");
     }
 
     /// Write `s` as a dot-escaped string body (quotes, backslashes, and
@@ -189,6 +188,8 @@ pub const LeakResult = struct {
             '"' => try writer.writeAll("\\\""),
             '\\' => try writer.writeAll("\\\\"),
             '\n' => try writer.writeAll("\\n"),
+            '{' => try writer.writeAll("\\{"),
+            '}' => try writer.writeAll("\\}"),
             else => try writer.writeByte(c),
         };
         try writer.writeByte('"');
@@ -272,7 +273,11 @@ pub fn dumpLeaks() !void {
     var buffer: [256]u8 = undefined;
     var writer = stderr.writer(heap.global_io, &buffer);
     try leaked.dumpDot(&writer.interface);
-    try leaked.dumpDetails(&writer.interface);
+    const terminal: std.Io.Terminal = .{
+        .writer = &writer.interface,
+        .mode = .no_color,
+    };
+    try leaked.dumpDetails(terminal);
     try writer.flush();
 }
 
@@ -314,68 +319,39 @@ pub fn dumpLastTouchedTrace(fd: i32) void {
     var buffer: [4096]u8 = undefined;
     var file_writer = file.writerStreaming(heap.global_io, &buffer);
     const writer: *std.Io.Writer = &file_writer.interface;
-    const terminal: std.Io.Terminal = .{ .writer = writer, .mode = .escape_codes };
+    const terminal: std.Io.Terminal = .{
+        .writer = writer,
+        .mode = std.Io.Terminal.Mode.detect(heap.global_io, file, false, false) catch .no_color,
+    };
     defer file_writer.interface.flush() catch {};
 
-    const n = next_debug_location.load(.monotonic);
-    if (n == 0) {
+    const entries = next_debug_location.load(.monotonic);
+    if (entries == 0) {
         writer.print("(no operations logged)\n", .{}) catch {};
         return;
     }
 
-    // Find the last initialized entry -- the most recent operation. Its object
-    // is the "last touched" object, our prime suspect.
-    var last_index: ?usize = null;
-    var i: usize = n;
-    while (i > 0) {
-        i -= 1;
-        if (debug_log[i].initialized.load(.acquire)) {
-            last_index = i;
-            break;
-        }
-    }
-    if (last_index == null) {
-        writer.print("(no initialized log entries)\n", .{}) catch {};
-        return;
-    }
-    const last_entry = &debug_log[last_index.?];
-    const last_ptr = last_entry.value.asPtr();
-
     // Recent context: the last ~15 entries, regardless of object, so the
     // immediate lead-up to the crash is visible even if the last-touched object
     // isn't the one that faulted.
-    writer.print("== Recent operations (last 15) ==\n", .{}) catch {};
-    {
-        var j: usize = if (n >= 15) n - 15 else 0;
-        while (j < n) : (j += 1) {
-            const e = &debug_log[j];
-            if (!e.initialized.load(.acquire)) continue;
-            const eptr = e.value.asPtr();
-            writer.print("  [{s}] addr=0x{x} {s}\n", .{
-                @tagName(e.category),
-                if (eptr) |p| @intFromPtr(p) else 0,
-                e.message,
-            }) catch {};
-        }
+    writer.print("== Recent operations summary (last 15) ==\n", .{}) catch {};
+    const start = entries -| 15;
+    var j: usize = start;
+    while (j < entries) : (j += 1) {
+        const entry = &debug_log[j];
+        if (!entry.initialized.load(.acquire)) continue;
+        const obj = entry.value.asPtr() orelse continue;
+        writer.print("  [{:>2}] addr=0x{x} {s}\n", .{ j - start, @intFromPtr(obj), entry.message }) catch {};
     }
 
-    // Full trace of the last-touched object: every logged event for its
-    // address, in order, each with its stack trace. This is the depth that
-    // isolates refcount bugs -- you see every borrow/release and where it
-    // happened, ending in the operation that left it dangling.
-    if (last_ptr) |ptr| {
-        writer.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(ptr)}) catch {};
-        var k: usize = 0;
-        while (k < n) : (k += 1) {
-            const e = &debug_log[k];
-            if (!e.initialized.load(.acquire)) continue;
-            const eptr = e.value.asPtr() orelse continue;
-            if (eptr != ptr) continue;
-            writer.print("  [{s}] {s}\n", .{ @tagName(e.category), e.message }) catch {};
-            std.debug.writeStackTrace(&e.stack_trace, terminal) catch {};
-        }
-    } else {
-        writer.print("\n(last operation had no object pointer)\n", .{}) catch {};
+    j = start;
+    while (j < entries) : (j += 1) {
+        const entry = &debug_log[j];
+        if (!entry.initialized.load(.acquire)) continue;
+        const obj = entry.value.asPtr() orelse continue;
+        writer.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)}) catch {};
+        writer.print("  [{:>2}] addr=0x{x} {s}\n", .{ j - start, @intFromPtr(obj), entry.message }) catch {};
+        std.debug.writeStackTrace(&entry.stack_trace, terminal) catch {};
     }
 }
 
@@ -393,7 +369,8 @@ test "leak" {
     var aw = std.Io.Writer.Allocating.init(heap.global_gpa);
     defer aw.deinit();
     try leaked.dumpDot(&aw.writer);
-    try leaked.dumpDetails(&aw.writer);
+    const terminal: std.Io.Terminal = .{ .writer = &aw.writer, .mode = .no_color };
+    try leaked.dumpDetails(terminal);
     const rendered = try aw.toOwnedSlice();
     defer heap.global_gpa.free(rendered);
 

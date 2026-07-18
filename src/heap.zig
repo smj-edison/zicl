@@ -975,7 +975,6 @@ pub const Object = struct {
             .none => {},
         }
         try ctx.addField(Metadata, info, "metadata", "{any}", obj.metadata);
-        try ctx.addField(u32, info, "ref_count", "{}", obj.getRefCount());
         if (obj.vtable.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
     }
 
@@ -1048,6 +1047,14 @@ pub const Object = struct {
                     .none => unreachable,
                 }
             },
+        }
+    }
+
+    pub fn maybeGetString(obj: *const Object) ?[:0]const u8 {
+        switch (obj.getStringDetails()) {
+            .special => |special| return special.getString(),
+            .normal => |bytes| return bytes,
+            .none => return null,
         }
     }
 
@@ -1232,8 +1239,8 @@ pub const Object = struct {
     pub fn invalidateString(obj: *Object) void {
         assert(obj.canShimmer());
         switch (obj.getStringDetails()) {
-            .special => |special| obj.asValue().trace("Invalidate string (was {s})", .{special.getString()}),
-            .normal => |bytes| obj.asValue().trace("Invalidate string (was {s})", .{bytes}),
+            .special => |special| obj.asValue().trace("Invalidate string (was \"{s}\")", .{special.getString()}),
+            .normal => |bytes| obj.asValue().trace("Invalidate string (was \"{s}\")", .{bytes}),
             .none => {},
         }
         obj.freeStringInner();

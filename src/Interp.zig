@@ -442,7 +442,7 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
 /// Call frame.
 const CallFrame = struct {
     /// Dictionary containing the frame's variables.
-    variables: objects.AlwaysCanBeType(Dictionary),
+    variables: *Dictionary,
     /// Arguments of this procedure call. Lifetime managed by creator.
     args: []Shimmerable,
     /// Signature of this procedure.
@@ -454,7 +454,7 @@ const CallFrame = struct {
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
-        frame.variables.deinit();
+        frame.variables.asHead().release();
         // Signature is also externally managed.
     }
 };
@@ -471,6 +471,7 @@ pub fn callFrame(interp: *Interp) *CallFrame {
 pub fn captureScope(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32) !*Dictionary {
     const frame = &interp.call_frames.items[call_frame_idx];
 
+    // Note, we duplicate here, we don't borrow it, since `variables` needs to stay mutable.
     const new_dict = (try frame.variables.asHead().duplicate()).castTo(Dictionary);
     errdefer new_dict.asHead().release();
 
@@ -553,7 +554,7 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: Closure.Conten
         .call_epoch = interp.nextCallEpoch(),
         .signature = signature,
         // TODO PERF recycle variable hash table if possible.
-        .variables = .initOwning(variables),
+        .variables = variables,
         .tailcall = null,
     });
 
@@ -1112,7 +1113,7 @@ fn invokeCommandMaybeMethod(
             assert(dict_resolved_shim.shimmered == .none);
             const as_mutable = dict_resolved_shim.current().asType(Dictionary).?;
             try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
-            interp.callFrame().variables.inner.invalidateString();
+            interp.callFrame().variables.asHead().invalidateString();
 
             if (duplicate) |dup| {
                 try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, dup));
@@ -1354,9 +1355,11 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     new_interp.parsed_substs = try ParsedSubstitutions.initWithCapacity(heap.global_gpa, cfg.cache_capacity);
     errdefer new_interp.parsed_substs.deinit(heap.global_gpa);
 
+    var arg_names: objects.AlwaysCanBeType(List) = .initOwning(try objects.List.new(&.{}));
+    errdefer arg_names.deinit();
     // Push root call frame.
     _ = try new_interp.pushCallFrame(&.{}, .{
-        .arg_names = .initOwning(try objects.List.new(&.{})),
+        .arg_names = arg_names,
         .optional_values = null,
         .required_arity = 0,
         .optional_arity = 0,
@@ -1390,6 +1393,10 @@ pub fn deinit(interp: *Interp) void {
     interp.global_commands.deinit(heap.global_gpa);
 
     // Deinit all frames.
+
+    // We created this callframe's signature at interpreter init, so we manually
+    // clean it up.
+    interp.call_frames.items[0].signature.deinit();
     for (interp.call_frames.items) |*frame| frame.deinit();
     interp.call_frames.deinit(heap.global_gpa);
     interp.eval_frames.deinit(heap.global_gpa);

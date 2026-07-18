@@ -311,6 +311,7 @@ pub const String = struct {
     }
 
     pub fn newValue(bytes: []const u8) !Value {
+        if (bytes.len == 0) return heap.interned_empty_string.get();
         return (try newObject(bytes)).asValue();
     }
 
@@ -1402,7 +1403,7 @@ pub const List = struct {
     capacity: usize,
 
     pub fn new(items: []const Value) !*List {
-        const capacity = math.ceilPowerOfTwo(usize, items.len) catch items.len;
+        const capacity = math.ceilPowerOfTwo(usize, @max(items.len, 4)) catch items.len;
         return try newWithCapacity(items, capacity);
     }
 
@@ -1505,7 +1506,7 @@ pub const List = struct {
                         try Source.newFromEscaped(token_value, file_name.borrow(), line_no)
                     else
                         try Source.new(token_value, file_name.borrow(), line_no);
-                    defer source.asHead().release();
+                    errdefer source.asHead().release();
 
                     try new_items.append(heap.global_gpa, source.asHead().asValue());
                 },

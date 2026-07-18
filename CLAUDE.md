@@ -253,6 +253,7 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 -   Whenever you refer to a variable or a piece of code, enclose it in backticks. Exceptions to this rule include integer types (i.e. i64, u5), error types (i.e. error.OutOfMemory), and command/subcommand names surrounded by brackets (e.g. [puts], not `puts`).
 -   Don't remove comments when porting code. There's been multiple instances where code lost important comments during porting or refactoring. It makes it unnecessarily hard to reason about.
 -   Make sure comments don't include internal thought processes or references to temporary state. Comments should be written for future readers of the code, not for scratch work.
+-   Don't leave comments behind after fixing ownership/ref counting bugs, unless it's significantly outside of normal ownership patterns. They quickly balloon out of control and make the code incomprehensible. See "don't make comments with internal thought process."
 
 ## Available helper functions
 @.claude/helpers.md
