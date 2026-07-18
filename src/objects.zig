@@ -67,19 +67,19 @@ pub const Shimmerable = extern struct {
         }
     }
 
-    pub fn prepareToShimmer(self: *Shimmerable) !*Object {
+    pub fn prepareToShimmer(self: *Shimmerable, T: type) !*T {
         try self.ensureShimmerable();
 
         // We know that this must be an object, since we boxed it if
-        // it was a primitive.
+        // it was a primitive with `ensureShimmerable`.
         const obj = self.current().asPtr().?;
-        // Make sure the object has a string rep before we free its body. That is, if
-        // it has a string rep. `.none` objects are brand new, so they obviously don't
-        // have a string rep yet.
-        if (obj.vtable != &None.vtable) _ = try obj.getString();
+        // Make sure the object has a string rep before we free its body.
+        _ = try obj.getString();
         obj.invalidateInternalRep();
 
-        return obj;
+        obj.vtable = &T.vtable;
+
+        return obj.castTo(T);
     }
 
     pub fn getMutable(self: *Shimmerable, T: type, det: ?*ErrorDetails) !*T {
@@ -383,9 +383,7 @@ pub const String = struct {
         _ = det;
         if (shim.current().asType(String)) |str| return str;
 
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        const as_string = obj.castTo(String);
+        const as_string = try shim.prepareToShimmer(String);
         as_string.* = .{};
         return as_string;
     }
@@ -547,9 +545,7 @@ pub const HashReference = struct {
             return error.HashLookupFailed;
         };
 
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        const as_hash_ref = obj.castTo(HashReference);
+        const as_hash_ref = try shim.prepareToShimmer(HashReference);
         as_hash_ref.* = .{ .ref = target };
         return as_hash_ref;
     }
@@ -719,9 +715,8 @@ pub const Index = struct {
             }
         };
 
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        obj.castTo(Index).* = index;
+        const as_index = try shim.prepareToShimmer(Index);
+        as_index.* = index;
     }
 
     pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !Index {
@@ -842,9 +837,8 @@ pub const Float = struct {
             return;
         }
 
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        obj.castTo(Float).* = .{ .value = parsed };
+        const as_float = try shim.prepareToShimmer(Float);
+        as_float.* = .{ .value = parsed };
     }
 
     pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !f64 {
@@ -961,9 +955,7 @@ pub const Integer = struct {
             return parsed;
         }
 
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        const as_boxed_int = obj.castTo(Integer);
+        const as_boxed_int = try shim.prepareToShimmer(Integer);
         as_boxed_int.* = .{ .value = parsed };
         return parsed;
     }
@@ -1087,11 +1079,9 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
 
             const bytes = try shim.current().getString();
             if (map.get(bytes)) |variant| {
-                const obj = try shim.prepareToShimmer();
-                obj.vtable = &vtable;
-                const self = obj.castTo(Self);
-                self.variant = variant;
-                return self;
+                const as_self = try shim.prepareToShimmer(Self);
+                as_self.variant = variant;
+                return as_self;
             } else {
                 if (det) |details| details.* = .{
                     .message = try allocPrintZ("bad {s} \"{s}\": must be {s}", .{ enum_name, bytes, names }),
@@ -1310,12 +1300,6 @@ test "subcommand parser" {
     try testing.expectError(error.WrongUsage, Parser.parse(null, &args2));
 }
 
-/// `Boolean` is a namespace of helpers, not a heap object type. Bools are
-/// bijective with their canonical string rep ("true"/"false"), so they live
-/// entirely inline as the `.true`/`.false` `Value` tags -- there is never a
-/// reason to box one. When a bool primitive needs an `*Object` handle (to
-/// shimmer to another type), `Value.box` boxes it as a `String` instead. The
-/// functions below parse and produce inline bool values.
 pub const Boolean = struct {
     pub fn new(value: bool) Value {
         return Value.newBool(value);
@@ -1517,9 +1501,7 @@ pub const List = struct {
             }
         }
 
-        const obj = try shim.prepareToShimmer();
-        obj.vtable = &vtable;
-        const as_list = obj.castTo(List);
+        const as_list = try shim.prepareToShimmer(List);
         as_list.* = .{
             .items = new_items.items,
             .capacity = new_items.capacity,

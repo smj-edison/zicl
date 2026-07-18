@@ -171,9 +171,7 @@ pub const DictSugar = struct {
         errdefer dict_sugar.dict_name.release();
         errdefer dict_sugar.dict_path.asHead().release();
 
-        const obj = try name.prepareToShimmer();
-        obj.vtable = &vtable;
-        const as_dict_sugar = obj.castTo(DictSugar);
+        const as_dict_sugar = try name.prepareToShimmer(DictSugar);
         as_dict_sugar.* = .{
             .dict_name = dict_sugar.dict_name,
             .dict_path = dict_sugar.dict_path,
@@ -282,9 +280,8 @@ fn reshimmerToVariable(
     if (try resolveVariable(interp, det, var_call_frame, name.current())) |var_value| {
         switch (var_value) {
             .local_variable => |local_var| {
-                const obj = try name.prepareToShimmer();
-                obj.vtable = &CachedLocalVar.vtable;
-                obj.castTo(CachedLocalVar).* = .{
+                const as_cached_local_var = try name.prepareToShimmer(CachedLocalVar);
+                as_cached_local_var.* = .{
                     .dictionary_in = local_var.dictionary_in,
                     .index = local_var.index,
                     .call_epoch = call_frame.call_epoch,
@@ -292,9 +289,8 @@ fn reshimmerToVariable(
                 return .normal;
             },
             .lexical_variable => |lexical_var| {
-                const obj = try name.prepareToShimmer();
-                obj.vtable = &CachedLexicalVar.vtable;
-                obj.castTo(CachedLexicalVar).* = .{
+                const as_cached_lexical_var = try name.prepareToShimmer(CachedLexicalVar);
+                as_cached_lexical_var.* = .{
                     .ref = lexical_var,
                     .call_epoch = call_frame.call_epoch,
                 };
@@ -367,9 +363,8 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, valu
     // so the returned pointer is the one we cache in the CachedLocalVar.
     const index = try call_frame.variables.put(name.current(), value);
 
-    const obj = try name.prepareToShimmer();
-    obj.vtable = &CachedLocalVar.vtable;
-    obj.castTo(CachedLocalVar).* = .{
+    const as_cached_local_var = try name.prepareToShimmer(CachedLocalVar);
+    as_cached_local_var.* = .{
         .call_epoch = call_frame.call_epoch,
         .dictionary_in = call_frame.variables,
         .index = index,

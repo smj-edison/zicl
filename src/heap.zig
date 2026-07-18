@@ -516,24 +516,8 @@ pub const Value = enum(ValueBacking) {
                 const obj = try objects.Integer.newBoxed(int);
                 return Object.from(objects.Integer, obj);
             },
-            .false => {
-                // Bools are bijective with "true"/"false", so there is no boxed
-                // Boolean type: box as a String carrying the canonical rep.
-                const obj = try Object.newObject(objects.String);
-                errdefer obj.head.freeBacking();
-                const duped = try global_gpa.dupeSentinel(u8, "false", 0);
-                errdefer global_gpa.free(duped);
-                try obj.head.setStringLocalObject(duped);
-                return obj.head;
-            },
-            .true => {
-                const obj = try Object.newObject(objects.String);
-                errdefer obj.head.freeBacking();
-                const duped = try global_gpa.dupeSentinel(u8, "true", 0);
-                errdefer global_gpa.free(duped);
-                try obj.head.setStringLocalObject(duped);
-                return obj.head;
-            },
+            .false => return try objects.String.newObject("false"),
+            .true => return try objects.String.newObject("true"),
             .interned => |bytes| {
                 const obj = try Object.newObject(objects.String);
                 errdefer obj.head.freeBacking();
