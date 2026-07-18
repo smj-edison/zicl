@@ -896,6 +896,13 @@ test "eval expression" {
     try testing.expectEqual(Value.newInt(15), result);
 }
 
+pub fn getBoolFromExpression(interp: *Interp, value: Value) !bool {
+    var expr_result = try interp.evalExpression(value);
+    defer expr_result.release();
+    var det: ErrorDetails = undefined;
+    return try interp.wrapError(&det, objects.Boolean.getFromValue(&det, value));
+}
+
 pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFlags) !Value {
     var cache_key: u256 = try value.getHashNoRegister();
     // Combine the signature's cache id with the expression's content hash, so
