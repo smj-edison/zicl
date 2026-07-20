@@ -1,5 +1,17 @@
+const std = @import("std");
+
+const common = @import("common.zig");
+const heap = common.heap;
+const ErrorDetails = common.ErrorDetails;
+const Value = common.Value;
+const objects = common.objects;
+const List = objects.List;
+const Interp = common.Interp;
+const Shimmerable = common.Shimmerable;
+const registerCommand = common.registerCommand;
+
 /// [incr]
-pub fn incrCmd(interp: *Interp, args: []Shimmerable) !void {
+pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var increment_by: i64 = 1;
 
     if (args.len == 3) {
@@ -9,25 +21,24 @@ pub fn incrCmd(interp: *Interp, args: []Shimmerable) !void {
 
     const var_name = &args[1];
 
-    if ((try interp.getVariable(var_name)).toHandle()) |val| {
-        const contents = try interp.getIntegerNoShimmer(val);
+    if ((try interp.getVariable(var_name)).asValue()) |val| {
+        var val_shim: Shimmerable = .{ .original = val };
+        defer val_shim.discardChanges();
+        var det: ErrorDetails = undefined;
+        const contents = try interp.wrapError(&det, objects.Integer.shimmerFrom(&det, &val_shim));
         const new_contents = std.math.add(i64, contents, increment_by) catch {
-            var det: objutil.ErrorDetails = undefined;
-            return interp.wrapError(&det, objutil.integerOverflowErrorWithWide(&det, @as(i65, contents) + increment_by));
+            return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, @as(i65, contents) + @as(i65, increment_by)));
         };
 
-        if (val.canMutate()) {
-            // Can modify directly.
-            val.invalidateBoth();
-            val.peek().* = objutil.integerObject(new_contents);
-            interp.setResult(val);
-        } else {
-            try interp.setVariableToObject(var_name, objutil.integerObject(new_contents));
-            interp.setResult((interp.getVariable(var_name) catch unreachable).toHandle().?);
-        }
+        const new_int = try objects.Integer.new(new_contents);
+        defer new_int.release();
+        try interp.setVariable(var_name, new_int);
+        interp.setResult(new_int);
     } else {
-        try interp.setVariableToObject(var_name, objutil.integerObject(increment_by));
-        interp.setResult((try interp.getVariable(var_name)).toHandle().?);
+        const new_int = try objects.Integer.new(increment_by);
+        defer new_int.release();
+        try interp.setVariable(var_name, new_int);
+        interp.setResult(new_int);
     }
 }
 
@@ -39,7 +50,7 @@ pub fn setCmd(interp: *Interp, args: []Shimmerable) !void {
         // Return the value.
         interp.setResult(try interp.getVariableOrError(var_name));
     } else {
-        try interp.setVariableTo(var_name, args[2].current());
+        try interp.setVariable(var_name, args[2].current());
         // Return the stored value (may differ from args[2] after upvar follow).
         interp.setResult(try interp.getVariableOrError(var_name));
     }
@@ -69,9 +80,7 @@ pub fn unsetCmd(interp: *Interp, args: []Shimmerable) !void {
         while (i < args.len) : (i += 1) {
             interp.unsetVariableSilent(&args[i]) catch |err| switch (err) {
                 error.VariableNotFound,
-                error.HashLookupFailed,
                 error.LookupFailed,
-                error.NotHashReference,
                 error.BadVariableName,
                 error.BadDict,
                 => {},
@@ -89,7 +98,7 @@ pub fn upvarCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     if (args.len > 3 and @mod(args.len, 2) == 0) {
         if (interp.getInteger(&args[1])) |level| {
-            if (level >= 0) {
+            if (level >= 0 and level <= std.math.maxInt(u32)) {
                 levels_up = @intCast(level);
                 upvar_names_start = 2;
             } else {
@@ -108,7 +117,7 @@ pub fn upvarCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len - upvar_names_start < 2) return error.WrongUsage;
 
     const current_frame = interp.callFrameIdx();
-    if (current_frame < levels_up) {
+    if (levels_up > current_frame) {
         try interp.setResultString("bad level");
         return error.EvalError;
     }
@@ -119,10 +128,17 @@ pub fn upvarCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         try args[j].ensureShimmerable();
         try args[j + 1].ensureShimmerable();
 
-        var det: objutil.ErrorDetails = undefined;
+        var det: ErrorDetails = undefined;
         try interp.wrapError(
             &det,
-            interp.setVariableUpvarInner(&det, current_frame, args[j + 1].current(), target_frame, args[j].current()),
+            interp.setVariableUpvar(&args[j + 1], target_frame, args[j].current()),
         );
     }
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
+    try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
+    try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null, null);
+    try registerCommand(interp, "upvar", upvarCmd, "?level? otherVar myVar ?otherVar myVar ...?", 2, null, null);
 }

@@ -1,7 +1,23 @@
+const std = @import("std");
+
+const Tokenizer = @import("../Tokenizer.zig");
+const evaltypes = @import("../evaltypes.zig");
+const common = @import("common.zig");
+const AlwaysCanBeType = common.AlwaysCanBeType;
+const assert = common.assert;
+const heap = common.heap;
+const Object = heap.Object;
+const ErrorDetails = common.ErrorDetails;
+const Value = common.Value;
+const objects = common.objects;
+const List = objects.List;
+const Interp = common.Interp;
+const Shimmerable = common.Shimmerable;
+const registerCommand = common.registerCommand;
+
 pub fn exprCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    const result = try (try interp.evalExpression(args[1].current())).toObject();
-    defer result.decrRefCount();
-    interp.setResult(result);
+    const result = try interp.evalExpression(args[1].current());
+    interp.setResultOwning(result);
 }
 
 pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
@@ -21,8 +37,8 @@ pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
         }
 
         try interp.setResultFormatted(
-            "bad option \"{f}\": must be -nocommands, -novariables, or -nobackslashes",
-            .{args[arg_index].current()},
+            "bad option \"{s}\": must be -nocommands, -novariables, or -nobackslashes",
+            .{try args[arg_index].current().getString()},
         );
         return error.EvalError;
     }
@@ -31,15 +47,14 @@ pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
     interp.setResultOwning(try interp.evalSubstitution(to_substitute.current(), flags));
 }
 
-/// [uplevel] - evaluate a script in an upper scope.
-/// Syntax: uplevel ?level? script ?arg ...?
+/// [uplevel]
 pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len < 2) return error.WrongUsage;
 
     var script_start: usize = 1;
     var levels_up: u32 = 1;
 
-    const first_str = try args[1].getString();
+    const first_str = try args[1].current().getString();
     if (first_str.len > 0 and (first_str[0] >= '0' and first_str[0] <= '9')) {
         if (interp.getInteger(&args[1])) |level| {
             if (level >= 0) {
@@ -67,14 +82,11 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     }
     const target_frame = current_frame - levels_up;
 
-    const script, const is_new_script = blk: {
-        if (args.len - script_start == 1) {
-            break :blk .{ args[script_start].current(), false };
-        }
-        const list = try objutil.newListFromShimmerables(args[script_start..]);
-        break :blk .{ list, true };
-    };
-    defer if (is_new_script) script.decrRefCount();
+    const script = if (args.len - script_start == 1)
+        args[script_start].current().borrow()
+    else
+        (try objects.List.newFromShimmerables(args[script_start..])).asHead().asValue();
+    defer script.release();
 
     const cache_key = @as(u256, interp.call_frames.items[target_frame].signature.cache_id) ^ try script.getHashNoRegister();
     return interp.evalObjectInner(target_frame, script, cache_key);
@@ -84,48 +96,46 @@ pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len == 2) {
         try interp.evalObject(args[1].current());
     } else {
-        try interp.evalObject(try objutil.newListFromShimmerables(args[1..]));
+        const new = try objects.List.newFromShimmerables(args[1..]);
+        defer new.asHead().release();
+        try interp.evalObject(new.asHead().asValue());
     }
 }
 
 /// [apply]
 pub fn applyCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    var det: objutil.ErrorDetails = undefined;
-    const closure_and_key = try interp.wrapError(&det, interp.getClosure(&det, args[1].current(), false));
+    const closure_and_key = try interp.getClosure(args[1].current(), false);
+
+    var duped = closure_and_key.closure.duplicate();
+    defer duped.deinit();
 
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
-    try Interp.narrowToEvalError(interp.callClosure(
-        closure_and_key.closure,
-        closure_and_key.cache_key,
-        args[1..],
-    ));
+    try Interp.narrowToEvalError(interp.callClosure(&duped, closure_and_key.cache_key, args[1..]));
 }
 
 pub fn applymethodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    var det: objutil.ErrorDetails = undefined;
-    const closure_and_key = try interp.wrapError(&det, interp.getClosure(&det, args[1].current(), true));
+    const closure_and_key = try interp.getClosure(args[1].current(), true);
 
     if (!closure_and_key.closure.is_method) {
         try interp.setResultString("[applymethod] called with a function");
         return error.EvalError;
     }
 
-    try Interp.narrowToEvalError(interp.callClosure(
-        closure_and_key.closure,
-        closure_and_key.cache_key,
-        args[1..],
-    ));
+    var duped = closure_and_key.closure.duplicate();
+    defer duped.deinit();
 
-    const new_self = args[2].shimmered.toHandle().?;
+    try Interp.narrowToEvalError(interp.callClosure(&duped, closure_and_key.cache_key, args[1..]));
+
+    const new_self = args[2].shimmered.asValue().?;
     args[2].shimmered = .none; // It's bad practice to leave a `Shimmerable` as mutated.
-    defer new_self.decrRefCount();
+    defer new_self.release();
     const method_result = interp.result;
 
-    interp.setResultOwning(try objutil.newList(&.{ new_self, method_result }));
+    interp.setResultOwning((try objects.List.new(&.{ new_self, method_result })).asHead().asValue());
 }
 
-pub fn tallcallCommand(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+pub fn tailcallCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (interp.callFrameIdx() == 0) {
         try interp.setResultString("tailcall can only be called from a proc or lambda");
         return error.EvalError;
@@ -137,8 +147,8 @@ pub fn tallcallCommand(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             else => return error.EvalError,
         };
 
-        const tailcall_args = try Heap.global_gpa.dupe(Shimmerable, args[1..]);
-        errdefer Heap.global_gpa.free(tailcall_args);
+        const tailcall_args = try heap.global_gpa.dupe(Shimmerable, args[1..]);
+        errdefer heap.global_gpa.free(tailcall_args);
 
         // `args[1..]` includes the name of the command to run.
         assert(interp.callFrame().tailcall == null);
@@ -164,39 +174,54 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
         }
     };
 
-    // Shimmer to list via the interp helper, which handles the case where
-    // the handle can't be shimmered in place.
-    try interp.shimmerToList(arglist);
+    const new_closure = blk: {
+        // Shimmer to list via the interp helper, which handles the case where
+        // the handle can't be shimmered in place.
+        var det: ErrorDetails = undefined;
+        const args_as_list = try interp.wrapError(&det, objects.List.shimmerFrom(&det, arglist));
+        var parsed_args: evaltypes.Closure.ParsedArgList = try interp.wrapError(&det, evaltypes.Closure.parseArgList(&det, args_as_list));
+        errdefer parsed_args.deinit();
 
-    var det: objutil.ErrorDetails = undefined;
-    const parsed_args = try interp.wrapError(&det, Interp.parseClosureArgList(&det, arglist.current()));
-    defer parsed_args.deinit();
+        // Capture the current scope.
+        const scope: *objects.Dictionary = try Interp.narrowToEvalError(interp.captureCurrentScope());
+        errdefer scope.asHead().release();
+        // As well as reference it.
+        const scope_hash_ref = try objects.HashReference.new(scope.asHead());
+        errdefer scope_hash_ref.asHead().release();
 
-    // Capture the current scope.
-    const scope = try interp.captureCurrentScope();
-    defer scope.decrRefCount();
+        const closure_obj = try Object.newObject(evaltypes.Closure);
+        errdefer closure_obj.head.freeBacking();
+        const closure_content = try heap.global_gpa.create(evaltypes.Closure.Content);
+        errdefer heap.global_gpa.destroy(closure_content);
+        const arg_names = try objects.List.newFromSliceOwning(parsed_args.arg_names);
+        errdefer arg_names.asHead().release();
+        const optional_values =
+            if (parsed_args.optional_values.len > 0) try objects.List.newFromSliceOwning(parsed_args.optional_values) else null;
+        errdefer comptime unreachable; // We now take ownership of everything.
 
-    // Build a non-owning closure descriptor. createClosureObject borrows
-    // all fields, so we don't need to borrow here.
-    const closure_obj = try Interp.createClosureObject(.{
-        .args = parsed_args.arg_names,
-        .body = body.current(),
-        .name = if (fn_name) |val| val.current().toOptional() else .none,
-        .scope_hash_ref = scope.toOptional(),
-        .required_arity = parsed_args.required_arity,
-        .optional_arity = parsed_args.optional_arity,
-        .optional_values = parsed_args.optional_values,
-        .has_args_parameter = parsed_args.has_args_parameter,
-        .is_method = mode == .method,
-        .cache_id = Heap.nextCacheId(),
-    });
-    defer closure_obj.decrRefCount();
+        closure_content.* = .{
+            .arg_names = .initOwning(arg_names),
+            .body = body.current().borrow(),
+            .name = if (fn_name) |val| val.current().borrow().asOptional() else .none,
+            .scope_hash_ref = .initOwning(scope_hash_ref),
+            .required_arity = parsed_args.required_arity,
+            .optional_arity = parsed_args.optional_values.len,
+            .optional_values = if (optional_values) |values| AlwaysCanBeType(List).initOwning(values) else null,
+            .has_args_parameter = parsed_args.has_args_parameter,
+            .is_method = mode == .method,
+            .cache_id = evaltypes.Closure.closure_cache_id.fetchAdd(1, .monotonic),
+        };
+
+        closure_obj.body.closure = closure_content;
+        break :blk closure_obj.head;
+    };
+    defer new_closure.release();
 
     if (fn_name) |val| {
-        try interp.setVariableTo(val, closure_obj);
-        interp.setResult(try interp.getVariableOrError(val));
+        try interp.setVariable(val, new_closure.asValue());
+        interp.setResult(new_closure.asValue());
     } else {
-        interp.setResult(closure_obj);
+        interp.setResult(new_closure.asValue());
     }
 }
 
@@ -209,5 +234,18 @@ pub fn methodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn sourceCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    try interp.evalFile(try args[1].getString());
+    try interp.evalFile(try args[1].current().getString());
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null, null);
+    try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null, null);
+    try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null, null);
+    try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
+    try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3, null);
+    try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
+    try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
+    try registerCommand(interp, "subst", substCmd, "?options? string", 1, 4, null);
+    try registerCommand(interp, "tailcall", tailcallCmd, "command ?arg ...?", 1, null, null);
+    try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null, null);
 }

@@ -930,11 +930,11 @@ pub const Integer = struct {
                 shim.shimmered.swap(Value.newInt(@intCast(parsed)));
             }
             return parsed;
+        } else {
+            const as_boxed_int = try shim.prepareToShimmer(Integer);
+            as_boxed_int.* = .{ .value = parsed };
+            return parsed;
         }
-
-        const as_boxed_int = try shim.prepareToShimmer(Integer);
-        as_boxed_int.* = .{ .value = parsed };
-        return parsed;
     }
 
     fn updateString(obj: *Object) !void {
@@ -1382,6 +1382,33 @@ pub const List = struct {
         return new_list.body;
     }
 
+    pub fn newFromShimmerables(shims: []const Shimmerable) !*List {
+        const capacity = math.ceilPowerOfTwo(usize, @max(shims.len, 4)) catch shims.len;
+
+        const new_list = try Object.newObject(List);
+        errdefer new_list.head.freeBacking();
+
+        const new_items = try heap.global_gpa.alloc(Value, capacity);
+        for (shims, new_items[0..shims.len]) |shim, *new_item| {
+            new_item.* = shim.current().borrow();
+        }
+        new_list.body.items = new_items[0..shims.len];
+        new_list.body.capacity = capacity;
+
+        return new_list.body;
+    }
+
+    /// Frees `items` on error.
+    pub fn newFromSliceOwning(items: []Value) !*List {
+        errdefer heap.global_gpa.free(items);
+
+        const new_list = try Object.newObject(List);
+        errdefer new_list.head.freeBacking();
+
+        new_list.body.* = .{ .items = items, .capacity = items.len };
+        return new_list.body;
+    }
+
     fn backingSlice(self: *List) []Value {
         return self.items.ptr[0..self.capacity];
     }
@@ -1642,6 +1669,10 @@ pub const Dictionary = struct {
 
     pub fn new(items: []const Value) !*Dictionary {
         const capacity = math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len;
+        return try newWithCapacity(items, capacity);
+    }
+
+    pub fn newWithCapacity(items: []const Value, capacity: usize) !*Dictionary {
         const new_dict = try Object.newObject(Dictionary);
         errdefer new_dict.head.freeBacking();
 

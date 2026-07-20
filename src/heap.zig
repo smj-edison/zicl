@@ -330,12 +330,8 @@ pub const OptionalValue = enum(ValueBacking) {
     }
 
     pub fn fromValue(value: ?Value) OptionalValue {
-        if (value) |val| {
-            val.assert(val.asRep() != ValueRep.none_value);
-            return val.asOptional();
-        } else {
-            return .none;
-        }
+        if (value) |val| return val.asOptional();
+        return .none;
     }
 
     pub fn borrow(optional: OptionalValue) OptionalValue {

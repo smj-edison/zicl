@@ -1,9 +1,11 @@
 const std = @import("std");
+pub const assert = std.debug.assert;
 
 pub const heap = @import("../heap.zig");
 pub const Value = heap.Value;
 
 pub const objects = @import("../objects.zig");
+pub const AlwaysCanBeType = objects.AlwaysCanBeType;
 pub const ErrorDetails = objects.ErrorDetails;
 pub const Shimmerable = objects.Shimmerable;
 
@@ -31,7 +33,9 @@ pub fn registerCommand(
 }
 
 pub fn registerCoreCommands(interp: *Interp) !void {
-    try @import("./control_flow.zig").registerCommands(interp);
+    try @import("control_flow.zig").registerCommands(interp);
+    try @import("variables.zig").registerCommands(interp);
+    try @import("eval.zig").registerCommands(interp);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {

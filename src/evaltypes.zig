@@ -361,7 +361,7 @@ pub const Script = struct {
                             token.loc.line_no + line_no,
                         );
                         errdefer source.asHead().release();
-                        try new_token_tags.append(heap.global_gpa, .simple_string);
+                        try new_token_tags.append(heap.global_gpa, token.tag);
                         try new_token_values.append(heap.global_gpa, source.asHead().asValue());
                     },
                 }
@@ -419,8 +419,9 @@ pub const Script = struct {
     }
 
     pub fn deinit(parsed: *Script) void {
-        parsed.tags.deinit(heap.global_gpa);
+        heap.global_gpa.free(parsed.tags);
         for (parsed.values) |value| value.release();
+        heap.global_gpa.free(parsed.values);
     }
 
     pub fn borrow(script: *Script) *Script {
@@ -430,7 +431,130 @@ pub const Script = struct {
 
     pub fn release(script: *Script) void {
         script.ref_count -= 1;
-        if (script.ref_count == 0) heap.global_gpa.destroy(script);
+        if (script.ref_count == 0) {
+            script.deinit();
+            heap.global_gpa.destroy(script);
+        }
+    }
+};
+
+pub const Substitution = struct {
+    ref_count: usize = 1,
+    /// Tokens array.
+    tags: []Tokenizer.Token.Tag,
+    /// The associated values for their corresponding tokens.
+    values: []Value,
+    flags: Tokenizer.SubstFlags,
+
+    pub fn parse(det: ?*ErrorDetails, value: Value, flags: Tokenizer.SubstFlags) !*Substitution {
+        const file_name: OptionalValue = if (value.asType(objects.Source)) |src| src.file_name else .none;
+        const line_no = if (value.asType(objects.Source)) |src| src.line_no else 1;
+
+        // Parse all the tokens of the substitution, handling any errors that come up.
+
+        const bytes = try value.getString();
+        // Because substitutions are deduplicated, there may be substitutions
+        // from multiple different locations in the Tcl code. This means we
+        // can't use an absolute line number for the script, but instead all
+        // line numbers are relative (hence why we start at 0 here).
+        var parser = Tokenizer.init(bytes, 0);
+
+        // Set up tokens list (to be added to).
+        var tokens = try std.ArrayList(Tokenizer.Token).initCapacity(heap.global_gpa, bytes.len / 8);
+        defer tokens.deinit(heap.global_gpa);
+
+        // Add all tokens to the list, handling any errors that may come up.
+        while (true) {
+            const next_token = parser.nextSubstToken(flags) catch |err| {
+                if (det) |details| {
+                    details.* = .{ .message = try Tokenizer.convertTokenizerError(heap.global_gpa, err) };
+                    if (parser.error_details) |parser_details| details.index = parser_details.index;
+                }
+                return err;
+            };
+            if (next_token.tag == .end_of_file) break;
+            try tokens.append(heap.global_gpa, next_token);
+        }
+
+        if (options.token_debugging) {
+            ioutil.debug("Substitution tokens:\n", .{});
+            for (tokens.items, 0..) |token, i| {
+                ioutil.debug("[{: >3}@{: >3}]  .{s: <20}  \"{s}\"\n", .{
+                    i,
+                    token.loc.line_no,
+                    @tagName(token.tag),
+                    bytes[token.loc.start..token.loc.end],
+                });
+            }
+        }
+
+        // This list will contain the corrisponding value for each token.
+        var new_token_values: std.ArrayList(Value) = .empty;
+        errdefer new_token_values.deinit(heap.global_gpa);
+        errdefer for (new_token_values.items) |val| val.release();
+
+        var new_token_tags: std.ArrayList(Tokenizer.Token.Tag) = .empty;
+        errdefer new_token_tags.deinit(heap.global_gpa);
+
+        for (0..tokens.items.len) |token_idx| {
+            const token = tokens.items[token_idx];
+
+            switch (token.tag) {
+                .escaped_string => {
+                    const source = try objects.Source.newFromEscaped(
+                        bytes[token.loc.start..token.loc.end],
+                        file_name,
+                        token.loc.line_no + line_no,
+                    );
+                    errdefer source.asHead().release();
+                    try new_token_tags.append(heap.global_gpa, .simple_string); // Switch it to .simple_string.
+                    try new_token_values.append(heap.global_gpa, source.asHead().asValue());
+                },
+                else => {
+                    const source = try objects.Source.new(
+                        bytes[token.loc.start..token.loc.end],
+                        file_name,
+                        token.loc.line_no + line_no,
+                    );
+                    errdefer source.asHead().release();
+                    try new_token_tags.append(heap.global_gpa, token.tag);
+                    try new_token_values.append(heap.global_gpa, source.asHead().asValue());
+                },
+            }
+        }
+
+        const tags_slice = try new_token_tags.toOwnedSlice(heap.global_gpa);
+        errdefer heap.global_gpa.free(tags_slice);
+        const values_slice = try new_token_values.toOwnedSlice(heap.global_gpa);
+        errdefer heap.global_gpa.free(values_slice);
+
+        const subst_on_heap = try heap.global_gpa.create(Substitution);
+        subst_on_heap.* = .{
+            .tags = tags_slice,
+            .values = values_slice,
+            .flags = flags,
+        };
+
+        return subst_on_heap;
+    }
+
+    pub fn deinit(subst: *Substitution) void {
+        heap.global_gpa.free(subst.tags);
+        for (subst.values) |value| value.release();
+        heap.global_gpa.free(subst.values);
+    }
+
+    pub fn borrow(subst: *Substitution) *Substitution {
+        subst.ref_count += 1;
+        return subst;
+    }
+
+    pub fn release(script: *Substitution) void {
+        script.ref_count -= 1;
+        if (script.ref_count == 0) {
+            script.deinit();
+            heap.global_gpa.destroy(script);
+        }
     }
 };
 
@@ -500,7 +624,7 @@ pub const Expression = struct {
         }
     }
 
-    fn exprBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
+    fn evalBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
         var det: ErrorDetails = undefined;
         return switch (oper) {
             .mul => blk: {
@@ -557,12 +681,6 @@ pub const Expression = struct {
                 const rhs_constrained: u6 = @intCast(rhs);
                 break :blk @as(i64, @bitCast(std.math.rotr(u64, @bitCast(lhs), rhs_constrained)));
             },
-            .less_than => @intFromBool(lhs < rhs),
-            .greater_than => @intFromBool(lhs > rhs),
-            .less_or_equal => @intFromBool(lhs <= rhs),
-            .greater_or_equal => @intFromBool(lhs >= rhs),
-            .equal => @intFromBool(lhs == rhs),
-            .not_equal => @intFromBool(lhs != rhs),
             .bit_and => lhs & rhs,
             .bit_xor => lhs ^ rhs,
             .bit_or => lhs | rhs,
@@ -577,18 +695,18 @@ pub const Expression = struct {
         };
     }
 
-    fn exprBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !Value {
+    fn evalBinaryOperatorFloat(interp: *Interp, oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) !f64 {
         return switch (oper) {
-            .mul => Value.newFloat(lhs * rhs),
+            .mul => lhs * rhs,
             .div => blk: {
                 if (rhs == 0.0) {
                     interp.setResultOwning(division_by_zero_message.get());
                     return error.DivisionByZero;
                 } else {
-                    break :blk Value.newFloat(lhs / rhs);
+                    break :blk lhs / rhs;
                 }
             },
-            .mod => Value.newFloat(std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
+            .mod => std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
                 error.DivisionByZero => {
                     interp.setResultOwning(division_by_zero_message.get());
                     return error.DivisionByZero;
@@ -597,24 +715,42 @@ pub const Expression = struct {
                     interp.setResultOwning(negative_denom_message.get());
                     return error.NegativeDenominator;
                 },
-            }),
-            .sub => Value.newFloat(lhs - rhs),
-            .add => Value.newFloat(lhs + rhs),
+            },
+            .sub => lhs - rhs,
+            .add => lhs + rhs,
             .shiftl, .shiftr, .rotl, .rotr => {
                 try interp.setResultFormatted("cannot bit shift on floats {} and {}", .{ lhs, rhs });
                 return error.BadInteger;
             },
-            .less_than => Value.newBool(lhs < rhs),
-            .greater_than => Value.newBool(lhs > rhs),
-            .less_or_equal => Value.newBool(lhs <= rhs),
-            .greater_or_equal => Value.newBool(lhs >= rhs),
-            .equal => Value.newBool(lhs == rhs),
-            .not_equal => Value.newBool(lhs != rhs),
-            .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or => {
+            .bit_and, .bit_xor, .bit_or => {
                 try interp.setResultFormatted("cannot do bitwise operations on floats {} and {}", .{ lhs, rhs });
                 return error.BadInteger;
             },
-            .pow => Value.newFloat(std.math.pow(f64, lhs, rhs)),
+            .pow => std.math.pow(f64, lhs, rhs),
+            else => unreachable,
+        };
+    }
+
+    fn integerCompare(oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) bool {
+        return switch (oper) {
+            .less_than => lhs < rhs,
+            .greater_than => lhs > rhs,
+            .less_or_equal => lhs <= rhs,
+            .greater_or_equal => lhs >= rhs,
+            .equal => lhs == rhs,
+            .not_equal => lhs != rhs,
+            else => unreachable,
+        };
+    }
+
+    fn floatCompare(oper: expr_parse.Node.Tag, lhs: f64, rhs: f64) bool {
+        return switch (oper) {
+            .less_than => lhs < rhs,
+            .greater_than => lhs > rhs,
+            .less_or_equal => lhs <= rhs,
+            .greater_or_equal => lhs >= rhs,
+            .equal => lhs == rhs,
+            .not_equal => lhs != rhs,
             else => unreachable,
         };
     }
@@ -632,17 +768,9 @@ pub const Expression = struct {
             .shiftr,
             .rotl,
             .rotr,
-            .less_than,
-            .greater_than,
-            .less_or_equal,
-            .greater_or_equal,
-            .equal,
-            .not_equal,
             .bit_and,
             .bit_xor,
             .bit_or,
-            .bool_and,
-            .bool_or,
             .pow,
             => {
                 const children = node_data.binary;
@@ -651,9 +779,13 @@ pub const Expression = struct {
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
                 defer rhs_value.release();
 
-                // Fast case: both are already integers (inline or boxed).
+                // Fast case: both are already integers/both are already floats.
                 if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
-                    return try objects.Integer.new(try exprBinaryOperatorInteger(interp, node_tag, lhs, rhs));
+                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node_tag, lhs, rhs));
+                };
+
+                if (objects.Float.asFloat(lhs_value)) |lhs| if (objects.Float.asFloat(rhs_value)) |rhs| {
+                    return Value.newFloat(try evalBinaryOperatorFloat(interp, node_tag, lhs, rhs));
                 };
 
                 // Slow case: coerce both to int-or-float (shimmering as needed),
@@ -662,10 +794,42 @@ pub const Expression = struct {
                 const rhs_number = try interp.getIntOrFloatInPlace(&rhs_value);
 
                 if (lhs_number.asInt()) |lhs| if (rhs_number.asInt()) |rhs| {
-                    return try objects.Integer.new(try exprBinaryOperatorInteger(interp, node_tag, lhs, rhs));
+                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node_tag, lhs, rhs));
                 };
 
-                return try exprBinaryOperatorFloat(interp, node_tag, lhs_number.asFloat(), rhs_number.asFloat());
+                return Value.newFloat(try evalBinaryOperatorFloat(interp, node_tag, lhs_number.asFloat(), rhs_number.asFloat()));
+            },
+            .less_than,
+            .greater_than,
+            .less_or_equal,
+            .greater_or_equal,
+            .equal,
+            .not_equal,
+            => {
+                const children = node_data.binary;
+                var lhs_value = try evalNode(interp, nodes, children.@"0");
+                defer lhs_value.release();
+                var rhs_value = try evalNode(interp, nodes, children.@"1");
+                defer rhs_value.release();
+
+                // Fast case: both are already integers/both are already floats.
+                if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
+                    return Value.newBool(integerCompare(node_tag, lhs, rhs));
+                };
+
+                if (objects.Float.asFloat(lhs_value)) |lhs| if (objects.Float.asFloat(rhs_value)) |rhs| {
+                    return Value.newBool(floatCompare(node_tag, lhs, rhs));
+                };
+
+                // Slow case: try both as integers first, else fall back to both as floats.
+                const lhs_number = try interp.getIntOrFloatInPlace(&lhs_value);
+                const rhs_number = try interp.getIntOrFloatInPlace(&rhs_value);
+
+                if (lhs_number.asInt()) |lhs| if (rhs_number.asInt()) |rhs| {
+                    return Value.newBool(integerCompare(node_tag, lhs, rhs));
+                };
+
+                return Value.newBool(floatCompare(node_tag, lhs_number.asFloat(), rhs_number.asFloat()));
             },
             .string_equal,
             .string_not_equal,
@@ -726,11 +890,43 @@ pub const Expression = struct {
                 const var_value = try interp.getVariableOrError(&name_shim);
                 return var_value.borrow();
             },
+            .bool_and => {
+                const children = node_data.binary;
+                var lhs_value = try evalNode(interp, nodes, children.@"0");
+                defer lhs_value.release();
+                const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
+
+                if (lhs_as_bool) {
+                    var rhs_value = try evalNode(interp, nodes, children.@"0");
+                    defer rhs_value.release();
+                    const rhs_as_bool = try interp.getBooleanInPlace(&rhs_value);
+                    return Value.newBool(rhs_as_bool);
+                } else {
+                    // Short circuit and never evaluate rhs.
+                    return Value.newBool(false);
+                }
+            },
+            .bool_or => {
+                const children = node_data.binary;
+                var lhs_value = try evalNode(interp, nodes, children.@"0");
+                defer lhs_value.release();
+                const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
+
+                if (lhs_as_bool) {
+                    // Short circuit and never evaluate rhs.
+                    return Value.newBool(true);
+                } else {
+                    var rhs_value = try evalNode(interp, nodes, children.@"0");
+                    defer rhs_value.release();
+                    const rhs_as_bool = try interp.getBooleanInPlace(&rhs_value);
+                    return Value.newBool(rhs_as_bool);
+                }
+            },
             .bool_not => {
                 var result = try evalNode(interp, nodes, node_data.unary);
                 defer result.release();
                 const result_bool = try interp.getBooleanInPlace(&result);
-                return Value.newInt(if (result_bool) 0 else 1);
+                return Value.newBool(!result_bool);
             },
             .bit_not => {
                 var result = try evalNode(interp, nodes, node_data.unary);
@@ -1110,31 +1306,29 @@ pub const Closure = struct {
         var parsed_args = try parseArgList(det, args_as_list);
         defer parsed_args.deinit();
 
-        const has_args_param = parsed_args.has_args_parameter;
-        const optional_arity = parsed_args.optional_values.len;
-        const required_arity = args_as_list.items.len - optional_arity - @intFromBool(has_args_param);
-
-        const arg_names_list = try objects.List.new(parsed_args.arg_names);
+        const arg_names_list = try objects.List.newFromSliceOwning(parsed_args.arg_names);
         errdefer arg_names_list.asHead().release();
-        const optional_values_list = if (optional_arity > 0) try objects.List.new(parsed_args.optional_values) else null;
+        const optional_values_list =
+            if (parsed_args.optional_values.len > 0) try objects.List.newFromSliceOwning(parsed_args.optional_values) else null;
         errdefer if (optional_values_list) |list| list.asHead().release();
 
         return .{
             .arg_names = .initOwning(arg_names_list),
             .optional_values = if (optional_values_list) |val| .initOwning(val) else null,
-            .required_arity = required_arity,
-            .optional_arity = optional_arity,
+            .required_arity = parsed_args.required_arity,
+            .optional_arity = parsed_args.optional_values.len,
             .body = body,
             .name = maybe_name.borrow(),
             .scope_hash_ref = if (scope_hash_ref) |val| .initOwning(val) else null,
-            .has_args_parameter = has_args_param,
+            .has_args_parameter = parsed_args.has_args_parameter,
             .is_method = is_method,
             .cache_id = closure_cache_id.fetchAdd(1, .monotonic),
         };
     }
 
-    const ParsedArgList = struct {
+    pub const ParsedArgList = struct {
         arg_names: []Value,
+        required_arity: usize,
         optional_values: []Value,
         has_args_parameter: bool,
 
@@ -1149,10 +1343,10 @@ pub const Closure = struct {
 
     /// Validates a closure argument list and extracts arity information.
     pub fn parseArgList(det: ?*ErrorDetails, args: *const objects.List) !ParsedArgList {
-        var arg_names = try objects.List.new(&.{});
-        defer arg_names.asHead().release();
-        var optional_values: ?*objects.List = null;
-        defer if (optional_values) |val| val.asHead().release();
+        var arg_names: std.ArrayList(Value) = .empty;
+        arg_names.deinit(heap.global_gpa);
+        var optional_values: std.ArrayList(Value) = .empty;
+        optional_values.deinit(heap.global_gpa);
 
         var args_parameter_found = false;
         for (0..args.items.len) |i| {
@@ -1189,11 +1383,6 @@ pub const Closure = struct {
                 return error.BadClosure;
             } else if (arg_as_list.items.len == 2) {
                 // Optional parameter.
-                if (optional_values == null) {
-                    // We haven't created a list for optional args yet, so we'll go ahead and init it.
-                    optional_values = try objects.List.new(&.{});
-                }
-
                 if (try arg_as_list.items[0].equalsString("args")) {
                     if (det) |details| details.* = .{
                         .message = try allocPrintZ("\"args\" must be a required parameter", .{}),
@@ -1202,12 +1391,12 @@ pub const Closure = struct {
                 }
 
                 // Add the optional parameter onto the optional parameters list.
-                try optional_values.?.append(arg_as_list.items[1]);
+                try optional_values.append(heap.global_gpa, arg_as_list.items[1]);
 
                 // Pull out the name from the default list (`{name default}`).
-                try arg_names.append(arg_as_list.items[0]);
+                try arg_names.append(heap.global_gpa, arg_as_list.items[0]);
             } else {
-                if (optional_values != null) {
+                if (optional_values.items.len > 0) {
                     if (det) |details| details.* = .{
                         .message = try allocPrintZ("required parameter after optional parameter not allowed", .{}),
                     };
@@ -1216,24 +1405,24 @@ pub const Closure = struct {
 
                 if (try arg_as_list.items[0].equalsString("args")) args_parameter_found = true;
 
-                try arg_names.append(arg_as_list.items[0]);
+                try arg_names.append(heap.global_gpa, arg_as_list.items[0]);
             }
         }
 
-        const arg_names_slice = try heap.global_gpa.dupe(Value, arg_names.items);
+        const arg_names_slice = try arg_names.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(arg_names_slice);
-        for (arg_names_slice) |val| val.incrRefCount();
-        errdefer for (arg_names_slice) |val| val.release();
+        const optional_values_slice = try optional_values.toOwnedSlice(heap.global_gpa);
+        errdefer comptime unreachable;
 
-        var optional_values_slice: []Value = &.{};
-        if (optional_values) |opt_values| {
-            const duped = try heap.global_gpa.dupe(Value, opt_values.items);
-            for (duped) |val| val.incrRefCount();
-            optional_values_slice = duped;
-        }
+        for (arg_names_slice) |arg| arg.incrRefCount();
+        for (optional_values_slice) |value| value.incrRefCount();
+
+        const optional_arity = optional_values_slice.len;
+        const required_arity = arg_names_slice.len - optional_arity - @intFromBool(args_parameter_found);
 
         return .{
             .arg_names = arg_names_slice,
+            .required_arity = required_arity,
             .optional_values = optional_values_slice,
             .has_args_parameter = args_parameter_found,
         };

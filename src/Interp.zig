@@ -28,6 +28,7 @@ const evaltypes = @import("evaltypes.zig");
 const Closure = evaltypes.Closure;
 const Script = evaltypes.Script;
 const Expression = evaltypes.Expression;
+const Substitution = evaltypes.Substitution;
 
 // We re-export these so callers only need to import Interp and not evaltypes.
 pub const ReturnCode = evaltypes.ReturnCode;
@@ -107,15 +108,10 @@ const FullHashContext = struct {
         return a == b;
     }
 };
-const ParsedScripts = memutil.LruCache(u256, *evaltypes.Script, FullHashContext);
+const ParsedScripts = memutil.LruCache(u256, *Script, FullHashContext);
 const ParsedExpressions = memutil.LruCache(u256, *Expression, FullHashContext);
 const ParsedClosures = memutil.LruCache(u256, Closure.Content, FullHashContext);
-pub const Substitution = struct {
-    subst: *evaltypes.Script,
-    /// Currently only used for integrity checks.
-    flags: Tokenizer.SubstFlags,
-};
-const ParsedSubstitutions = memutil.LruCache(u256, Substitution, FullHashContext);
+const ParsedSubstitutions = memutil.LruCache(u256, *Substitution, FullHashContext);
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(evaltypes.NativeCommand);
 
@@ -469,31 +465,31 @@ pub fn callFrame(interp: *Interp) *CallFrame {
 }
 
 /// Returns a dict containing this call frame's variables.
-pub fn captureScope(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32) !*Dictionary {
+pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
     const frame = &interp.call_frames.items[call_frame_idx];
 
     // Note, we duplicate here, we don't borrow it, since `variables` needs to stay mutable.
-    const new_dict = (try frame.variables.asHead().duplicate()).castTo(Dictionary);
+    const new_dict = try Dictionary.newWithCapacity(&.{}, frame.variables.capacity);
     errdefer new_dict.asHead().release();
 
     // Make sure there's no upvars, or if there are, resolve them to their values.
-    var i: usize = 1;
-    while (i < new_dict.items.len) : (i += 2) {
-        if (new_dict.items[i].asType(vartypes.UpvarLink)) |link| {
+    var i: usize = 0;
+    while (i < frame.variables.items.len) : (i += 2) {
+        if (frame.variables.items[i + 1].asType(vartypes.UpvarLink)) |link| {
+            // Found an upvar, so resolve it to its value.
             var name_shim: Shimmerable = .{ .original = link.linked_name };
             defer name_shim.discardChanges();
-            if (try interp.getVariableInner(det, link.call_frame, &name_shim)) |linked_value| {
-                new_dict.items[i].swap(linked_value.borrow());
+            if ((try interp.getVariableInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
+                _ = try new_dict.put(frame.variables.items[i], linked_value);
             } else {
-                if (det) |details| {
-                    heap.global_gpa.free(details.message);
-                    details.* = .{ .message = try allocPrintZ(
-                        "failed to capture the variable \"{s}\", as it was an upvar that pointed at nothing",
-                        .{try new_dict.items[i - 1].getString()},
-                    ) };
-                }
+                try interp.setResultFormatted(
+                    "failed to capture the variable \"{s}\", as it was an upvar that pointed at nothing",
+                    .{try new_dict.items[i - 1].getString()},
+                );
                 return error.UninitializedUpvar;
             }
+        } else {
+            _ = try new_dict.put(frame.variables.items[i], frame.variables.items[i + 1]);
         }
     }
 
@@ -501,9 +497,8 @@ pub fn captureScope(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32) !
 }
 
 /// Returns a dict capturing the current call frame's variables.
-pub fn captureCurrentScope(interp: *Interp) !Value {
-    var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, interp.captureScope(&det, interp.callFrameIdx()));
+pub fn captureCurrentScope(interp: *Interp) !*Dictionary {
+    return try interp.captureScope(interp.callFrameIdx());
 }
 
 var global_proc_epoch: std.atomic.Value(u64) = .init(0);
@@ -662,6 +657,17 @@ pub fn getScript(interp: *Interp, value: Value, cache_key: u256) !*Script {
     }
 }
 
+pub fn getSubstitution(interp: *Interp, value: Value, cache_key: u256, flags: Tokenizer.SubstFlags) !*Substitution {
+    if (interp.parsed_substs.get(cache_key)) |parsed| {
+        return parsed;
+    } else {
+        var det: ErrorDetails = undefined;
+        const new_subst = try interp.wrapError(&det, Substitution.parse(&det, value, flags));
+        if (interp.parsed_substs.put(cache_key, new_subst)) |ejected| ejected.release();
+        return new_subst;
+    }
+}
+
 pub const ClosureAndCacheKey = struct {
     closure: Closure.Content,
     cache_key: u256,
@@ -690,7 +696,7 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
 
     if (!can_be_method and closure_and_key.closure.is_method) {
         interp.setResultOwning(heap.createInternedString("method cannot be invoked as function").get());
-        return error.CannotBeMethod;
+        return error.EvalError;
     }
 
     return closure_and_key;
@@ -901,7 +907,7 @@ pub fn getBoolFromExpression(interp: *Interp, value: Value) !bool {
     var expr_result = try interp.evalExpression(value);
     defer expr_result.release();
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, objects.Boolean.getFromValue(&det, value));
+    return try interp.wrapError(&det, objects.Boolean.getFromValue(&det, expr_result));
 }
 
 pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFlags) !Value {
@@ -914,10 +920,10 @@ pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFla
     cache_key ^= @as(u256, @as(u3, @bitCast(flags))) << @sizeOf(@TypeOf(interp.callFrame().signature.cache_id));
 
     var det: ErrorDetails = undefined;
-    const subst: Substitution = try interp.wrapError(&det, getScript(&det, value, cache_key, flags));
+    const subst: *Substitution = try interp.wrapError(&det, interp.getSubstitution(value, cache_key, flags));
     assert(subst.flags == flags); // Integrity check.
 
-    return try interp.interpolateTokens(subst.subst.tags, subst.subst.values, 0, @intCast(subst.subst.tags.len));
+    return try interp.interpolateTokens(subst.tags, subst.values, 0, @intCast(subst.tags.len));
 }
 
 pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
@@ -1423,7 +1429,7 @@ pub fn deinit(interp: *Interp) void {
     interp.parsed_closures.deinit(heap.global_gpa);
 
     var substs = interp.parsed_substs.valueIterator();
-    while (substs.next()) |subst| subst.subst.release();
+    while (substs.next()) |subst| subst.*.release();
     interp.parsed_substs.deinit(heap.global_gpa);
 }
 
@@ -1521,10 +1527,38 @@ pub fn setVariableSilent(interp: *Interp, name: *Shimmerable, value: Value) !voi
     try vartypes.setVariable(interp, null, interp.callFrameIdx(), name, value);
 }
 
+pub fn setVariableUpvar(
+    interp: *Interp,
+    name: *Shimmerable,
+    target_call_frame_idx: u32,
+    target_name: Value,
+) !void {
+    var det: ErrorDetails = undefined;
+    return try interp.wrapError(&det, vartypes.setVariableUpvar(
+        interp,
+        &det,
+        interp.callFrameIdx(),
+        name,
+        target_call_frame_idx,
+        target_name,
+    ));
+}
+
 pub fn getVariable(interp: *Interp, name: *Shimmerable) !OptionalValue {
-    try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
     const value = interp.wrapError(&det, vartypes.getVariable(interp, &det, interp.callFrameIdx(), name)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try interp.setResultStringOwning(det.message);
+            return error.EvalError;
+        },
+    };
+    return OptionalValue.fromValue(value);
+}
+
+pub fn getVariableInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !OptionalValue {
+    var det: ErrorDetails = undefined;
+    const value = interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame_idx, name)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try interp.setResultStringOwning(det.message);

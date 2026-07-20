@@ -588,10 +588,10 @@ pub fn unsetVariable(
         },
         .dict_sugar => {
             const dict_sugar = try DictSugar.shimmerAssumeValid(name);
-            var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
-            defer dict_name.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
+            var dict_name_shim: Shimmerable = .{ .original = dict_sugar.dict_name };
+            defer dict_name_shim.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
 
-            const resolved_dict = try getVariable(interp, null, call_frame_idx, dict_sugar.dict_name) orelse {
+            const resolved_dict = try getVariable(interp, null, call_frame_idx, &dict_name_shim) orelse {
                 if (det) |details| details.* = .{
                     .message = try allocPrintZ("can't unset \"{s}\": no such element in dictionary", .{try name.current().getString()}),
                 };
@@ -630,7 +630,7 @@ pub fn unsetVariable(
                             return error.VariableNotFound;
                         },
                     };
-                    try setVariable(interp, null, call_frame_idx, &dict_name, new_dict.asHead().asValue());
+                    try setVariable(interp, null, call_frame_idx, &dict_name_shim, new_dict.asHead().asValue());
                     break :blk did_remove;
                 }
             };
@@ -638,7 +638,7 @@ pub fn unsetVariable(
             if (!did_remove) {
                 if (det) |details| details.* = .{ .message = try allocPrintZ(
                     "can't unset \"{s}\": no such element in dictionary",
-                    .{try name.getString()},
+                    .{try name.current().getString()},
                 ) };
                 return error.VariableNotFound;
             }
