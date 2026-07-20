@@ -1,19 +1,86 @@
 const std = @import("std");
 const testing = std.testing;
+
 const pcre2 = @import("pcre2");
+
+const memutil = @import("memutil.zig");
+const StructIterator = memutil.StructIterator;
 const strutil = @import("strutil.zig");
-const Heap = @import("Heap.zig");
-const Handle = Heap.Handle;
-const OptionalHandle = Heap.OptionalHandle;
-const objutil = @import("objutil.zig");
-const Shimmerable = objutil.Shimmerable;
+const heap = @import("heap.zig");
+const Object = heap.Object;
+const Value = heap.Value;
+const objects = @import("objects.zig");
+const String = objects.String;
+const ErrorDetails = objects.ErrorDetails;
+const Shimmerable = objects.Shimmerable;
 const Interp = @import("Interp.zig");
+
+pub const Regexp = struct {
+    regexp: *pcre2.pcre2_code_8,
+    compile_options: u32,
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable, compile_opts: u32) !*const Regexp {
+        if (shim.current().asType(Regexp)) |regexp| {
+            if (regexp.compile_options == compile_opts) return regexp;
+        }
+
+        const pattern = try shim.current().getString();
+
+        var err_code: c_int = 0;
+        var err_offset: usize = 0;
+        const compile_ctx = pcre2.pcre2_compile_context_create_8(pcre2_ctx) orelse return error.OutOfMemory;
+        defer pcre2.pcre2_compile_context_free_8(compile_ctx);
+
+        const compiled = pcre2.pcre2_compile_8(
+            pattern.ptr,
+            pattern.len,
+            compile_opts,
+            &err_code,
+            &err_offset,
+            compile_ctx,
+        ) orelse {
+            if (err_code == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
+            if (det) |details| {
+                var buf: [256]u8 = undefined;
+                const msg_len = pcre2.pcre2_get_error_message_8(err_code, &buf, buf.len);
+                const msg = buf[0..@intCast(msg_len)];
+                details.* = .{ .message = try heap.global_gpa.dupeSentinel(u8, msg, 0) };
+            }
+            return error.BadRegexp;
+        };
+
+        const as_regexp = try shim.prepareToShimmer(Regexp);
+        as_regexp.* = .{
+            .regexp = compiled,
+            .compile_options = compile_opts,
+        };
+    }
+
+    fn freeInternalRep(obj: *Object) void {
+        const as_regexp = obj.castTo(Regexp);
+        pcre2.pcre2_code_free_8(as_regexp.regexp);
+    }
+
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const regexp = obj.constCastTo(Regexp);
+        ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = Object.duplicateStringOnly,
+        .update_string = null,
+        .free_internal_rep = freeInternalRep,
+        .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(Regexp),
+    };
+};
 
 fn pcreMalloc(size: usize, userdata: ?*anyopaque) callconv(.c) ?*anyopaque {
     _ = userdata;
 
     const total_size = @sizeOf(usize) + size;
-    const ptr = Heap.global_gpa.rawAlloc(total_size, .of(usize), @returnAddress()) orelse return null;
+    const ptr = heap.global_gpa.rawAlloc(total_size, .of(usize), @returnAddress()) orelse return null;
 
     @as(*usize, @ptrCast(@alignCast(ptr))).* = total_size;
     return ptr + @sizeOf(usize);
@@ -24,7 +91,7 @@ fn pcreFree(ptr: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) void {
     if (ptr) |val| {
         const base = @as([*]u8, @ptrCast(val)) - @sizeOf(usize);
         const total_size = @as(*usize, @ptrCast(@alignCast(base))).*;
-        Heap.global_gpa.rawFree(base[0..total_size], .of(usize), @returnAddress());
+        heap.global_gpa.rawFree(base[0..total_size], .of(usize), @returnAddress());
     }
 }
 
@@ -44,57 +111,42 @@ pub fn deinitGlobals() void {
     pcre2_match_ctx = undefined;
 }
 
-pub fn buildIndexPair(start: i64, end: i64) !Handle {
-    // PCRE2 gives us half-open ranges [start, end). Tcl uses inclusive
-    // indices [start, end].
-    const inclusive_end = if (start == -1) -1 else end - 1;
-    const start_handle = try objutil.newInteger(start);
-    errdefer start_handle.decrRefCount();
-    const end_handle = try objutil.newInteger(inclusive_end);
-    errdefer end_handle.decrRefCount();
-    const list = try objutil.newList(&.{ start_handle, end_handle });
-    start_handle.decrRefCount();
-    end_handle.decrRefCount();
-    return list;
-}
-
 pub fn matchToList(
     subject: []const u8,
     ovector: []usize,
     opt_indices: bool,
-) !Handle {
-    const list = try objutil.newListWithCapacity(@intCast(ovector.len));
-    errdefer list.decrRefCount();
+) !*objects.List {
+    const list = try objects.List.newWithCapacity(&.{}, ovector.len);
+    errdefer list.asHead().release();
 
     var pair_idx: usize = 0;
     while (pair_idx < ovector.len) : (pair_idx += 2) {
         const start = ovector[pair_idx];
         const end = ovector[pair_idx + 1];
 
-        var item: Handle = undefined;
         if (start == std.math.maxInt(usize)) {
             if (opt_indices) {
-                item = try buildIndexPair(-1, -1);
+                list.appendAssumeCapacity(try objects.List.new(&.{ Value.newInt(-1), Value.newInt(-1) }));
             } else {
-                item = Heap.local_heap.emptyHandle();
+                list.appendAssumeCapacity(heap.interned_empty_string.get());
             }
         } else {
             if (opt_indices) {
-                item = try buildIndexPair(@intCast(start), @intCast(end));
+                const start_value = try objects.Integer.new(start);
+                defer start_value.release();
+                const end_value = try objects.Integer.new(end);
+                defer end_value.release();
+                list.appendAssumeCapacity(try objects.List.new(&.{ start_value, end_value }));
             } else {
-                const capture = subject[start..end];
-                item = try objutil.newString(capture);
+                list.appendAssumeCapacity(try objects.String.newValue(subject[start..end]));
             }
         }
-        defer item.decrRefCount();
-
-        objutil.listAppendAssumeCapacity(list, item.dupOrRef());
     }
 
     return list;
 }
 
-pub fn doesStringMatch(det: ?*objutil.ErrorDetails, re: *pcre2.struct_pcre2_real_code_8, bytes: []const u8) !bool {
+pub fn doesStringMatch(det: ?*ErrorDetails, re: *pcre2.struct_pcre2_real_code_8, bytes: []const u8) !bool {
     const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, pcre2_ctx) orelse return error.OutOfMemory;
     defer pcre2.pcre2_match_data_free_8(match_data);
 
@@ -105,7 +157,7 @@ pub fn doesStringMatch(det: ?*objutil.ErrorDetails, re: *pcre2.struct_pcre2_real
         if (det) |details| {
             var buf: [256]u8 = undefined;
             const msg_len = pcre2.pcre2_get_error_message_8(return_code, &buf, buf.len);
-            details.* = .{ .message = try objutil.newString(buf[0..@intCast(msg_len)]) };
+            details.* = .{ .message = try heap.global_gpa.dupeSentinel(u8, buf[0..@intCast(msg_len)], 0) };
         }
         return error.RegexError;
     }
@@ -164,21 +216,20 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (opt_line or opt_lineanchor) compile_opts |= pcre2.PCRE2_MULTILINE;
     if (opt_line or opt_linestop) compile_opts &= ~@as(u32, pcre2.PCRE2_DOTALL);
 
-    var det: objutil.ErrorDetails = undefined;
-    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, &remaining[0], compile_opts));
-
-    const re = remaining[0].current().getRegexpExtraData();
+    const regexp_args = &remaining[0];
+    var det: objects.ErrorDetails = undefined;
+    const regexp = try interp.wrapError(&det, Regexp.shimmerFrom(&det, regexp_args, compile_opts));
 
     const subject = try remaining[1].getString();
     const match_vars = remaining[2..];
 
-    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, pcre2_ctx) orelse return error.OutOfMemory;
+    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(regexp.regexp, pcre2_ctx) orelse return error.OutOfMemory;
     defer pcre2.pcre2_match_data_free_8(match_data);
 
     var start_offset: usize = 0;
     var skip_match = false;
     if (opt_start != 0) {
-        const cp_len = try interp.getCodepointLength(&remaining[1]);
+        const cp_len = try String.getCodepointLength(&remaining[1]);
         var start_cp_idx = opt_start;
         if (start_cp_idx < 0) {
             start_cp_idx += @as(i64, @intCast(cp_len)) + 1;
@@ -195,19 +246,16 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var match_opts: u32 = 0;
     if (start_offset > 0) match_opts |= pcre2.PCRE2_NOTBOL;
 
-    var result_list: ?Handle = null;
-    if (opt_inline and opt_all) {
-        const list = try objutil.newList(&.{});
-        result_list = list;
-    }
-    errdefer if (result_list) |val| val.decrRefCount();
+    var result_list: ?*objects.List = null;
+    if (opt_inline and opt_all) result_list = try objects.List.new(&.{});
+    errdefer if (result_list) |val| val.asHead().release();
 
     var match_count: usize = 0;
 
     if (!skip_match) while (true) {
         if (start_offset > subject.len) break;
         const return_code = pcre2.pcre2_match_8(
-            re,
+            regexp.regexp,
             subject.ptr,
             subject.len,
             start_offset,
@@ -234,10 +282,10 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if (opt_all) {
                 const match_list = try matchToList(subject, ovector, opt_indices);
                 defer match_list.decrRefCount();
-                const match_len = objutil.listLength(match_list);
+                const match_len = objects.listLength(match_list);
                 var result_list_handle = result_list.?;
                 for (0..match_len) |j| {
-                    const item = objutil.listItemNoFollow(match_list, @intCast(j));
+                    const item = objects.listItemNoFollow(match_list, @intCast(j));
                     _ = try interp.listAppendInPlace(&result_list_handle, item);
                 }
                 result_list = result_list_handle;
@@ -308,7 +356,7 @@ fn setRegexpCaptureVars(
                     try interp.setVariableTo(var_name, pair);
                 } else {
                     const capture = subject[start..end];
-                    const capture_handle = try objutil.newString(capture);
+                    const capture_handle = try objects.newString(capture);
                     try interp.setVariableTo(var_name, capture_handle);
                     capture_handle.decrRefCount();
                 }
@@ -372,8 +420,8 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var new: OptionalHandle = .none;
     errdefer new.swapWithNone();
 
-    var det: objutil.ErrorDetails = undefined;
-    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, &remaining[0], compile_opts));
+    var det: objects.ErrorDetails = undefined;
+    try Interp.wrapError(interp, &det, objects.shimmerToRegexp(&det, &remaining[0], compile_opts));
 
     const re = remaining[0].current().getRegexpExtraData();
     const pattern_str = try remaining[0].getString();
@@ -460,7 +508,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     try result.appendSlice(Heap.global_gpa, subject[src_pos..]);
 
-    const result_str = try objutil.newString(result.items);
+    const result_str = try objects.newString(result.items);
     defer result_str.decrRefCount();
 
     if (remaining.len == 4) {

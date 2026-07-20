@@ -616,29 +616,6 @@ pub const HashReference = struct {
     };
 };
 
-pub const Regexp = struct {
-    regexp: *pcre2.pcre2_code_8,
-
-    fn freeInternalRep(obj: *Object) void {
-        const as_regexp = obj.castTo(Regexp);
-        pcre2.pcre2_code_free_8(as_regexp.regexp);
-    }
-
-    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const regexp = obj.constCastTo(Regexp);
-        ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = Object.duplicateStringOnly,
-        .update_string = null,
-        .free_internal_rep = freeInternalRep,
-        .make_crossthread = null,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(Regexp),
-    };
-};
-
 pub const Index = struct {
     index: i64,
     is_relative: bool,
@@ -1566,6 +1543,13 @@ pub const List = struct {
         .name = @typeName(List),
     };
 };
+
+pub fn valuesToShimmerables(gpa: std.mem.Allocator, values: []Value) ![]Shimmerable {
+    const shimmerables = try gpa.alloc(Shimmerable, values.len);
+    errdefer gpa.free(shimmerables);
+    for (values, shimmerables) |value, *shim| shim.* = .{ .original = value };
+    return shimmerables;
+}
 
 fn testLists(ta: std.mem.Allocator) !void {
     try heap.testStart(ta, testing.io);

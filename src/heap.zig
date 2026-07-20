@@ -25,7 +25,7 @@ pub var init_mutex: std.Io.Mutex = .init;
 pub var running_leak_check: bool = false;
 
 pub var global_gpa: mem.Allocator = undefined;
-threadlocal var local_arena_instance: std.heap.ArenaAllocator = undefined;
+threadlocal var local_arena_instance: memutil.RewindableArena = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var nativefn_registry: NativeFnRegistry = .{};
@@ -69,8 +69,8 @@ pub fn deinitGlobals() void {
     initialized = false;
 }
 
-pub fn initThread(arena_gpa: Allocator) void {
-    local_arena_instance = std.heap.ArenaAllocator.init(arena_gpa);
+pub fn initThread() void {
+    local_arena_instance = memutil.RewindableArena.init(global_gpa);
     local_arena = local_arena_instance.allocator();
 }
 
@@ -81,7 +81,7 @@ pub fn deinitThread() void {
 
 pub fn testStart(gpa: Allocator, io: std.Io) !void {
     try initGlobals(gpa, io);
-    initThread(gpa);
+    initThread();
 }
 
 pub fn testFinish() void {
