@@ -54,6 +54,8 @@ pub const Regexp = struct {
             .regexp = compiled,
             .compile_options = compile_opts,
         };
+
+        return as_regexp;
     }
 
     fn freeInternalRep(obj: *Object) void {
@@ -63,7 +65,7 @@ pub const Regexp = struct {
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const regexp = obj.constCastTo(Regexp);
-        ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
+        try ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
     }
 
     pub const vtable: Object.VTable = .{
@@ -111,6 +113,15 @@ pub fn deinitGlobals() void {
     pcre2_match_ctx = undefined;
 }
 
+pub fn createIndexPair(start: i64, end: i64) !Value {
+    const start_value = try objects.Integer.new(start);
+    defer start_value.release();
+    const end_value = try objects.Integer.new(end);
+    defer end_value.release();
+    const indices_list = try objects.List.new(&.{ start_value, end_value });
+    return indices_list.asHead().asValue();
+}
+
 pub fn matchToList(
     subject: []const u8,
     ovector: []usize,
@@ -126,19 +137,16 @@ pub fn matchToList(
 
         if (start == std.math.maxInt(usize)) {
             if (opt_indices) {
-                list.appendAssumeCapacity(try objects.List.new(&.{ Value.newInt(-1), Value.newInt(-1) }));
+                list.appendAssumeCapacityOwning(try createIndexPair(-1, -1));
             } else {
-                list.appendAssumeCapacity(heap.interned_empty_string.get());
+                list.appendAssumeCapacityOwning(heap.interned_empty_string.get());
             }
         } else {
             if (opt_indices) {
-                const start_value = try objects.Integer.new(start);
-                defer start_value.release();
-                const end_value = try objects.Integer.new(end);
-                defer end_value.release();
-                list.appendAssumeCapacity(try objects.List.new(&.{ start_value, end_value }));
+                list.appendAssumeCapacityOwning(try createIndexPair(start, end));
             } else {
-                list.appendAssumeCapacity(try objects.String.newValue(subject[start..end]));
+                const capture = subject[start..end];
+                list.appendAssumeCapacityOwning(try objects.String.newValue(capture));
             }
         }
     }
@@ -216,9 +224,9 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (opt_line or opt_lineanchor) compile_opts |= pcre2.PCRE2_MULTILINE;
     if (opt_line or opt_linestop) compile_opts &= ~@as(u32, pcre2.PCRE2_DOTALL);
 
-    const regexp_args = &remaining[0];
+    const regexp_arg = &remaining[0];
     var det: objects.ErrorDetails = undefined;
-    const regexp = try interp.wrapError(&det, Regexp.shimmerFrom(&det, regexp_args, compile_opts));
+    const regexp = try interp.wrapError(&det, Regexp.shimmerFrom(&det, regexp_arg, compile_opts));
 
     const subject = try remaining[1].getString();
     const match_vars = remaining[2..];
@@ -343,31 +351,31 @@ fn setRegexpCaptureVars(
             const end = ovector[idx * 2 + 1];
             if (start == std.math.maxInt(usize)) {
                 if (opt_indices) {
-                    const pair = try buildIndexPair(-1, -1);
-                    defer pair.decrRefCount();
-                    try interp.setVariableTo(var_name, pair);
+                    const indices_list = try createIndexPair(-1, -1);
+                    defer indices_list.release();
+                    try interp.setVariable(var_name, indices_list);
                 } else {
-                    try interp.setVariableTo(var_name, Heap.local_heap.emptyHandle());
+                    try interp.setVariable(var_name, heap.interned_empty_string.get());
                 }
             } else {
                 if (opt_indices) {
-                    const pair = try buildIndexPair(@intCast(start), @intCast(end));
-                    defer pair.decrRefCount();
-                    try interp.setVariableTo(var_name, pair);
+                    const indices_list = try createIndexPair(start, end);
+                    defer indices_list.release();
+                    try interp.setVariable(var_name, indices_list);
                 } else {
                     const capture = subject[start..end];
-                    const capture_handle = try objects.newString(capture);
-                    try interp.setVariableTo(var_name, capture_handle);
-                    capture_handle.decrRefCount();
+                    const capture_value = try objects.String.new(capture);
+                    defer capture_value.asHead().release();
+                    try interp.setVariable(var_name, capture_value);
                 }
             }
         } else {
             if (opt_indices) {
-                const pair = try buildIndexPair(-1, -1);
-                defer pair.decrRefCount();
-                try interp.setVariableTo(var_name, pair);
+                const pair = try createIndexPair(-1, -1);
+                defer pair.release();
+                try interp.setVariable(var_name, pair);
             } else {
-                try interp.setVariableTo(var_name, Heap.local_heap.emptyHandle());
+                try interp.setVariable(var_name, heap.interned_empty_string.get());
             }
         }
     }
@@ -417,28 +425,25 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (opt_line or opt_lineanchor) compile_opts |= pcre2.PCRE2_MULTILINE;
     if (opt_line or opt_linestop) compile_opts &= ~@as(u32, pcre2.PCRE2_DOTALL);
 
-    var new: OptionalHandle = .none;
-    errdefer new.swapWithNone();
-
+    const regexp_arg = &remaining[0];
     var det: objects.ErrorDetails = undefined;
-    try Interp.wrapError(interp, &det, objects.shimmerToRegexp(&det, &remaining[0], compile_opts));
+    const regexp = try interp.wrapError(&det, Regexp.shimmerFrom(&det, regexp_arg, compile_opts));
 
-    const re = remaining[0].current().getRegexpExtraData();
-    const pattern_str = try remaining[0].getString();
+    const pattern_str = try regexp_arg.current().getString();
 
-    const subject = try remaining[1].getString();
-    const sub_spec = try remaining[2].getString();
+    const subject = try remaining[1].current().getString();
+    const sub_spec = try remaining[2].current().getString();
 
-    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(re, null) orelse return error.OutOfMemory;
+    const match_data = pcre2.pcre2_match_data_create_from_pattern_8(regexp.regexp, null) orelse return error.OutOfMemory;
     defer pcre2.pcre2_match_data_free_8(match_data);
 
     var result: std.ArrayList(u8) = .empty;
-    defer result.deinit(Heap.global_gpa);
+    errdefer result.deinit(heap.global_gpa);
 
     var src_pos: usize = 0;
     var start_offset: usize = 0;
     if (opt_start != 0) {
-        const cp_len = try interp.getCodepointLength(&remaining[1]);
+        const cp_len = try String.getCodepointLength(&remaining[1]);
         var start_char_idx = opt_start;
         if (start_char_idx < 0) {
             start_char_idx += @as(i64, @intCast(cp_len)) + 1;
@@ -450,7 +455,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         } else {
             start_offset = strutil.cpIndex(subject, @intCast(start_char_idx)) orelse subject.len;
         }
-        try result.appendSlice(Heap.global_gpa, subject[0..start_offset]);
+        try result.appendSlice(heap.global_gpa, subject[0..start_offset]);
         src_pos = start_offset;
     }
 
@@ -461,7 +466,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     while (true) {
         if (start_offset > subject.len) break;
-        const rc = pcre2.pcre2_match_8(re, subject.ptr, subject.len, start_offset, match_opts, match_data, null);
+        const rc = pcre2.pcre2_match_8(regexp.regexp, subject.ptr, subject.len, start_offset, match_opts, match_data, null);
         if (rc == pcre2.PCRE2_ERROR_NOMATCH) break;
         if (rc == pcre2.PCRE2_ERROR_NOMEMORY) return error.OutOfMemory;
         if (rc < 0) {
@@ -480,7 +485,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         const match_start = ovector[0];
         const match_end = ovector[1];
 
-        try result.appendSlice(Heap.global_gpa, subject[src_pos..match_start]);
+        try result.appendSlice(heap.global_gpa, subject[src_pos..match_start]);
         try applySubstitution(&result, subject, ovector, ovector_count, sub_spec);
 
         src_pos = match_end;
@@ -495,7 +500,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             } else {
                 const char_len = strutil.cpIndex(subject[src_pos..], 1) orelse 0;
                 if (char_len == 0) break;
-                try result.appendSlice(Heap.global_gpa, subject[src_pos .. src_pos + char_len]);
+                try result.appendSlice(heap.global_gpa, subject[src_pos .. src_pos + char_len]);
                 src_pos += char_len;
                 start_offset = src_pos;
                 match_opts |= pcre2.PCRE2_NOTBOL;
@@ -506,16 +511,20 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         }
     }
 
-    try result.appendSlice(Heap.global_gpa, subject[src_pos..]);
-
-    const result_str = try objects.newString(result.items);
-    defer result_str.decrRefCount();
+    try result.appendSlice(heap.global_gpa, subject[src_pos..]);
+    try result.append(heap.global_gpa, 0); // Null sentinel.
+    const substituted = try result.toOwnedSlice(heap.global_gpa);
+    const substituted_str = blk: {
+        errdefer heap.global_gpa.free(substituted);
+        break :blk try String.newOwning(substituted[0 .. substituted.len - 1 :0]);
+    };
+    defer substituted_str.asHead().release();
 
     if (remaining.len == 4) {
-        try interp.setVariableTo(&remaining[3], result_str);
+        try interp.setVariable(&remaining[3], substituted_str.asHead().asValue());
         try interp.setResultInteger(@intCast(match_count));
     } else {
-        interp.setResult(result_str);
+        interp.setResult(substituted_str.asHead().asValue());
     }
 }
 
@@ -531,7 +540,7 @@ fn applySubstitution(
         const c = sub_spec[j];
         if (c == '&') {
             if (ovector_count > 0 and ovector[0] != std.math.maxInt(usize)) {
-                try result.appendSlice(Heap.global_gpa, subject[ovector[0]..ovector[1]]);
+                try result.appendSlice(heap.global_gpa, subject[ovector[0]..ovector[1]]);
             }
         } else if (c == '\\') {
             if (j + 1 < sub_spec.len) {
@@ -542,26 +551,26 @@ fn applySubstitution(
                     if (idx < ovector_count and ovector[idx * 2] != std.math.maxInt(usize)) {
                         const start = ovector[idx * 2];
                         const end = ovector[idx * 2 + 1];
-                        try result.appendSlice(Heap.global_gpa, subject[start..end]);
+                        try result.appendSlice(heap.global_gpa, subject[start..end]);
                     }
                 } else if (next_c == '\\' or next_c == '&') {
-                    try result.append(Heap.global_gpa, next_c);
+                    try result.append(heap.global_gpa, next_c);
                 } else {
-                    try result.append(Heap.global_gpa, '\\');
-                    try result.append(Heap.global_gpa, next_c);
+                    try result.append(heap.global_gpa, '\\');
+                    try result.append(heap.global_gpa, next_c);
                 }
             } else {
-                try result.append(Heap.global_gpa, '\\');
+                try result.append(heap.global_gpa, '\\');
             }
         } else {
-            try result.append(Heap.global_gpa, c);
+            try result.append(heap.global_gpa, c);
         }
     }
 }
 
 fn regexMemStressTest(ta: std.mem.Allocator) !void {
-    _ = try Heap.testStart(ta, testing.io);
-    defer Heap.testFinish();
+    _ = try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
 
     const pattern = "hello, (\\w+)";
     const subject = "hello, world";

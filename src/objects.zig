@@ -1295,7 +1295,7 @@ pub const Boolean = struct {
         return error.BadBoolean;
     }
 
-    pub fn getFromValue(det: ?*ErrorDetails, value: Value) !Value {
+    pub fn getFromValue(det: ?*ErrorDetails, value: Value) !bool {
         return try fromString(det, try value.getString());
     }
 
@@ -1393,11 +1393,15 @@ pub const List = struct {
     }
 
     pub fn appendAssumeCapacity(list: *List, value: Value) void {
+        list.appendAssumeCapacityOwning(value.borrow());
+    }
+
+    pub fn appendAssumeCapacityOwning(list: *List, value: Value) void {
         assert(list.asHead().canMutate());
 
         const old_len = list.items.len;
         list.items = list.backingSlice()[0..(old_len + 1)];
-        list.items[old_len] = value.borrow();
+        list.items[old_len] = value;
     }
 
     /// `list` must be mutable.

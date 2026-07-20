@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const heap = @import("../heap.zig");
 pub const Value = heap.Value;
 
@@ -26,4 +28,26 @@ pub fn registerCommand(
         .max_arity = max_arity,
         .multiple_of = stride,
     });
+}
+
+pub fn registerCoreCommands(interp: *Interp) !void {
+    try @import("./control_flow.zig").registerCommands(interp);
+}
+
+pub fn testStart(ta: std.mem.Allocator) !Interp {
+    _ = try heap.testStart(ta, std.testing.io);
+    errdefer heap.testFinish();
+    var interp = try Interp.init(.{});
+    errdefer interp.deinit();
+    try registerCoreCommands(&interp);
+    return interp;
+}
+
+pub fn testFinish(interp: *Interp) void {
+    interp.deinit();
+    heap.testFinish();
+}
+
+test {
+    _ = @import("control_flow.zig");
 }

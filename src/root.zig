@@ -26,11 +26,11 @@ test {
     _ = @import("ioutil.zig");
     _ = @import("leak_check.zig");
 
-    // _ = @import("Tokenizer.zig");
+    _ = @import("Tokenizer.zig");
     _ = @import("Interp.zig");
-    // _ = @import("commands.zig");
-    // _ = @import("expr_parse.zig");
-    // _ = @import("regex.zig");
+    _ = @import("expr_parse.zig");
+    _ = @import("regex.zig");
+    _ = @import("commands/common.zig");
 
     // _ = @import("test/test_root.zig");
 }

@@ -31,6 +31,7 @@ const Expression = evaltypes.Expression;
 
 // We re-export these so callers only need to import Interp and not evaltypes.
 pub const ReturnCode = evaltypes.ReturnCode;
+pub const ReturnCodeEnum = evaltypes.ReturnCodeEnum;
 pub const Error = evaltypes.Error;
 
 const Interp = @This();
@@ -192,7 +193,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
 
     var var_name_wb: Shimmerable = .{ .original = var_name };
     defer var_name_wb.discardChanges();
-    try interp.setVariableTo(&var_name_wb, var_value);
+    try interp.setVariable(&var_name_wb, var_value);
 
     _ = interp.nextProcedureEpoch();
 }

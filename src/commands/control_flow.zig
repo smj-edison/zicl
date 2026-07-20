@@ -1,5 +1,9 @@
 const std = @import("std");
 
+const pcre2 = @import("pcre2");
+
+const strutil = @import("../strutil.zig");
+const regex = @import("../regex.zig");
 const common = @import("common.zig");
 const heap = common.heap;
 const ErrorDetails = common.ErrorDetails;
@@ -8,6 +12,7 @@ const objects = common.objects;
 const List = objects.List;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
+const registerCommand = common.registerCommand;
 
 pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.Error!enum { @"continue", @"break", none } {
     if (result) |_| {
@@ -31,6 +36,7 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
     return .none;
 }
 
+/// [for]
 pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     // Do the initialization.
     try interp.evalObject(args[1].current());
@@ -61,74 +67,66 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, map }) Interp.Error!void {
     const body = &args[args.len - 1];
 
-    // [foreach] can simultaneously loop over multiple lists, so it's easiest to think of it as zipped.
-    // It's not quite a normal zip though, since the stride over each list depends on how many variables
-    // it captures.
+    // [foreach] can simultaneously loop over multiple lists, so it's easiest to
+    // think of it as a zipping iteratoe. It's not quite a normal zip though,
+    // since the stride over each list depends on how many variables it
+    // captures.
 
     const list_count = (args.len - 2) / 2;
 
     // Track per-list iteration state.
     var iter_state: std.ArrayList(struct {
-        stride: u32,
-        length: u32,
-        current_index: u32,
-    }) = try .initCapacity(heap.global_gpa, list_count);
-    defer iter_state.deinit(heap.global_gpa);
+        stride: usize,
+        length: usize,
+        current_index: usize,
+    }) = try .initCapacity(heap.local_arena, list_count);
 
     for (0..list_count) |i| {
-        const as_list = try interp.getList(&args[i * 2 + 1]);
-        const stride = as_list.items.len;
+        const list_variable_names = try interp.getList(&args[i * 2 + 1]);
+        const list_values = try interp.getList(&args[i * 2 + 2]);
+        const stride = list_variable_names.items.len;
         if (stride == 0) {
             try interp.setResultString("foreach varlist is empty");
             return error.EvalError;
         }
         iter_state.appendAssumeCapacity(.{
             .stride = stride,
-            .length = try interp.getListLength(&args[i * 2 + 2]),
+            .length = list_values.items.len,
             .current_index = 0,
         });
     }
 
-    var result_list: Mutable = .{ .original = Heap.local_heap.emptyHandle() };
-    errdefer result_list.discardChanges();
+    const result_list = if (mode == .map) try List.new(&.{}) else null;
+    errdefer if (result_list) |list| list.asHead().release();
 
-    while (true) {
+    outer: while (true) {
         // Continue only if any list still has unconsumed elements.
-        keep_going: for (0..list_count) |i| {
-            const list_state = iter_state.get(i);
-            if (list_state.current_index < list_state.length) break :keep_going;
-        } else break;
+        inner: for (0..list_count) |i| {
+            if (iter_state.items[i].current_index < iter_state.items[i].length) break :inner;
+        } else {
+            // All lists have consumed their elements, so we're done.
+            break :outer;
+        }
 
         // Go through all the lists and assign their variables.
         for (0..list_count) |list_index| {
-            var var_list = &args[list_index * 2 + 1];
-            const value_list = &args[list_index * 2 + 2];
+            const var_list = try interp.getList(&args[list_index * 2 + 1]);
+            const value_list = try interp.getList(&args[list_index * 2 + 2]);
 
-            const stride = iter_state.items(.stride)[list_index];
-            const length = iter_state.items(.length)[list_index];
-            const current_index = &iter_state.items(.current_index)[list_index];
+            const state = &iter_state.items[list_index];
 
             // Assign variables for this specific list.
-            for (0..stride) |v| {
-                var var_name = objutil.listItem(var_list.current(), @intCast(v));
+            for (0..state.stride) |var_name_index| {
+                var var_name: Shimmerable = .{ .original = var_list.items[var_name_index] };
+                defer var_name.discardChanges();
 
-                // Ensure the name can shimmer before passing to `setVariableInner`.
-                var name_new: OptionalHandle = .none;
-                try Heap.ensureShimmerableOrDup(var_name, &name_new);
-                if (name_new.toHandle()) |new| {
-                    // Write the duplicated handle back to the variable list.
-                    try objutil.listSetInner(var_list.asMutable(), @intCast(v), new.referenceOwning());
-                    var_name = objutil.listItem(var_list.current(), @intCast(v));
-                }
-
-                const value = if (current_index.* < length) blk: {
-                    const item = objutil.listItem(value_list.current(), current_index.*);
-                    current_index.* += 1;
+                const value = if (state.current_index < state.length) blk: {
+                    const item = value_list.items[state.current_index];
+                    state.current_index += 1;
                     break :blk item;
-                } else Heap.local_heap.emptyHandle();
+                } else heap.interned_empty_string.get();
 
-                var det: objutil.ErrorDetails = undefined;
-                try interp.wrapError(&det, interp.setVariableInner(&det, interp.callFrameIdx(), var_name, value.dupOrRef()));
+                try interp.setVariable(&var_name, value);
             }
         }
 
@@ -137,12 +135,16 @@ fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, 
             .@"break" => break,
             .@"continue" => continue,
             .none => {
-                if (mode == .map) _ = try interp.listAppend(&result_list, interp.result);
+                if (result_list) |val| try val.append(interp.result);
             },
         }
     }
 
-    interp.setResultOwning(result_list.consume());
+    if (result_list) |list| {
+        interp.setResultOwning(list.asHead().asValue());
+    } else {
+        interp.setEmptyResult();
+    }
 }
 
 /// [foreach]
@@ -151,8 +153,8 @@ pub fn foreachCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 test "loop commands" {
-    var interp = try testStart(testing.allocator);
-    defer testFinish(&interp);
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
 
     // Basic loop.
     try interp.testExpectScriptResult("5",
@@ -305,12 +307,19 @@ pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     }
 }
 
+fn commandMatch(interp: *Interp, command: Value, pattern: Value, string: Value) !bool {
+    const script = try objects.List.new(&.{ command, pattern, string });
+    defer script.asHead().release();
+    try interp.evalObject(script.asHead().asValue());
+    return try interp.getBooleanInPlace(&interp.result);
+}
+
 /// [switch]
 pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
     const MatchType = enum { exact, glob, regex, command };
     var match_type: MatchType = .exact;
 
-    var command_to_match: ?Handle = null;
+    var command_to_match: ?Value = null;
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
@@ -318,7 +327,7 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
         // of the flags.
         if (args.len - arg_index < 2) return error.WrongUsage;
 
-        const bytes = try args[arg_index].getString();
+        const bytes = try args[arg_index].current().getString();
 
         if (bytes[0] != '-') break; // Not a flag.
         if (try args[arg_index].current().equalsString("--")) {
@@ -337,8 +346,8 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
             command_to_match = args[arg_index].current();
         } else {
             try interp.setResultFormatted(
-                "bad option \"{f}\": must be -exact, -glob, -regexp, -command procname or --",
-                .{args[arg_index].current()},
+                "bad option \"{s}\": must be -exact, -glob, -regexp, -command procname or --",
+                .{try args[arg_index].current().getString()},
             );
             return error.EvalError;
         }
@@ -346,28 +355,25 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
 
     // Value we're switching on.
     const to_match_on = args[arg_index].current().borrow();
-    defer to_match_on.decrRefCount();
+    defer to_match_on.release();
     arg_index += 1;
     const to_match_on_bytes = try to_match_on.getString();
 
-    const switch_body, var to_free_after = blk: {
+    const switch_body, const should_discard_changes = blk: {
         if (args.len - arg_index == 1) {
-            try interp.shimmerToList(&args[arg_index]);
-            const handles = try objutil.listToShimmerables(Heap.global_gpa, args[arg_index].current());
-            break :blk .{ handles.items, handles };
+            const as_list = try interp.getList(&args[arg_index]);
+            const handles = try objects.valuesToShimmerables(heap.local_arena, as_list.items);
+            break :blk .{ handles, true };
         } else {
             if (@mod(args.len - arg_index, 2) != 0) return error.WrongUsage;
-            break :blk .{ args[arg_index..], null };
+            break :blk .{ args[arg_index..], false };
         }
     };
-    defer if (to_free_after) |*val| {
-        for (switch_body) |*wb| wb.discardChanges();
-        val.deinit(Heap.global_gpa);
-    };
+    defer if (should_discard_changes) for (switch_body) |*wb| wb.discardChanges();
 
-    // We need to borrow `body_to_run`, since it may mutate under us otherwise when `commandMatch` is called.
-    var body_to_run: ?Handle = null;
-    defer if (body_to_run) |val| val.decrRefCount();
+    // We need to borrow `body_to_run`, since it may mutate under us when `commandMatch` is called.
+    var body_to_run: ?Value = null;
+    defer if (body_to_run) |val| val.release();
 
     // Go through each switch arm until we find one that matches.
     var arm_idx: usize = 0;
@@ -378,27 +384,24 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
         if (!is_default or arm_idx < switch_body.len - 2) {
             switch (match_type) {
                 .exact => {
-                    if (try Heap.checkIfEqual(to_match_on, switch_body[arm_idx].current())) {
+                    if (try to_match_on.equals(switch_body[arm_idx].current())) {
                         body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break;
                     }
                 },
                 .glob => {
-                    const matches = strutil.globMatch(try switch_body[arm_idx].getString(), to_match_on_bytes, false);
+                    const matches = strutil.globMatch(try switch_body[arm_idx].current().getString(), to_match_on_bytes, false);
                     if (matches) {
                         body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break;
                     }
                 },
                 .regex => {
-                    var det: objutil.ErrorDetails = undefined;
+                    var det: ErrorDetails = undefined;
                     const opts = pcre2.PCRE2_UTF | pcre2.PCRE2_UCP | pcre2.PCRE2_DOTALL;
-                    try Interp.wrapError(interp, &det, objutil.shimmerToRegexp(&det, &switch_body[arm_idx], opts));
-                    const regexp_handle = switch_body[arm_idx].current();
+                    const regexp = try interp.wrapError(&det, regex.Regexp.shimmerFrom(&det, &switch_body[arm_idx], opts));
 
-                    const re = regexp_handle.getRegexpExtraData();
-
-                    const matches = try interp.wrapError(&det, regex.doesStringMatch(&det, re, to_match_on_bytes));
+                    const matches = try interp.wrapError(&det, regex.doesStringMatch(&det, regexp.regexp, to_match_on_bytes));
                     if (matches) {
                         body_to_run = switch_body[arm_idx + 1].current().borrow();
                         break; // Match!
@@ -426,7 +429,10 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
             while (true_body_idx < switch_body.len) : (true_body_idx += 2) {
                 if (!(try switch_body[true_body_idx].current().equalsString("-"))) break;
             } else {
-                try interp.setResultFormatted("no body specified for pattern \"{f}\"", .{switch_body[arm_idx].current()});
+                try interp.setResultFormatted(
+                    "no body specified for pattern \"{s}\"",
+                    .{try switch_body[arm_idx].current().getString()},
+                );
             }
             break :blk switch_body[true_body_idx].current();
         } else to_run;
@@ -441,7 +447,6 @@ pub fn errorCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     if (args.len >= 3) {
         // Store the error code so [catch]/[try] can pick it up.
-        try interp.shimmerToList(&args[2]);
         interp.pending_error_code.swap(args[2].current().borrow());
     }
 
@@ -455,7 +460,7 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var code: Interp.ReturnCode = .@"return";
     var level: u32 = 1;
 
-    const Flags = objutil.TclEnum(enum { @"-code", @"-level", @"-errorcode" }, "[return] flags", false);
+    const Flags = objects.EnumConstructor(enum { @"-code", @"-level", @"-errorcode" }, false);
 
     var i: usize = 1;
     while (i + 1 < args.len) {
@@ -466,7 +471,7 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
         if (flag_value) |val| switch (val) {
             .@"-code" => {
-                var det: objutil.ErrorDetails = undefined;
+                var det: ErrorDetails = undefined;
                 code = try interp.wrapError(&det, Interp.ReturnCodeEnum.get(&det, value));
                 i += 2;
             },
@@ -480,8 +485,7 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 i += 2;
             },
             .@"-errorcode" => {
-                interp.pending_error_code.swapWithNone();
-                interp.pending_error_code = value.current().borrow().toOptional();
+                interp.pending_error_code.swap(value.current().borrow());
                 i += 2;
             },
         } else {
@@ -508,6 +512,7 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     return code.toError();
 }
 
+/// [break]
 pub fn breakCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len == 2) {
         const level = try interp.getInteger(&args[1]);
@@ -523,6 +528,7 @@ pub fn breakCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     return error.Break;
 }
 
+/// [continue]
 pub fn continueCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len == 2) {
         const level = try interp.getInteger(&args[1]);
@@ -538,4 +544,15 @@ pub fn continueCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     }
 
     return error.Continue;
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "break", breakCmd, "?level?", 0, 1, null);
+    try registerCommand(interp, "continue", continueCmd, "?level?", 0, 1, null);
+    try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2, null);
+    try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
+    try registerCommand(interp, "foreach", foreachCmd, "varList list ?varList list ...? body", 3, null, 2);
+    try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
+    try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
+    try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
 }
