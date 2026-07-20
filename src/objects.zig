@@ -630,8 +630,8 @@ pub const Index = struct {
         end: usize,
 
         /// This properly accounts for both `start` and `end` being inclusive, per tcl convention.
-        pub fn fromIndexes(len: u32, start_index: Index, end_index: Index) Range {
-            var start = start_index.asAbsoluteIndex(len);
+        pub fn fromIndexes(len: u64, start_index: Index, end_index: Index) Range {
+            var start: i65 = start_index.asAbsoluteIndex(len);
             // Convert inclusive to exclusive with `+ 1`.
             var end = end_index.asAbsoluteIndex(len) + 1;
 
@@ -646,9 +646,9 @@ pub const Index = struct {
         }
     };
 
-    pub fn asAbsoluteIndex(self: Index, len: u32) i64 {
+    pub fn asAbsoluteIndex(self: Index, len: u64) i65 {
         if (self.is_relative) {
-            return self.index + (len -| 1);
+            return @as(i65, self.index) + (len -| 1);
         } else {
             return self.index;
         }
@@ -694,6 +694,7 @@ pub const Index = struct {
 
         const as_index = try shim.prepareToShimmer(Index);
         as_index.* = index;
+        return as_index;
     }
 
     pub fn get(det: ?*ErrorDetails, shim: *Shimmerable) !Index {
@@ -709,7 +710,7 @@ pub const Index = struct {
         }
     }
 
-    pub fn getRange(det: ?*ErrorDetails, len: usize, start: *Shimmerable, end: *Shimmerable) !Range {
+    pub fn getRange(det: ?*ErrorDetails, len: u64, start: *Shimmerable, end: *Shimmerable) !Range {
         const start_index = try get(det, start);
         const end_index = try get(det, end);
         return Range.fromIndexes(len, start_index, end_index);

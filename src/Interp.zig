@@ -357,6 +357,7 @@ pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.setResultOwning(try String.newValue(bytes));
 }
 
+/// Frees `bytes` in error cases.
 pub fn setResultStringOwning(interp: *Interp, bytes: [:0]u8) !void {
     interp.setResultOwning((try String.newOwning(bytes)).asHead().asValue());
 }

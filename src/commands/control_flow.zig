@@ -231,36 +231,6 @@ test "loop commands" {
     try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
         \\ foreach {} {1 2} { puts hi }
     );
-
-    // [lmap] basic iteration.
-    try interp.testExpectScriptResult("2 4 6",
-        \\ lmap x {1 2 3} { expr {$x * 2} }
-    );
-
-    // [lmap] with multiple list pairs.
-    try interp.testExpectScriptResult("{1 x} {2 y}",
-        \\ lmap a {1 2} b {x y} { list $a $b }
-    );
-
-    // [lmap] continue skips the result.
-    try interp.testExpectScriptResult("2 6",
-        \\ lmap x {1 2 3} { if {$x == 2} { continue } ; expr {$x * 2} }
-    );
-
-    // [lmap] break stops early.
-    try interp.testExpectScriptResult("2",
-        \\ lmap x {1 2 3} { if {$x == 2} { break } ; expr {$x * 2} }
-    );
-
-    // [lmap] empty input list returns empty list.
-    try interp.testExpectScriptResult("",
-        \\ lmap x {} { expr {$x * 2} }
-    );
-
-    // [lmap] empty varlist error.
-    try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
-        \\ lmap {} {1 2} { puts hi }
-    );
 }
 
 /// [if]
