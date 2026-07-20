@@ -9,6 +9,7 @@ const Integer = objects.Integer;
 const Float = objects.Float;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
+const registerCommand = common.registerCommand;
 
 fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
@@ -16,29 +17,29 @@ fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
         var result: i64 = if (operator == .add) 0 else 1;
 
         for (1..args.len) |i| {
-            const operand = blk: {
-                if (args[i].tag() == .integer) {
-                    break :blk args[i].peek().body.integer;
-                } else if (args[i].tag() == .float) {
-                    break :not_all_ints;
-                } else {
-                    // Try to shimmer it to an integer.
-                    const res = objects.Integer.parse(null, try args[i].current().getString()) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.IntegerOverflow, error.BadInteger => {
-                            break :not_all_ints;
-                        },
-                    };
-                    break :blk res;
-                }
+            const operand = Integer.shimmerFrom(null, &args[i]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadInteger => break :not_all_ints,
+                error.IntegerOverflow => {
+                    // Capture the error.
+                    var det: ErrorDetails = undefined;
+                    _ = try interp.wrapError(&det, Integer.shimmerFrom(&det, &args[i]));
+                    unreachable;
+                },
             };
 
-            result = switch (operator) {
-                .add => std.math.add(i64, result, operand),
-                .mul => std.math.mul(i64, result, operand),
-            } catch {
-                return interp.integerOverflowError(null);
-            };
+            switch (operator) {
+                .add => {
+                    result = std.math.add(i64, result, operand) catch {
+                        return interp.integerOverflowError(i65, @as(i65, result) + operand);
+                    };
+                },
+                .mul => {
+                    result = std.math.mul(i64, result, operand) catch {
+                        return interp.integerOverflowError(i128, std.math.mulWide(i64, result, operand));
+                    };
+                },
+            }
         }
 
         try interp.setResultInteger(result);
@@ -48,16 +49,8 @@ fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
     var result: f64 = 0;
 
     for (1..args.len) |i| {
-        const operand: f64 = blk: {
-            if (args[i].tag() == .integer) {
-                break :blk @floatFromInt(args[i].peek().body.integer);
-            } else if (args[i].tag() == .float) {
-                break :blk args[i].peek().body.float;
-            } else {
-                // Try to shimmer it to a float.
-                break :blk try interp.getFloat(&args[i]);
-            }
-        };
+        var det: ErrorDetails = undefined;
+        const operand: f64 = (try interp.wrapError(&det, Number.getAsIntOrFloat(&det, &args[i]))).asFloat();
 
         result = switch (operator) {
             .add => result + operand,
@@ -65,7 +58,7 @@ fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
         };
     }
 
-    try interp.setResultFloat(result);
+    interp.setResultFloat(result);
 }
 
 fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { sub, div }) Interp.Error!void {
@@ -78,7 +71,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
         switch (operator) {
             .sub => {
                 switch (value) {
-                    .int => |int| {
+                    .integer => |int| {
                         const result = std.math.sub(i64, 0, int) catch {
                             // The only case an integer can overflow is when negating the
                             // lowest possible integer (for example, with i8, going from
@@ -88,20 +81,20 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                         try interp.setResultInteger(result);
                     },
                     .float => |float| {
-                        interp.setResult(try Value.newFloat(-float));
+                        interp.setResultOwning(Value.newFloat(-float));
                     },
                 }
             },
             .div => {
                 const as_float: f64 = switch (value) {
                     .float => |float| float,
-                    .int => |int| @floatFromInt(int),
+                    .integer => |int| @floatFromInt(int),
                 };
                 if (as_float == 0.0) {
-                    interp.setResultOwning(common.Expression.division_by_zero_message.get());
+                    interp.setResultOwning(Number.division_by_zero_message.get());
                     return error.EvalError;
                 }
-                interp.setResult(try Value.newFloat(1.0 / as_float));
+                interp.setResult(Value.newFloat(1.0 / as_float));
             },
         }
 
@@ -115,18 +108,15 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
         var result: i64 = 0;
 
         for (1..args.len) |i| {
-            const operand = blk: {
-                if (Integer.asInt(args[i].current())) |int| break :blk int;
-                if (Float.asFloat(args[i].current())) |_| break :not_all_ints;
-
-                // Try to shimmer it to an integer.
-                const res = objects.Integer.parse(null, try args[i].current().getString()) catch |err| switch (err) {
-                    error.IntegerOverflow, error.BadInteger => {
-                        break :not_all_ints;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
-                break :blk res;
+            const operand = Integer.shimmerFrom(null, &args[i]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadInteger => break :not_all_ints,
+                error.IntegerOverflow => {
+                    // Capture the error.
+                    var det: ErrorDetails = undefined;
+                    _ = try interp.wrapError(&det, Integer.shimmerFrom(&det, &args[i]));
+                    unreachable;
+                },
             };
 
             if (i == 1) {
@@ -137,7 +127,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                         return interp.integerOverflowError(i65, @as(i65, result) - @as(i65, operand));
                     },
                     .div => std.math.divFloor(i64, result, operand) catch |err| switch (err) {
-                        error.Overflow => return interp.integerOverflowError(i65, @as(i65, result) / @as(i65, operand)),
+                        error.Overflow => return interp.integerOverflowError(i65, @divFloor(@as(i65, result), @as(i65, operand))),
                         error.DivisionByZero => {
                             interp.setResultOwning(Number.division_by_zero_message.get());
                             return error.EvalError;
@@ -154,13 +144,8 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
     var result: f64 = 0;
 
     for (1..args.len) |i| {
-        const operand: f64 = blk: {
-            if (Integer.asInt(args[i].current())) |int| break :blk @floatFromInt(int);
-            if (Float.asFloat(args[i].current())) |float| break :blk float;
-
-            // Try to shimmer it to a float.
-            break :blk try interp.getFloat(&args[i]);
-        };
+        var det: ErrorDetails = undefined;
+        const operand: f64 = (try interp.wrapError(&det, Number.getAsIntOrFloat(&det, &args[i]))).asFloat();
 
         result = switch (operator) {
             .sub => result - operand,
@@ -174,7 +159,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
         };
     }
 
-    try interp.setResultFloat(result);
+    interp.setResultFloat(result);
 }
 
 pub fn addCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -191,4 +176,34 @@ pub fn subCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 pub fn divCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     try subDivHelper(interp, args, .div);
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "*", mulCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "+", addCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "-", subCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "/", divCmd, "?number ...?", 1, null, null);
+}
+
+test "arithmetic addition" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("10", "+ 5 5");
+    // Make sure it stays as an integer.
+    try interp.testExpectScriptResult("9223372036854775807", "+ 9223372036854775807 0");
+    // It should report integer overflow if the ints are too big.
+    try interp.testExpectScriptError(error.EvalError,
+        \\integer value "18446744073709551614" too big to be represented
+    , "+ 9223372036854775807 9223372036854775807");
+}
+
+test "arithmetic division" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Make sure it stays as an integer.
+    try interp.testExpectScriptResult("2", "/ 12 5");
+    try interp.testExpectScriptResult("0", "/ 2 2 2");
+    try interp.testExpectScriptError(error.EvalError, "division by zero", "/ 5 0");
 }

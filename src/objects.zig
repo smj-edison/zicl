@@ -912,6 +912,12 @@ pub const Integer = struct {
 
     pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
         if (asInt(shim.current())) |int| return int;
+        if (Float.asFloat(shim.current())) |_| {
+            if (det) |details| details.* = .{
+                .message = try allocPrintZ("expected integer but got \"{s}\"", .{try shim.current().getString()}),
+            };
+            return error.BadInteger;
+        }
 
         const bytes = try shim.current().getString();
         const parsed = try parse(det, bytes);

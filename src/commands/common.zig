@@ -37,6 +37,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try @import("variables.zig").registerCommands(interp);
     try @import("eval.zig").registerCommands(interp);
     try @import("strings.zig").registerCommands(interp);
+    try @import("math.zig").registerCommands(interp);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
@@ -55,4 +56,6 @@ pub fn testFinish(interp: *Interp) void {
 
 test {
     _ = @import("control_flow.zig");
+    _ = @import("strings.zig");
+    _ = @import("math.zig");
 }
