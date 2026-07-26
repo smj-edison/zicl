@@ -59,12 +59,12 @@ pub const Regexp = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_regexp = obj.castTo(Regexp);
+        const as_regexp = obj.asType(Regexp).?;
         pcre2.pcre2_code_free_8(as_regexp.regexp);
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const regexp = obj.constCastTo(Regexp);
+        const regexp = obj.asTypeConst(Regexp).?;
         try ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
     }
 
@@ -139,7 +139,7 @@ pub fn matchToList(
             if (opt_indices) {
                 list.appendAssumeCapacityOwning(try createIndexPair(-1, -1));
             } else {
-                list.appendAssumeCapacityOwning(heap.interned_empty_string.get());
+                list.appendAssumeCapacityOwning(heap.interned_empty_string);
             }
         } else {
             if (opt_indices) {
@@ -355,7 +355,7 @@ fn setRegexpCaptureVars(
                     defer indices_list.release();
                     try interp.setVariable(var_name, indices_list);
                 } else {
-                    try interp.setVariable(var_name, heap.interned_empty_string.get());
+                    try interp.setVariable(var_name, heap.interned_empty_string);
                 }
             } else {
                 if (opt_indices) {
@@ -375,7 +375,7 @@ fn setRegexpCaptureVars(
                 defer pair.release();
                 try interp.setVariable(var_name, pair);
             } else {
-                try interp.setVariable(var_name, heap.interned_empty_string.get());
+                try interp.setVariable(var_name, heap.interned_empty_string);
             }
         }
     }

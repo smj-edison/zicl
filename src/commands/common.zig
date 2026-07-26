@@ -58,4 +58,5 @@ test {
     _ = @import("control_flow.zig");
     _ = @import("strings.zig");
     _ = @import("math.zig");
+    _ = @import("eval.zig");
 }

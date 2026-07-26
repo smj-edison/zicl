@@ -19,8 +19,7 @@ const Object = heap.Object;
 const Tokenizer = @import("Tokenizer.zig");
 // const expr_parse = @import("expr_parse.zig");
 
-pub const interned_tilde_parent = heap.createInternedString("~parent");
-
+pub const interned_tilde_parent = heap.InternedString.newValue("~parent");
 pub const ErrorDetails = struct {
     message: [:0]u8,
     index: ?u32 = null,
@@ -60,10 +59,15 @@ pub const Shimmerable = extern struct {
         return shimmered;
     }
 
+    pub fn ensureBoxed(self: *Shimmerable) error{OutOfMemory}!*const Object {
+        if (self.current().asPtr() == null) self.shimmered.swap((try self.current().raw.box()).asValue());
+        return self.current().asPtr().?;
+    }
+
     pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
-        switch (self.current().expandedValue()) {
-            .ptr => |ptr| if (!ptr.canShimmer()) self.shimmered.swap((try ptr.duplicate()).asValue()),
-            else => self.shimmered.swap((try self.current().box()).asValue()),
+        _ = try self.ensureBoxed();
+        if (self.current().asPtr()) |obj| {
+            if (!obj.canShimmer()) self.shimmered.swap((try obj.duplicate()).asValue());
         }
     }
 
@@ -79,7 +83,7 @@ pub const Shimmerable = extern struct {
 
         obj.vtable = &T.vtable;
 
-        return obj.castTo(T);
+        return obj.asType(T).?;
     }
 
     pub fn getMutable(self: *Shimmerable, T: type, det: ?*ErrorDetails) !*T {
@@ -98,6 +102,10 @@ pub const Shimmerable = extern struct {
         }
 
         return (try self.current().duplicate()).asType(T).?;
+    }
+
+    pub fn getString(self: *const Shimmerable) ![:0]const u8 {
+        return try self.current().getString();
     }
 };
 
@@ -143,7 +151,7 @@ pub fn AlwaysCanBeType(T: type) type {
         pub fn getMutable(self: *Self) error{OutOfMemory}!*T {
             if (self.inner.canMutate()) {
                 // Since we own it, we know it should never have changed types.
-                return self.inner.castTo(T);
+                return self.inner.asType(T);
             } else {
                 const duped = try self.inner.duplicate();
                 errdefer duped.release();
@@ -160,7 +168,7 @@ pub fn AlwaysCanBeType(T: type) type {
                 if (shim.shimmered.asValue()) |val| if (val.asPtr()) |obj| Object.swap(&self.inner, obj);
 
                 assert(self.inner.canMutate());
-                return self.inner.castTo(T);
+                return self.inner.asType(T);
             }
         }
     };
@@ -311,7 +319,7 @@ pub const String = struct {
     }
 
     pub fn newValue(bytes: []const u8) !Value {
-        if (bytes.len == 0) return heap.interned_empty_string.get();
+        if (bytes.len == 0) return heap.interned_empty_string;
         return (try newObject(bytes)).asValue();
     }
 
@@ -398,13 +406,13 @@ pub const String = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.codepoint_length = .init(src.constCastTo(String).codepoint_length.load(.monotonic));
+        new_obj.body.codepoint_length = .init(src.asTypeConst(String).?.codepoint_length.load(.monotonic));
 
         return new_obj.head;
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const string = obj.constCastTo(String);
+        const string = obj.asTypeConst(String).?;
         try ctx.addField(usize, info, "codepoint_length", "{}", string.codepoint_length.load(.monotonic));
     }
 
@@ -440,7 +448,7 @@ pub const Source = struct {
         const obj = try String.newObject(bytes);
 
         obj.vtable = &vtable;
-        const as_source = obj.castTo(Source);
+        const as_source = obj.asType(Source).?;
         as_source.* = .{
             .file_name = file_name.borrow(),
             .line_no = line,
@@ -454,7 +462,7 @@ pub const Source = struct {
         const obj = (try String.newFromEscaped(escaped)).asHead();
 
         obj.vtable = &vtable;
-        const as_source = obj.castTo(Source);
+        const as_source = obj.asType(Source).?;
         as_source.* = .{
             .file_name = file_name.borrow(),
             .line_no = line,
@@ -473,7 +481,7 @@ pub const Source = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const cast_src = src.constCastTo(Source);
+        const cast_src = src.asTypeConst(Source).?;
         new_obj.body.file_name = cast_src.file_name.borrow();
         new_obj.body.line_no = cast_src.line_no;
 
@@ -481,17 +489,17 @@ pub const Source = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_source = obj.castTo(Source);
+        const as_source = obj.asType(Source).?;
         as_source.file_name.release();
         if (as_source.hash.load(.acquire)) |hash_ptr| heap.global_gpa.destroy(hash_ptr);
     }
 
     fn makeCrossthread(obj: *Object) void {
-        obj.castTo(Source).file_name.makeCrossthread();
+        obj.asType(Source).?.file_name.makeCrossthread();
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const source = obj.constCastTo(Source);
+        const source = obj.asTypeConst(Source).?;
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followOptionalValue("file_name", source.file_name);
         if (source.hash.load(.monotonic)) |hash| try ctx.followNode(u256, info, "hash", hash);
@@ -581,18 +589,18 @@ pub const HashReference = struct {
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        new_obj.body.ref = src.constCastTo(HashReference).ref.borrow();
+        new_obj.body.ref = src.asTypeConst(HashReference).?.ref.borrow();
 
         return new_obj.head;
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_hash_ref = obj.castTo(HashReference);
+        const as_hash_ref = obj.asType(HashReference).?;
         as_hash_ref.ref.release();
     }
 
     fn updateString(obj: *Object) !void {
-        const as_hash_ref = obj.castTo(HashReference);
+        const as_hash_ref = obj.asType(HashReference).?;
         const target_hash = try as_hash_ref.ref.getHashRegistering();
         var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
         _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
@@ -601,7 +609,7 @@ pub const HashReference = struct {
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const hash_ref = obj.constCastTo(HashReference);
+        const hash_ref = obj.asTypeConst(HashReference).?;
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.follow(Object, "ref", hash_ref.ref);
     }
@@ -702,9 +710,12 @@ pub const Index = struct {
         // shimmer though, as it'll probably still be used for its
         // original purpose).
 
-        switch (shim.current().expandedValue()) {
-            .inline_int => |int| {
-                return .{ .index = int, .is_relative = false };
+        if (Integer.asInt(shim.current())) |int| return .{ .index = int, .is_relative = false };
+
+        const raw = shim.current().raw;
+        switch (raw.tag) {
+            .integer => {
+                return .{ .index = raw.as.integer, .is_relative = false };
             },
             else => return (try shimmerFrom(det, shim)).*,
         }
@@ -721,7 +732,7 @@ pub const Index = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const as_index = src.constCastTo(Index);
+        const as_index = src.asTypeConst(Index).?;
         new_obj.body.index = as_index.index;
         new_obj.body.is_relative = as_index.is_relative;
 
@@ -729,7 +740,7 @@ pub const Index = struct {
     }
 
     fn updateString(obj: *Object) !void {
-        const as_index = obj.castTo(Index);
+        const as_index = obj.asType(Index).?;
         const bytes = blk: {
             if (as_index.is_relative) {
                 const sign = if (as_index.index >= 0) "+" else "";
@@ -828,7 +839,7 @@ pub const Float = struct {
     }
 
     fn updateString(obj: *Object) !void {
-        const as_float = obj.castTo(Float);
+        const as_float = obj.asType(Float).?;
         const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{as_float.value}, 0);
         try obj.setStringIgnoreRace(bytes);
     }
@@ -838,7 +849,7 @@ pub const Float = struct {
         errdefer new_obj.head.deinit();
         try src.duplicateHeadOnto(new_obj.head);
 
-        const as_float = src.constCastTo(Float);
+        const as_float = src.asTypeConst(Float).?;
         new_obj.body.value = as_float.value;
 
         return new_obj.head;
@@ -945,7 +956,7 @@ pub const Integer = struct {
     }
 
     fn updateString(obj: *Object) !void {
-        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{obj.castTo(Integer).value}, 0);
+        const bytes = try std.fmt.allocPrintSentinel(heap.global_gpa, "{}", .{obj.asType(Integer).?.value}, 0);
         try obj.setStringIgnoreRace(bytes);
     }
 
@@ -954,7 +965,7 @@ pub const Integer = struct {
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
 
-        new_obj.body.value = src.constCastTo(Integer).value;
+        new_obj.body.value = src.asTypeConst(Integer).?.value;
 
         return new_obj.head;
     }
@@ -974,8 +985,8 @@ pub const Number = union(enum) {
     integer: i64,
     float: f64,
 
-    pub const negative_denom_message = heap.createInternedString("negative denominator");
-    pub const division_by_zero_message = heap.createInternedString("division by zero");
+    pub const negative_denom_message = heap.InternedString.newValue("negative denominator");
+    pub const division_by_zero_message = heap.InternedString.newValue("division by zero");
 
     pub fn getAsIntOrFloat(det: ?*ErrorDetails, shim: *Shimmerable) !Number {
         if (Integer.asInt(shim.current())) |int| return .{ .integer = int };
@@ -1084,7 +1095,7 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
             errdefer new_obj.head.freeBacking();
             try src.duplicateHeadOnto(new_obj.head);
 
-            new_obj.body.variant = src.constCastTo(Self).variant;
+            new_obj.body.variant = src.asTypeConst(Self).?.variant;
 
             return new_obj.head;
         }
@@ -1371,7 +1382,8 @@ pub const List = struct {
     capacity: usize,
 
     pub fn new(items: []const Value) !*List {
-        const capacity = math.ceilPowerOfTwo(usize, @max(items.len, 4)) catch items.len;
+        const capacity =
+            if (items.len > 0) math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len else 0;
         return try newWithCapacity(items, capacity);
     }
 
@@ -1462,7 +1474,7 @@ pub const List = struct {
             try shim.ensureShimmerable();
 
             const obj: *Object = shim.current().asPtr().?;
-            const as_dict = obj.castTo(Dictionary);
+            const as_dict = obj.asType(Dictionary).?;
             // The list shares the dict's items, so just free the dict's table
             // and swap the head over.
             as_dict.table.deinit(heap.global_gpa);
@@ -1470,7 +1482,7 @@ pub const List = struct {
             const old_capacity = as_dict.capacity;
 
             obj.vtable = &vtable;
-            const as_list = obj.castTo(List);
+            const as_list = obj.asType(List).?;
             as_list.* = .{ .items = old_items, .capacity = old_capacity };
 
             return as_list;
@@ -1530,13 +1542,13 @@ pub const List = struct {
     }
 
     fn updateString(obj: *Object) !void {
-        const as_list = obj.castTo(List);
+        const as_list = obj.asType(List).?;
         const bytes = try quoteValues(heap.global_gpa, as_list.items);
         try obj.setStringIgnoreRace(bytes);
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const as_list = src.constCastTo(List);
+        const as_list = src.asTypeConst(List).?;
         const new_obj = try Object.newObjectUninitialized(List);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
@@ -1553,19 +1565,19 @@ pub const List = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_list = obj.castTo(List);
+        const as_list = obj.asType(List).?;
         for (as_list.items) |item| item.release();
         heap.global_gpa.free(as_list.items.ptr[0..as_list.capacity]);
     }
 
     fn makeCrossthread(obj: *Object) void {
         if (obj.metadata.cross_thread) return;
-        const as_list = obj.castTo(List);
+        const as_list = obj.asType(List).?;
         for (as_list.items) |item| item.makeCrossthread();
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const as_list = obj.constCastTo(List);
+        const as_list = obj.asTypeConst(List).?;
         if (as_list.items.len == 0) return;
 
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
@@ -1666,6 +1678,7 @@ pub const Dictionary = struct {
     }
 
     fn ensureCapacity(self: *Dictionary, new_capacity: usize) !void {
+        assert(self.asHead().canMutate());
         if (new_capacity > self.capacity) {
             const new_backing = try heap.global_gpa.realloc(self.backingSlice(), new_capacity);
             self.items = new_backing[0..self.items.len];
@@ -1675,7 +1688,8 @@ pub const Dictionary = struct {
     }
 
     pub fn new(items: []const Value) !*Dictionary {
-        const capacity = math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len;
+        const capacity =
+            if (items.len > 0) math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len else 0;
         return try newWithCapacity(items, capacity);
     }
 
@@ -1742,7 +1756,7 @@ pub const Dictionary = struct {
         const old_capacity = list.capacity;
         const obj = shim.current().asPtr().?;
         obj.vtable = &vtable;
-        const as_dict = obj.castTo(Dictionary);
+        const as_dict = obj.asType(Dictionary).?;
         as_dict.* = .{
             .items = old_items,
             .capacity = old_capacity,
@@ -1763,12 +1777,57 @@ pub const Dictionary = struct {
         return .none;
     }
 
-    /// `dict` must be mutable.
-    pub fn put(dict: *Dictionary, key: Value, value: Value) !usize {
+    /// This is different than a normal put operation, since it should be used
+    /// exclusively for swapping one value of one internal rep with a equivalent
+    /// value of a different internal rep. Used for shimmer writeback. It also
+    /// doesn't invalidate the dictionary's current string.
+    pub fn shimmerWriteback(dict: *Dictionary, key: Value, value: Value) !void {
+        assert(!dict.asHead().metadata.cross_thread);
+
+        // Ensure the key already has a hash, since the table requires everything used
+        // to have a precomputed hash.
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        const value_index = dict.table.get(key).?; // Key is replaced in place, so it must exist.
+        dict.items[value_index].swap(value.borrow());
+
+        // Note, we don't invalidate the string or remove duplicates here, since
+        // this is a completely transparent operation as far as the user is concerned.
+    }
+
+    pub fn put(dict: *Dictionary, key: Value, value: Value) error{OutOfMemory}!usize {
         assert(dict.asHead().canMutate());
-        const result = try dict.putInner(key, value, true);
-        dict.asHead().invalidateString();
-        return result;
+        if (dict.capacity < dict.items.len + 2) try dict.ensureCapacity(@max(4, dict.capacity * 2));
+
+        // Ensure the key already has a hash, since the table requires everything used
+        // to have a precomputed hash.
+        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        if (dict.table.get(key)) |existing_value_index| {
+            // Key exists, so replace the value in place.
+            dict.items[existing_value_index].swap(value.borrow());
+
+            dict.asHead().invalidateString();
+            const shifted_index = removeDuplicates(dict, existing_value_index).?;
+            return shifted_index;
+        } else {
+            // New item, so we need to expand the dict.
+            assert(dict.capacity >= dict.items.len + 2);
+
+            const old_len = dict.items.len;
+            const new_key_index = old_len;
+            const new_value_index = old_len + 1;
+
+            // `Dictionary.ensureCapacity` also ensures enough room for the table.
+            dict.table.putAssumeCapacity(key, new_value_index);
+
+            // Expand the items slice to include the new items we made room for.
+            dict.items = dict.backingSlice()[0..(old_len + 2)];
+            dict.items[new_key_index] = key.borrow();
+            dict.items[new_value_index] = value.borrow();
+
+            dict.asHead().invalidateString();
+            const shifted_index = removeDuplicates(dict, new_value_index);
+            return shifted_index.?;
+        }
     }
 
     /// Does not invalidate the string. Used in cases where a `put` operation doesn't affect
@@ -1817,13 +1876,13 @@ pub const Dictionary = struct {
     pub fn resolveParentDict(dict: *Dictionary, det: ?*ErrorDetails) error{ LookupFailed, OutOfMemory }!?*const Dictionary {
         assert(dict.asHead().canShimmer());
 
-        const tilde_parent = interned_tilde_parent.get();
+        const tilde_parent = interned_tilde_parent;
         if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
             var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
             defer hash_ref_shim.discardChanges();
             const parent_dict = try HashReference.resolveAsDictionary(det, &hash_ref_shim);
             if (hash_ref_shim.shimmered.asValue()) |new_hash_ref| {
-                _ = try dict.putInner(tilde_parent, new_hash_ref, false);
+                try dict.shimmerWriteback(tilde_parent, new_hash_ref);
             }
             return parent_dict;
         }
@@ -1859,9 +1918,9 @@ pub const Dictionary = struct {
         // without resolving to a parent.
         var dict_shim: Shimmerable = .{ .original = dict.asHead().asValue() };
         const in_parent_dict = try getFollowingLinks(det, &dict_shim, key);
-        assert(dict_shim.shimmered == .none); // We already checked that `dict` is mutable.
+        assert(dict_shim.shimmered.isNone()); // We already checked that `dict` is mutable.
 
-        if (in_parent_dict != .none) {
+        if (in_parent_dict.isSome()) {
             // Key was found in the parent, so we do need to flatten.
             dict.flatten(det) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1983,7 +2042,7 @@ pub const Dictionary = struct {
 
     /// Remove all links from a dict and combine them into one dict.
     pub fn flattenInner(dict: *const Dictionary, det: ?*ErrorDetails) !?*Dictionary {
-        if ((try dict.getNoFollow(interned_tilde_parent.get())).asValue()) |parent_hash_ref| {
+        if ((try dict.getNoFollow(interned_tilde_parent)).asValue()) |parent_hash_ref| {
             var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
             defer parent_hash_ref_shim.discardChanges();
             const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
@@ -2019,7 +2078,7 @@ pub const Dictionary = struct {
         if ((try dict.getNoFollow(key)).asValue()) |val| return val.asOptional();
 
         // Wasn't in this dictionary, so check if it's in a parent dict.
-        const tilde_parent = interned_tilde_parent.get();
+        const tilde_parent = interned_tilde_parent;
         const parent_dict: ?*const Dictionary = blk: {
             if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
                 var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
@@ -2028,7 +2087,7 @@ pub const Dictionary = struct {
                 if (hash_ref_shim.shimmered.asValue()) |new_hash_ref| {
                     try shim.ensureShimmerable();
                     const as_shimmerable_dict = shim.current().asType(Dictionary).?;
-                    _ = try as_shimmerable_dict.putInner(tilde_parent, new_hash_ref, false);
+                    try as_shimmerable_dict.shimmerWriteback(tilde_parent, new_hash_ref);
                     dict = as_shimmerable_dict;
                 }
                 break :blk parent_dict;
@@ -2042,7 +2101,7 @@ pub const Dictionary = struct {
             if (parent_shim.shimmered.asValue()) |value| {
                 try shim.ensureShimmerable();
                 const as_shimmerable_dict = shim.current().asType(Dictionary).?;
-                _ = try as_shimmerable_dict.putInner(tilde_parent, value, false);
+                try as_shimmerable_dict.shimmerWriteback(tilde_parent, value);
             }
             return looked_up;
         }
@@ -2063,7 +2122,7 @@ pub const Dictionary = struct {
                 try shim.ensureShimmerable();
                 // The child dict changed, propagate back up.
                 const as_dict = shim.current().asType(Dictionary).?;
-                _ = try as_dict.putInner(context.get(0), new_child, false);
+                try as_dict.shimmerWriteback(context.get(0), new_child);
             }
             return child_result;
         } else {
@@ -2096,7 +2155,7 @@ pub const Dictionary = struct {
 
         var child_dict_shim: Shimmerable = .{ .original = child_dict };
         _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
-        if (child_dict_shim.shimmered == .none and child_dict_shim.original.canMutate()) {
+        if (child_dict_shim.shimmered.isNone() and child_dict_shim.original.canMutate()) {
             // Mutate in place, if possible.
             const as_dict = child_dict_shim.original.asType(Dictionary).?;
             try as_dict.putRecursively(det, context.sliceAfter(1), value);
@@ -2120,7 +2179,7 @@ pub const Dictionary = struct {
             _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
 
             const did_remove = blk: {
-                if (child_dict_shim.shimmered == .none and child_dict_shim.original.canMutate()) {
+                if (child_dict_shim.shimmered.isNone() and child_dict_shim.original.canMutate()) {
                     // Mutate in place, if possible.
                     const as_dict = child_dict_shim.original.asType(Dictionary).?;
                     break :blk try as_dict.removeRecursively(det, context.sliceAfter(1));
@@ -2163,7 +2222,7 @@ pub const Dictionary = struct {
     }
 
     fn duplicate(src: *const Object) !*Object {
-        const as_dict = src.constCastTo(Dictionary);
+        const as_dict = src.asTypeConst(Dictionary).?;
         const new_obj = try Object.newObjectUninitialized(Dictionary);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
@@ -2188,25 +2247,25 @@ pub const Dictionary = struct {
     }
 
     fn freeInternalRep(obj: *Object) void {
-        const as_dict = obj.castTo(Dictionary);
+        const as_dict = obj.asType(Dictionary).?;
         for (as_dict.items) |item| item.release();
         heap.global_gpa.free(as_dict.backingSlice());
         as_dict.table.deinit(heap.global_gpa);
     }
 
     fn makeCrossthread(obj: *Object) void {
-        const as_dict = obj.castTo(Dictionary);
+        const as_dict = obj.asType(Dictionary).?;
         for (as_dict.items) |item| item.makeCrossthread();
     }
 
     fn updateString(obj: *Object) !void {
-        const as_dict = obj.castTo(Dictionary);
+        const as_dict = obj.asType(Dictionary).?;
         const bytes = try quoteValues(heap.global_gpa, as_dict.items);
         try obj.setStringIgnoreRace(bytes);
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const as_dict = obj.constCastTo(Dictionary);
+        const as_dict = obj.asTypeConst(Dictionary).?;
         if (as_dict.items.len == 0) return;
 
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
@@ -2247,7 +2306,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer bad_key.release();
 
     try testing.expectEqualStrings("1", try (try dict1.getNoFollow(good_key)).asValue().?.getString());
-    try testing.expectEqual(OptionalValue.none, try dict1.getNoFollow(bad_key));
+    try testing.expectEqual(.none, (try dict1.getNoFollow(bad_key)).raw.tag);
 
     // Dict with duplicate entries.
     var dup_shim: Shimmerable = .{ .original = try String.newValue("foo 5 bar 10 foo 15") };
@@ -2344,9 +2403,9 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
 
     // A missing leaf, and a missing top-level key, both yield none.
     const path_foo_bogus = ValueSliceContext{ .items = &.{ key_foo, bad_key } };
-    try testing.expectEqual(.none, try Dictionary.getRecursively(null, &outer_shim, path_foo_bogus));
+    try testing.expectEqual(.none, (try Dictionary.getRecursively(null, &outer_shim, path_foo_bogus)).raw.tag);
     const path_bogus = ValueSliceContext{ .items = &.{bad_key} };
-    try testing.expectEqual(.none, try Dictionary.getRecursively(null, &outer_shim, path_bogus));
+    try testing.expectEqual(.none, (try Dictionary.getRecursively(null, &outer_shim, path_bogus)).raw.tag);
 
     // putRecursively into an existing nested key creates a new leaf beside the old one.
     const path_foo_baz = ValueSliceContext{ .items = &.{ key_foo, key_baz } };
@@ -2362,7 +2421,7 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
 
     // removeRecursively drops the nested leaf.
     try testing.expect(try outer_dict.removeRecursively(null, path_foo_bar));
-    try testing.expectEqual(.none, try Dictionary.getRecursively(null, &outer_shim, path_foo_bar));
+    try testing.expectEqual(.none, (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).raw.tag);
 
     // removeRecursively on a missing intermediate key errors.
     const path_bogus_baz = ValueSliceContext{ .items = &.{ bad_key, key_baz } };

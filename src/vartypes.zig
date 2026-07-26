@@ -77,7 +77,7 @@ pub const UpvarLink = struct {
     call_frame: u32,
 
     fn freeInternalRep(src: *Object) void {
-        src.castTo(UpvarLink).linked_name.release();
+        src.asType(UpvarLink).?.linked_name.release();
     }
 
     fn enumerateStruct(_: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
@@ -181,7 +181,7 @@ pub const DictSugar = struct {
     }
 
     fn freeInternalRep(src: *Object) void {
-        const as_dict_sugar = src.castTo(DictSugar);
+        const as_dict_sugar = src.asType(DictSugar).?;
         as_dict_sugar.dict_name.release();
         as_dict_sugar.dict_path.asHead().release();
     }
@@ -249,7 +249,7 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
     if (maybe_scope_hash_ref.*) |*scope_hash_ref| {
-        const hash_ref = scope_hash_ref.*.inner.castTo(objects.HashReference);
+        const hash_ref = try scope_hash_ref.get();
         var dict_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
         defer dict_shim.discardChanges();
         const in_linked_scope = try objects.Dictionary.getFollowingLinks(det, &dict_shim, var_name);
@@ -395,7 +395,7 @@ pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
                     error.BadDict => return error.LookupFailed,
                 };
 
-                if (existing_dict_shim.shimmered == .none and existing_dict.canMutate()) {
+                if (existing_dict_shim.shimmered.isNone() and existing_dict.canMutate()) {
                     // Mutate in place.
                     const as_dict_mut = existing_dict.asType(Dictionary).?;
                     as_dict_mut.putRecursively(
@@ -756,8 +756,8 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
     }
 }
 fn testVariables(ta: std.mem.Allocator) !void {
-    defer heap.testFinish();
     try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
 
@@ -765,7 +765,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
     defer str_foo.deinit();
 
     // Make sure it doesn't resolve to anything.
-    try testing.expectEqual(null, resolveVariable(&interp, null, 0, str_foo.current()));
+    try testing.expect(null == try resolveVariable(&interp, null, 0, str_foo.current()));
 
     const str_value = try objects.String.newValue("value");
     defer str_value.release();
@@ -791,10 +791,10 @@ fn testVariables(ta: std.mem.Allocator) !void {
     try expectErrorOrOom(error.LookupFailed, getVariable(&interp, null, 0, &str_foo_bar));
 
     // Clear foo so we can set it to a dictionary.
-    try setVariable(&interp, null, 0, &str_foo, heap.interned_empty_string.get());
+    try setVariable(&interp, null, 0, &str_foo, heap.interned_empty_string);
     try setVariable(&interp, null, 0, &str_foo_bar, str_baz);
 
-    try testing.expectEqual(str_baz, (try getVariable(&interp, null, 0, &str_foo_bar)).?);
+    try testing.expectEqual(str_baz.asPtr().?, (try getVariable(&interp, null, 0, &str_foo_bar)).?.asPtr().?);
 }
 
 test "variable basics" {
@@ -802,8 +802,8 @@ test "variable basics" {
 }
 
 fn testVariableLink(ta: std.mem.Allocator) !void {
-    defer heap.testFinish();
     try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
 
@@ -811,7 +811,7 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
     var str_foo: Shimmerable = .{ .original = try objects.String.newValue("foo") };
     defer str_foo.deinit();
 
-    try testing.expectEqual(null, resolveVariable(&interp, null, 0, str_foo.current()));
+    try testing.expect(null == try resolveVariable(&interp, null, 0, str_foo.current()));
     const str_value = try objects.String.newValue("value");
     defer str_value.release();
     try setVariable(&interp, null, 0, &str_foo, str_value);

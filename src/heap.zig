@@ -16,6 +16,7 @@ const StructIterator = memutil.StructIterator;
 const ioutil = @import("ioutil.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
+const regex = @import("regex.zig");
 
 pub var initialized: bool = false;
 /// Use to lock `custom_types` or `script_metadata` when adding or removing
@@ -50,6 +51,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     registered_hashes = .{};
 
     leak_check.init();
+    try regex.initGlobals();
 
     initialized = true;
 }
@@ -62,6 +64,7 @@ pub fn deinitGlobals() void {
     if (!initialized) return;
 
     leak_check.deinit();
+    regex.deinitGlobals();
 
     nativefn_registry.deinit(global_gpa);
     registered_hashes.entries.deinit(global_gpa);
@@ -284,54 +287,116 @@ pub const HashRegistry = struct {
     }
 };
 
-const ValueBacking = u64;
-const ValueRep = packed struct(ValueBacking) {
-    pub const Tag = enum(u3) {
-        canonical_nan = 0,
+pub const InternedString = extern struct {
+    ptr: [*:0]const u8,
+    len: u16,
+
+    pub fn new(comptime bytes: [:0]const u8) InternedString {
+        return .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) };
+    }
+
+    pub fn newValue(comptime bytes: [:0]const u8) Value {
+        const interned = new(bytes);
+        return .fromRep(.{
+            .tag = .interned,
+            .as = .{ .interned = interned.ptr },
+            .interned_string_len = @intCast(interned.len),
+        });
+    }
+
+    pub fn asSlice(interned: InternedString) [:0]const u8 {
+        return interned.ptr[0..interned.len :0];
+    }
+};
+
+const ValueRep = extern struct {
+    comptime {
+        assert(@sizeOf(ValueRep) <= 16);
+    }
+
+    pub const Tag = enum(u8) {
         none,
-        ptr,
-        int,
-        false,
-        true,
+        pointer,
+        boolean,
+        integer,
+        float,
         interned,
     };
 
-    /// First 2 bytes of the f64. We store the tag here, as well as
-    /// use `nan_value` to check if this is a tagged NaN, a canonical
-    /// NaN, or a float.
-    pub const Head = packed struct(u16) {
-        tag: Tag,
-        nan_value: u13 = 0xFFF,
-    };
+    as: extern union {
+        pointer: *Object,
+        float: f64,
+        integer: i64,
+        boolean: bool,
+        interned: [*:0]const u8,
+    },
+    /// Used to store the interned string length, in the case that the
+    /// `tag` type is .interned. I couldn't get the C ABI to keep
+    /// `ValueRep`'s size inside two words otherwise.
+    interned_string_len: u16 = 0,
+    tag: Tag,
 
-    value: packed union(u48) {
-        ptr: u48,
-        int: packed struct { data: i32, padding: u16 = 0 },
-        padding: u48,
-        /// Pointer to the interned string, where the string is prefixed with its length.
-        interned: u48,
-    } = .{ .padding = 0 },
-    head: Head,
+    pub fn asPtr(rep: ValueRep) ?*Object {
+        if (rep.tag == .pointer) return rep.as.pointer;
+        return null;
+    }
 
-    pub const none_value: ValueRep = .{
-        .head = .{ .tag = .none },
-    };
+    pub fn asInlineInt(rep: ValueRep) ?i64 {
+        if (rep.tag == .integer) return rep.as.integer;
+        return null;
+    }
+
+    pub fn asInlineFloat(rep: ValueRep) ?f64 {
+        if (rep.tag == .float) return rep.as.float;
+        return null;
+    }
+
+    pub fn asInlineBool(rep: ValueRep) ?bool {
+        if (rep.tag == .boolean) return rep.as.boolean;
+        return null;
+    }
+
+    pub fn asInterned(rep: ValueRep) ?InternedString {
+        if (rep.tag == .interned) return rep.as.interned;
+    }
+
+    /// Must be a primitive.
+    pub fn box(rep: ValueRep) !*Object {
+        return switch (rep.tag) {
+            .none => unreachable,
+            .pointer => unreachable,
+            .integer => (try objects.Integer.newBoxed(rep.as.integer)).asHead(),
+            .boolean => try objects.String.newObject(if (rep.as.boolean) "true" else "false"),
+            .interned => try objects.String.newObject(rep.as.interned[0..rep.interned_string_len]),
+            .float => (try objects.Float.newBoxed(rep.as.float)).asHead(),
+        };
+    }
 };
 
-pub const interned_empty_string = createInternedString("");
-pub const OptionalValue = enum(ValueBacking) {
-    none = @bitCast(ValueRep.none_value),
-    _,
+pub const interned_empty_string = InternedString.newValue("");
+pub const OptionalValue = extern struct {
+    pub const none: OptionalValue = .{ .raw = .{ .tag = .none, .as = undefined } };
+
+    raw: ValueRep,
+
+    pub fn isNone(optional: OptionalValue) bool {
+        return optional.raw.tag == .none;
+    }
+
+    pub fn isSome(optional: OptionalValue) bool {
+        return !optional.isNone();
+    }
 
     pub fn asValue(optional: OptionalValue) ?Value {
-        if (optional != .none) {
-            return @enumFromInt(@intFromEnum(optional));
-        } else return null;
+        switch (optional.raw.tag) {
+            .none => return null,
+            else => return Value.fromRep(optional.raw),
+        }
     }
 
     pub fn fromValue(value: ?Value) OptionalValue {
         if (value) |val| return val.asOptional();
-        return .none;
+        return .{ .raw = .{ .tag = .none, .as = undefined } };
     }
 
     pub fn borrow(optional: OptionalValue) OptionalValue {
@@ -354,7 +419,7 @@ pub const OptionalValue = enum(ValueBacking) {
     }
 
     pub fn orEmpty(optional: OptionalValue) Value {
-        return optional.orElse(interned_empty_string.get());
+        return optional.orElse(interned_empty_string);
     }
 
     pub fn swap(ref: *OptionalValue, new: Value) void {
@@ -368,83 +433,36 @@ pub const OptionalValue = enum(ValueBacking) {
     }
 };
 
-pub const Value = enum(ValueBacking) {
-    _,
+pub const Value = extern struct {
+    raw: ValueRep,
 
     pub fn asOptional(value: Value) OptionalValue {
-        return @enumFromInt(@intFromEnum(value));
+        return .{ .raw = value.raw };
     }
 
-    pub fn asRep(value: Value) ValueRep {
-        return @bitCast(@intFromEnum(value));
-    }
-
-    pub fn isFloat(value: Value) bool {
-        const rep = value.asRep();
-        const is_nan = rep.head.nan_value == 0x0FFF;
-        return !is_nan or (is_nan and rep.head.tag == .canonical_nan);
-    }
-
-    const Expanded = union(enum) {
-        ptr: *Object,
-        inline_int: i32,
-        false,
-        true,
-        interned: [:0]const u8,
-        inline_float: f64,
-    };
-    pub fn expandedValue(value: Value) Expanded {
-        const rep = value.asRep();
-        if (value.isFloat()) return .{ .inline_float = @bitCast(rep) };
-        switch (rep.head.tag) {
-            .canonical_nan => unreachable, // Already handled by `.isFloat()`.
-            .none => unreachable,
-            .ptr => return .{ .ptr = @ptrFromInt(rep.value.ptr) },
-            .int => return .{ .inline_int = rep.value.int.data },
-            .false => return .false,
-            .true => return .true,
-            .interned => {
-                const bytes_ptr = @as([*]const u8, @ptrFromInt(value.asRep().value.interned));
-                const len_ptr = bytes_ptr - @sizeOf(usize);
-                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
-                const bytes = bytes_ptr[0..len :0];
-                return .{ .interned = bytes };
-            },
-        }
+    pub fn fromRep(rep: ValueRep) Value {
+        assert(rep.tag != .none);
+        return .{ .raw = rep };
     }
 
     pub fn asPtr(value: Value) ?*Object {
-        switch (value.expandedValue()) {
-            .ptr => |val| return val,
-            else => return null,
-        }
+        return value.raw.asPtr();
     }
 
-    pub fn asInlineInt(value: Value) ?i32 {
-        switch (value.expandedValue()) {
-            .inline_int => |val| return val,
-            else => return null,
-        }
+    pub fn asInlineInt(value: Value) ?i64 {
+        return value.raw.asInlineInt();
     }
 
     pub fn asInlineFloat(value: Value) ?f64 {
-        switch (value.expandedValue()) {
-            .inline_float => |val| return val,
-            else => return null,
-        }
+        return value.raw.asInlineFloat();
     }
 
     pub fn asInlineBool(value: Value) ?bool {
-        return switch (value.expandedValue()) {
-            .false => false,
-            .true => true,
-            else => null,
-        };
+        return value.asInlineBool();
     }
 
     pub fn asType(value: Value, T: type) ?*T {
-        const obj = value.asPtr() orelse return null;
-        if (obj.vtable == &T.vtable) return obj.castTo(T);
+        if (value.asPtr()) |obj| return obj.asType(T);
         return null;
     }
 
@@ -467,8 +485,6 @@ pub const Value = enum(ValueBacking) {
             // Primitives can't mutate.
             return false;
         }
-
-        return true;
     }
 
     pub fn incrRefCount(value: Value) void {
@@ -500,44 +516,7 @@ pub const Value = enum(ValueBacking) {
         if (value.asPtr()) |obj| {
             return try obj.duplicate();
         } else {
-            return try value.box();
-        }
-    }
-
-    /// Must be a primitive.
-    pub fn box(value: Value) !*Object {
-        switch (value.expandedValue()) {
-            .ptr => unreachable,
-            .inline_int => |int| {
-                const obj = try objects.Integer.newBoxed(int);
-                return Object.from(objects.Integer, obj);
-            },
-            .false => return try objects.String.newObject("false"),
-            .true => return try objects.String.newObject("true"),
-            .interned => |bytes| {
-                const obj = try Object.newObject(objects.String);
-                errdefer obj.head.freeBacking();
-                const duped = try global_gpa.dupeSentinel(u8, bytes, 0);
-                errdefer global_gpa.free(duped);
-                try obj.head.setStringLocalObject(duped);
-                return obj.head;
-            },
-            .inline_float => |float| {
-                const obj = try objects.Float.newBoxed(float);
-                return Object.from(objects.Float, obj);
-            },
-        }
-    }
-
-    pub fn duplicateBoxed(value: Value) !*Object {
-        if (value.asPtr()) |obj| {
-            if (obj.vtable.duplicate) |duplicate_fn| {
-                return try duplicate_fn(obj);
-            } else {
-                debug.panic("Could not duplicate {s}", .{obj.vtable.name});
-            }
-        } else {
-            return try value.box();
+            return try value.raw.box();
         }
     }
 
@@ -547,54 +526,34 @@ pub const Value = enum(ValueBacking) {
         old.release();
     }
 
-    pub fn fromRep(rep: ValueRep) Value {
-        debug.assert(rep != ValueRep.none_value);
-        return @enumFromInt(@as(ValueBacking, @bitCast(rep)));
-    }
-
     pub fn makeCrossthread(value: Value) void {
         if (value.asPtr()) |obj| obj.makeCrossthread();
     }
 
-    pub fn newInt(value: i32) Value {
-        return Value.fromRep(.{
-            .head = .{ .tag = .int },
-            .value = .{ .int = .{ .data = value } },
-        });
+    pub fn newInt(value: i64) Value {
+        return .{ .raw = .{ .tag = .integer, .as = .{ .integer = value } } };
     }
 
     pub fn newFloat(value: f64) Value {
-        const rep: ValueRep = @bitCast(value);
-        // TODO instead of asserting here, it might be better to mask out the bits
-        // after the value.
-        if (rep.head.nan_value == 0x0FFF) assert(rep.head.tag == .canonical_nan);
-        return @enumFromInt(@as(ValueBacking, @bitCast(value)));
+        return .{ .raw = .{ .tag = .float, .as = .{ .float = value } } };
     }
 
     pub fn newBool(value: bool) Value {
-        return Value.fromRep(.{
-            .head = .{ .tag = if (value) .true else .false },
-        });
+        return .{ .raw = .{ .tag = .boolean, .as = .{ .boolean = value } } };
     }
 
     pub fn getString(value: Value) ![:0]const u8 {
-        switch (value.expandedValue()) {
-            .inline_float => |float| {
+        switch (value.raw.tag) {
+            .none => unreachable,
+            .float => {
                 var buf: [350]u8 = undefined;
-                const rendered = objects.Float.renderFloat(float, &buf);
+                const rendered = objects.Float.renderFloat(value.raw.as.float, &buf);
                 return try local_arena.dupeSentinel(u8, rendered, 0);
             },
-            .ptr => |obj| return try obj.getString(),
-            .inline_int => |int| return try std.fmt.allocPrintSentinel(local_arena, "{}", .{int}, 0),
-            .false => return "false",
-            .true => return "true",
-            .interned => {
-                // Length of interned string is stored right before.
-                const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
-                const len_ptr = bytes_ptr - @sizeOf(usize);
-                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
-                return bytes_ptr[0..len :0];
-            },
+            .pointer => return try value.raw.as.pointer.getString(),
+            .integer => return try std.fmt.allocPrintSentinel(local_arena, "{}", .{value.raw.as.integer}, 0),
+            .boolean => return if (value.raw.as.boolean) "true" else "false",
+            .interned => return value.raw.as.interned[0..value.raw.interned_string_len :0],
         }
     }
 
@@ -604,48 +563,71 @@ pub const Value = enum(ValueBacking) {
         comptime assert(std.fmt.count("{}", .{-std.math.floatMin(f64)}) + 1 <= 350); // + 1 for null.
         comptime assert(std.fmt.count("{}", .{-std.math.floatMax(f64)}) + 1 <= 350);
 
-        switch (value.expandedValue()) {
-            .inline_float => |float| return objects.Float.renderFloat(float, buf),
-            .ptr => |obj| return try obj.getString(),
-            .inline_int => |int| return std.fmt.bufPrintSentinel(buf, "{}", .{int}, 0) catch unreachable,
-            .false => return "false",
-            .true => return "true",
-            .interned => {
-                // Length of interned string is stored right before.
-                const bytes_ptr = @as([*]u8, @ptrFromInt(value.asRep().value.interned));
-                const len_ptr = bytes_ptr - @sizeOf(usize);
-                const len = mem.readInt(usize, len_ptr[0..@sizeOf(usize)], .native);
-                return bytes_ptr[0..len :0];
-            },
+        switch (value.raw.tag) {
+            .none => unreachable,
+            .float => return objects.Float.renderFloat(value.raw.as.float, buf),
+            .pointer => return try value.raw.as.pointer.getString(),
+            .integer => return std.fmt.bufPrintSentinel(buf, "{}", .{value.raw.as.integer}, 0) catch unreachable,
+            .boolean => return if (value.raw.as.boolean) "true" else "false",
+            .interned => return value.raw.as.interned[0..value.raw.interned_string_len :0],
         }
     }
 
     /// Guaranteed to return error.OutOfMemory if and only if one of the value `Value`'s
     /// is an object pointer, and that Object OOM'd while generating its string.
     pub fn equals(a: Value, b: Value) error{OutOfMemory}!bool {
-        // If they're both primitives, we can compare their values directly. Note that we can't compare
-        // interned string values directly, since they're not guaranteed to be unique.
-        const is_a_primitive = switch (a.expandedValue()) {
-            .inline_int, .false, .true, .interned, .inline_float => true,
-            else => false,
-        };
-        const is_b_primitive = switch (b.expandedValue()) {
-            .inline_int, .false, .true, .interned, .inline_float => true,
-            else => false,
-        };
-        if (is_a_primitive and is_b_primitive) return a == b;
+        switch (a.raw.tag) {
+            .integer => {
+                switch (b.raw.tag) {
+                    .integer => return a.raw.as.integer == b.raw.as.integer,
+                    .float, .boolean => return false,
+                    else => {
+                        // Still need to fall through, because an interned string
+                        // might contain a string value equal to a's value.
+                    },
+                }
+            },
+            .float => {
+                switch (b.raw.tag) {
+                    .float => return a.raw.as.float == b.raw.as.float,
+                    .integer, .boolean => return false,
+                    else => {},
+                }
+            },
+            .boolean => {
+                switch (b.raw.tag) {
+                    .boolean => return a.raw.as.boolean == b.raw.as.boolean,
+                    .integer, .float => return false,
+                    else => {},
+                }
+            },
+            .interned => {
+                switch (b.raw.tag) {
+                    .interned => if (a.raw.as.interned == b.raw.as.interned) return true,
+                    else => {},
+                }
+                // If the two values weren't identical, they may still contain
+                // the same string if one came from a different source. Hence,
+                // we fall through to the string comparison logic.
+            },
+            .pointer => {},
+            .none => unreachable,
+        }
 
         if (a.asPtr()) |a_ptr| if (b.asPtr()) |b_ptr| {
             // If both strings are special strings, we can compare their hashes, to avoid
             // potentially expensive comparisons.
             const a_details = a_ptr.getStringDetails();
             const b_details = b_ptr.getStringDetails();
-            if (std.meta.activeTag(a_details) == .special and std.meta.activeTag(b_details) == .special) {
-                return try a_details.special.getHash() == try b_details.special.getHash();
-            }
+            if (a_details.asSpecial()) |a_special| if (b_details.asSpecial()) |b_special| {
+                return try a_special.getHash() == try b_special.getHash();
+            };
+            // Else, fall through to the generic logic.
         };
 
         var buf_a: [350]u8 = undefined;
+        // We use `getStringWithBuffer` instead of `getString`, because `equals` is called in
+        // hash `eql` functions which must never fail.
         const a_bytes = try a.getStringWithBuffer(&buf_a);
         var buf_b: [350]u8 = undefined;
         const b_bytes = try b.getStringWithBuffer(&buf_b);
@@ -666,39 +648,6 @@ pub const Value = enum(ValueBacking) {
         return hashutil.hashBytes(value.getStringWithBuffer(&buf) catch unreachable);
     }
 };
-
-/// Produces a type that owns a length-prefixed, NUL-terminated interned string
-/// buffer in rodata. The layout is `[@sizeOf(usize) bytes of length][bytes][0]`,
-/// matching how `getString` reads the length from just before the bytes pointer.
-/// The buffer's address is stable for the life of the program but is only known
-/// at run time, so the `Value` is built by `value()` at run time -- it can't be
-/// a comptime `const`, since the final rodata address isn't known at compile.
-pub fn createInternedString(comptime bytes: []const u8) type {
-    const len_bytes = comptime blk: {
-        var b: [@sizeOf(usize)]u8 = undefined;
-        std.mem.writeInt(usize, &b, bytes.len, .native);
-        break :blk b;
-    };
-    const null_byte: [1]u8 = .{0};
-    const combined = len_bytes ++ bytes ++ null_byte;
-    return struct {
-        const interned_str = combined;
-
-        /// Pointer to the bytes (just past the length prefix), NUL-terminated.
-        pub fn bytesPtr() [*:0]const u8 {
-            const s = interned_str.ptr[@sizeOf(usize)..(interned_str.len - 1) :0];
-            return s.ptr;
-        }
-
-        pub fn get() Value {
-            const ptr = bytesPtr();
-            return Value.fromRep(.{
-                .head = .{ .tag = .interned },
-                .value = .{ .interned = @intCast(@intFromPtr(ptr)) },
-            });
-        }
-    };
-}
 
 /// Special strings are strings that have special properties, such as being large,
 /// having a different allocation backing then what's visible, or (in the future)
@@ -793,7 +742,10 @@ pub const SpecialString = struct {
     }
 };
 
-pub const Object = struct {
+pub const Object = extern struct {
+    pub const body_max_size = 48;
+    pub const body_align = 8;
+
     pub const VTable = struct {
         duplicate: ?*const fn (src: *const Object) error{OutOfMemory}!*Object,
         free_internal_rep: ?*const fn (obj: *Object) void,
@@ -828,51 +780,53 @@ pub const Object = struct {
     /// See `setString` for an explanation of how the sequencing of
     /// `string` and `string_metadata` works.
     string: std.atomic.Value(?*anyopaque),
-    string_metadata: std.atomic.Value(StringMetadata),
     metadata: Metadata,
-    hash_metadata: std.atomic.Value(HashMetadata),
 
     vtable: *const VTable,
-    ref_count: u32,
 
-    pub const object_size: usize = 80;
-    comptime {
-        assert(@sizeOf(Object) < object_size);
+    ref_count: u32,
+    string_metadata: std.atomic.Value(StringMetadata),
+    hash_metadata: std.atomic.Value(HashMetadata),
+
+    body_backing: [body_max_size]u8 align(body_align),
+
+    pub fn assertValidType(T: type) void {
+        comptime {
+            if (@sizeOf(T) > body_max_size) @compileError("Object is too large");
+            if (@alignOf(T) > body_align) @compileError(std.fmt.comptimePrint(
+                "Object has too high alignment requirements ({s} has align {}, while max align is {})",
+                .{ @typeName(T), @alignOf(T), body_align },
+            ));
+        }
     }
 
     pub fn from(T: type, ptr: *T) *Object {
-        const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(ptr));
-        return @ptrCast(aligned_bytes - @sizeOf(Object));
+        assertValidType(T);
+        const bytes_ptr: *align(body_align) [body_max_size]u8 = @ptrCast(@alignCast(ptr));
+        return @fieldParentPtr("body_backing", bytes_ptr);
     }
 
     pub fn fromConst(T: type, ptr: *const T) *const Object {
-        const aligned_bytes: [*]align(@alignOf(Object)) const u8 = @ptrCast(@alignCast(ptr));
-        return @ptrCast(aligned_bytes - @sizeOf(Object));
-    }
-
-    pub fn castToInner(obj: *Object) *align(@alignOf(Object)) anyopaque {
-        const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
-        return @ptrCast(aligned_bytes + @sizeOf(Object));
+        assertValidType(T);
+        const bytes_ptr: *align(body_align) const [body_max_size]u8 = @ptrCast(@alignCast(ptr));
+        return @fieldParentPtr("body_backing", bytes_ptr);
     }
 
     /// Asserts that `obj` has type `T.vtable`.
-    pub fn castTo(obj: *Object, T: type) *T {
-        assert(obj.vtable == &T.vtable);
-        const aligned_bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
-        return @ptrCast(aligned_bytes + @sizeOf(Object));
+    pub fn asType(obj: *Object, T: type) ?*T {
+        assertValidType(T);
+        if (obj.vtable == &T.vtable) return @ptrCast(@alignCast(&obj.body_backing));
+        return null;
     }
 
-    pub fn constCastTo(obj: *const Object, T: type) *const T {
-        assert(obj.vtable == &T.vtable);
-        const aligned_bytes: [*]align(@alignOf(Object)) const u8 = @ptrCast(@alignCast(obj));
-        return @ptrCast(aligned_bytes + @sizeOf(Object));
+    pub fn asTypeConst(obj: *const Object, T: type) ?*const T {
+        assertValidType(T);
+        if (obj.vtable == &T.vtable) return @ptrCast(@alignCast(&obj.body_backing));
+        return null;
     }
 
     pub fn asValue(obj: *Object) Value {
-        return Value.fromRep(.{
-            .head = .{ .tag = .ptr },
-            .value = .{ .ptr = @intCast(@intFromPtr(obj)) },
-        });
+        return Value.fromRep(.{ .tag = .pointer, .as = .{ .pointer = obj } });
     }
 
     pub fn canMutate(obj: *const Object) bool {
@@ -888,7 +842,7 @@ pub const Object = struct {
         // If the hash is registered, it means it is considered frozen. We can't very
         // well mutate something that has a fixed value. Note we can load this as
         // unordered, since it's not a crossthread object, as we just checked above.
-        if (obj.hash_metadata.load(.unordered).hash_registered) return false;
+        if (obj.hash_metadata.raw.hash_registered) return false;
         return true;
     }
 
@@ -897,22 +851,22 @@ pub const Object = struct {
     }
 
     pub fn newObjectUninitialized(T: type) !struct { head: *Object, body: *T } {
-        comptime assert(@sizeOf(Object) + @sizeOf(T) <= object_size);
-        comptime assert(@alignOf(T) <= @alignOf(Object));
+        assertValidType(T);
 
-        const bytes = try global_gpa.alignedAlloc(u8, .of(Object), object_size);
-        const obj: *Object = @ptrCast(bytes.ptr);
-        obj.vtable = &T.vtable;
-        obj.ref_count = 1;
-        obj.metadata = .{};
-        obj.hash_metadata = .init(.{});
+        const obj = try global_gpa.create(Object);
+        obj.* = .{
+            .vtable = &T.vtable,
+            .ref_count = 1,
+            .metadata = .{},
+            .hash_metadata = .init(.{}),
+            .string = undefined,
+            .string_metadata = undefined,
+            .body_backing = undefined,
+        };
 
         leak_check.globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{@typeName(T)});
 
-        return .{
-            .head = @ptrCast(bytes),
-            .body = @ptrCast(bytes.ptr + @sizeOf(Object)),
-        };
+        return .{ .head = obj, .body = obj.asType(T).? };
     }
 
     pub fn newObject(T: type) !struct { head: *Object, body: *T } {
@@ -922,7 +876,7 @@ pub const Object = struct {
         return .{ .head = new_obj.head, .body = new_obj.body };
     }
 
-    pub fn duplicate(obj: *Object) !*Object {
+    pub fn duplicate(obj: *const Object) !*Object {
         if (obj.vtable.duplicate) |duplicate_fn| {
             return try duplicate_fn(obj);
         } else {
@@ -960,9 +914,7 @@ pub const Object = struct {
 
     pub fn freeBacking(obj: *Object) void {
         leak_check.globalTrace(.free, obj.asValue(), "Freed", .{});
-        const bytes: [*]align(@alignOf(Object)) u8 = @ptrCast(@alignCast(obj));
-        const slice: []align(@alignOf(Object)) u8 = bytes[0..object_size];
-        global_gpa.free(slice);
+        global_gpa.destroy(obj);
     }
 
     pub fn deinit(obj: *Object) void {
@@ -975,6 +927,13 @@ pub const Object = struct {
         none,
         special: *SpecialString,
         normal: [:0]const u8,
+
+        pub fn asSpecial(details: StringDetails) ?*SpecialString {
+            switch (details) {
+                .special => |special| return special,
+                else => return null,
+            }
+        }
     };
     pub fn getStringDetails(obj: *const Object) StringDetails {
         const str_metadata = if (obj.metadata.cross_thread)
@@ -1233,26 +1192,24 @@ pub const Object = struct {
 
     pub fn getHashNoRegister(obj: *Object) !u256 {
         switch (obj.getStringDetails()) {
-            .special => |special| return special.getHash(),
+            .special => |special| return try special.getHash(),
             .none, .normal => {
                 // Fall through.
             },
         }
 
-        if (obj.vtable == &objects.Source.vtable) {
-            // If it's a source object, it may contain a cached hash.
-            const as_source: *objects.Source = Object.castTo(obj, objects.Source);
-            if (as_source.hash.load(.monotonic)) |hash| {
+        if (obj.asType(objects.Source)) |source| {
+            if (source.hash.load(.monotonic)) |hash| {
                 return hash.*;
             } else {
                 const hash = hashutil.hashBytes(try obj.getString());
                 const hash_ptr = try global_gpa.create(u256);
                 hash_ptr.* = hash;
-                if (as_source.hash.cmpxchgStrong(null, hash_ptr, .release, .acquire)) |other_set| {
+                if (source.hash.cmpxchgStrong(null, hash_ptr, .release, .acquire)) |other_set| {
                     global_gpa.destroy(hash_ptr);
                     return other_set.?.*;
                 }
-                return hash_ptr.*;
+                return hash;
             }
         }
 
@@ -1417,7 +1374,7 @@ fn testBoxInteger(ta: std.mem.Allocator) !void {
     try testStart(ta, testing.io);
     defer testFinish();
 
-    const obj = try Value.newInt(42).box();
+    const obj = try Value.newInt(42).raw.box();
     defer obj.release();
     try testing.expectEqualStrings("42", try obj.getString());
 }
@@ -1430,7 +1387,7 @@ fn testBoxFloat(ta: std.mem.Allocator) !void {
     try testStart(ta, testing.io);
     defer testFinish();
 
-    const obj = try Value.newFloat(3.14).box();
+    const obj = try Value.newFloat(3.14).raw.box();
     defer obj.release();
     try testing.expectEqualStrings("3.14", try obj.getString());
 }
@@ -1443,11 +1400,11 @@ fn testBoxBool(ta: std.mem.Allocator) !void {
     try testStart(ta, testing.io);
     defer testFinish();
 
-    const true_obj = try Value.newBool(true).box();
+    const true_obj = try Value.newBool(true).raw.box();
     defer true_obj.release();
     try testing.expectEqualStrings("true", try true_obj.getString());
 
-    const false_obj = try Value.newBool(false).box();
+    const false_obj = try Value.newBool(false).raw.box();
     defer false_obj.release();
     try testing.expectEqualStrings("false", try false_obj.getString());
 }

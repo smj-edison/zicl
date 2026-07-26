@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const debug = std.debug;
 const options = @import("options");
 
 const memutil = @import("memutil.zig");
@@ -352,6 +353,42 @@ pub fn dumpLastTouchedTrace(fd: i32) void {
         writer.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)}) catch {};
         writer.print("  [{:>2}] addr=0x{x} {s}\n", .{ j - start, @intFromPtr(obj), entry.message }) catch {};
         std.debug.writeStackTrace(&entry.stack_trace, terminal) catch {};
+    }
+}
+
+export fn dumpTraceForObject(addr: usize, verbose: bool) void {
+    if (!options.trace_mem) return;
+
+    const entries = next_debug_location.load(.monotonic);
+    if (entries == 0) {
+        debug.print("(no operations logged)\n", .{});
+        return;
+    }
+
+    var counter: usize = 0;
+    for (debug_log[0..entries]) |*entry| {
+        if (!entry.initialized.load(.acquire)) continue;
+        const obj = entry.value.asPtr() orelse continue;
+        if (@intFromPtr(obj) == addr) {
+            debug.print("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
+            counter += 1;
+        }
+    }
+
+    if (verbose) {
+        counter = 0;
+        for (debug_log[0..entries]) |*entry| {
+            if (!entry.initialized.load(.acquire)) continue;
+            const obj = entry.value.asPtr() orelse continue;
+            if (@intFromPtr(obj) == addr) {
+                debug.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)});
+                debug.print("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
+                const stderr = heap.global_io.lockStderr(&.{}, .no_color) catch continue;
+                defer heap.global_io.unlockStderr();
+                std.debug.writeStackTrace(&entry.stack_trace, stderr.terminal()) catch {};
+                counter += 1;
+            }
+        }
     }
 }
 

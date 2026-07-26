@@ -31,7 +31,7 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
         if ((try interp.getVariable(var_name)).asValue()) |val| {
             interp.setResult(val);
         } else {
-            try interp.setVariable(var_name, heap.interned_empty_string.get());
+            try interp.setVariable(var_name, heap.interned_empty_string);
             interp.setEmptyResult();
         }
         return;
@@ -185,7 +185,7 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
 
                 const bytes = try str.current().getString();
                 const byte_start = strutil.cpIndex(bytes, range.start) orelse {
-                    interp.setResultOwning(heap.interned_empty_string.get());
+                    interp.setResultOwning(heap.interned_empty_string);
                     return;
                 };
                 const byte_end = strutil.cpIndex(bytes, range.end) orelse bytes.len;

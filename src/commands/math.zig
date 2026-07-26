@@ -91,7 +91,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                     .integer => |int| @floatFromInt(int),
                 };
                 if (as_float == 0.0) {
-                    interp.setResultOwning(Number.division_by_zero_message.get());
+                    interp.setResultOwning(Number.division_by_zero_message);
                     return error.EvalError;
                 }
                 interp.setResult(Value.newFloat(1.0 / as_float));
@@ -129,7 +129,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                     .div => std.math.divFloor(i64, result, operand) catch |err| switch (err) {
                         error.Overflow => return interp.integerOverflowError(i65, @divFloor(@as(i65, result), @as(i65, operand))),
                         error.DivisionByZero => {
-                            interp.setResultOwning(Number.division_by_zero_message.get());
+                            interp.setResultOwning(Number.division_by_zero_message);
                             return error.EvalError;
                         },
                     },
@@ -151,7 +151,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
             .sub => result - operand,
             .div => blk: {
                 if (operand == 0.0) {
-                    interp.setResultOwning(Number.division_by_zero_message.get());
+                    interp.setResultOwning(Number.division_by_zero_message);
                     return error.EvalError;
                 }
                 break :blk result / operand;

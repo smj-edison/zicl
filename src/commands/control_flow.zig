@@ -124,7 +124,7 @@ fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, 
                     const item = value_list.items[state.current_index];
                     state.current_index += 1;
                     break :blk item;
-                } else heap.interned_empty_string.get();
+                } else heap.interned_empty_string;
 
                 try interp.setVariable(&var_name, value);
             }

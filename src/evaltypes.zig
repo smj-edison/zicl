@@ -95,7 +95,7 @@ pub const ParsedScriptCommand = struct {
     word_count: u32,
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const command = obj.constCastTo(ParsedScriptCommand);
+        const command = obj.asTypeConst(ParsedScriptCommand).?;
         try ctx.addField(u32, info, "line", "{}", command.line);
         try ctx.addField(u32, info, "word_count", "{}", command.word_count);
     }
@@ -639,17 +639,17 @@ pub const Expression = struct {
                     return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, widened));
                 },
                 error.DivisionByZero => {
-                    interp.setResultOwning(division_by_zero_message.get());
+                    interp.setResultOwning(division_by_zero_message);
                     return error.DivisionByZero;
                 },
             },
             .mod => std.math.mod(i64, lhs, rhs) catch |err| switch (err) {
                 error.NegativeDenominator => {
-                    interp.setResultOwning(negative_denom_message.get());
+                    interp.setResultOwning(negative_denom_message);
                     return error.NegativeDenominator;
                 },
                 error.DivisionByZero => {
-                    interp.setResultOwning(division_by_zero_message.get());
+                    interp.setResultOwning(division_by_zero_message);
                     return error.DivisionByZero;
                 },
             },
@@ -688,7 +688,7 @@ pub const Expression = struct {
             .bool_or => @intFromBool((lhs != 0) or (rhs != 0)),
             .pow => std.math.powi(i64, lhs, rhs) catch {
                 // Report overflow for both underflow and overflow. Maybe I should report separately?
-                interp.setResultOwning(heap.createInternedString("integer value too big to be represented").get());
+                interp.setResultOwning(heap.InternedString.newValue("integer value too big to be represented"));
                 return error.IntegerOverflow;
             },
             else => unreachable,
@@ -700,7 +700,7 @@ pub const Expression = struct {
             .mul => lhs * rhs,
             .div => blk: {
                 if (rhs == 0.0) {
-                    interp.setResultOwning(division_by_zero_message.get());
+                    interp.setResultOwning(division_by_zero_message);
                     return error.DivisionByZero;
                 } else {
                     break :blk lhs / rhs;
@@ -708,11 +708,11 @@ pub const Expression = struct {
             },
             .mod => std.math.mod(f64, lhs, rhs) catch |err| switch (err) {
                 error.DivisionByZero => {
-                    interp.setResultOwning(division_by_zero_message.get());
+                    interp.setResultOwning(division_by_zero_message);
                     return error.DivisionByZero;
                 },
                 error.NegativeDenominator => {
-                    interp.setResultOwning(negative_denom_message.get());
+                    interp.setResultOwning(negative_denom_message);
                     return error.NegativeDenominator;
                 },
             },
@@ -1118,9 +1118,9 @@ pub const Expression = struct {
 };
 
 pub const Closure = struct {
-    pub const interned_name = heap.createInternedString("name");
-    pub const interned_impl = heap.createInternedString("impl");
-    pub const interned_scope = heap.createInternedString("scope");
+    pub const interned_name = heap.InternedString.newValue("name");
+    pub const interned_impl = heap.InternedString.newValue("impl");
+    pub const interned_scope = heap.InternedString.newValue("scope");
 
     closure: *Content,
 
@@ -1240,9 +1240,9 @@ pub const Closure = struct {
             },
         };
 
-        const maybe_name = try as_dict.getNoFollow(interned_name.get());
-        const maybe_impl = try as_dict.getNoFollow(interned_impl.get());
-        const maybe_scope = try as_dict.getNoFollow(interned_scope.get());
+        const maybe_name = try as_dict.getNoFollow(interned_name);
+        const maybe_impl = try as_dict.getNoFollow(interned_impl);
+        const maybe_scope = try as_dict.getNoFollow(interned_scope);
 
         const args, const body = blk: {
             if (maybe_impl.asValue()) |impl| {
@@ -1344,9 +1344,11 @@ pub const Closure = struct {
     /// Validates a closure argument list and extracts arity information.
     pub fn parseArgList(det: ?*ErrorDetails, args: *const objects.List) !ParsedArgList {
         var arg_names: std.ArrayList(Value) = .empty;
-        arg_names.deinit(heap.global_gpa);
+        defer arg_names.deinit(heap.global_gpa);
+        defer for (arg_names.items) |item| item.release();
         var optional_values: std.ArrayList(Value) = .empty;
-        optional_values.deinit(heap.global_gpa);
+        defer optional_values.deinit(heap.global_gpa);
+        defer for (optional_values.items) |item| item.release();
 
         var args_parameter_found = false;
         for (0..args.items.len) |i| {
@@ -1391,10 +1393,10 @@ pub const Closure = struct {
                 }
 
                 // Add the optional parameter onto the optional parameters list.
-                try optional_values.append(heap.global_gpa, arg_as_list.items[1]);
+                try optional_values.append(heap.global_gpa, arg_as_list.items[1].borrow());
 
                 // Pull out the name from the default list (`{name default}`).
-                try arg_names.append(heap.global_gpa, arg_as_list.items[0]);
+                try arg_names.append(heap.global_gpa, arg_as_list.items[0].borrow());
             } else {
                 if (optional_values.items.len > 0) {
                     if (det) |details| details.* = .{
@@ -1405,17 +1407,15 @@ pub const Closure = struct {
 
                 if (try arg_as_list.items[0].equalsString("args")) args_parameter_found = true;
 
-                try arg_names.append(heap.global_gpa, arg_as_list.items[0]);
+                try arg_names.append(heap.global_gpa, arg_as_list.items[0].borrow());
             }
         }
 
         const arg_names_slice = try arg_names.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(arg_names_slice);
+        errdefer for (arg_names_slice) |item| item.release();
         const optional_values_slice = try optional_values.toOwnedSlice(heap.global_gpa);
         errdefer comptime unreachable;
-
-        for (arg_names_slice) |arg| arg.incrRefCount();
-        for (optional_values_slice) |value| value.incrRefCount();
 
         const optional_arity = optional_values_slice.len;
         const required_arity = arg_names_slice.len - optional_arity - @intFromBool(args_parameter_found);
@@ -1436,7 +1436,7 @@ pub const Closure = struct {
 
         const new_closure = try heap.global_gpa.create(Content);
         errdefer heap.global_gpa.destroy(new_closure);
-        new_closure.* = src.constCastTo(Closure).closure.duplicate();
+        new_closure.* = src.asTypeConst(Closure).?.closure.duplicate();
 
         new_obj.body.* = .{ .closure = new_closure };
 
@@ -1444,13 +1444,13 @@ pub const Closure = struct {
     }
 
     fn freeInternalRep(src: *Object) void {
-        const as_closure = src.castTo(Closure);
+        const as_closure = src.asType(Closure).?;
         as_closure.closure.deinit();
         heap.global_gpa.destroy(as_closure.closure);
     }
 
     fn updateString(obj: *Object) !void {
-        const as_closure = obj.castTo(Closure);
+        const as_closure = obj.asType(Closure).?;
         const closure = as_closure.closure;
         const required = closure.required_arity;
         const optional = closure.optional_arity;
@@ -1506,7 +1506,7 @@ pub const Closure = struct {
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const closure = obj.constCastTo(Closure);
+        const closure = obj.asTypeConst(Closure).?;
         const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
         try helper.follow(Content, "closure", closure.closure);
     }

@@ -17,10 +17,10 @@ const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
 const objects = @import("objects.zig");
-const vartypes = @import("vartypes.zig");
-const allocPrintZ = objects.allocPrintZ;
 const Shimmerable = objects.Shimmerable;
 const ErrorDetails = objects.ErrorDetails;
+const vartypes = @import("vartypes.zig");
+const allocPrintZ = objects.allocPrintZ;
 const Dictionary = objects.Dictionary;
 const String = objects.String;
 const List = objects.List;
@@ -115,11 +115,11 @@ const ParsedSubstitutions = memutil.LruCache(u256, *Substitution, FullHashContex
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(evaltypes.NativeCommand);
 
-const interned_name = heap.createInternedString("name");
-const interned_impl = heap.createInternedString("impl");
-const interned_scope = heap.createInternedString("scope");
-const interned_zicl_oom = heap.createInternedString("ZICL OOM");
-const interned_oom = heap.createInternedString("out of memory");
+const interned_name = heap.InternedString.newValue("name");
+const interned_impl = heap.InternedString.newValue("impl");
+const interned_scope = heap.InternedString.newValue("scope");
+const interned_zicl_oom = heap.InternedString.newValue("ZICL OOM");
+const interned_oom = heap.InternedString.newValue("out of memory");
 
 pub fn narrowError(err: anyerror) evaltypes.EvalError {
     return switch (err) {
@@ -242,21 +242,21 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
             defer list.asHead().release();
             for (args[called_idx..]) |arg| list.appendAssumeCapacity(arg.current());
 
-            try interp.setVariable(&var_name, list.asHead().asValue());
+            try interp.setVariableInFrame(call_frame_idx, &var_name, list.asHead().asValue());
         } else if (signature_idx >= closure.required_arity) {
             // This is an optional argument.
 
             // Are there any remaining unassigned arguments?
             if (called_idx < args.len) {
-                try interp.setVariable(&var_name, args[called_idx].current());
+                try interp.setVariableInFrame(call_frame_idx, &var_name, args[called_idx].current());
                 called_idx += 1;
             } else {
                 // Else populate it with its default value.
                 const default_value = optional_values[signature_idx - closure.required_arity];
-                try interp.setVariable(&var_name, default_value);
+                try interp.setVariableInFrame(call_frame_idx, &var_name, default_value);
             }
         } else {
-            try interp.setVariable(&var_name, args[called_idx].current());
+            try interp.setVariableInFrame(call_frame_idx, &var_name, args[called_idx].current());
             called_idx += 1;
         }
     }
@@ -308,14 +308,16 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
                 const retcode = ReturnCode.toError(to_call(interp, @intCast(args_as_handles.len), args_as_handles.ptr));
 
                 for (args, args_as_handles) |*arg, native_arg| {
-                    // We don't need to worry about this not firing with an ABA
-                    // pointer address issue, since each argument has already
-                    // been borrowed.
-                    if (native_arg != arg.current()) {
-                        arg.shimmered.swap(native_arg);
-                    } else {
-                        native_arg.release();
-                    }
+                    if (arg.current().asPtr()) |arg_obj| if (native_arg.asPtr()) |native_obj| {
+                        // We don't need to worry about this not firing with an ABA
+                        // pointer address issue, since each argument has already
+                        // been borrowed.
+                        if (arg_obj != native_obj) {
+                            arg.shimmered.swap(native_arg);
+                            continue;
+                        }
+                    };
+                    native_arg.release();
                 }
 
                 return retcode;
@@ -332,7 +334,7 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
 
 fn freeLastResult(interp: *Interp) void {
     interp.result.release();
-    interp.result = heap.interned_empty_string.get();
+    interp.result = heap.interned_empty_string;
 }
 
 pub fn setResult(interp: *Interp, value: Value) void {
@@ -355,6 +357,11 @@ pub fn setResultFloat(interp: *Interp, value: f64) void {
 
 pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.setResultOwning(try String.newValue(bytes));
+}
+
+pub fn setResultError(interp: *Interp, value: Value) error{EvalError} {
+    interp.setResult(value);
+    return error.EvalError;
 }
 
 /// Frees `bytes` in error cases.
@@ -542,7 +549,7 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: Closure.Conten
     errdefer variables.asHead().release();
 
     if (signature.scope_hash_ref) |scope_hash_ref| {
-        _ = try variables.put(objects.interned_tilde_parent.get(), scope_hash_ref.inner.asValue());
+        _ = try variables.put(objects.interned_tilde_parent, scope_hash_ref.inner.asValue());
     }
 
     const new_call_frame_idx = interp.call_frames.items.len;
@@ -630,7 +637,7 @@ fn interpolateTokens(
         new_str_len += (try new_value.getString()).len;
     }
 
-    if (new_str_len == 0) return heap.interned_empty_string.get();
+    if (new_str_len == 0) return heap.interned_empty_string;
 
     const new_bytes = blk: {
         var bytes = try heap.global_gpa.allocSentinel(u8, new_str_len, 0);
@@ -696,7 +703,7 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
     };
 
     if (!can_be_method and closure_and_key.closure.is_method) {
-        interp.setResultOwning(heap.createInternedString("method cannot be invoked as function").get());
+        interp.setResultOwning(heap.InternedString.newValue("method cannot be invoked as function"));
         return error.EvalError;
     }
 
@@ -901,7 +908,7 @@ test "eval expression" {
     var expr = try String.newValue("5 + 10");
     defer expr.release();
     const result = try interp.evalExpression(expr);
-    try testing.expectEqual(Value.newInt(15), result);
+    try testing.expect(try Value.newInt(15).equals(result));
 }
 
 pub fn getBoolFromExpression(interp: *Interp, value: Value) !bool {
@@ -928,7 +935,7 @@ pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFla
 }
 
 pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
-    if (interp.stack_trace != .none) return;
+    if (interp.stack_trace.isSome()) return;
     interp.stack_trace.swap(try buildErrorStack(interp));
 }
 
@@ -955,7 +962,7 @@ fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
         const closure_name = call_frame.signature.name.orEmpty();
 
         const source_info = eval_frame.currently_evaluating.asType(objects.Source);
-        const file_name = if (source_info) |info| info.file_name.orEmpty() else heap.interned_empty_string.get();
+        const file_name = if (source_info) |info| info.file_name.orEmpty() else heap.interned_empty_string;
         const base_line = if (source_info) |info| info.line_no else null;
 
         const base = if (base_line) |val| val else 1;
@@ -977,7 +984,7 @@ fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
 
 /// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
 fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { command: ?CommandOrClosure, self: OptionalValue } {
-    const command = interp.getCommand(interp.callFrameIdx(), &args[0], true) catch |err| switch (err) {
+    var command = interp.getCommand(interp.callFrameIdx(), &args[0], true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EvalError => return error.EvalError,
         error.CommandNotFound => {
@@ -988,6 +995,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
             return .{ .command = null, .self = .none };
         },
     };
+    errdefer command.deinit();
 
     const is_method = switch (command) {
         .closure => |closure| closure.closure.is_method,
@@ -1083,7 +1091,7 @@ fn invokeCommandMaybeMethod(
         const method_dict_path = &args[0];
         // `self` is returned back through `args[1]`.
         const new_self = &args[1];
-        assert(new_self.shimmered != .none);
+        assert(new_self.shimmered.isSome());
 
         // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
         var det: ErrorDetails = undefined;
@@ -1125,7 +1133,7 @@ fn invokeCommandMaybeMethod(
 
             var dict_resolved_shim: Shimmerable = .{ .original = to_use };
             _ = try interp.wrapError(&det, Dictionary.shimmerFrom(&det, &dict_resolved_shim));
-            assert(dict_resolved_shim.shimmered == .none);
+            assert(dict_resolved_shim.shimmered.isNone());
             const as_mutable = dict_resolved_shim.current().asType(Dictionary).?;
             try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
             interp.callFrame().variables.asHead().invalidateString();
@@ -1153,7 +1161,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     var args_raw = try heap.local_arena.alloc(Shimmerable, command_info.word_count + 1);
     // Contains what is considered to be the current arguments.
     var args = args_raw[1..];
-    args_raw[0] = .{ .original = heap.interned_empty_string.get() };
+    args_raw[0] = .{ .original = heap.interned_empty_string };
 
     {
         // This is not always the same as which word token we're on, as argument expansion
@@ -1269,8 +1277,8 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
                     if (narrowed_err == error.OutOfMemory) {
                         // In the case of OOM, the inside function almost certainly failed
                         // to set a result, so we set it here.
-                        interp.setResult(interned_oom.get());
-                        interp.pending_error_code.swap(interned_zicl_oom.get());
+                        interp.setResult(interned_oom);
+                        interp.pending_error_code.swap(interned_zicl_oom);
                     }
 
                     if (narrowed_err == error.WrongUsage) {
@@ -1278,7 +1286,7 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
                     }
 
                     if (narrowed_err == error.EvalError) {
-                        if (interp.stack_trace == .none) {
+                        if (interp.stack_trace.isNone()) {
                             // Something went wrong when initializing the eval frame,
                             // so we'll set up a dummy frame, so there's at least a
                             // line number and file name.
@@ -1337,7 +1345,7 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     errdefer unknown_str.release();
 
     var new_interp: Interp = .{
-        .result = heap.interned_empty_string.get(),
+        .result = heap.interned_empty_string,
         .eval_frames = .empty,
         .call_frames = .empty,
         .current_call_epoch = global_call_epoch.fetchAdd(1, .monotonic) + 1,
@@ -1378,7 +1386,7 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
         .optional_values = null,
         .required_arity = 0,
         .optional_arity = 0,
-        .body = heap.interned_empty_string.get(),
+        .body = heap.interned_empty_string,
         .name = .none,
         .scope_hash_ref = null,
         .has_args_parameter = false,
@@ -1392,7 +1400,7 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
         .args = &.{},
         .call_frame = 0,
         .current_line = 0,
-        .currently_evaluating = heap.interned_empty_string.get(),
+        .currently_evaluating = heap.interned_empty_string,
     });
     errdefer new_interp.eval_frames.deinit(heap.global_gpa);
 
@@ -1648,8 +1656,8 @@ pub fn removeDictValueRecursively(interp: *Interp, dict: *Dictionary, context: a
 }
 
 test "recursive dict keys" {
-    defer heap.testFinish();
     try heap.testStart(testing.allocator, testing.io);
+    defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
 
@@ -1703,8 +1711,8 @@ test "recursive dict keys" {
 }
 
 fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
-    defer heap.testFinish();
     try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
 
@@ -1824,17 +1832,17 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     try testing.expectEqual(initial_refcount - 1, intermediate.asPtr().?.getRefCount());
 
     // Test 8: Remove multiple items from a nested dict.
-    dict.asHead().release();
-    dict = try objects.Dictionary.new(&.{});
-    try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, value_qux);
-    try interp.putDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } }, value_qux);
-    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict.asHead().getString());
-    did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } });
+    var dict_multiple_items = try objects.Dictionary.new(&.{});
+    defer dict_multiple_items.asHead().release();
+    try interp.putDictValueRecursively(dict_multiple_items, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, value_qux);
+    try interp.putDictValueRecursively(dict_multiple_items, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } }, value_qux);
+    try testing.expectEqualStrings("foo {bar qux baz qux}", try dict_multiple_items.asHead().getString());
+    did_remove = try interp.removeDictValueRecursively(dict_multiple_items, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {baz qux}", try dict.asHead().getString());
-    did_remove = try interp.removeDictValueRecursively(dict, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } });
+    try testing.expectEqualStrings("foo {baz qux}", try dict_multiple_items.asHead().getString());
+    did_remove = try interp.removeDictValueRecursively(dict_multiple_items, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } });
     try testing.expect(did_remove);
-    try testing.expectEqualStrings("foo {}", try dict.asHead().getString());
+    try testing.expectEqualStrings("foo {}", try dict_multiple_items.asHead().getString());
 }
 
 test "recursive dict removal" {
