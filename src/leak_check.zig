@@ -191,6 +191,7 @@ pub const LeakResult = struct {
             '\n' => try writer.writeAll("\\n"),
             '{' => try writer.writeAll("\\{"),
             '}' => try writer.writeAll("\\}"),
+            '<' => try writer.writeAll("\\<"),
             else => try writer.writeByte(c),
         };
         try writer.writeByte('"');

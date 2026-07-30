@@ -59,7 +59,7 @@ pub const Shimmerable = extern struct {
         return shimmered;
     }
 
-    pub fn ensureBoxed(self: *Shimmerable) error{OutOfMemory}!*const Object {
+    pub fn ensureBoxed(self: *Shimmerable) error{OutOfMemory}!*Object {
         if (self.current().asPtr() == null) self.shimmered.swap((try self.current().raw.box()).asValue());
         return self.current().asPtr().?;
     }
@@ -237,9 +237,31 @@ pub const IterHelper = struct {
         T: type,
         edge_coming_from: []const u8,
         comptime fmt: []const u8,
-        val: T,
+        args: anytype,
     ) StructIterator.Error!void {
-        try helper.ctx.addField(T, helper.info, edge_coming_from, fmt, val);
+        try helper.ctx.addField(T, helper.info, edge_coming_from, fmt, args);
+    }
+
+    pub fn followFieldSlice(
+        helper: *const IterHelper,
+        T: type,
+        field_name: []const u8,
+        comptime fmt: []const u8,
+        values: []const T,
+    ) StructIterator.Error!void {
+        const items_info: StructIterator.NodeInfo = .{
+            .node = @ptrCast(values.ptr),
+            .parent_info = helper.info,
+            .enumerate_struct = null, // `[]T` has no walking function.
+            .type_name = @typeName([]T),
+            .as_string = null,
+        };
+        try helper.ctx.vtable.visit_node(helper.ctx, &items_info, field_name);
+
+        for (values, 0..) |item, i| {
+            const rendered_index = try std.fmt.allocPrint(helper.ctx.arena, "{}", .{i});
+            try helper.ctx.addField(T, helper.info, rendered_index, fmt, .{item});
+        }
     }
 };
 
@@ -413,7 +435,7 @@ pub const String = struct {
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const string = obj.asTypeConst(String).?;
-        try ctx.addField(usize, info, "codepoint_length", "{}", string.codepoint_length.load(.monotonic));
+        try ctx.addField(usize, info, "codepoint_length", "{}", .{string.codepoint_length.load(.monotonic)});
     }
 
     pub const vtable: Object.VTable = .{
@@ -482,8 +504,11 @@ pub const Source = struct {
         try src.duplicateHeadOnto(new_obj.head);
 
         const cast_src = src.asTypeConst(Source).?;
-        new_obj.body.file_name = cast_src.file_name.borrow();
-        new_obj.body.line_no = cast_src.line_no;
+        new_obj.body.* = .{
+            .file_name = cast_src.file_name.borrow(),
+            .line_no = cast_src.line_no,
+            .hash = .init(null),
+        };
 
         return new_obj.head;
     }
@@ -1417,17 +1442,6 @@ pub const List = struct {
         return new_list.body;
     }
 
-    /// Frees `items` on error.
-    pub fn newFromSliceOwning(items: []Value) !*List {
-        errdefer heap.global_gpa.free(items);
-
-        const new_list = try Object.newObject(List);
-        errdefer new_list.head.freeBacking();
-
-        new_list.body.* = .{ .items = items, .capacity = items.len };
-        return new_list.body;
-    }
-
     fn backingSlice(self: *List) []Value {
         return self.items.ptr[0..self.capacity];
     }
@@ -1647,6 +1661,19 @@ pub const ValueSliceContext = struct {
     }
     pub fn get(self: @This(), index: usize) Value {
         return self.items[index];
+    }
+    pub fn sliceAfter(self: @This(), index: usize) @This() {
+        return .{ .items = self.items[index..] };
+    }
+};
+
+pub const ShimmerableSliceContext = struct {
+    items: []const Shimmerable,
+    pub fn len(self: @This()) usize {
+        return self.items.len;
+    }
+    pub fn get(self: @This(), index: usize) Value {
+        return self.items[index].current();
     }
     pub fn sliceAfter(self: @This(), index: usize) @This() {
         return .{ .items = self.items[index..] };

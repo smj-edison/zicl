@@ -106,26 +106,26 @@ pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 pub fn applyCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const closure_and_key = try interp.getClosure(args[1].current(), false);
 
-    var duped = closure_and_key.closure.duplicate();
-    defer duped.deinit();
+    closure_and_key.closure.asHead().incrRefCount(); // Pin the closure so it doesn't get freed while we evaluate it.
+    defer closure_and_key.closure.asHead().release();
 
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
-    try Interp.narrowToEvalError(interp.callClosure(&duped, closure_and_key.cache_key, args[1..]));
+    try Interp.narrowToEvalError(interp.callClosure(closure_and_key.closure.content, closure_and_key.cache_key, args[1..]));
 }
 
 pub fn applymethodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const closure_and_key = try interp.getClosure(args[1].current(), true);
 
-    if (!closure_and_key.closure.is_method) {
+    if (!closure_and_key.closure.content.is_method) {
         try interp.setResultString("[applymethod] called with a function");
         return error.EvalError;
     }
 
-    var duped = closure_and_key.closure.duplicate();
-    defer duped.deinit();
+    closure_and_key.closure.asHead().incrRefCount(); // Pin the closure so it doesn't get freed while we evaluate it.
+    defer closure_and_key.closure.asHead().release();
 
-    try Interp.narrowToEvalError(interp.callClosure(&duped, closure_and_key.cache_key, args[1..]));
+    try Interp.narrowToEvalError(interp.callClosure(closure_and_key.closure.content, closure_and_key.cache_key, args[1..]));
 
     const new_self = args[2].shimmered.asValue().?;
     args[2].shimmered = .none; // It's bad practice to leave a `Shimmerable` as mutated.
@@ -180,7 +180,7 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
         var det: ErrorDetails = undefined;
         const args_as_list = try interp.wrapError(&det, objects.List.shimmerFrom(&det, arglist));
         var parsed_args: evaltypes.Closure.ParsedArgList = try interp.wrapError(&det, evaltypes.Closure.parseArgList(&det, args_as_list));
-        errdefer parsed_args.deinit();
+        defer parsed_args.deinit();
 
         // Capture the current scope.
         const scope: *objects.Dictionary = try Interp.narrowToEvalError(interp.captureCurrentScope());
@@ -193,10 +193,10 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
         errdefer closure_obj.head.freeBacking();
         const closure_content = try heap.global_gpa.create(evaltypes.Closure.Content);
         errdefer heap.global_gpa.destroy(closure_content);
-        const arg_names = try objects.List.newFromSliceOwning(parsed_args.arg_names);
+        const arg_names = try objects.List.new(parsed_args.arg_names);
         errdefer arg_names.asHead().release();
         const optional_values =
-            if (parsed_args.optional_values.len > 0) try objects.List.newFromSliceOwning(parsed_args.optional_values) else null;
+            if (parsed_args.optional_values.len > 0) try objects.List.new(parsed_args.optional_values) else null;
         errdefer comptime unreachable; // We now take ownership of everything.
 
         closure_content.* = .{
@@ -212,7 +212,7 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
             .cache_id = evaltypes.Closure.closure_cache_id.fetchAdd(1, .monotonic),
         };
 
-        closure_obj.body.closure = closure_content;
+        closure_obj.body.content = closure_content;
         break :blk closure_obj.head;
     };
     defer new_closure.release();
@@ -336,7 +336,7 @@ test "fn parsing" {
     // A manually-constructed fn string exercises parseClosure directly, since
     // there is no .closure tag to shortcut through.
     try interp.testExpectScriptResult("30",
-        \\ set foo "fn impl {{a b} {+ \$a \$b}} scope [hash { + {nativefn +}}]"
+        \\ set foo "fn impl {{a b} {+ \$a \$b}} scope [ref { + {nativefn +}}]"
         \\ foo 10 20
     );
 }
@@ -396,7 +396,7 @@ test "method parseable by applymethod" {
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("{x 5} 10",
-        \\ set method "method impl {{self y} {+ \$self::x \$y}} scope [hash {+ {nativefn +}}]"
+        \\ set method "method impl {{self y} {+ \$self::x \$y}} scope [ref {+ {nativefn +}}]"
         \\ applymethod $method {x 5} 5
     );
 }

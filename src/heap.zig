@@ -797,6 +797,8 @@ pub const Object = extern struct {
                 "Object has too high alignment requirements ({s} has align {}, while max align is {})",
                 .{ @typeName(T), @alignOf(T), body_align },
             ));
+            if (!@hasDecl(T, "vtable")) @compileError("Type is missing vtable");
+            if (@TypeOf(@field(T, "vtable")) != VTable) @compileError("Wrong vtable type");
         }
     }
 
@@ -885,7 +887,7 @@ pub const Object = extern struct {
     }
 
     pub fn makeCrossthread(obj: *Object) void {
-        if (obj.vtable.make_crossthread) |make_crossthread_fn| make_crossthread_fn(obj);
+        obj.vtable.make_crossthread.?(obj);
         obj.metadata.cross_thread = true;
     }
 
@@ -908,7 +910,7 @@ pub const Object = extern struct {
             },
             .none => {},
         }
-        try ctx.addField(Metadata, info, "metadata", "{any}", obj.metadata);
+        try ctx.addField(Metadata, info, "metadata", "{any}", .{obj.metadata});
         if (obj.vtable.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
     }
 

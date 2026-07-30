@@ -110,7 +110,7 @@ const FullHashContext = struct {
 };
 const ParsedScripts = memutil.LruCache(u256, *Script, FullHashContext);
 const ParsedExpressions = memutil.LruCache(u256, *Expression, FullHashContext);
-const ParsedClosures = memutil.LruCache(u256, Closure.Content, FullHashContext);
+const ParsedClosures = memutil.LruCache(u256, *Closure, FullHashContext);
 const ParsedSubstitutions = memutil.LruCache(u256, *Substitution, FullHashContext);
 
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(evaltypes.NativeCommand);
@@ -194,9 +194,11 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
     _ = interp.nextProcedureEpoch();
 }
 
-/// If called with a closure, this will _modify_ `args[1]`, not just shimmer it.
+/// If called with a method, this will _modify_ `args[1]`, not just shimmer it.
 pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, args: []Shimmerable) !void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
+
+    const is_method = closure.is_method;
 
     // Check arity.
     const too_few_arguments: bool = arg_count < closure.required_arity;
@@ -215,7 +217,7 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
         return error.InfiniteRecursion;
     }
 
-    const call_frame_idx = try interp.pushCallFrame(args, closure.*);
+    const call_frame_idx = try interp.pushCallFrame(args, closure);
     defer {
         var frame_mut = interp.call_frames.pop().?;
         frame_mut.deinit();
@@ -261,11 +263,21 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
         }
     }
 
+    // Note that once we evaluate `closure`, we can no longer guarantee that it's still shimmered
+    // as a Closure. This is because the closure and variable namespaces are the same, so something
+    // like
+    // ```
+    // fn foo {} {
+    //   upvar foo foo
+    //   puts [dict get $foo name]
+    // }
+    // ```
+    // will shimmer `foo` halfway through evaluation.
     try interp.evalObjectInner(call_frame_idx, closure.body, cache_key);
 
     // When called as a method, we write back `self` to `args[1]`, so that the
     // caller can update the new method.
-    if (closure.is_method) {
+    if (is_method) {
         var self_var_name: Shimmerable = .{ .original = arg_names[0] };
         defer self_var_name.discardChanges(); // TODO PERF don't discard, write back.
         if (vartypes.getVariableOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
@@ -390,16 +402,16 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
     const first_file = stack_trace.items[1];
     const first_line = stack_trace.items[2];
 
-    try buf.print(heap.local_arena, "{s}:{s}: Error: {s}\n", .{
+    try buf.print(heap.global_gpa, "{s}:{s}: Error: {s}\n", .{
         try first_file.getString(),
         try first_line.getString(),
         try error_mesage.getString(),
     });
-    try buf.print(heap.local_arena, "Traceback:\n", .{});
+    try buf.print(heap.global_gpa, "Traceback:\n", .{});
 
     if (stack_trace.items.len <= 4) {
         // Stack trace only had one entry, so there's no point in printing the traceback.
-        return try String.new(buf.items);
+        return try String.newValue(buf.items);
     }
 
     // Stack trace is a flat list of {command file line args} repeated per frame.
@@ -411,27 +423,27 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
         const args = try stack_trace.items[i + 3].getString();
 
         if (file.len > 0) {
-            try buf.print(heap.local_arena, "  File \"{s}\", line {s}", .{ file, line });
+            try buf.print(heap.global_gpa, "  File \"{s}\", line {s}", .{ file, line });
         }
 
         if (fn_name.len > 0) {
             if (file.len > 0) {
-                try buf.print(heap.local_arena, ", in {s}", .{fn_name});
+                try buf.print(heap.global_gpa, ", in {s}", .{fn_name});
             } else {
-                try buf.print(heap.local_arena, "  In {s}", .{fn_name});
+                try buf.print(heap.global_gpa, "  In {s}", .{fn_name});
             }
         }
 
         if (file.len > 0 or fn_name.len > 0) {
-            try buf.append(heap.local_arena, '\n');
+            try buf.append(heap.global_gpa, '\n');
         }
 
         if (args.len > 0) {
             if (std.mem.indexOfScalar(u8, args, '\n')) |args_newline| {
                 const shortened = args[0..args_newline];
-                try buf.print(heap.local_arena, "    {s}...\n", .{shortened});
+                try buf.print(heap.global_gpa, "    {s}...\n", .{shortened});
             } else {
-                try buf.print(heap.local_arena, "    {s}\n", .{args});
+                try buf.print(heap.global_gpa, "    {s}\n", .{args});
             }
         }
     }
@@ -441,7 +453,8 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
         _ = buf.pop();
     };
 
-    return try String.new(buf.items);
+    const owned_slice = try buf.toOwnedSliceSentinel(heap.global_gpa, 0);
+    return (try String.newOwning(owned_slice)).asHead().asValue();
 }
 
 /// Call frame.
@@ -450,8 +463,15 @@ const CallFrame = struct {
     variables: *Dictionary,
     /// Arguments of this procedure call. Lifetime managed by creator.
     args: []Shimmerable,
-    /// Signature of this procedure.
-    signature: Closure.Content,
+    /// Signature of the closure that is being called. Note this is an abridged
+    /// signature, since we only use a few of the fields of the closure during
+    /// evaluation.
+    signature: struct {
+        cache_id: u64,
+        /// Used during stack trace reporting, so we can say what closure was executed.
+        name: OptionalValue,
+        scope_hash_ref: ?objects.AlwaysCanBeType(objects.HashReference),
+    },
     /// Call epoch. Used to invalidate previous variable lookups.
     call_epoch: u64,
     /// Set this during evaluation to trigger a tailcall.
@@ -460,7 +480,8 @@ const CallFrame = struct {
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
         frame.variables.asHead().release();
-        // Signature is also externally managed.
+        frame.signature.name.release();
+        if (frame.signature.scope_hash_ref) |*scope_hash_ref| scope_hash_ref.deinit();
     }
 };
 
@@ -544,7 +565,9 @@ pub fn evalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.evalFrameIdx()];
 }
 
-fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: Closure.Content) !u32 {
+/// `signature` does not need to outlive this function call, as this borrows everything
+/// needed from `signature` when creating the call frame.
+fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure.Content) !u32 {
     var variables = try Dictionary.new(&.{});
     errdefer variables.asHead().release();
 
@@ -556,7 +579,11 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: Closure.Conten
     try interp.call_frames.append(heap.global_gpa, .{
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
-        .signature = signature,
+        .signature = .{
+            .cache_id = signature.cache_id,
+            .name = signature.name.borrow(),
+            .scope_hash_ref = if (signature.scope_hash_ref) |val| val.duplicate() else null,
+        },
         // TODO PERF recycle variable hash table if possible.
         .variables = variables,
         .tailcall = null,
@@ -656,11 +683,13 @@ fn interpolateTokens(
 
 pub fn getScript(interp: *Interp, value: Value, cache_key: u256) !*Script {
     if (interp.parsed_scripts.get(cache_key)) |parsed| {
+        parsed.asHead().incrRefCount();
         return parsed;
     } else {
         var det: ErrorDetails = undefined;
         const new_script = try interp.wrapError(&det, Script.parse(&det, value));
-        if (interp.parsed_scripts.put(cache_key, new_script)) |ejected| ejected.release();
+        if (interp.parsed_scripts.put(cache_key, new_script)) |ejected| ejected.asHead().release();
+        new_script.asHead().incrRefCount();
         return new_script;
     }
 }
@@ -671,19 +700,19 @@ pub fn getSubstitution(interp: *Interp, value: Value, cache_key: u256, flags: To
     } else {
         var det: ErrorDetails = undefined;
         const new_subst = try interp.wrapError(&det, Substitution.parse(&det, value, flags));
-        if (interp.parsed_substs.put(cache_key, new_subst)) |ejected| ejected.release();
+        if (interp.parsed_substs.put(cache_key, new_subst)) |ejected| ejected.asHead().release();
         return new_subst;
     }
 }
 
 pub const ClosureAndCacheKey = struct {
-    closure: Closure.Content,
+    closure: *Closure,
     cache_key: u256,
 };
 pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAndCacheKey {
     const closure_and_key: ClosureAndCacheKey = blk: {
         if (value.asType(Closure)) |closure| {
-            break :blk .{ .closure = closure.closure.*, .cache_key = @as(u256, closure.closure.cache_id) };
+            break :blk .{ .closure = closure, .cache_key = @as(u256, closure.content.cache_id) };
         }
 
         const cache_key = try value.getHashNoRegister();
@@ -694,15 +723,12 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
             // We need to parse the closure.
             var det: ErrorDetails = undefined;
             const closure = try interp.wrapError(&det, Closure.parse(&det, try value.getString()));
-            if (interp.parsed_closures.put(cache_key, closure)) |ejected| {
-                var ejected_mut = ejected;
-                ejected_mut.deinit();
-            }
+            if (interp.parsed_closures.put(cache_key, closure)) |ejected| ejected.asHead().release();
             break :blk .{ .closure = closure, .cache_key = cache_key };
         }
     };
 
-    if (!can_be_method and closure_and_key.closure.is_method) {
+    if (!can_be_method and closure_and_key.closure.content.is_method) {
         interp.setResultOwning(heap.InternedString.newValue("method cannot be invoked as function"));
         return error.EvalError;
     }
@@ -716,7 +742,7 @@ const CommandOrClosure = union(enum) {
 
     pub fn deinit(self: *CommandOrClosure) void {
         switch (self.*) {
-            .closure => |*closure| closure.closure.deinit(),
+            .closure => |*closure| closure.closure.asHead().release(),
             else => {},
         }
     }
@@ -733,9 +759,10 @@ fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_
     };
 
     if (var_val.asType(Closure)) |closure| {
+        closure.asHead().incrRefCount();
         return .{ .closure = .{
-            .closure = closure.closure.duplicate(),
-            .cache_key = @as(u256, closure.closure.cache_id),
+            .closure = closure,
+            .cache_key = @as(u256, closure.content.cache_id),
         } };
     }
 
@@ -761,6 +788,7 @@ fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_
         return error.CommandNotFound;
     } else {
         const closure = try interp.getClosure(var_val, can_be_method);
+        closure.closure.asHead().incrRefCount();
         return .{ .closure = closure };
     }
 }
@@ -830,7 +858,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: *CommandOrClosure, args: [
                     break :blk interp.callNative(command, current_args);
                 },
                 .closure => |*closure| {
-                    break :blk interp.callClosure(&closure.closure, closure.cache_key, current_args);
+                    break :blk interp.callClosure(closure.closure.content, closure.cache_key, current_args);
                 },
             }
         };
@@ -873,7 +901,7 @@ pub fn getExpression(interp: *Interp, value: Value, cache_key: u256) !*Expressio
     } else {
         var det: objects.ErrorDetails = undefined;
         const new_expr = try interp.wrapError(&det, Expression.parse(&det, value));
-        if (interp.parsed_exprs.put(cache_key, new_expr)) |ejected| ejected.release();
+        if (interp.parsed_exprs.put(cache_key, new_expr)) |ejected| ejected.asHead().release();
 
         return new_expr;
     }
@@ -886,7 +914,7 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
     const expr: *Expression = try interp.getExpression(value, cache_key);
 
-    return Expression.evalNode(interp, expr.nodes, expr.root_node) catch |err| switch (err) {
+    return Expression.evalNode(interp, expr.parsed.nodes, expr.parsed.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => {
             // Give the caller some context for what failed.
@@ -998,7 +1026,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
     errdefer command.deinit();
 
     const is_method = switch (command) {
-        .closure => |closure| closure.closure.is_method,
+        .closure => |closure| closure.closure.content.is_method,
         .command => false,
     };
     if (is_method) {
@@ -1104,7 +1132,7 @@ fn invokeCommandMaybeMethod(
         const as_dict_sugar = blk: {
             switch (ensure_result) {
                 .not_found => {
-                    const args_list = try command.closure.closure.arg_names.get();
+                    const args_list = try command.closure.closure.content.arg_names.get();
                     const self_name = try args_list.items[0].getString();
                     try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
                     return error.EvalError;
@@ -1236,8 +1264,9 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
 
 pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) evaltypes.EvalError!void {
     // Try to get the script, parsing if necessary.
-    const parsed = (try interp.getScript(script, cache_key)).borrow();
-    defer parsed.release();
+    const parsed = (try interp.getScript(script, cache_key));
+    defer parsed.asHead().release(); // `parsed` was borrowed by `getScript`.
+
     // Don't evaluate empty scripts.
     if (parsed.tags.len <= 1) return;
 
@@ -1379,9 +1408,9 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     errdefer new_interp.parsed_substs.deinit(heap.global_gpa);
 
     var arg_names: objects.AlwaysCanBeType(List) = .initOwning(try objects.List.new(&.{}));
-    errdefer arg_names.deinit();
+    defer arg_names.deinit();
     // Push root call frame.
-    _ = try new_interp.pushCallFrame(&.{}, .{
+    _ = try new_interp.pushCallFrame(&.{}, &.{
         .arg_names = arg_names,
         .optional_values = null,
         .required_arity = 0,
@@ -1417,28 +1446,25 @@ pub fn deinit(interp: *Interp) void {
 
     // Deinit all frames.
 
-    // We created this callframe's signature at interpreter init, so we manually
-    // clean it up.
-    interp.call_frames.items[0].signature.deinit();
     for (interp.call_frames.items) |*frame| frame.deinit();
     interp.call_frames.deinit(heap.global_gpa);
     interp.eval_frames.deinit(heap.global_gpa);
 
     // Clean up caches as well.
     var scripts = interp.parsed_scripts.valueIterator();
-    while (scripts.next()) |script| script.*.release();
+    while (scripts.next()) |script| script.*.asHead().release();
     interp.parsed_scripts.deinit(heap.global_gpa);
 
     var exprs = interp.parsed_exprs.valueIterator();
-    while (exprs.next()) |expr| expr.*.release();
+    while (exprs.next()) |expr| expr.*.asHead().release();
     interp.parsed_exprs.deinit(heap.global_gpa);
 
     var closures = interp.parsed_closures.valueIterator();
-    while (closures.next()) |closure| closure.deinit();
+    while (closures.next()) |closure| closure.*.asHead().deinit();
     interp.parsed_closures.deinit(heap.global_gpa);
 
     var substs = interp.parsed_substs.valueIterator();
-    while (substs.next()) |subst| subst.*.release();
+    while (substs.next()) |subst| subst.*.asHead().release();
     interp.parsed_substs.deinit(heap.global_gpa);
 }
 

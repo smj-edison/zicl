@@ -84,7 +84,7 @@ pub const UpvarLink = struct {
         const upvar: *const UpvarLink = @ptrCast(@alignCast(info.node));
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
         try helper.followValue("linked_name", upvar.linked_name);
-        try helper.addField(u32, "call_frame", "{}", upvar.call_frame);
+        try helper.addField(u32, "call_frame", "{}", .{upvar.call_frame});
     }
 
     pub const vtable: Object.VTable = .{

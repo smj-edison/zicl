@@ -17,7 +17,7 @@ pub fn refCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn derefCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    interp.setResult(try interp.resolveHash(&args[1]));
+    interp.setResult((try interp.resolveHash(&args[1])).ref.asValue());
 }
 
 pub fn launderCmd(interp: *Interp, args: []Shimmerable) !void {
@@ -52,7 +52,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     switch (subcommand) {
         .exists => {
             const val = try interp.getVariable(&args[2]);
-            try interp.setResultInteger(if (val.toHandle() != null) 1 else 0);
+            interp.setResultBoolean(val.isSome());
         },
         .source => {
             const script = &args[2];
@@ -83,7 +83,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             }
         },
         .frame => {
-            const bad_level_err = heap.createInternedString("bad level").get();
+            const bad_level_err = heap.InternedString.newValue("bad level");
             const current = @as(i64, interp.callFrameIdx());
 
             if (args.len == 2) {
@@ -124,17 +124,17 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             const result_dict = try objects.Dictionary.newWithCapacity(&.{}, 10);
             errdefer result_dict.asHead().release();
-            try result_dict.put(heap.createInternedString("type").get(), heap.createInternedString("source").get());
+            _ = try result_dict.put(heap.InternedString.newValue("type"), heap.InternedString.newValue("source"));
             if (eval_frame.currently_evaluating.asType(objects.Source)) |source| {
                 const line_no = try objects.Integer.new(source.line_no);
                 defer line_no.release();
-                try result_dict.put(heap.createInternedString("line").get(), line_no);
-                try result_dict.put(heap.createInternedString("file").get(), source.file_name.orEmpty());
+                _ = try result_dict.put(heap.InternedString.newValue("line"), line_no);
+                _ = try result_dict.put(heap.InternedString.newValue("file"), source.file_name.orEmpty());
             }
 
             const rel_level = try objects.Integer.new(current - target);
             defer rel_level.release();
-            try result_dict.put(heap.createInternedString("level").get(), rel_level);
+            _ = try result_dict.put(heap.InternedString.newValue("level"), rel_level);
 
             interp.setResultOwning(result_dict.asHead().asValue());
         },
@@ -147,7 +147,11 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             try interp.setResultString(name);
         },
         .type => {
-            try interp.setResultString(@tagName(args[1].tag()));
+            if (args[1].current().asPtr()) |obj| {
+                try interp.setResultString(obj.vtable.name);
+            } else {
+                try interp.setResultString(@tagName(args[1].current().raw.tag));
+            }
         },
     }
 }
@@ -166,4 +170,13 @@ pub fn errorinfoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         error.WrongSize => return,
     };
     interp.setResultOwning(error_message);
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "breakpoint", breakpointCmd, "", 0, 0, null);
+    try registerCommand(interp, "deref", derefCmd, "hash", 1, 1, null);
+    try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
+    try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
+    try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
+    try registerCommand(interp, "ref", refCmd, "string", 1, 1, null);
 }

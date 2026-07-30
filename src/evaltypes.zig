@@ -11,6 +11,7 @@ const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
 const objects = @import("objects.zig");
+const IterHelper = objects.IterHelper;
 const allocPrintZ = objects.allocPrintZ;
 const Shimmerable = objects.Shimmerable;
 const ErrorDetails = objects.ErrorDetails;
@@ -96,8 +97,8 @@ pub const ParsedScriptCommand = struct {
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const command = obj.asTypeConst(ParsedScriptCommand).?;
-        try ctx.addField(u32, info, "line", "{}", command.line);
-        try ctx.addField(u32, info, "word_count", "{}", command.word_count);
+        try ctx.addField(u32, info, "line", "{}", .{command.line});
+        try ctx.addField(u32, info, "word_count", "{}", .{command.word_count});
     }
 
     pub const vtable: Object.VTable = .{
@@ -179,13 +180,15 @@ pub const ParsedScriptCommand = struct {
 ///
 /// Will (re)create the internal representation of the $string object
 /// two times.
-///
 pub const Script = struct {
-    ref_count: usize = 1,
     /// Tokens array.
     tags: []Tokenizer.Token.Tag,
     /// The associated values for their corresponding tokens.
     values: []Value,
+
+    pub fn asHead(self: *Script) *Object {
+        return Object.from(Script, self);
+    }
 
     pub fn parse(det: ?*ErrorDetails, value: Value) !*Script {
         const file_name: OptionalValue = if (value.asType(objects.Source)) |src| src.file_name else .none;
@@ -381,18 +384,18 @@ pub const Script = struct {
         const values_slice = try new_token_values.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(values_slice);
 
-        const script_on_heap = try heap.global_gpa.create(Script);
-        script_on_heap.* = .{
+        const script_obj = try Object.newObject(Script);
+        script_obj.body.* = .{
             .tags = tags_slice,
             .values = values_slice,
         };
 
         if (options.token_debugging) {
             ioutil.debug("Dumping tokens\n", .{});
-            script_on_heap.printTokens();
+            script_obj.body.printTokens();
         }
 
-        return script_on_heap;
+        return script_obj.body;
     }
 
     pub fn printTokens(script: *const Script) void {
@@ -402,7 +405,7 @@ pub const Script = struct {
         for (script.tags.items, script.values, 0..) |token, value, i| {
             switch (token) {
                 .start_of_command => {
-                    const command_details = value.asType(objects.ParsedScriptCommand).?;
+                    const command_details = value.asType(ParsedScriptCommand).?;
                     line = command_details.line;
                     ioutil.debug(
                         formatting ++ "line: {}, word count: {}\n",
@@ -418,33 +421,41 @@ pub const Script = struct {
         }
     }
 
-    pub fn deinit(parsed: *Script) void {
-        heap.global_gpa.free(parsed.tags);
-        for (parsed.values) |value| value.release();
-        heap.global_gpa.free(parsed.values);
+    fn freeInternalRep(src: *Object) void {
+        const as_script = src.asType(Script).?;
+        heap.global_gpa.free(as_script.tags);
+        for (as_script.values) |value| value.release();
+        heap.global_gpa.free(as_script.values);
     }
 
-    pub fn borrow(script: *Script) *Script {
-        script.ref_count += 1;
-        return script;
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const as_script = obj.asTypeConst(Script).?;
+
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValueSlice("values", as_script.values);
+        try helper.followFieldSlice(Tokenizer.Token.Tag, "tags", "{}", as_script.tags);
     }
 
-    pub fn release(script: *Script) void {
-        script.ref_count -= 1;
-        if (script.ref_count == 0) {
-            script.deinit();
-            heap.global_gpa.destroy(script);
-        }
-    }
+    pub const vtable: Object.VTable = .{
+        .duplicate = null,
+        .free_internal_rep = freeInternalRep,
+        .update_string = null,
+        .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(@This()),
+    };
 };
 
 pub const Substitution = struct {
-    ref_count: usize = 1,
     /// Tokens array.
     tags: []Tokenizer.Token.Tag,
     /// The associated values for their corresponding tokens.
     values: []Value,
     flags: Tokenizer.SubstFlags,
+
+    pub fn asHead(self: *Substitution) *Object {
+        return Object.from(Substitution, self);
+    }
 
     pub fn parse(det: ?*ErrorDetails, value: Value, flags: Tokenizer.SubstFlags) !*Substitution {
         const file_name: OptionalValue = if (value.asType(objects.Source)) |src| src.file_name else .none;
@@ -528,44 +539,55 @@ pub const Substitution = struct {
         const values_slice = try new_token_values.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(values_slice);
 
-        const subst_on_heap = try heap.global_gpa.create(Substitution);
-        subst_on_heap.* = .{
+        const subst_obj = try Object.newObject(Substitution);
+        subst_obj.body.* = .{
             .tags = tags_slice,
             .values = values_slice,
             .flags = flags,
         };
 
-        return subst_on_heap;
+        return subst_obj.body;
     }
 
-    pub fn deinit(subst: *Substitution) void {
-        heap.global_gpa.free(subst.tags);
-        for (subst.values) |value| value.release();
-        heap.global_gpa.free(subst.values);
+    fn freeInternalRep(obj: *Object) void {
+        const as_subst = obj.asType(Substitution).?;
+        heap.global_gpa.free(as_subst.tags);
+        for (as_subst.values) |value| value.release();
+        heap.global_gpa.free(as_subst.values);
     }
 
-    pub fn borrow(subst: *Substitution) *Substitution {
-        subst.ref_count += 1;
-        return subst;
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const as_subst = obj.asTypeConst(Substitution).?;
+
+        const helper: IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.followValueSlice("values", as_subst.values);
+        try helper.followFieldSlice(Tokenizer.Token.Tag, "tags", "{}", as_subst.tags);
     }
 
-    pub fn release(script: *Substitution) void {
-        script.ref_count -= 1;
-        if (script.ref_count == 0) {
-            script.deinit();
-            heap.global_gpa.destroy(script);
-        }
-    }
+    pub const vtable: Object.VTable = .{
+        .duplicate = null,
+        .free_internal_rep = freeInternalRep,
+        .update_string = null,
+        .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(@This()),
+    };
 };
 
 pub const Expression = struct {
-    ref_count: u32 = 1,
-    root_node: expr_parse.Node.Index,
-    nodes: std.MultiArrayList(expr_parse.Node),
+    parsed: expr_parse.Parsed,
+
+    pub fn asHead(self: *Expression) *Object {
+        return Object.from(Expression, self);
+    }
 
     pub fn parse(det: ?*ErrorDetails, value: Value) !*Expression {
         const file_name: OptionalValue = if (value.asType(objects.Source)) |val| val.file_name.borrow() else .none;
         const line_no: u32 = if (value.asType(objects.Source)) |val| val.line_no else 1;
+
+        // The expression object we'll store the result in.
+        const expr_obj = try Object.newObject(Expression);
+        errdefer expr_obj.head.release();
 
         // Parse all the tokens of the expr, handling any errors that come up.
         const bytes = try value.getString();
@@ -584,7 +606,7 @@ pub const Expression = struct {
                         details.index = parser_details.index;
                     }
                 }
-                return err;
+                return error.ParseError;
             }
         }
 
@@ -596,32 +618,28 @@ pub const Expression = struct {
         }
 
         // Next, go ahead and parse the expression from the tokens.
-        var parser = expr_parse.Parse.init(file_name, bytes, tokens.slice());
-        errdefer parser.deinit();
-        if (parser.parseExpr()) |root_node| {
-            const new_expr = try heap.global_gpa.create(Expression);
-            // Note we don't deinit parser here, since we take ownership.
-            new_expr.* = .{ .nodes = parser.nodes, .root_node = root_node.? };
-            return new_expr;
-        } else |err| {
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ParseError => {
-                    if (det) |details| {
-                        var aw = std.Io.Writer.Allocating.init(heap.global_gpa);
-                        errdefer aw.deinit();
-                        const err_details = parser.err.?;
-                        parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
+        var parser = expr_parse.Parser.init(heap.global_gpa, file_name, bytes, tokens.slice());
+        defer parser.deinit();
+        const parsed = parser.parseExpr() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => {
+                if (det) |details| {
+                    var aw = std.Io.Writer.Allocating.init(heap.global_gpa);
+                    errdefer aw.deinit();
+                    const err_details = parser.err.?;
+                    parser.renderError(err_details, &aw.writer) catch return error.OutOfMemory;
 
-                        details.* = .{
-                            .message = try aw.toOwnedSliceSentinel(0),
-                            .index = err_details.sourceIndex(&parser),
-                        };
-                    }
-                    return error.ParseError;
-                },
-            }
-        }
+                    details.* = .{
+                        .message = try aw.toOwnedSliceSentinel(0),
+                        .index = err_details.sourceIndex(&parser),
+                    };
+                }
+                return error.ParseError;
+            },
+        };
+
+        expr_obj.body.* = .{ .parsed = parsed };
+        return expr_obj.body;
     }
 
     fn evalBinaryOperatorInteger(interp: *Interp, oper: expr_parse.Node.Tag, lhs: i64, rhs: i64) !i64 {
@@ -755,10 +773,9 @@ pub const Expression = struct {
         };
     }
 
-    pub fn evalNode(interp: *Interp, nodes: std.MultiArrayList(expr_parse.Node), node_index: expr_parse.Node.Index) !Value {
-        const node_tag = nodes.items(.tag)[@intFromEnum(node_index)];
-        const node_data: *expr_parse.Node.Data = &nodes.items(.data)[@intFromEnum(node_index)];
-        switch (node_tag) {
+    pub fn evalNode(interp: *Interp, nodes: []expr_parse.Node, node_index: expr_parse.Node.Index) !Value {
+        const node = nodes[@intFromEnum(node_index)];
+        switch (node.tag) {
             .mul,
             .div,
             .mod,
@@ -773,7 +790,7 @@ pub const Expression = struct {
             .bit_or,
             .pow,
             => {
-                const children = node_data.binary;
+                const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
                 defer lhs_value.release();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
@@ -781,11 +798,11 @@ pub const Expression = struct {
 
                 // Fast case: both are already integers/both are already floats.
                 if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
-                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node_tag, lhs, rhs));
+                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node.tag, lhs, rhs));
                 };
 
                 if (objects.Float.asFloat(lhs_value)) |lhs| if (objects.Float.asFloat(rhs_value)) |rhs| {
-                    return Value.newFloat(try evalBinaryOperatorFloat(interp, node_tag, lhs, rhs));
+                    return Value.newFloat(try evalBinaryOperatorFloat(interp, node.tag, lhs, rhs));
                 };
 
                 // Slow case: coerce both to int-or-float (shimmering as needed),
@@ -794,10 +811,10 @@ pub const Expression = struct {
                 const rhs_number = try interp.getIntOrFloatInPlace(&rhs_value);
 
                 if (lhs_number.asInt()) |lhs| if (rhs_number.asInt()) |rhs| {
-                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node_tag, lhs, rhs));
+                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node.tag, lhs, rhs));
                 };
 
-                return Value.newFloat(try evalBinaryOperatorFloat(interp, node_tag, lhs_number.asFloat(), rhs_number.asFloat()));
+                return Value.newFloat(try evalBinaryOperatorFloat(interp, node.tag, lhs_number.asFloat(), rhs_number.asFloat()));
             },
             .less_than,
             .greater_than,
@@ -806,7 +823,7 @@ pub const Expression = struct {
             .equal,
             .not_equal,
             => {
-                const children = node_data.binary;
+                const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
                 defer lhs_value.release();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
@@ -814,11 +831,11 @@ pub const Expression = struct {
 
                 // Fast case: both are already integers/both are already floats.
                 if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
-                    return Value.newBool(integerCompare(node_tag, lhs, rhs));
+                    return Value.newBool(integerCompare(node.tag, lhs, rhs));
                 };
 
                 if (objects.Float.asFloat(lhs_value)) |lhs| if (objects.Float.asFloat(rhs_value)) |rhs| {
-                    return Value.newBool(floatCompare(node_tag, lhs, rhs));
+                    return Value.newBool(floatCompare(node.tag, lhs, rhs));
                 };
 
                 // Slow case: try both as integers first, else fall back to both as floats.
@@ -826,10 +843,10 @@ pub const Expression = struct {
                 const rhs_number = try interp.getIntOrFloatInPlace(&rhs_value);
 
                 if (lhs_number.asInt()) |lhs| if (rhs_number.asInt()) |rhs| {
-                    return Value.newBool(integerCompare(node_tag, lhs, rhs));
+                    return Value.newBool(integerCompare(node.tag, lhs, rhs));
                 };
 
-                return Value.newBool(floatCompare(node_tag, lhs_number.asFloat(), rhs_number.asFloat()));
+                return Value.newBool(floatCompare(node.tag, lhs_number.asFloat(), rhs_number.asFloat()));
             },
             .string_equal,
             .string_not_equal,
@@ -840,7 +857,7 @@ pub const Expression = struct {
             .string_less_than_or_equal,
             .string_greater_than_or_equal,
             => {
-                const children = node_data.binary;
+                const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
                 defer lhs_value.release();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
@@ -849,7 +866,7 @@ pub const Expression = struct {
                 const lhs_string = try lhs_value.getString();
                 const rhs_string = try rhs_value.getString();
 
-                const result = switch (node_tag) {
+                const result = switch (node.tag) {
                     .string_equal => std.mem.eql(u8, lhs_string, rhs_string),
                     .string_not_equal => !std.mem.eql(u8, lhs_string, rhs_string),
                     .string_in => std.mem.indexOf(u8, rhs_string, lhs_string) != null,
@@ -864,7 +881,7 @@ pub const Expression = struct {
                 return Value.newInt(if (result) 1 else 0);
             },
             .ternary_conditional => {
-                const children = node_data.ternary;
+                const children = node.data.ternary;
                 var condition = try evalNode(interp, nodes, children.@"0");
                 defer condition.release();
                 const condition_as_bool = try interp.getBooleanInPlace(&condition);
@@ -875,23 +892,23 @@ pub const Expression = struct {
                     return evalNode(interp, nodes, children.@"2");
                 }
             },
-            .value => return node_data.value.borrow(),
+            .value => return node.data.value.borrow(),
             .command_subst => {
-                const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node_data.value.getHashNoRegister();
-                try interp.evalObjectInner(interp.callFrameIdx(), node_data.value, nested_cache_key);
+                const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node.data.value.getHashNoRegister();
+                try interp.evalObjectInner(interp.callFrameIdx(), node.data.value, nested_cache_key);
                 return interp.result.borrow();
             },
             .variable_subst => {
-                // `node_data.value` is the variable name. Wrap it in a
+                // `node.data.value` is the variable name. Wrap it in a
                 // Shimmerable so the variable resolver can shimmer it to a
                 // `CachedLocalVar`/`DictSugar` in place.
-                var name_shim: Shimmerable = .{ .original = node_data.value };
+                var name_shim: Shimmerable = .{ .original = node.data.value };
                 defer name_shim.discardChanges();
                 const var_value = try interp.getVariableOrError(&name_shim);
                 return var_value.borrow();
             },
             .bool_and => {
-                const children = node_data.binary;
+                const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
                 defer lhs_value.release();
                 const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
@@ -907,7 +924,7 @@ pub const Expression = struct {
                 }
             },
             .bool_or => {
-                const children = node_data.binary;
+                const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
                 defer lhs_value.release();
                 const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
@@ -923,13 +940,13 @@ pub const Expression = struct {
                 }
             },
             .bool_not => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const result_bool = try interp.getBooleanInPlace(&result);
                 return Value.newBool(!result_bool);
             },
             .bit_not => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
@@ -941,13 +958,13 @@ pub const Expression = struct {
                 };
             },
             .identity => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 // Shimmer to a number (errors on non-numeric), then return it.
                 _ = try interp.getIntOrFloatInPlace(&result);
                 return result;
             },
             .negation => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
@@ -956,7 +973,7 @@ pub const Expression = struct {
                 };
             },
             .to_int, .to_wide => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
@@ -973,7 +990,7 @@ pub const Expression = struct {
                 };
             },
             .abs => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
@@ -989,7 +1006,7 @@ pub const Expression = struct {
                 };
             },
             .to_double => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
@@ -998,7 +1015,7 @@ pub const Expression = struct {
                 };
             },
             .round => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
@@ -1010,7 +1027,7 @@ pub const Expression = struct {
                 return Value.newFloat(interp.nextRandomFloat());
             },
             .srand => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 const seed_int: i64 = switch (value) {
@@ -1041,7 +1058,7 @@ pub const Expression = struct {
             .log10,
             .sqrt,
             => {
-                var result = try evalNode(interp, nodes, node_data.unary);
+                var result = try evalNode(interp, nodes, node.data.unary);
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 const as_float: f64 = switch (value) {
@@ -1049,7 +1066,7 @@ pub const Expression = struct {
                     .float => |float| float,
                 };
 
-                const computed = switch (node_tag) {
+                const computed = switch (node.tag) {
                     .sin => @sin(as_float),
                     .cos => @cos(as_float),
                     .tan => @tan(as_float),
@@ -1071,9 +1088,9 @@ pub const Expression = struct {
                 return Value.newFloat(computed);
             },
             .atan2, .fmod, .hypot => {
-                var lhs_result = try evalNode(interp, nodes, node_data.binary.@"0");
+                var lhs_result = try evalNode(interp, nodes, node.data.binary.@"0");
                 defer lhs_result.release();
-                var rhs_result = try evalNode(interp, nodes, node_data.binary.@"1");
+                var rhs_result = try evalNode(interp, nodes, node.data.binary.@"1");
                 defer rhs_result.release();
                 const lhs_number = try interp.getIntOrFloatInPlace(&lhs_result);
                 const rhs_number = try interp.getIntOrFloatInPlace(&rhs_result);
@@ -1086,7 +1103,7 @@ pub const Expression = struct {
                     .float => |float| float,
                 };
 
-                const computed = switch (node_tag) {
+                const computed = switch (node.tag) {
                     .atan2 => std.math.atan2(lhs, rhs),
                     .fmod => @mod(lhs, rhs),
                     .hypot => @sqrt(lhs * lhs + rhs * rhs),
@@ -1098,23 +1115,24 @@ pub const Expression = struct {
         }
     }
 
-    pub fn deinit(expr: *Expression) void {
-        expr_parse.deinitNodes(heap.global_gpa, &expr.nodes);
-        expr.* = undefined;
+    fn freeInternalRep(obj: *Object) void {
+        const as_expr = obj.asType(Expression).?;
+        as_expr.parsed.deinit(heap.global_gpa);
     }
 
-    pub fn borrow(expr: *Expression) *Expression {
-        expr.ref_count += 1;
-        return expr;
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const as_expr = obj.asTypeConst(Expression).?;
+        try ctx.followNode(expr_parse.Parsed, info, "parsed", &as_expr.parsed);
     }
 
-    pub fn release(expr: *Expression) void {
-        expr.ref_count -= 1;
-        if (expr.ref_count == 0) {
-            expr.deinit();
-            heap.global_gpa.destroy(expr);
-        }
-    }
+    pub const vtable: Object.VTable = .{
+        .duplicate = null,
+        .free_internal_rep = freeInternalRep,
+        .update_string = null,
+        .make_crossthread = null,
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(@This()),
+    };
 };
 
 pub const Closure = struct {
@@ -1122,7 +1140,11 @@ pub const Closure = struct {
     pub const interned_impl = heap.InternedString.newValue("impl");
     pub const interned_scope = heap.InternedString.newValue("scope");
 
-    closure: *Content,
+    content: *Content,
+
+    pub fn asHead(self: *Closure) *Object {
+        return Object.from(Closure, self);
+    }
 
     pub const Content = struct {
         /// Argument list of the procedure.
@@ -1183,9 +1205,9 @@ pub const Closure = struct {
             try helper.followValue("body", closure.body);
             try helper.followOptionalValue("name", closure.name);
             try helper.followOptional(Object, "scope_hash_ref", if (closure.scope_hash_ref) |val| val.inner else null);
-            try helper.addField(bool, "has_args_parameter", "{}", closure.has_args_parameter);
-            try helper.addField(bool, "is_method", "{}", closure.is_method);
-            try helper.addField(u64, "cache_id", "{}", closure.cache_id);
+            try helper.addField(bool, "has_args_parameter", "{}", .{closure.has_args_parameter});
+            try helper.addField(bool, "is_method", "{}", .{closure.is_method});
+            try helper.addField(u64, "cache_id", "{}", .{closure.cache_id});
         }
 
         pub fn getUsage(closure: *Content, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
@@ -1215,7 +1237,7 @@ pub const Closure = struct {
     };
 
     pub var closure_cache_id: std.atomic.Value(u64) = .init(0);
-    pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !Content {
+    pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !*Closure {
         const is_method, const prefix_len = blk: {
             if (bytes.len > 3 and std.mem.eql(u8, bytes[0..3], "fn "))
                 break :blk .{ false, @as(usize, 3) };
@@ -1306,13 +1328,17 @@ pub const Closure = struct {
         var parsed_args = try parseArgList(det, args_as_list);
         defer parsed_args.deinit();
 
-        const arg_names_list = try objects.List.newFromSliceOwning(parsed_args.arg_names);
+        const arg_names_list = try objects.List.new(parsed_args.arg_names);
         errdefer arg_names_list.asHead().release();
         const optional_values_list =
-            if (parsed_args.optional_values.len > 0) try objects.List.newFromSliceOwning(parsed_args.optional_values) else null;
+            if (parsed_args.optional_values.len > 0) try objects.List.new(parsed_args.optional_values) else null;
         errdefer if (optional_values_list) |list| list.asHead().release();
 
-        return .{
+        const closure_content = try heap.global_gpa.create(Content);
+        errdefer heap.global_gpa.destroy(closure_content);
+        const closure_obj = try Object.newObject(Closure);
+
+        closure_content.* = .{
             .arg_names = .initOwning(arg_names_list),
             .optional_values = if (optional_values_list) |val| .initOwning(val) else null,
             .required_arity = parsed_args.required_arity,
@@ -1324,6 +1350,9 @@ pub const Closure = struct {
             .is_method = is_method,
             .cache_id = closure_cache_id.fetchAdd(1, .monotonic),
         };
+        closure_obj.body.content = closure_content;
+
+        return closure_obj.body;
     }
 
     pub const ParsedArgList = struct {
@@ -1434,24 +1463,23 @@ pub const Closure = struct {
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        const new_closure = try heap.global_gpa.create(Content);
-        errdefer heap.global_gpa.destroy(new_closure);
-        new_closure.* = src.asTypeConst(Closure).?.closure.duplicate();
+        const new_content = try heap.global_gpa.create(Content);
+        errdefer heap.global_gpa.destroy(new_content);
+        new_content.* = src.asTypeConst(Closure).?.content.duplicate();
 
-        new_obj.body.* = .{ .closure = new_closure };
+        new_obj.body.* = .{ .content = new_content };
 
         return new_obj.head;
     }
 
     fn freeInternalRep(src: *Object) void {
         const as_closure = src.asType(Closure).?;
-        as_closure.closure.deinit();
-        heap.global_gpa.destroy(as_closure.closure);
+        as_closure.content.deinit();
+        heap.global_gpa.destroy(as_closure.content);
     }
 
     fn updateString(obj: *Object) !void {
-        const as_closure = obj.asType(Closure).?;
-        const closure = as_closure.closure;
+        const closure = obj.asType(Closure).?.content;
         const required = closure.required_arity;
         const optional = closure.optional_arity;
 
@@ -1508,7 +1536,7 @@ pub const Closure = struct {
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const closure = obj.asTypeConst(Closure).?;
         const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.follow(Content, "closure", closure.closure);
+        try helper.follow(Content, "closure", closure.content);
     }
 
     pub const vtable: Object.VTable = .{
@@ -1517,7 +1545,7 @@ pub const Closure = struct {
         .update_string = updateString,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(Closure),
+        .name = @typeName(@This()),
     };
 };
 

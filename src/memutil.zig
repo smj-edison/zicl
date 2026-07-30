@@ -847,6 +847,16 @@ pub const StructIterator = struct {
         edge_coming_from: []const u8,
         node_ptr: *const T,
     ) Error!void {
+        try ctx.followNodeInner(T, node_info, edge_coming_from, @as(*const anyopaque, node_ptr));
+    }
+
+    pub fn followNodeInner(
+        ctx: StructIterator,
+        T: type,
+        node_info: *const NodeInfo,
+        edge_coming_from: []const u8,
+        node_ptr: *const anyopaque,
+    ) Error!void {
         const child_node: NodeInfo = .{
             .parent_info = node_info,
             .node = node_ptr,
@@ -870,7 +880,7 @@ pub const StructIterator = struct {
             .node = dummy_node,
             .enumerate_struct = null,
             .type_name = @typeName(T),
-            .as_string = try ctx.arena.dupeSentinel(u8, val, 0),
+            .as_string = try ctx.arena.dupe(u8, val),
             .is_synthetic = true,
         };
         try ctx.vtable.visit_node(ctx, &child_node, edge_coming_from);
@@ -882,7 +892,7 @@ pub const StructIterator = struct {
         node_info: *const NodeInfo,
         edge_coming_from: []const u8,
         comptime fmt: []const u8,
-        val: T,
+        args: anytype,
     ) Error!void {
         const dummy_node = try ctx.arena.create(u8);
         const child_node: NodeInfo = .{
@@ -890,7 +900,7 @@ pub const StructIterator = struct {
             .node = dummy_node,
             .enumerate_struct = null,
             .type_name = @typeName(T),
-            .as_string = try std.fmt.allocPrint(ctx.arena, fmt, .{val}),
+            .as_string = try std.fmt.allocPrint(ctx.arena, fmt, args),
             .is_synthetic = true,
         };
         try ctx.vtable.visit_node(ctx, &child_node, edge_coming_from);

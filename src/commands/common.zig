@@ -38,6 +38,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try @import("eval.zig").registerCommands(interp);
     try @import("strings.zig").registerCommands(interp);
     try @import("math.zig").registerCommands(interp);
+    try @import("misc.zig").registerCommands(interp);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {

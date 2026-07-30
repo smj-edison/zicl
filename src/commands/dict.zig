@@ -74,8 +74,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             interp.setResult(try interp.getDictValueRecursivelyOrError(dict, objects.ShimmerableSliceContext{ .items = path }));
         },
         .getdef => {
-            const getdef_ctx = objutil.ShimmerableSliceContext{ .items = args[3..(args.len - 1)] };
-            if ((try interp.getDictValueRecursively(&args[2], getdef_ctx)).toHandle()) |val| {
+            const getdef_ctx = objects.ShimmerableSliceContext{ .items = args[3..(args.len - 1)] };
+            if ((try interp.getDictValueRecursively(&args[2], getdef_ctx)).asValue()) |val| {
                 interp.setResult(val);
             } else {
                 interp.setResult(args[args.len - 1].current());
