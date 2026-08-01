@@ -1,11 +1,15 @@
 const std = @import("std");
 
-const common = @import("common.zig");
+const strutil = @import("../strutil.zig");
 
+const common = @import("common.zig");
+const heap = common.heap;
 const objects = common.objects;
+const String = objects.String;
 const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
+const registerCommand = common.registerCommand;
 
 const Dictionary = objects.Dictionary;
 
@@ -63,10 +67,11 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .create => {
             const pairs = args[2..];
             if (@mod(pairs.len, 2) != 0) return error.WrongUsage;
-            const new_dict = try Dictionary.new(&.{});
+            const new_dict = try Dictionary.newWithCapacity(&.{}, pairs.len);
+            errdefer new_dict.asHead().release();
             var arg_i: usize = 2;
             while (arg_i < args.len) : (arg_i += 2) try new_dict.put(args[arg_i].current(), args[arg_i + 1].current());
-            interp.setResultOwning(new_dict);
+            interp.setResultOwning(new_dict.asHead().asValue());
         },
         .get => {
             const dict = &args[2];
@@ -83,137 +88,229 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .set => {
             const var_name = &args[2];
-            const keys = args[3..(args.len - 1)];
+            const key_context: objects.ShimmerableSliceContext = .{ .items = args[3..(args.len - 1)] };
+            const value = args[args.len - 1].current();
 
-            var dict: Mutable = blk: {
-                if ((try interp.getVariable(var_name)).toHandle()) |val| {
-                    break :blk .{ .original = val };
+            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+                if (try interp.wrapError(&det, dict_raw.asMutableInPlace(Dictionary, &det))) |dict_mut| {
+                    try interp.putDictValueRecursively(dict_mut, key_context, value);
+                    interp.callFrame().variables.asHead().invalidateString(); // Mutated in place.
                 } else {
-                    const new_variable_dict = try objutil.newDictWithCapacity(2);
-                    defer new_variable_dict.decrRefCount();
-                    try interp.setVariableTo(var_name, new_variable_dict);
-                    break :blk .{ .original = (try interp.getVariable(var_name)).toHandle().? };
+                    const duped = try dict_raw.duplicateAsBoxed();
+                    defer duped.release();
+                    const as_dict_mut = try interp.wrapError(&det, duped.asValue().asMutableInPlace(Dictionary, &det));
+                    try interp.putDictValueRecursively(as_dict_mut.?, key_context, value);
+                    try interp.setVariable(var_name, duped.asValue());
                 }
-            };
-            defer dict.discardChanges();
-
-            if (keys.len == 0) {
-                interp.setResult(dict.current());
-                return;
-            }
-
-            const new_value = args[args.len - 1].current().dupOrRef();
-            const set_ctx = objutil.ShimmerableSliceContext{ .items = keys };
-            _ = try interp.wrapError(&det, objutil.dictPutRecursively(&det, &dict, set_ctx, new_value));
-
-            if (dict.takeMutated().toHandle()) |new| {
-                defer new.decrRefCount();
-                try interp.setVariableTo(var_name, new);
-                // TODO probably can do this faster than looking back up every time.
-                interp.setResult((try interp.getVariable(var_name)).toHandle().?);
             } else {
-                interp.setResult(dict.current());
+                const new_dict = try objects.Dictionary.newWithCapacity(&.{}, 4);
+                defer new_dict.asHead().release();
+                try interp.putDictValueRecursively(new_dict, key_context, value);
+                try interp.setVariable(var_name, new_dict.asHead().asValue());
             }
         },
         .unset => {
             const var_name = &args[2];
             if (args.len < 4) return error.WrongUsage;
 
-            var dict: Mutable = blk: {
-                if ((try interp.getVariable(var_name)).toHandle()) |val| {
-                    break :blk .{ .original = val };
-                } else {
-                    const new_variable_dict = try objutil.newDictWithCapacity(2);
-                    defer new_variable_dict.decrRefCount();
-                    try interp.setVariableTo(var_name, new_variable_dict);
-                    break :blk .{ .original = (try interp.getVariable(var_name)).toHandle().? };
-                }
-            };
-            defer dict.discardChanges();
+            const unset_ctx: objects.ShimmerableSliceContext = .{ .items = args[3..args.len] };
 
-            const unset_ctx = objutil.ShimmerableSliceContext{ .items = args[3..args.len] };
-            _ = try interp.wrapError(&det, objutil.dictRemoveRecursively(&det, &dict, unset_ctx));
-            if (dict.takeMutated().toHandle()) |new| {
-                defer new.decrRefCount();
-                try interp.setVariableToObject(var_name, new.reference());
+            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+                if (try interp.wrapError(&det, dict_raw.asMutableInPlace(Dictionary, &det))) |dict_mut| {
+                    _ = try interp.removeDictValueRecursively(dict_mut, unset_ctx);
+                    interp.callFrame().variables.asHead().invalidateString(); // Mutated in place.
+                } else {
+                    const duped = try dict_raw.duplicateAsBoxed();
+                    defer duped.release();
+                    const as_dict_mut = try interp.wrapError(&det, duped.asValue().asMutableInPlace(Dictionary, &det));
+                    _ = try interp.removeDictValueRecursively(as_dict_mut.?, unset_ctx);
+                    try interp.setVariable(var_name, duped.asValue());
+                }
+            } else {
+                const new_dict = try objects.Dictionary.new(&.{});
+                defer new_dict.asHead().release();
+                try interp.setVariable(var_name, new_dict.asHead().asValue());
             }
         },
         .exists => {
             const dict = &args[2];
-            const exists_ctx = objutil.ShimmerableSliceContext{ .items = args[3..] };
-            try interp.setResultBoolean((try interp.getDictValueRecursively(dict, exists_ctx)) != .none);
+            const exists_ctx: objects.ShimmerableSliceContext = .{ .items = args[3..] };
+            interp.setResultBoolean((try interp.getDictValueRecursively(dict, exists_ctx)).isSome());
         },
         .keys, .values => {
-            var new_dict: OptionalHandle = .none;
-            errdefer new_dict.decrOptional();
-            var kv_map: objutil.DictKvResult = try interp.wrapError(&det, objutil.dictGetKvPairs(&det, Heap.global_gpa, &args[2]));
-            defer {
-                var iter = kv_map.iterator();
-                while (iter.next()) |val| {
-                    val.key_ptr.decrRefCount();
-                    val.value_ptr.decrRefCount();
-                }
-                kv_map.deinit(Heap.global_gpa);
-            }
+            var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[2]));
+            defer kv_result.deinit(heap.local_arena);
+            const kv_map = kv_result.mapping;
+
+            const items = if (subcommand == .keys) kv_map.keys() else kv_map.values();
 
             if (args.len == 4) {
-                const pattern = &args[3];
-                var filtered = try objutil.newListWithCapacity(@intCast(kv_map.count()));
-                errdefer filtered.decrRefCount();
-                for (kv_map.keys(), kv_map.values()) |key, value| {
-                    const used = if (subcommand == .keys) key else value;
-                    if (try objutil.globMatch(pattern.current(), used, false)) {
-                        objutil.listAppendAssumeCapacity(filtered, used.dupOrRef());
-                    }
+                const pattern = try args[3].current().getString();
+                var filtered = try objects.List.newWithCapacity(&.{}, kv_map.count());
+                for (items) |item| {
+                    const bytes = try item.getString();
+                    if (strutil.globMatch(pattern, bytes, false)) filtered.appendAssumeCapacity(item);
                 }
-                interp.setResultOwning(filtered);
+
+                interp.setResultOwning(filtered.asHead().asValue());
             } else {
-                interp.setResultOwning(try objutil.newList(if (subcommand == .keys) kv_map.keys() else kv_map.values()));
+                interp.setResultOwning((try objects.List.new(items)).asHead().asValue());
             }
         },
         .merge => {
             const dicts = args[2..];
 
             if (dicts.len == 0) {
-                interp.setResultOwning(try objutil.newDictWithCapacity(0));
+                interp.setResultOwning((try Dictionary.new(&.{})).asHead().asValue());
                 return;
-            }
-
-            // Make sure everything is a dict.
-            for (dicts) |*d| try interp.shimmerToDict(d);
-
-            if (dicts.len == 1) {
+            } else if (dicts.len == 1) {
                 interp.setResult(dicts[0].current());
                 return;
             }
 
-            var result = try objutil.newDictWithCapacity(0);
-            errdefer result.decrRefCount();
+            var result = try Dictionary.new(&.{});
+            errdefer result.asHead().release();
 
-            for (dicts) |dict| {
-                const pair_count = dict.peek().body.dict.len / 2;
-                var pair_i: u32 = 0;
-                while (pair_i < pair_count) : (pair_i += 1) {
-                    const k = objutil.dictItem(dict.current(), pair_i * 2);
-                    const v = objutil.dictItem(dict.current(), pair_i * 2 + 1);
-                    _ = try interp.putDictValueInPlace(&result, k, v);
+            for (dicts) |*dict| {
+                const as_dict: *const Dictionary = try interp.wrapError(&det, Dictionary.shimmerFrom(&det, dict));
+
+                var key_i: usize = 0;
+                while (key_i < as_dict.items.len) : (key_i += 2) {
+                    try result.put(as_dict.items[key_i], as_dict.items[key_i + 1]);
                 }
             }
 
-            interp.setResultOwning(result);
+            interp.setResultOwning(result.asHead().asValue());
         },
         .link => {
-            const link_to = &args[2];
+            const referent = &args[2];
             const dict = &args[3];
 
-            var mutable_dict = try dict.duplicateForMutable();
-            errdefer mutable_dict.decrRefCount();
+            const dict_mut: *Dictionary = try interp.wrapError(&det, dict.getMutable(Dictionary, &det));
+            errdefer dict_mut.asHead().release();
 
-            const hash_ref = try objutil.createHashReference(link_to.current());
-            defer hash_ref.decrRefCount();
-            _ = try interp.putDictValueInPlace(&mutable_dict, Heap.local_heap.getInternedString(.@"^parent"), hash_ref);
-            interp.setResultOwning(mutable_dict);
+            const hash_ref = try objects.HashReference.newFromValue(referent.current());
+            defer hash_ref.asHead().release();
+            try dict_mut.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
+
+            interp.setResultOwning(dict_mut.asHead().asValue());
         },
         else => std.debug.panic("unimplemented: {}", .{subcommand}),
     }
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "dict", dictCmd, "subcommand ?arg ...?", 1, null, null);
+}
+
+test "dict unset" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Dictionaries can be created by unsetting.
+    try interp.testExpectScriptResult("", "dict unset nonexistent alsononexistent");
+    try interp.testExpectScriptResult("", "set nonexistent"); // Shouldn't error.
+}
+
+test "dict commands" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptError(error.EvalError,
+        \\Missing value to go with key when converting "10" to a dictionary.
+    ,
+        \\ dict set x a 10
+        \\ puts [dict get $x a 5]
+    );
+
+    try interp.testExpectScriptResult("qux",
+        \\ dict set foo bar baz qux
+        \\ dict get $foo bar baz
+    );
+}
+
+test "dict parent links" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("value",
+        \\ set a {key value}
+        \\ set b "~parent [ref $a] key2 value2"
+        \\ dict get $b key
+    );
+}
+
+test "dict link command" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("value",
+        \\ set a {key value}
+        \\ set b {key2 value2}
+        \\ set c [dict link $a $b]
+        \\ dict get $c key
+    );
+}
+
+test "dict sugar" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("a b y 10",
+        \\ set x {a b}
+        \\ set x::y 10
+        \\ set x
+    );
+}
+
+test "dict keys" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Basic dict keys.
+    try interp.testExpectScriptResult("a b", "dict keys {a 1 b 2}");
+
+    // Keys with pattern.
+    try interp.testExpectScriptResult("a", "dict keys {a 1 b 2} a*");
+
+    const foo_str = try String.newValue("foo");
+    defer foo_str.release();
+    const bar_str = try String.newValue("bar");
+    defer bar_str.release();
+    const baz_str = try String.newValue("baz");
+    defer baz_str.release();
+    const one_str = try String.newValue("1");
+    defer one_str.release();
+    const two_str = try String.newValue("2");
+    defer two_str.release();
+    const three_str = try String.newValue("3");
+    defer three_str.release();
+    const four_str = try String.newValue("4");
+    defer four_str.release();
+
+    // Parent links: parent keys first, then child keys not already present.
+    const parent = try objects.Dictionary.new(&.{ foo_str, one_str, bar_str, two_str });
+    defer parent.asHead().release();
+
+    var child = try objects.Dictionary.new(&.{
+        foo_str, three_str,
+        baz_str, four_str,
+    });
+    defer child.asHead().release();
+
+    var hash_ref = try objects.HashReference.new(parent.asHead());
+    defer hash_ref.asHead().release();
+    try child.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
+
+    {
+        var var_name: Shimmerable = .{ .original = try String.newValue("d") };
+        defer var_name.deinit();
+        try interp.setVariable(&var_name, child.asHead().asValue());
+    }
+
+    // foo is in both parent and child; parent foo takes precedence in order.
+    // bar is only in parent.
+    // baz is only in child.
+    // Order: parent keys first (foo, bar), then new child keys (baz).
+    try interp.testExpectScriptResult("foo bar baz", "dict keys $d");
 }

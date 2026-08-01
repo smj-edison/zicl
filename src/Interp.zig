@@ -509,7 +509,7 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
             var name_shim: Shimmerable = .{ .original = link.linked_name };
             defer name_shim.discardChanges();
             if ((try interp.getVariableInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
-                _ = try new_dict.put(frame.variables.items[i], linked_value);
+                try new_dict.put(frame.variables.items[i], linked_value);
             } else {
                 try interp.setResultFormatted(
                     "failed to capture the variable \"{s}\", as it was an upvar that pointed at nothing",
@@ -518,7 +518,7 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
                 return error.UninitializedUpvar;
             }
         } else {
-            _ = try new_dict.put(frame.variables.items[i], frame.variables.items[i + 1]);
+            try new_dict.put(frame.variables.items[i], frame.variables.items[i + 1]);
         }
     }
 
@@ -572,7 +572,7 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure
     errdefer variables.asHead().release();
 
     if (signature.scope_hash_ref) |scope_hash_ref| {
-        _ = try variables.put(objects.interned_tilde_parent, scope_hash_ref.inner.asValue());
+        try variables.put(objects.interned_tilde_parent, scope_hash_ref.inner.asValue());
     }
 
     const new_call_frame_idx = interp.call_frames.items.len;

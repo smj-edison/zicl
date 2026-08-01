@@ -487,6 +487,26 @@ pub const Value = extern struct {
         }
     }
 
+    pub fn asMutableInPlace(value: Value, T: type, det: ?*objects.ErrorDetails) !?*T {
+        if (value.canMutate()) {
+            if (value.asType(T)) |as_type| return as_type;
+
+            var shim: objects.Shimmerable = .{ .original = value };
+            _ = try T.shimmerFrom(det, &shim);
+
+            if (shim.shimmered.isSome()) {
+                // Something went wonky with the shimmer function not
+                // shimmering in place, so we'll fall back to having
+                // the user handle this.
+                shim.discardChanges();
+                return null;
+            } else {
+                assert(value.canMutate());
+                return value.asType(T).?;
+            }
+        } else return null;
+    }
+
     pub fn incrRefCount(value: Value) void {
         if (value.asPtr()) |obj| obj.incrRefCount();
     }
@@ -606,9 +626,10 @@ pub const Value = extern struct {
                     .interned => if (a.raw.as.interned == b.raw.as.interned) return true,
                     else => {},
                 }
-                // If the two values weren't identical, they may still contain
-                // the same string if one came from a different source. Hence,
-                // we fall through to the string comparison logic.
+                // If the two value string pointers weren't identical, they may
+                // be equal strings, if one pointer came from a different
+                // source. Hence, we fall through to the string comparison
+                // logic.
             },
             .pointer => {},
             .none => unreachable,

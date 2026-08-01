@@ -113,7 +113,7 @@ var shim: objects.Shimmerable = .{ .original = dict_value };
 errdefer shim.discardChanges(); // error path only; `consume` invalidates the buffer.
 
 const dict = try shim.getMutable(objects.Dictionary, &det);
-_ = try dict.put(key, value);
+try dict.put(key, value);
 // `shim.current()` now holds the mutated dict.
 dict_value = shim.consume();
 ```
@@ -255,7 +255,7 @@ Insert or update a key, using a `Shimmerable` for mutation.
 var shim: objects.Shimmerable = .{ .original = dict_value };
 errdefer shim.discardChanges();
 const dict = try shim.getMutable(objects.Dictionary, &det);
-_ = try dict.put(key, value);
+try dict.put(key, value);
 dict_value = shim.consume();
 ```
 

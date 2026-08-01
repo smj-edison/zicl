@@ -124,17 +124,17 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             const result_dict = try objects.Dictionary.newWithCapacity(&.{}, 10);
             errdefer result_dict.asHead().release();
-            _ = try result_dict.put(heap.InternedString.newValue("type"), heap.InternedString.newValue("source"));
+            try result_dict.put(heap.InternedString.newValue("type"), heap.InternedString.newValue("source"));
             if (eval_frame.currently_evaluating.asType(objects.Source)) |source| {
                 const line_no = try objects.Integer.new(source.line_no);
                 defer line_no.release();
-                _ = try result_dict.put(heap.InternedString.newValue("line"), line_no);
-                _ = try result_dict.put(heap.InternedString.newValue("file"), source.file_name.orEmpty());
+                try result_dict.put(heap.InternedString.newValue("line"), line_no);
+                try result_dict.put(heap.InternedString.newValue("file"), source.file_name.orEmpty());
             }
 
             const rel_level = try objects.Integer.new(current - target);
             defer rel_level.release();
-            _ = try result_dict.put(heap.InternedString.newValue("level"), rel_level);
+            try result_dict.put(heap.InternedString.newValue("level"), rel_level);
 
             interp.setResultOwning(result_dict.asHead().asValue());
         },

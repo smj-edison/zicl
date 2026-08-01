@@ -361,7 +361,7 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, valu
 
     // Add variable. `getMutable` duplicates the dict if it's shared (COW),
     // so the returned pointer is the one we cache in the CachedLocalVar.
-    const index = try call_frame.variables.put(name.current(), value);
+    const index = try call_frame.variables.putInner(name.current(), value);
 
     const as_cached_local_var = try name.prepareToShimmer(CachedLocalVar);
     as_cached_local_var.* = .{

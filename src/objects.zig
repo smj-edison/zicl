@@ -551,6 +551,16 @@ pub const HashReference = struct {
         return new_obj.body;
     }
 
+    pub fn newFromValue(value: Value) !*HashReference {
+        if (value.asPtr()) |obj| {
+            return try new(obj);
+        } else {
+            const boxed = try value.raw.box();
+            errdefer boxed.release();
+            return try new(boxed);
+        }
+    }
+
     pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const HashReference {
         if (shim.current().asType(HashReference)) |hash_ref| return hash_ref;
 
@@ -1407,12 +1417,12 @@ pub const List = struct {
     capacity: usize,
 
     pub fn new(items: []const Value) !*List {
-        const capacity =
-            if (items.len > 0) math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len else 0;
-        return try newWithCapacity(items, capacity);
+        return try newWithCapacity(items, items.len);
     }
 
     pub fn newWithCapacity(items: []const Value, capacity: usize) !*List {
+        assert(items.len <= capacity);
+
         const new_list = try Object.newObject(List);
         errdefer new_list.head.freeBacking();
 
@@ -1715,12 +1725,12 @@ pub const Dictionary = struct {
     }
 
     pub fn new(items: []const Value) !*Dictionary {
-        const capacity =
-            if (items.len > 0) math.ceilPowerOfTwo(usize, @max(4, items.len)) catch items.len else 0;
-        return try newWithCapacity(items, capacity);
+        return try newWithCapacity(items, items.len);
     }
 
     pub fn newWithCapacity(items: []const Value, capacity: usize) !*Dictionary {
+        assert(items.len <= capacity);
+
         const new_dict = try Object.newObject(Dictionary);
         errdefer new_dict.head.freeBacking();
 
@@ -1821,7 +1831,11 @@ pub const Dictionary = struct {
         // this is a completely transparent operation as far as the user is concerned.
     }
 
-    pub fn put(dict: *Dictionary, key: Value, value: Value) error{OutOfMemory}!usize {
+    pub fn put(dict: *Dictionary, key: Value, value: Value) error{OutOfMemory}!void {
+        _ = try dict.putInner(key, value);
+    }
+
+    pub fn putInner(dict: *Dictionary, key: Value, value: Value) error{OutOfMemory}!usize {
         assert(dict.asHead().canMutate());
         if (dict.capacity < dict.items.len + 2) try dict.ensureCapacity(@max(4, dict.capacity * 2));
 
@@ -1854,48 +1868,6 @@ pub const Dictionary = struct {
             dict.asHead().invalidateString();
             const shifted_index = removeDuplicates(dict, new_value_index);
             return shifted_index.?;
-        }
-    }
-
-    /// Does not invalidate the string. Used in cases where a `put` operation doesn't affect
-    /// how the string is generated, such as switching out a shimmered hash reference.
-    pub fn putInner(dict: *Dictionary, key: Value, value: Value, remove_duplicates: bool) !usize {
-        assert(!dict.asHead().metadata.cross_thread);
-
-        // Ensure the key already has a hash, since the table requires everything used
-        // to have a precomputed hash.
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
-
-        if (dict.table.get(key)) |existing_value_index| {
-            // Key exists, so replace the value in place.
-            const old = dict.items[existing_value_index];
-            dict.items[existing_value_index] = value.borrow();
-            old.release();
-
-            if (remove_duplicates) {
-                const shifted_index = removeDuplicates(dict, existing_value_index).?;
-                return shifted_index;
-            } else return existing_value_index;
-        } else {
-            // New item, so we need to expand the dict.
-
-            const old_len = dict.items.len;
-            const new_key_index = old_len;
-            const new_value_index = old_len + 1;
-
-            if (dict.capacity < old_len + 2) try dict.ensureCapacity(@max(4, dict.capacity * 2));
-            // `ensureCapacity` also ensures enough room for the table.
-            dict.table.putAssumeCapacity(key, new_value_index);
-
-            // Expand the items slice to include the new items we made room for.
-            dict.items = dict.backingSlice()[0..(old_len + 2)];
-            dict.items[new_key_index] = key.borrow();
-            dict.items[new_value_index] = value.borrow();
-
-            if (remove_duplicates) {
-                const shifted_index = removeDuplicates(dict, new_value_index);
-                return shifted_index.?;
-            } else return new_value_index;
         }
     }
 
@@ -2084,7 +2056,7 @@ pub const Dictionary = struct {
             var pair_index: u32 = 0;
             while (pair_index < dict.items.len) : (pair_index += 2) {
                 if (try dict.items[pair_index].equalsString("~parent")) continue;
-                _ = try to_add_to.put(dict.items[pair_index], dict.items[pair_index + 1]);
+                try to_add_to.put(dict.items[pair_index], dict.items[pair_index + 1]);
             }
 
             return to_add_to;
@@ -2162,7 +2134,7 @@ pub const Dictionary = struct {
         assert(context.len() > 0);
 
         if (context.len() == 1) {
-            _ = try dict.put(context.get(0), value);
+            try dict.put(context.get(0), value);
             return;
         }
 
@@ -2175,7 +2147,7 @@ pub const Dictionary = struct {
                 const new_child_dict = (try new(&.{})).asHead().asValue();
                 defer new_child_dict.release();
 
-                _ = try dict.put(context.get(0), new_child_dict);
+                try dict.put(context.get(0), new_child_dict);
                 break :blk new_child_dict;
             }
         };
@@ -2190,7 +2162,7 @@ pub const Dictionary = struct {
             const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
             defer child_dict_mut.asHead().release();
             try child_dict_mut.putRecursively(det, context.sliceAfter(1), value);
-            _ = try dict.put(context.get(0), child_dict_mut.asHead().asValue());
+            try dict.put(context.get(0), child_dict_mut.asHead().asValue());
         }
 
         dict.asHead().invalidateString();
@@ -2214,7 +2186,7 @@ pub const Dictionary = struct {
                     const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
                     defer child_dict_mut.asHead().release();
                     const did_remove = try child_dict_mut.removeRecursively(det, context.sliceAfter(1));
-                    _ = try dict.put(context.get(0), child_dict_mut.asHead().asValue());
+                    try dict.put(context.get(0), child_dict_mut.asHead().asValue());
                     break :blk did_remove;
                 }
             };
@@ -2231,21 +2203,71 @@ pub const Dictionary = struct {
         }
     }
 
-    /// A key->value map, with parent keys inserted before child keys.
-    pub const KvResult = std.array_hash_map.Custom(Value, Value, struct {
-        pub fn hash(_: @This(), key: Value) u32 {
-            return @truncate(key.getHashNoRegister() catch unreachable);
+    pub const KvResult = struct {
+        /// A key->value map, with parent keys inserted before child keys.
+        mapping: std.array_hash_map.Custom(Value, Value, struct {
+            pub fn hash(_: @This(), key: Value) u32 {
+                return @truncate(key.getHashNoRegister() catch unreachable);
+            }
+            pub fn eql(_: @This(), a: Value, b: Value, _: usize) bool {
+                return a.equals(b) catch unreachable;
+            }
+        }, true),
+
+        pub fn deinit(result: *KvResult, arena: std.mem.Allocator) void {
+            for (result.mapping.keys()) |key| key.release();
+            for (result.mapping.values()) |value| value.release();
+            result.mapping.deinit(arena);
         }
-        pub fn eql(_: @This(), a: Value, b: Value, _: usize) bool {
-            return a.equals(b) catch unreachable;
-        }
-    }, true);
+    };
 
     pub fn getKvPairs(det: ?*ErrorDetails, arena: std.mem.Allocator, shim: *Shimmerable) !KvResult {
-        _ = det;
-        _ = arena;
-        _ = shim;
-        @panic("TODO: ~parent getKvPairs not yet ported to the new heap");
+        var result: KvResult = .{ .mapping = .empty };
+        errdefer result.deinit(arena);
+
+        try dictGetKvPairsInner(det, arena, shim, &result);
+
+        return result;
+    }
+
+    fn dictGetKvPairsInner(det: ?*ErrorDetails, arena: std.mem.Allocator, shim: *Shimmerable, result: *KvResult) !void {
+        const as_dict = try shimmerFrom(det, shim);
+        if ((try as_dict.getNoFollow(interned_tilde_parent)).asValue()) |parent_link| {
+            var parent_link_shim: Shimmerable = .{ .original = parent_link };
+            defer parent_link_shim.discardChanges();
+
+            const hash_ref = HashReference.shimmerFrom(det, &parent_link_shim) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.HashLookupFailed, error.NotHashReference => return error.LinkLookupFailed,
+            };
+            if (parent_link_shim.shimmered.asValue()) |new_parent_link| {
+                try @constCast(as_dict).shimmerWriteback(interned_tilde_parent, new_parent_link);
+            }
+
+            var parent_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
+            defer parent_shim.discardChanges();
+            // Recurse into parent before adding to the result so parent keys are inserted before child keys.
+            try dictGetKvPairsInner(det, arena, &parent_shim, result);
+
+            if (parent_shim.shimmered.asValue()) |new_parent| {
+                const new_hash_ref = try HashReference.newFromValue(new_parent);
+                errdefer new_hash_ref.asHead().release();
+                try @constCast(as_dict).shimmerWriteback(interned_tilde_parent, new_hash_ref.asHead().asValue());
+            }
+        }
+
+        var key_i: usize = 0;
+        while (key_i < as_dict.items.len) : (key_i += 2) {
+            const key = as_dict.items[key_i];
+            const value = as_dict.items[key_i + 1];
+            if (try key.equals(interned_tilde_parent)) continue;
+
+            const gop = try result.mapping.getOrPut(arena, key);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = key.borrow();
+                gop.value_ptr.* = value.borrow();
+            }
+        }
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -2360,10 +2382,10 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // `put` borrows the value into the dict, so the caller retains its handle
     // (released by `defer value3.release()` above) -- no extra `.borrow()` or
     // the call leaks a ref.
-    _ = try dict_for_put.put(key_bar, value3);
+    try dict_for_put.put(key_bar, value3);
     try testing.expectEqual(2, dict_for_put.items.len / 2);
     // Add a new key; pair count grows.
-    _ = try dict_for_put.put(key3, value3);
+    try dict_for_put.put(key3, value3);
     try testing.expectEqual(@as(usize, 3), dict_for_put.items.len / 2);
     try testing.expectEqualStrings("3", try (try dict_for_put.getNoFollow(key3)).asValue().?.getString());
 
@@ -2378,15 +2400,15 @@ fn testDicts(ta: std.mem.Allocator) !void {
     defer dict_edge_cases.asHead().release();
 
     // Use a value as a key, and a key as the value.
-    _ = try dict_edge_cases.put(dict_edge_cases.items[1], dict_edge_cases.items[2]);
+    try dict_edge_cases.put(dict_edge_cases.items[1], dict_edge_cases.items[2]);
     try testing.expectEqualStrings("bar", try (try dict_edge_cases.getNoFollow(value1)).asValue().?.getString());
 
     // Alias a key by using it as both key and value.
-    _ = try dict_edge_cases.put(dict_edge_cases.items[0], dict_edge_cases.items[0]);
+    try dict_edge_cases.put(dict_edge_cases.items[0], dict_edge_cases.items[0]);
     try testing.expectEqualStrings("foo", try (try dict_edge_cases.getNoFollow(key_foo)).asValue().?.getString());
 
     // Alias a value by using it as both key and value.
-    _ = try dict_edge_cases.put(dict_edge_cases.items[3], dict_edge_cases.items[3]);
+    try dict_edge_cases.put(dict_edge_cases.items[3], dict_edge_cases.items[3]);
     try testing.expectEqualStrings("2", try (try dict_edge_cases.getNoFollow(value2)).asValue().?.getString());
 }
 
@@ -2436,14 +2458,14 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
 
     // putRecursively into an existing nested key creates a new leaf beside the old one.
     const path_foo_baz = ValueSliceContext{ .items = &.{ key_foo, key_baz } };
-    _ = try outer_dict.putRecursively(null, path_foo_baz, value3);
+    try outer_dict.putRecursively(null, path_foo_baz, value3);
     try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_baz)).asValue().?.getString());
     // The pre-existing sibling is untouched.
     try testing.expectEqualStrings("2", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).asValue().?.getString());
 
     // putRecursively creating a wholly new child dict at a fresh top-level key.
     const path_qux_baz = ValueSliceContext{ .items = &.{ key_qux, key_baz } };
-    _ = try outer_dict.putRecursively(null, path_qux_baz, value3);
+    try outer_dict.putRecursively(null, path_qux_baz, value3);
     try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_qux_baz)).asValue().?.getString());
 
     // removeRecursively drops the nested leaf.
