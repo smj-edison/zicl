@@ -154,9 +154,41 @@ fn wrapErrorDetailsReturnType(ResultType: type) type {
         return error{ OutOfMemory, EvalError }!@typeInfo(ResultType).error_union.payload;
     }
 }
+/// Reject wrapping a call that already reports through the interpreter.
+///
+/// Such a call returns exactly what `wrapErrorDetailsReturnType` produces, and
+/// it consumed its own `ErrorDetails` on the way out. Wrapping it again means
+/// this call's `det` is never written, and `wrapError` then hands that
+/// uninitialized `message` to `setResultStringOwning`, which faults rather than
+/// failing. Catching it here turns a general protection exception into a
+/// compile error naming the call site.
+fn assertWrappable(ResultType: type) void {
+    comptime {
+        const ErrorSet = switch (@typeInfo(ResultType)) {
+            .error_set => ResultType,
+            .error_union => |error_union| error_union.error_set,
+            // Not fallible at all, so there is nothing to wrap either way.
+            else => return,
+        };
+        // `anyerror` and an unresolved inferred set carry no member list, so
+        // they cannot be checked. `wrapShimmerFn` legitimately lands here.
+        const members = @typeInfo(ErrorSet).error_set orelse return;
+        for (members) |member| {
+            const already_interpreter_level = std.mem.eql(u8, member.name, "OutOfMemory") or
+                std.mem.eql(u8, member.name, "EvalError");
+            if (!already_interpreter_level) return;
+        }
+        @compileError("wrapError on a call that already reports its own errors, so this " ++
+            "`det` would never be written. Call it directly with `try` instead. See the " ++
+            "`interp.*` helpers that wrap internally, such as `getVariable` or `getSubstitution`.");
+    }
+}
+
 /// Used to convert from an object error to an interpreter error (e.g. putting
 /// it in the interpreter result, instead of det)
 pub fn wrapError(interp: *Interp, det: *ErrorDetails, result: anytype) wrapErrorDetailsReturnType(@TypeOf(result)) {
+    comptime assertWrappable(@TypeOf(result));
+
     if (comptime std.meta.activeTag(@typeInfo(@TypeOf(result))) == .error_set) {
         if (result == error.OutOfMemory) {
             return error.OutOfMemory;
