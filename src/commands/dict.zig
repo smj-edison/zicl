@@ -94,13 +94,11 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
                 if (try interp.wrapError(&det, dict_raw.asMutableInPlace(Dictionary, &det))) |dict_mut| {
                     try interp.putDictValueRecursively(dict_mut, key_context, value);
-                    interp.callFrame().variables.asHead().invalidateString(); // Mutated in place.
                 } else {
-                    const duped = try dict_raw.duplicateAsBoxed();
-                    defer duped.release();
-                    const as_dict_mut = try interp.wrapError(&det, duped.asValue().asMutableInPlace(Dictionary, &det));
-                    try interp.putDictValueRecursively(as_dict_mut.?, key_context, value);
-                    try interp.setVariable(var_name, duped.asValue());
+                    const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
+                    defer duped.asHead().release();
+                    try interp.putDictValueRecursively(duped, key_context, value);
+                    try interp.setVariable(var_name, duped.asHead().asValue());
                 }
             } else {
                 const new_dict = try objects.Dictionary.newWithCapacity(&.{}, 4);
@@ -118,13 +116,11 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
                 if (try interp.wrapError(&det, dict_raw.asMutableInPlace(Dictionary, &det))) |dict_mut| {
                     _ = try interp.removeDictValueRecursively(dict_mut, unset_ctx);
-                    interp.callFrame().variables.asHead().invalidateString(); // Mutated in place.
                 } else {
-                    const duped = try dict_raw.duplicateAsBoxed();
-                    defer duped.release();
-                    const as_dict_mut = try interp.wrapError(&det, duped.asValue().asMutableInPlace(Dictionary, &det));
-                    _ = try interp.removeDictValueRecursively(as_dict_mut.?, unset_ctx);
-                    try interp.setVariable(var_name, duped.asValue());
+                    const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
+                    defer duped.asHead().release();
+                    _ = try interp.removeDictValueRecursively(duped, unset_ctx);
+                    try interp.setVariable(var_name, duped.asHead().asValue());
                 }
             } else {
                 const new_dict = try objects.Dictionary.new(&.{});

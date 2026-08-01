@@ -61,4 +61,5 @@ test {
     _ = @import("strings.zig");
     _ = @import("math.zig");
     _ = @import("eval.zig");
+    _ = @import("variables.zig");
 }

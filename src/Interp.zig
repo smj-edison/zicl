@@ -459,8 +459,9 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
 
 /// Call frame.
 const CallFrame = struct {
-    /// Dictionary containing the frame's variables.
-    variables: *Dictionary,
+    /// The frame's variables. Held by pointer, not inline, so that the
+    /// `*VarTable` a `CachedLocalVar` caches survives `call_frames` reallocating.
+    variables: *vartypes.VarTable,
     /// Arguments of this procedure call. Lifetime managed by creator.
     args: []Shimmerable,
     /// Signature of the closure that is being called. Note this is an abridged
@@ -479,7 +480,7 @@ const CallFrame = struct {
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
-        frame.variables.asHead().release();
+        frame.variables.destroy();
         frame.signature.name.release();
         if (frame.signature.scope_hash_ref) |*scope_hash_ref| scope_hash_ref.deinit();
     }
@@ -496,29 +497,40 @@ pub fn callFrame(interp: *Interp) *CallFrame {
 /// Returns a dict containing this call frame's variables.
 pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
     const frame = &interp.call_frames.items[call_frame_idx];
+    const table = frame.variables;
 
-    // Note, we duplicate here, we don't borrow it, since `variables` needs to stay mutable.
-    const new_dict = try Dictionary.newWithCapacity(&.{}, frame.variables.capacity);
+    // The lexical scope link lives on the frame's signature rather than in the
+    // table, so it has to be re-materialized here. It goes in first so that a
+    // captured scope's iteration order, and therefore its content hash, doesn't
+    // depend on when the link was established relative to the frame's variables.
+    const parent_link: ?Value = if (frame.signature.scope_hash_ref) |ref| ref.inner.asValue() else null;
+    const parent_slots: usize = if (parent_link != null) 2 else 0;
+
+    // Note, the captured scope is a copy: the frame keeps mutating its variables
+    // after this returns, while a captured scope must not change.
+    const new_dict = try Dictionary.newWithCapacity(&.{}, table.count() * 2 + parent_slots);
     errdefer new_dict.asHead().release();
 
-    // Make sure there's no upvars, or if there are, resolve them to their values.
-    var i: usize = 0;
-    while (i < frame.variables.items.len) : (i += 2) {
-        if (frame.variables.items[i + 1].asType(vartypes.UpvarLink)) |link| {
-            // Found an upvar, so resolve it to its value.
-            var name_shim: Shimmerable = .{ .original = link.linked_name };
-            defer name_shim.discardChanges();
-            if ((try interp.getVariableInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
-                try new_dict.put(frame.variables.items[i], linked_value);
-            } else {
-                try interp.setResultFormatted(
-                    "failed to capture the variable \"{s}\", as it was an upvar that pointed at nothing",
-                    .{try new_dict.items[i - 1].getString()},
-                );
-                return error.UninitializedUpvar;
-            }
-        } else {
-            try new_dict.put(frame.variables.items[i], frame.variables.items[i + 1]);
+    if (parent_link) |link| try new_dict.put(objects.interned_tilde_parent, link);
+
+    // Upvars can't be captured as links, since the frame they point into may be
+    // gone by the time the closure runs, so they resolve to their values here.
+    for (table.map.keys(), table.map.values()) |name, slot| {
+        switch (slot) {
+            .normal => |value| try new_dict.put(name, value),
+            .upvar => |link| {
+                var name_shim: Shimmerable = .{ .original = link.linked_name };
+                defer name_shim.discardChanges();
+                if ((try interp.getVariableInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
+                    try new_dict.put(name, linked_value);
+                } else {
+                    try interp.setResultFormatted(
+                        "failed to capture the variable \"{s}\", as it was an upvar that pointed at nothing",
+                        .{try name.getString()},
+                    );
+                    return error.UninitializedUpvar;
+                }
+            },
         }
     }
 
@@ -568,12 +580,10 @@ pub fn evalFrame(interp: *Interp) *EvalFrame {
 /// `signature` does not need to outlive this function call, as this borrows everything
 /// needed from `signature` when creating the call frame.
 fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure.Content) !u32 {
-    var variables = try Dictionary.new(&.{});
-    errdefer variables.asHead().release();
-
-    if (signature.scope_hash_ref) |scope_hash_ref| {
-        try variables.put(objects.interned_tilde_parent, scope_hash_ref.inner.asValue());
-    }
+    // The lexical scope link is not stored in the table; it lives on the frame's
+    // signature below, and `captureScope` re-materializes it when it needs one.
+    const variables = try vartypes.VarTable.create();
+    errdefer variables.destroy();
 
     const new_call_frame_idx = interp.call_frames.items.len;
     try interp.call_frames.append(heap.global_gpa, .{
@@ -955,8 +965,7 @@ pub fn evalSubstitution(interp: *Interp, value: Value, flags: Tokenizer.SubstFla
     // Also make sure to include the flags in the cache id.
     cache_key ^= @as(u256, @as(u3, @bitCast(flags))) << @sizeOf(@TypeOf(interp.callFrame().signature.cache_id));
 
-    var det: ErrorDetails = undefined;
-    const subst: *Substitution = try interp.wrapError(&det, interp.getSubstitution(value, cache_key, flags));
+    const subst: *Substitution = try interp.getSubstitution(value, cache_key, flags);
     assert(subst.flags == flags); // Integrity check.
 
     return try interp.interpolateTokens(subst.tags, subst.values, 0, @intCast(subst.tags.len));
@@ -1164,7 +1173,6 @@ fn invokeCommandMaybeMethod(
             assert(dict_resolved_shim.shimmered.isNone());
             const as_mutable = dict_resolved_shim.current().asType(Dictionary).?;
             try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
-            interp.callFrame().variables.asHead().invalidateString();
 
             if (duplicate) |dup| {
                 try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, dup));

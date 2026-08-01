@@ -86,22 +86,33 @@ pub const Shimmerable = extern struct {
         return obj.asType(T).?;
     }
 
-    pub fn getMutable(self: *Shimmerable, T: type, det: ?*ErrorDetails) !*T {
-        _ = try T.shimmerFrom(det, self);
+    pub fn getMutable(shim: *Shimmerable, T: type, det: ?*ErrorDetails) !*T {
+        _ = try T.shimmerFrom(det, shim);
 
         // Even if `original` or `shimmered` can mutate due to their ref count
         // being 1, we've been tasked with making sure this object doesn't
         // mutate, since the purpose of `Shimmer` is to ensure that we only ever
         // write back something that has the same string (or will have the same
         // string when generated).
-        if (self.shimmered.asValue()) |value| {
+        if (shim.shimmered.asValue()) |value| {
             if (value.canMutate()) {
-                self.shimmered = .none;
+                shim.shimmered = .none;
                 return value.asType(T).?;
             }
         }
 
-        return (try self.current().duplicate()).asType(T).?;
+        // Important to know: duplication is not guaranteed to return the same object type,
+        // so we have to check if it did return the same object type, and if not, shimmer
+        // to that type.
+        const duped = try shim.current().duplicate();
+        if (duped.asType(T)) |val| return val; // Fast path: duplication returned the same object type.
+        defer duped.release();
+
+        var duped_shim: Shimmerable = .{ .original = duped };
+        defer duped_shim.discardChanges();
+        _ = try T.shimmerFrom(det, &duped_shim);
+
+        return duped_shim.current().borrow().asType(T).?;
     }
 
     pub fn getString(self: *const Shimmerable) ![:0]const u8 {

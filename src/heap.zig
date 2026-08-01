@@ -540,6 +540,15 @@ pub const Value = extern struct {
         }
     }
 
+    /// Duplicate `value` and shimmer the copy to `T`, returning a `*T` the
+    /// caller owns and may mutate. Use this for the copy-on-write half of a
+    /// mutation, where `asMutableInPlace` returned null.
+    pub fn duplicateAsType(value: Value, T: type, det: ?*objects.ErrorDetails) !*T {
+        var shim: objects.Shimmerable = .{ .original = value };
+        defer shim.discardChanges();
+        return try shim.getMutable(T, det);
+    }
+
     pub fn swap(ref: *Value, new: Value) void {
         const old = ref.*;
         ref.* = new;
@@ -1243,6 +1252,41 @@ pub const Object = extern struct {
         const hash = try obj.getHashNoRegister();
         try registered_hashes.register(hash, obj); // Idempotent.
         return hash;
+    }
+
+    /// Force everything `getHashNoRegister` would otherwise allocate lazily, so
+    /// that later calls can run from a context that cannot fail (a hash map's
+    /// `hash`/`eql`, for instance).
+    ///
+    /// This is deliberately cheaper than calling `getHashNoRegister` outright.
+    /// Only a `SpecialString` and a `Source` cache a hash out of line, and only
+    /// those two allocate; every other object hashes its bytes on demand, which
+    /// never allocates once the string rep exists. Calling `getHashNoRegister`
+    /// to prepare would therefore hash the bytes once here and again at every
+    /// later use, since that result is not cached for ordinary objects.
+    pub fn ensureInfallibleHashing(obj: *Object) error{OutOfMemory}!void {
+        _ = try obj.getString();
+        switch (obj.getStringDetails()) {
+            .none => unreachable, // `getString` above just produced one.
+            .special => |special| _ = try special.getHash(),
+            .normal => if (obj.asType(objects.Source)) |_| {
+                _ = try obj.getHashNoRegister();
+            },
+        }
+    }
+
+    /// Whether `getHashNoRegister` is now guaranteed not to allocate. Intended
+    /// for asserting the `ensureInfallibleHashing` precondition at the point
+    /// that depends on it, so a missed call fails loudly instead of turning
+    /// into an unreachable on an allocation failure.
+    pub fn hasInfallibleHash(obj: *const Object) bool {
+        switch (obj.getStringDetails()) {
+            .none => return false,
+            .special => |special| return special.hash.load(.monotonic) != null,
+            .normal => {},
+        }
+        if (obj.asTypeConst(objects.Source)) |source| return source.hash.load(.monotonic) != null;
+        return true;
     }
 
     pub fn duplicateHeadOnto(src: *const Object, dest: *Object) error{OutOfMemory}!void {

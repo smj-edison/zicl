@@ -37,12 +37,17 @@ zig build test -Dtest-filter="test_name_pattern"
 
 Remember that the default zig test runner (the one we use) does not print anything on success, it only returns a successful code. To get feedback, use `zig build test --summary line`, alongside any other needed parameters.
 
+Run `zig fmt` on any file you touch, without asking. The editor formats on save, so an unformatted file just shows up as noise in the next diff.
+
 Build with specific options:
 
 ```bash
 # Disable memory tracing (memory tracing can take up a lot of processing
 # power, but has really useful leak/double free messages)
 zig build -Dtrace-mem=false
+
+# Disable the expensive internal state checks (on by default in Debug)
+zig build -Dexpensive-checks=false
 
 # Force LLVM backend
 zig build -Duse-llvm=true
@@ -51,13 +56,18 @@ zig build -Duse-llvm=true
 zig build -Dtoken-debugging=true
 ```
 
+Other options: `-Dstatic-link` (statically link libc, default true), `-Duse-utf8`
+(UTF-8 support in `strutil`, default true), and `-Dthreading` (default true).
+
 ## Current port status
 
-The project is mid-way through a ground-up rewrite of its heap and object system. The new foundation lives in `src/heap.zig` and `src/objects.zig` and is the source of truth for everything described below. The interpreter layer is being migrated onto it:
+The project is mid-way through a ground-up rewrite of its heap and object system. The new foundation lives in `src/heap.zig` and `src/objects.zig` and is the source of truth for everything described below. The interpreter layer has largely been migrated onto it:
 
--   `src/heap.zig`, `src/objects.zig`, `src/memutil.zig`, `src/strutil.zig`, `src/ioutil.zig`, `src/leak_check.zig` -- new foundation, compiles and is tested.
--   `src/Interp.zig` -- partially ported. It still references the old `objutil`, `Heap`, `Handle`, `OptionalHandle`, `Mutable`, and `expr_parse` names in places that haven't been rewritten yet. When working in this file, port those call sites to the new `heap`/`objects` API (see `.claude/cookbook.md` and `.claude/helpers.md`).
--   `src/expr_parse.zig`, `src/commands.zig`, `src/regex.zig`, `src/Tokenizer.zig` -- not yet wired into the new root (`src/root.zig`); they are commented out in the test import block until their port lands.
+-   `src/heap.zig`, `src/objects.zig`, `src/memutil.zig`, `src/strutil.zig`, `src/ioutil.zig`, `src/leak_check.zig`, `src/tripwire.zig` -- new foundation, compiles and is tested.
+-   `src/Interp.zig`, `src/evaltypes.zig`, `src/vartypes.zig`, `src/expr_parse.zig`, `src/regex.zig`, `src/Tokenizer.zig` -- ported and wired into the test root (`src/root.zig`).
+-   `src/commands/` -- most command modules are ported and registered by `commands/common.zig`'s `registerCoreCommands`. Only `control_flow.zig`, `strings.zig`, `math.zig`, `eval.zig`, and `dict.zig` currently contribute tests (via `commands/common.zig`'s test block); `io.zig`, `list.zig`, and `try_catch.zig` are not yet registered or imported.
+-   `src/test/` -- the old end-to-end suites are _not_ built. `src/test/test_root.zig` is commented out in `src/root.zig` and still imports suites that have already been moved out. As a suite is ported, its tests move next to the code they exercise (the dict tests now live in `src/commands/dict.zig`, the eval and closure tests in `src/commands/eval.zig`), so treat `src/test/` as a backlog of scripts to port, not as a live suite.
+-   `src/root.zig`'s `main` still panics; there is no working REPL yet.
 
 The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have been deleted. Do not resurrect them. Use `src/heap.zig` and `src/objects.zig` instead.
 
@@ -65,21 +75,24 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 
 ### Core Components
 
-**Heap (src/heap.zig)**: The object and value system. A single global allocator (`heap.global_gpa`) backs every heap object. There is no per-thread heap and no buddy allocator; objects are individually allocated with `global_gpa.alignedAlloc` into fixed 80-byte slots. The heap module owns:
+**Heap (src/heap.zig)**: The object and value system. A single global allocator (`heap.global_gpa`) backs every heap object. There is no per-thread heap and no buddy allocator; objects are individually allocated into fixed 88-byte slots. The heap module owns:
 
--   `Value` and `OptionalValue` -- the 64-bit NaN-boxed value representation (see below).
--   `Object` -- the 80-byte heap-allocated object header, carrying a vtable, ref count, atomic string metadata, and hash metadata.
+-   `Value` and `OptionalValue` -- the 16-byte tagged-union value representation (see below).
+-   `Object` -- the 88-byte heap-allocated object header plus body, carrying a vtable, ref count, atomic string metadata, and hash metadata.
 -   `SpecialString` -- the wrapper for large strings (> 1024 bytes) and strings that embed hash references, ref-counted independently of their owning object.
 -   `HashRegistry` (`heap.registered_hashes`) -- a global, `RwLock`-protected, content-addressable store mapping `u256` Blake3 hashes to a representative `*Object`. Lets any thread resolve a shared object by hash, and reclaims the representative once every instance of the hash is gone.
 -   `NativeFnRegistry` (`heap.nativefn_registry`) -- a global, mutex-protected map from command name to a lazy `NativeInitFn`, for lazily loading C commands.
 -   `hashutil` -- Blake3 hashing, base64url encoding of hashes, and scanning strings for `blake3~<hash>` references.
 
-**Object System (src/objects.zig)**: Implements Tcl's dynamic typing through vtable-based type shimmering. Each Tcl type is a Zig struct that owns a `pub const vtable: Object.VTable` and a body laid out immediately after the `Object` header in the same 80-byte allocation:
+**Object System (src/objects.zig)**: Implements Tcl's dynamic typing through vtable-based type shimmering. Each Tcl type is a Zig struct that owns a `pub const vtable: Object.VTable` and a body that lives in the `Object`'s inline `body_backing` (at most `Object.body_max_size` = 48 bytes, aligned to `Object.body_align` = 8):
 
--   `None` (untyped string-only object), `String`, `Integer`, `Float`, `Boolean`, `List`, `Dictionary`, `Index`, `Source`, `HashReference`, `Regexp`, `ParsedScript`, `ParsedScriptCommand`.
+-   `objects.zig` owns the data types: `None` (untyped string-only object), `String`, `Integer`, `Float`, `Boolean`, `List`, `Dictionary`, `Index`, `Source`, and `HashReference`. `Number` is a plain tagged union (int or float), not an object type.
+-   The evaluation types live in `src/evaltypes.zig`: `Script`, `ParsedScriptCommand`, `Substitution`, `Expression`, `Closure`, and `NativeCommand` (`NativeCommand` is a plain struct held in the command table, not an object type).
+-   The variable-resolution types live in `src/vartypes.zig`: `CachedLocalVar`, `CachedLexicalVar`, `UpvarLink`, and `DictSugar`.
+-   `Regexp` lives in `src/regex.zig`, next to the pcre2 bindings and the [regexp]/[regsub] commands.
 -   Each type provides `new`/`newObject`/`newValue` constructors and a `shimmerFrom(det, *Shimmerable)` entry point that converts a value into that type in place (or into a duplicated object when the original can't shimmer).
--   `Shimmerable` is the single working buffer for both shimmer and mutation. `Shimmerable.getMutable(T, det)` returns a `*T` you can mutate directly, duplicating first if the original is shared or cross-thread. The old separate `Mutable` struct is gone.
--   `AlwaysType(T)` wraps a `*T` so it can shimmer but never mutate, used for read-only typed views.
+-   `Shimmerable` is the working buffer for shimmering. Mutation is copy-on-write: `Value.asMutableInPlace(T, det)` returns a `*T` when the value can be shimmered _and_ mutated in place, and null when the caller has to duplicate instead. `Shimmerable.getMutable(T, det)` is the shim-flavored counterpart, and returns an owned copy (see below).
+-   `AlwaysCanBeType(T)` wraps a `*Object` so it can shimmer but never mutate in place, used for read-only typed views. Its `getMutable` duplicates rather than mutating the shared object.
 -   `Dictionary` supports `~parent` links (a `HashReference` stored under the interned key `~parent`) for lexical scope chains. Lookups and iteration follow parent links recursively, with parent keys taking precedence. `Dictionary.flatten` collapses a link chain into one flat dict.
 -   `SubcommandParser` and `EnumMapping`/`EnumConstructor` are comptime helpers for dispatching Tcl subcommands and parsing Tcl-facing enums.
 
@@ -90,45 +103,53 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 -   `IndexedMemoryPool(Item)` -- a pool that returns `usize` indices instead of pointers.
 -   `LruCache(K, V, Context)` -- the LRU cache used for parsed scripts, expressions, closures, and substitutions.
 -   `StructIterator` and `GraphWalker` -- the heap-graph walking machinery that powers leak diagnostics. Types opt in by providing an `enumerate_struct` vtable entry.
+-   `null_allocator` -- an allocator that always fails, used to prove a code path does not allocate.
+
+**Failure Injection (src/tripwire.zig)**: Vendored from ghostty. `tripwire.module(FailPoints, func)` builds a per-function set of named fail points; sprinkle `try tw.check(.point)` at the `try`s whose `errdefer` you want to exercise, then drive them from tests with `tw.errorAlways` and friends. Use it when `checkAllAllocationFailures` cannot reach an error path (non-OOM errors, or errors deep behind a cache hit).
 
 **Leak Checking (src/leak_check.zig)**: The diagnostic layer. When `options.trace_mem` is on, every alloc/free/borrow/release on a `Value` is logged with a stack trace into a global ring buffer. `leak_check.captureLeaks` walks every leaked object via `GraphWalker`/`StructIterator` and produces a `LeakResult` that can render a Graphviz dot digraph (`dumpDot`) of the reachable leak graph plus a per-object operation history (`dumpDetails`). `dumpLastTouchedTrace` is hooked into the panic path so a use-after-free prints the refcount history of the last-touched object alongside Zig's own stack trace.
 
-**Interpreter (src/Interp.zig)**: Executes parsed scripts. The parts that are already ported use the new `Value`/`Object`/`Shimmerable` API and follow the same design as before:
+**Interpreter (src/Interp.zig)**: Executes parsed scripts, using the `Value`/`Object`/`Shimmerable` API:
 
 -   Dual frame system: call frames (variable scope) and eval frames (execution state).
--   Variable resolution with epoch-based cache invalidation. Variables live in a `Dictionary` per call frame; lexical parents are reached via `~parent`/`HashReference` scope chains.
--   Closures (`[fn]`, `[method]`) with required/optional parameters, default values, and an `args` parameter. Closure scopes are captured as dicts, hashed, and stored in the `HashRegistry` so they can be shared across threads.
--   `DictSugar` for `var(key)` style variable names.
-
-See the port status note above for what is still using old names.
+-   Variable resolution with epoch-based cache invalidation, implemented in `src/vartypes.zig` (`setVariable`, `getVariable`, `unsetVariable`, `setVariableUpvar`). Variables live in a `Dictionary` per call frame; lexical parents are reached via `~parent`/`HashReference` scope chains.
+-   Closures (`[fn]`, `[method]`) with required/optional parameters, default values, and an `args` parameter. Closure scopes are captured as dicts (`Interp.captureScope`), hashed, and stored in the `HashRegistry` so they can be shared across threads.
+-   `vartypes.DictSugar` for `var(key)` style variable names.
+-   Four `LruCache`s keyed by `u256` content hash, for parsed scripts, expressions, closures, and substitutions (`getScript`, `getExpression`, `getClosure`, `getSubstitution`).
+-   `evaltypes.zig` holds the error set (`Error`/`EvalError`), the `ReturnCode` enum that maps Tcl return codes onto Zig errors, and the object types the interpreter caches.
 
 ### Object and Value Representation
 
-`Value` is a 64-bit NaN-boxed enum (`enum(ValueBacking)` where `ValueBacking = u64`). It packs small primitives inline and only heap-allocates complex objects:
+`Value` is a 16-byte `extern struct` wrapping a `ValueRep`: an `extern union` payload plus a `u16` interned-string length and a `Tag` byte. (It was NaN-boxed into 64 bits previously; that representation is gone.) It packs small primitives inline and only heap-allocates complex objects:
 
-1.  **Floats** occupy the full 64 bits as an IEEE-754 `f64`, with a canonical NaN reserved as the tag namespace.
-2.  **Tagged primitives** use the NaN payload: a 3-bit `Tag` (`int`, `false`, `true`, `interned`, `none`, `ptr`, `canonical_nan`) plus a 48-bit payload. `int` holds an `i32` inline; `interned` holds a pointer to a length-prefixed, NUL-terminated rodata string produced by `heap.createInternedString`; `ptr` holds a 48-bit pointer to a heap `Object`.
-3.  Everything else (lists, dicts, strings, closures, sources, regexps, etc.) is a heap-allocated `Object` reached via the `.ptr` tag.
+1.  **Tagged primitives.** `Tag` is one of `none`, `pointer`, `boolean`, `integer`, `float`, `interned`. `integer` holds a full `i64` inline, `float` an `f64`, `boolean` a `bool`, and `interned` a pointer to a NUL-terminated rodata string (with its length in `interned_string_len`) produced by `heap.InternedString.new`/`newValue`.
+2.  Everything else (lists, dicts, strings, closures, sources, regexps, etc.) is a heap-allocated `Object` reached via the `pointer` tag.
 
-`OptionalValue` is the same 64 bits with a dedicated `.none` representation, used for optional values and inside `Shimmerable`.
+Because integers are now full-width inline, `objects.Integer.new` never allocates and returns a plain `Value`; `Value.asInlineInt` returns `?i64`. `objects.Integer.newBoxed` still exists for the cases that need a real object, so use `objects.Integer.asInt` rather than `Value.asInlineInt` when a value could be either form.
 
-`Object` is an 80-byte struct (`Object.object_size`). The first `@sizeOf(Object)` bytes are the header (`vtable`, `ref_count`, atomic `string`/`string_metadata`, `metadata`, `hash_metadata`); the remaining bytes hold the type-specific body (`String`, `List`, `Dictionary`, etc.). `Object.from(T, ptr)` / `Object.castTo(obj, T)` translate between a typed body pointer and its header. A type's body is always allocated together with its header via `Object.newObject(T)` / `Object.newObjectUninitialized(T)`.
+`OptionalValue` is the same 16 bytes with the `none` tag reserved, used for optional values and inside `Shimmerable`. `Value.fromRep` asserts the tag is not `none`.
+
+`Object` is an 88-byte `extern struct`. The header is `string` (atomic), `metadata`, `vtable`, `ref_count`, `string_metadata` (atomic), and `hash_metadata` (atomic); the trailing `body_backing: [48]u8 align(8)` holds the type-specific body (`String`, `List`, `Dictionary`, etc.). `Object.from(T, ptr)` / `Object.asType(obj, T)` translate between a typed body pointer and its header (`asType` returns null on a vtable mismatch, and `asTypeConst` is the const variant). `Object.assertValidType(T)` enforces the size, alignment, and vtable requirements at comptime. A type's body is always allocated together with its header via `Object.newObject(T)` / `Object.newObjectUninitialized(T)`.
 
 Objects automatically "shimmer" between types. Shimmering replaces the vtable and body in place (when `canShimmer` holds, i.e. the object is not cross-thread) while preserving the string representation, or duplicates the object into a fresh slot tracked by the `Shimmerable`. The string representation is the source of truth: it is generated on demand by the type's `update_string` vtable entry and cached atomically on the object.
 
 ### Memory Management Principles
 
-1.  **Values vs Objects**: A `Value` is a lightweight 64-bit reference. Primitives (`int`, `float`, `bool`, `interned`) carry their data inline and need no allocation. Only `.ptr` values point at a heap `Object`, which is ref-counted.
+1.  **Values vs Objects**: A `Value` is a lightweight 16-byte reference. Primitives (`integer`, `float`, `boolean`, `interned`) carry their data inline and need no allocation. Only `pointer` values point at a heap `Object`, which is ref-counted.
 
-2.  **Shimmerable**: The single working buffer for in-place type changes and mutations.
-    -   `Shimmerable = { original: Value, shimmered: OptionalValue }`. `shimmered` holds a duplicated object when the original could not be shimmered or mutated in place.
-    -   `.current()` returns the effective `Value`; `.consume()` takes ownership and releases the original; `.discardChanges()` releases any duplicate and rolls back; `.prepareToShimmer()` ensures the object is exclusively owned and has its string rep cached before the body is overwritten.
-    -   For mutations, call `.getMutable(T, det)` to get a `*T` you can write to. It duplicates first if the object is shared, cross-thread, or hash-registered (i.e. whenever `canMutate` is false).
-    -   The old `Mutable` struct no longer exists. Use `Shimmerable` for both shimmer and mutation.
+2.  **Shimmerable**: The working buffer for in-place type changes.
+    -   `Shimmerable = { original: Value, shimmered: OptionalValue }`. `shimmered` holds a duplicated object when the original could not be shimmered in place.
+    -   `.current()` returns the effective `Value`; `.consume()` takes ownership and releases the original; `.discardChanges()` releases any duplicate and rolls back; `.prepareToShimmer(T)` ensures the object is exclusively owned (boxing a primitive if needed), caches the string rep, frees the old body, installs `T`'s vtable, and returns the `*T` body to fill in.
 
-3.  **Reference Counting**: All heap objects are ref-counted. `Value.borrow()` / `Object.borrow()` increment and return the same value; `Value.release()` / `Object.release()` decrement and free at zero. Cross-thread objects (`metadata.cross_thread == true`) use atomic ref counts; thread-local objects use plain integers. A hash-registered object that is the registry's representative unregisters itself when its ref count drops to 1 (the registry holds the last borrow), breaking the circular reference.
+3.  **Mutation is copy-on-write, and the caller picks the branch.** `Value.asMutableInPlace(T, det)` returns a `*T` when the value shimmers to `T` and is exclusively owned, and null otherwise. The two outcomes have different lifetimes, which is why every call site spells out both:
+    -   In place: no new object; the mutated object's owner keeps its reference, and you must invalidate that owner's string rep.
+    -   Copy-on-write: `duplicateAsBoxed` gives you an object that _you_ own, so it needs releasing on error paths and storing back into the slot on success.
 
-4.  **Ownership Patterns**:
+    `Shimmerable.getMutable(T, det)` is the same operation phrased over a shim, used where one is already in hand. It essentially always duplicates (it will not hand back `original` even at ref count 1, since the shim's contract is that only an equal-stringed value is written back); its one shortcut is stealing `shimmered` when the shimmer already built a mutable duplicate. The `*T` it returns is owned by the caller and detached from the shim, so `shim.current()` is _not_ the mutated object and `shim.consume()` would return the wrong value.
+
+4.  **Reference Counting**: All heap objects are ref-counted. `Value.borrow()` / `Object.borrow()` increment and return the same value; `Value.release()` / `Object.release()` decrement and free at zero. Cross-thread objects (`metadata.cross_thread == true`) use atomic ref counts; thread-local objects use plain integers. A hash-registered object that is the registry's representative unregisters itself when its ref count drops to 1 (the registry holds the last borrow), breaking the circular reference.
+
+5.  **Ownership Patterns**:
     -   Functions that allocate return owned values/objects (caller must release).
     -   `borrow()` increases ref count and returns the same value.
     -   `duplicate()` creates a shallow copy (deep for the string rep; collection items are borrowed).
@@ -140,7 +161,7 @@ Objects automatically "shimmer" between types. Shimmering replaces the vtable an
 Scripts go through several stages:
 
 1.  **Tokenization** (`Tokenizer`): Source to tokens with location info.
-2.  **Preprocessing** (`objects.ParsedScript`): Tokens into an optimized script structure. Precomputes word boundaries and argument counts, storing tokens as `.start_of_command` + arguments. Example: `set x 5` becomes [start_of_command(3), "set", "x", "5"].
+2.  **Preprocessing** (`evaltypes.Script`): Tokens into an optimized script structure. Precomputes word boundaries and argument counts, storing tokens as `.start_of_command` + arguments. Example: `set x 5` becomes [start_of_command(3), "set", "x", "5"].
 3.  **Caching** (`memutil.LruCache`): Parsed scripts, expressions, closures, and substitutions are cached by `u256` content hash.
 4.  **Evaluation** (`Interp.evalObject`): Walks the token list, substitutes variables/commands, invokes commands.
 
@@ -162,7 +183,17 @@ test "foo" {
 
 Always call `heap.testFinish()` to verify no memory leaks. `heap.testStart` initializes global state (`initGlobals`) and the calling thread's arena (`initThread`); `heap.testFinish` dumps any leaks (when `trace_mem` is on) and tears both down.
 
-The unit tests for the foundation live inline in `src/heap.zig` and `src/objects.zig`. The end-to-end test suites under `src/test/` (arithmetic, closure, dict, eval, list, parsing, regex, strings, subst, try_catch, variables) cover the interpreter and are re-enabled as the port lands.
+Tests that need a live interpreter use the pair in `src/commands/common.zig` instead, which wraps the heap lifecycle and registers the core commands:
+
+```zig
+fn testDict(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+    try interp.testExpectScriptResult("b", "dict get {a b} a");
+}
+```
+
+Unit tests live inline in the file they cover (`heap.zig`, `objects.zig`, `memutil.zig`, `strutil.zig`, `Interp.zig`, `vartypes.zig`, `expr_parse.zig`, `regex.zig`, and the command modules). See the port status note above for the state of the old `src/test/` suites.
 
 Helper functions available (in `src/Interp.zig`):
 
@@ -192,14 +223,19 @@ const list = try objects.List.shimmerFrom(&det, &shim);
 // `shim.current()` is the list. Any duplicate is released by the defer.
 ```
 
-**Mutating through a `Shimmerable`**:
+**Mutating a value (copy-on-write)**:
 
 ```zig
-var shim: objects.Shimmerable = .{ .original = dict_value };
-errdefer shim.discardChanges();
-const dict = try shim.getMutable(objects.Dictionary, &det);
-_ = try dict.put(key, value);
-dict_value = shim.consume();
+if (try dict_raw.asMutableInPlace(objects.Dictionary, &det)) |dict| {
+    try dict.put(key, value);
+    owner.asHead().invalidateString(); // Mutated in place; owner's string is stale.
+} else {
+    const duped = try dict_raw.duplicateAsBoxed();
+    defer duped.release();
+    const dict = (try duped.asValue().asMutableInPlace(objects.Dictionary, &det)).?;
+    try dict.put(key, value);
+    try storeBack(duped.asValue()); // The copy is ours; put it where it belongs.
+}
 ```
 
 See `.claude/cookbook.md` for extended recipes and `.claude/helpers.md` for the full function index.
@@ -235,7 +271,9 @@ const result = try processData(data);  // Ownership transferred on success.
 
 **Cross-thread objects**: Once `Object.makeCrossthread()` is called on an object, it can never shimmer or mutate again (even at ref count 1), because another thread may be traversing a collection that reaches it. `canShimmer` and `canMutate` both return false for cross-thread objects. Hash-registered objects are likewise frozen (`canMutate` returns false while `hash_registered` is set).
 
-**Command Naming**: Command implementation functions follow the pattern `nameCmd` (e.g., `ifCmd`, `forCmd`, `dictCmd`) with a `Cmd` prefix.
+**Object body too large**: `Object.assertValidType` fails at comptime with "Object is too large" when a type's body exceeds `Object.body_max_size` (48 bytes) or "Object has too high alignment requirements" when it needs more than `Object.body_align` (8). Shrink the body (an index into a side table, a pointer to an out-of-line struct) rather than growing the slot; every object in the heap pays for the increase.
+
+**Command Naming**: Command implementation functions follow the pattern `nameCmd` (e.g., `ifCmd`, `forCmd`, `dictCmd`) with a `Cmd` prefix. Command modules live in `src/commands/` and each exports a `registerCommands(interp)` that `commands/common.zig`'s `registerCoreCommands` calls.
 
 ## Debugging
 
@@ -245,6 +283,7 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 -   Write Tcl as Tcl, not TCL.
 -   Prefer commas or parenthesis over em-dashes. Also, write in ASCII characters exclusively (i.e. no — or →). Double hypens, --, can substitute for a proper em dash.
 -   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
+-   Comment the exceptions, not the conventions. If a reader who knows this codebase would already predict what a line does, leave it alone; spend the comment where the code departs from what they'd predict. This is the "what" comment rule applied to design rules rather than to syntax: that `interp.getInteger` reports its own errors is the convention and needs no note, whereas a call site that deliberately bypasses it does.
 -   End every comment with a period, exclaimation point, or similar (what's important is that the thought is properly terminated).
 -   Don't use UPPERCASE, instead use _emphasis_. TODO, FIXME, PERF, HACK, etc are exceptions to this rule, as they're used for grepping.
 -   If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.

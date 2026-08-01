@@ -298,6 +298,54 @@ test "fn nested closure scope" {
     );
 }
 
+test "fn nests lexical scopes three levels deep" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Every nesting level adds a `~parent` link, so this fails if capturing a
+    // scope drops the link or orders it inconsistently.
+    try interp.testExpectScriptResult("111",
+        \\ set a 1
+        \\ fn one {} {
+        \\   set b 10
+        \\   fn two {} {
+        \\     set c 100
+        \\     fn three {} { + $a [+ $b $c] }
+        \\     return $three
+        \\   }
+        \\   return [two]
+        \\ }
+        \\ set three [one]
+        \\ three
+    );
+}
+
+test "fn shadows a lexical with a local of the same name" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("inner",
+        \\ set x outer
+        \\ fn shadow {} { set x inner; return $x }
+        \\ shadow
+    );
+
+    // Shadowing must not disturb the captured scope it shadows.
+    try interp.testExpectScriptResult("outer",
+        \\ set x outer
+        \\ fn shadow {} { set x inner; return $x }
+        \\ shadow
+        \\ return $x
+    );
+}
+
+test "subst reports a parse error without faulting" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try std.testing.expectError(error.EvalError, interp.testRunScript("subst {[}"));
+}
+
 test "fn optional args" {
     var interp = try common.testStart(std.testing.allocator);
     defer common.testFinish(&interp);
