@@ -59,7 +59,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if (args.len == 3) {
                 if (script.current().asType(objects.Source)) |info| {
                     const file_name = info.file_name.orEmpty();
-                    const line_no = try objects.Integer.new(info.line_no);
+                    const line_no = objects.Integer.new(info.line_no);
                     defer line_no.release();
                     const list = try objects.List.new(&.{ file_name, line_no });
                     interp.setResultOwning(list.asHead().asValue());
@@ -126,13 +126,13 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             errdefer result_dict.asHead().release();
             try result_dict.put(heap.InternedString.newValue("type"), heap.InternedString.newValue("source"));
             if (eval_frame.currently_evaluating.asType(objects.Source)) |source| {
-                const line_no = try objects.Integer.new(source.line_no);
+                const line_no = objects.Integer.new(source.line_no);
                 defer line_no.release();
                 try result_dict.put(heap.InternedString.newValue("line"), line_no);
                 try result_dict.put(heap.InternedString.newValue("file"), source.file_name.orEmpty());
             }
 
-            const rel_level = try objects.Integer.new(current - target);
+            const rel_level = objects.Integer.new(current - target);
             defer rel_level.release();
             try result_dict.put(heap.InternedString.newValue("level"), rel_level);
 

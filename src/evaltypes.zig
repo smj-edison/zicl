@@ -798,7 +798,7 @@ pub const Expression = struct {
 
                 // Fast case: both are already integers/both are already floats.
                 if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
-                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node.tag, lhs, rhs));
+                    return objects.Integer.new(try evalBinaryOperatorInteger(interp, node.tag, lhs, rhs));
                 };
 
                 if (objects.Float.asFloat(lhs_value)) |lhs| if (objects.Float.asFloat(rhs_value)) |rhs| {
@@ -811,7 +811,7 @@ pub const Expression = struct {
                 const rhs_number = try interp.getIntOrFloatInPlace(&rhs_value);
 
                 if (lhs_number.asInt()) |lhs| if (rhs_number.asInt()) |rhs| {
-                    return try objects.Integer.new(try evalBinaryOperatorInteger(interp, node.tag, lhs, rhs));
+                    return objects.Integer.new(try evalBinaryOperatorInteger(interp, node.tag, lhs, rhs));
                 };
 
                 return Value.newFloat(try evalBinaryOperatorFloat(interp, node.tag, lhs_number.asFloat(), rhs_number.asFloat()));
@@ -950,7 +950,7 @@ pub const Expression = struct {
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
-                    .integer => |int| try objects.Integer.new(~int),
+                    .integer => |int| objects.Integer.new(~int),
                     .float => |float| {
                         try interp.setResultFormatted("cannot bit invert on float {}", .{float});
                         return error.BadInteger;
@@ -968,7 +968,7 @@ pub const Expression = struct {
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
-                    .integer => |int| try objects.Integer.new(-int),
+                    .integer => |int| objects.Integer.new(-int),
                     .float => |float| Value.newFloat(-float),
                 };
             },
@@ -977,12 +977,12 @@ pub const Expression = struct {
                 defer result.release();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
-                    .integer => |int| try objects.Integer.new(int),
+                    .integer => |int| objects.Integer.new(int),
                     .float => |float| {
                         if (float <= @as(f64, @floatFromInt(std.math.maxInt(i64))) and
                             float >= @as(f64, @floatFromInt(std.math.minInt(i64))) and !std.math.isNan(float))
                         {
-                            return try objects.Integer.new(@intFromFloat(float));
+                            return objects.Integer.new(@intFromFloat(float));
                         }
                         try interp.setResultFormatted("could not convert float \"{}\" to integer", .{float});
                         return error.BadInteger;
@@ -1000,7 +1000,7 @@ pub const Expression = struct {
                             var det: ErrorDetails = undefined;
                             return interp.wrapError(&det, objects.Integer.overflowError(u64, &det, abs_val));
                         }
-                        break :blk try objects.Integer.new(@intCast(abs_val));
+                        break :blk objects.Integer.new(@intCast(abs_val));
                     },
                     .float => |float| Value.newFloat(@abs(float)),
                 };
@@ -1020,7 +1020,7 @@ pub const Expression = struct {
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .float => |float| Value.newFloat(@round(float)),
-                    .integer => |int| try objects.Integer.new(int),
+                    .integer => |int| objects.Integer.new(int),
                 };
             },
             .rand => {

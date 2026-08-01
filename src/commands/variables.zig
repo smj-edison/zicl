@@ -30,12 +30,12 @@ pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, @as(i65, contents) + @as(i65, increment_by)));
         };
 
-        const new_int = try objects.Integer.new(new_contents);
+        const new_int = objects.Integer.new(new_contents);
         defer new_int.release();
         try interp.setVariable(var_name, new_int);
         interp.setResult(new_int);
     } else {
-        const new_int = try objects.Integer.new(increment_by);
+        const new_int = objects.Integer.new(increment_by);
         defer new_int.release();
         try interp.setVariable(var_name, new_int);
         interp.setResult(new_int);

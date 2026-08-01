@@ -114,9 +114,9 @@ pub fn deinitGlobals() void {
 }
 
 pub fn createIndexPair(start: i64, end: i64) !Value {
-    const start_value = try objects.Integer.new(start);
+    const start_value = objects.Integer.new(start);
     defer start_value.release();
-    const end_value = try objects.Integer.new(end);
+    const end_value = objects.Integer.new(end);
     defer end_value.release();
     const indices_list = try objects.List.new(&.{ start_value, end_value });
     return indices_list.asHead().asValue();

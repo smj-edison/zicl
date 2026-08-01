@@ -360,7 +360,7 @@ pub fn setResultOwning(interp: *Interp, value: Value) void {
 }
 
 pub fn setResultInteger(interp: *Interp, value: i64) !void {
-    interp.setResultOwning(try objects.Integer.new(value));
+    interp.setResultOwning(objects.Integer.new(value));
 }
 
 pub fn setResultFloat(interp: *Interp, value: f64) void {
@@ -1003,7 +1003,7 @@ fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
 
         trace.appendAssumeCapacity(closure_name);
         trace.appendAssumeCapacity(file_name);
-        trace.appendAssumeCapacity(try objects.Integer.new(absolute_line));
+        trace.appendAssumeCapacity(objects.Integer.new(absolute_line));
         trace.appendAssumeCapacity(args_list.asHead().asValue());
     }
 

@@ -903,11 +903,9 @@ pub const Float = struct {
 pub const Integer = struct {
     value: i64,
 
-    pub fn new(value: i64) !Value {
-        if (value >= math.minInt(i32) and value <= math.maxInt(i32)) {
-            return Value.newInt(@intCast(value));
-        }
-        return (try newBoxed(value)).asHead().asValue();
+    /// Integers are always stored inline, so this never allocates.
+    pub fn new(value: i64) Value {
+        return Value.newInt(value);
     }
 
     pub fn newBoxed(value: i64) !*Integer {
