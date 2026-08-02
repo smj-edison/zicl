@@ -65,8 +65,8 @@ The project is mid-way through a ground-up rewrite of its heap and object system
 
 -   `src/heap.zig`, `src/objects.zig`, `src/memutil.zig`, `src/strutil.zig`, `src/ioutil.zig`, `src/leak_check.zig`, `src/tripwire.zig` -- new foundation, compiles and is tested.
 -   `src/Interp.zig`, `src/evaltypes.zig`, `src/vartypes.zig`, `src/expr_parse.zig`, `src/regex.zig`, `src/Tokenizer.zig` -- ported and wired into the test root (`src/root.zig`).
--   `src/commands/` -- most command modules are ported and registered by `commands/common.zig`'s `registerCoreCommands`. Only `control_flow.zig`, `strings.zig`, `math.zig`, `eval.zig`, and `dict.zig` currently contribute tests (via `commands/common.zig`'s test block); `io.zig`, `list.zig`, and `try_catch.zig` are not yet registered or imported.
--   `src/test/` -- the old end-to-end suites are _not_ built. `src/test/test_root.zig` is commented out in `src/root.zig` and still imports suites that have already been moved out. As a suite is ported, its tests move next to the code they exercise (the dict tests now live in `src/commands/dict.zig`, the eval and closure tests in `src/commands/eval.zig`), so treat `src/test/` as a backlog of scripts to port, not as a live suite.
+-   `src/commands/` -- every command module is ported, registered by `commands/common.zig`'s `registerCoreCommands`, and imported by its test block.
+-   `src/test/` is gone. Every suite has moved next to the code it exercises, so tests live in the same file as their implementation.
 -   `src/root.zig`'s `main` still panics; there is no working REPL yet.
 
 The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have been deleted. Do not resurrect them. Use `src/heap.zig` and `src/objects.zig` instead.
@@ -89,7 +89,7 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 -   `objects.zig` owns the data types: `None` (untyped string-only object), `String`, `Integer`, `Float`, `Boolean`, `List`, `Dictionary`, `Index`, `Source`, and `HashReference`. `Number` is a plain tagged union (int or float), not an object type.
 -   The evaluation types live in `src/evaltypes.zig`: `Script`, `ParsedScriptCommand`, `Substitution`, `Expression`, `Closure`, and `NativeCommand` (`NativeCommand` is a plain struct held in the command table, not an object type).
 -   The variable-resolution types live in `src/vartypes.zig`: `CachedLocalVar`, `CachedLexicalVar`, `UpvarLink`, and `DictSugar`.
--   `Regexp` lives in `src/regex.zig`, next to the pcre2 bindings and the [regexp]/[regsub] commands.
+-   `Regexp` lives in `src/regex.zig`, next to the pcre2 bindings, because `heap.zig` drives the pcre2 context lifecycle and so cannot import from `src/commands/`. The [regexp] and [regsub] commands themselves live in `src/commands/regex.zig` like every other command.
 -   Each type provides `new`/`newObject`/`newValue` constructors and a `shimmerFrom(det, *Shimmerable)` entry point that converts a value into that type in place (or into a duplicated object when the original can't shimmer).
 -   `Shimmerable` is the working buffer for shimmering. Mutation is copy-on-write: `Value.asMutableInPlace(T, det)` returns a `*T` when the value can be shimmered _and_ mutated in place, and null when the caller has to duplicate instead. `Shimmerable.getMutable(T, det)` is the shim-flavored counterpart, and returns an owned copy (see below).
 -   `AlwaysCanBeType(T)` wraps a `*Object` so it can shimmer but never mutate in place, used for read-only typed views. Its `getMutable` duplicates rather than mutating the shared object.

@@ -31,6 +31,4 @@ test {
     _ = @import("expr_parse.zig");
     _ = @import("regex.zig");
     _ = @import("commands/common.zig");
-
-    // _ = @import("test/test_root.zig");
 }

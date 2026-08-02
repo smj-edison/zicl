@@ -77,7 +77,6 @@ loop_propagate: u32 = 0,
 /// Used for propagating a return code up multiple eval levels.
 return_propagate: struct {
     left_to_go: u32 = 0,
-    return_at_end: ?evaltypes.EvalError = null,
 } = .{},
 /// Stack trace captured at the error site.
 stack_trace: OptionalValue,
@@ -305,7 +304,25 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
     // }
     // ```
     // will shimmer `foo` halfway through evaluation.
-    try interp.evalObjectInner(call_frame_idx, closure.body, cache_key);
+
+    // `[return -level N]` counts closure calls, so this is where a level is
+    // consumed. Counting script evaluations instead would let a body such as an
+    // [if] eat the level before the closure ever sees it:
+    //
+    // ```
+    // fn f {} { if {true} { return 42 }; return 99 }
+    // ```
+    //
+    // Here the `if` body is its own evaluation, so `f` would answer 99.
+    interp.evalObjectInner(call_frame_idx, closure.body, cache_key) catch |err| switch (err) {
+        error.PropagateResult => {
+            interp.return_propagate.left_to_go -= 1;
+            if (interp.return_propagate.left_to_go > 0) return error.PropagateResult;
+            // Reaching zero means the return stops at this closure, and its
+            // result is the closure's result.
+        },
+        else => return err,
+    };
 
     // When called as a method, we write back `self` to `args[1]`, so that the
     // caller can update the new method.
@@ -344,7 +361,14 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
         }
 
         switch (command.call_info) {
-            .zig => |to_call| try to_call(interp, args),
+            // A command can also reject its arguments from inside its body, for
+            // reasons the arity bounds cannot express. Routing that back through
+            // the same path below gives it the real usage string, which only this
+            // function can build since only it knows which command ran.
+            .zig => |to_call| to_call(interp, args) catch |err| switch (err) {
+                error.WrongUsage => break :wrong_arg_count,
+                else => return err,
+            },
             .c => |to_call| {
                 const args_as_handles = try heap.local_arena.alloc(Value, args.len);
                 for (args, args_as_handles) |arg, *native_arg| native_arg.* = arg.current().borrow();
@@ -1341,29 +1365,16 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
             return error.Signal;
         } else {
             command_result catch |err| switch (err) {
-                error.PropagateResult => {
-                    interp.return_propagate.left_to_go -= 1;
-                    if (interp.return_propagate.left_to_go == 0) {
-                        if (interp.return_propagate.return_at_end) |return_at_end| {
-                            return return_at_end;
-                        } else {
-                            // Equivalent of TCL_OK.
-                            return;
-                        }
-                    } else {
-                        return error.PropagateResult;
-                    }
-                },
+                // `-level` counts closure calls, not script evaluations, so this
+                // just carries the result outward. `callClosure` is what consumes
+                // a level; see the comment there.
+                error.PropagateResult => return error.PropagateResult,
                 else => |narrowed_err| {
                     if (narrowed_err == error.OutOfMemory) {
                         // In the case of OOM, the inside function almost certainly failed
                         // to set a result, so we set it here.
                         interp.setResult(interned_oom);
                         interp.pending_error_code.swap(interned_zicl_oom);
-                    }
-
-                    if (narrowed_err == error.WrongUsage) {
-                        try interp.setResultString("FIXME: prolly should explain how to use the command");
                     }
 
                     if (narrowed_err == error.EvalError) {
@@ -1389,6 +1400,17 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
             };
         }
     }
+}
+
+/// Evaluate a script entered from outside the interpreter, such as a file or an
+/// embedder call. A `[return]` reaching this boundary has no closure left to
+/// return from, so it ends the script and keeps its result instead of escaping
+/// as an error. This is the only place a leftover level is discarded.
+pub fn evalTopLevel(interp: *Interp, script: Value) evaltypes.EvalError!void {
+    interp.evalObject(script) catch |err| switch (err) {
+        error.PropagateResult => interp.return_propagate = .{},
+        else => return err,
+    };
 }
 
 pub fn evalObject(interp: *Interp, script: Value) evaltypes.EvalError!void {
@@ -1418,7 +1440,7 @@ pub fn evalFile(interp: *Interp, filename: []const u8) evaltypes.EvalError!void 
     const source = try objects.Source.new(bytes, filename_value.asOptional(), 1);
     defer source.asHead().release();
 
-    try interp.evalObject(source.asHead().asValue());
+    try interp.evalTopLevel(source.asHead().asValue());
 }
 
 pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
@@ -1930,7 +1952,7 @@ test "recursive dict removal" {
 pub fn testRunScript(interp: *Interp, script: []const u8) !Value {
     var script_handle = try objects.String.newValue(script);
     defer script_handle.release();
-    try interp.evalObject(script_handle);
+    try interp.evalTopLevel(script_handle);
     return interp.result;
 }
 

@@ -27,19 +27,13 @@ fn buildErrorOptions(
     const options = try Dictionary.newWithCapacity(&.{}, 10);
     errdefer options.asHead().release();
 
-    // The return code surfaced to the caller.
-    const visible_code: i64 = code: {
-        // .return is an internal return type, so it should never be surfaced to the callee.
-        if (exit_code == .@"return") {
-            if (interp.return_propagate.return_at_end) |to_return| {
-                break :code @intFromEnum(Interp.ReturnCode.fromError(to_return));
-            } else {
-                break :code @intFromEnum(@as(Interp.ReturnCode, .ok));
-            }
-        } else {
-            break :code @intFromEnum(exit_code);
-        }
-    };
+    // The return code surfaced to the caller. `.return` is an internal code, and
+    // a return still travelling outward is on its way to completing normally, so
+    // what the caller sees for it is ok.
+    const visible_code: i64 = if (exit_code == .@"return")
+        @intFromEnum(@as(Interp.ReturnCode, .ok))
+    else
+        @intFromEnum(exit_code);
 
     try options.put(interned_code, objects.Integer.new(visible_code));
     try options.put(interned_level, objects.Integer.new(interp.return_propagate.left_to_go));
@@ -548,6 +542,17 @@ test "catch reports the code of non-error outcomes" {
     var interp = try common.testStart(testing.allocator);
     defer common.testFinish(&interp);
 
+    // 2 is `return`. [catch] observes it because a body is not a closure call,
+    // so nothing consumed the level before it got here.
+    try interp.testExpectScriptResult("2", "catch { return foo }");
+    // The caught result is still readable.
+    try interp.testExpectScriptResult("foo", "catch { return foo } msg; set msg");
+
+    // The options describe the return rather than the catch: a `[return]` is on
+    // its way to completing normally, so its own code is 0, and one level is
+    // still outstanding because nothing has consumed it yet.
+    try interp.testExpectScriptResult("0", "catch { return foo } msg opts; dict get $opts -code");
+    try interp.testExpectScriptResult("1", "catch { return foo } msg opts; dict get $opts -level");
     // 3 is `break`, 4 is `continue`.
     try interp.testExpectScriptResult("3", "catch { break }");
     try interp.testExpectScriptResult("4", "catch { continue }");

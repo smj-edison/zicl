@@ -906,3 +906,8 @@ pub fn quoteStrings(gpa: std.mem.Allocator, items: []const []const u8) ![:0]u8 {
 
     return unfinished_str[0..written :0];
 }
+
+test "codepointLength counts codepoints, not bytes" {
+    try std.testing.expectEqual(@as(usize, 8), codepointLength("1abc2de3"));
+    try std.testing.expectEqual(@as(usize, 8), codepointLength("abc2de3f"));
+}

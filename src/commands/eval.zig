@@ -396,6 +396,48 @@ test "subst reports a parse error without faulting" {
     try std.testing.expectError(error.EvalError, interp.testRunScript("subst {[}"));
 }
 
+test "subst basic" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("$x", "subst {\\$x}");
+    try interp.testExpectScriptError(error.EvalError,
+        \\wrong # args: should be "subst ?options? string"
+    , "subst");
+    try interp.testExpectScriptError(error.EvalError,
+        \\bad option "a": must be -nocommands, -novariables, or -nobackslashes
+    , "subst a b c");
+}
+
+test "parsing" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Make sure we handle "character after close brace" correctly. It's fine for
+    // a bracket to be after a brace in a script context.
+    try interp.testExpectScriptResult("2",
+        \\ set x [expr {1 + 1}]
+        \\ set x
+    );
+
+    // It should also work with argument expansion.
+    try interp.testExpectScriptResult("3",
+        \\ set items {1 2}
+        \\ set x [+ {*}$items]
+        \\ set x
+    );
+
+    try interp.testExpectScriptResult("hello world",
+        \\ set x "hello world"
+        \\ # multiple
+        \\
+        \\ # separated
+        \\
+        \\ # comments
+        \\ set x
+    );
+}
+
 test "fn optional args" {
     var interp = try common.testStart(std.testing.allocator);
     defer common.testFinish(&interp);

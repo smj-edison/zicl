@@ -340,7 +340,6 @@ pub const Parser = struct {
                 const loc = p.tokenLoc(p.nextToken());
                 const value = std.fmt.parseInt(i64, p.source[loc.start..loc.end], 10) catch unreachable;
                 const int_value = objects.Integer.new(value);
-                errdefer int_value.release();
 
                 return try p.addNode(.{
                     .tag = .value,

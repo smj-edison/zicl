@@ -473,12 +473,10 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     // -level 0 means "don't propagate, just set the result."
     if (level == 0) return;
 
-    // `evalObjectInner` decrements `left_to_go` each time PropagateResult bubbles up
-    // one eval level. Starting at `level` means it lands exactly `level` frames up.
-    interp.return_propagate = .{
-        .left_to_go = level,
-        .return_at_end = null,
-    };
+    // `callClosure` decrements `left_to_go` each time PropagateResult leaves a
+    // closure. Starting at `level` means it lands exactly `level` calls up, and
+    // an intervening body such as an [if] does not consume any of it.
+    interp.return_propagate = .{ .left_to_go = level };
 
     return code.toError();
 }
@@ -526,6 +524,67 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
+}
+
+test "return escapes a nested body to leave the closure" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // `-level` counts closure calls, so an intervening body must not swallow the
+    // return. Each of these answers 99 if a body consumes the level instead.
+    try interp.testExpectScriptResult("42",
+        \\ fn f {} { if {true} { return 42 }; return 99 }
+        \\ f
+    );
+    try interp.testExpectScriptResult("7",
+        \\ fn g {} { for {set i 0} {$i < 3} {incr i} { return 7 }; return 99 }
+        \\ g
+    );
+    try interp.testExpectScriptResult("found",
+        \\ fn h {} { foreach x {a b c} { if {true} { return found } }; return 99 }
+        \\ h
+    );
+    // Two bodies deep is still one closure level.
+    try interp.testExpectScriptResult("deep",
+        \\ fn i {} { if {true} { if {true} { return deep } }; return 99 }
+        \\ i
+    );
+}
+
+test "return -code raises that code instead of returning" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("1", "fn f {} { return -code error boom }; catch { f }");
+    try interp.testExpectScriptResult("boom", "fn f {} { return -code error boom }; catch { f } m; set m");
+
+    // Combining -code with -level is exercised but not pinned down here: an
+    // error unwinds past `outer` either way, so the observable result is the
+    // same whether the level is honored or the error is raised immediately.
+    try interp.testExpectScriptResult("1",
+        \\ fn inner {} { return -code error -level 2 boom }
+        \\ fn outer {} { inner; return "not reached" }
+        \\ catch { outer }
+    );
+}
+
+test "return -level skips out of several closures" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Level 2 leaves both `inner` and `outer`, so `outer`'s trailing command
+    // never runs.
+    try interp.testExpectScriptResult("from inner",
+        \\ fn inner {} { return -level 2 "from inner" }
+        \\ fn outer {} { inner; return "not reached" }
+        \\ outer
+    );
+
+    // Level 0 sets the result without unwinding at all.
+    try interp.testExpectScriptResult("kept going",
+        \\ fn f {} { return -level 0 ignored; return "kept going" }
+        \\ f
+    );
 }
 
 test "return exits a closure early" {

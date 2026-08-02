@@ -31,12 +31,10 @@ pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         };
 
         const new_int = objects.Integer.new(new_contents);
-        defer new_int.release();
         try interp.setVariable(var_name, new_int);
         interp.setResult(new_int);
     } else {
         const new_int = objects.Integer.new(increment_by);
-        defer new_int.release();
         try interp.setVariable(var_name, new_int);
         interp.setResult(new_int);
     }

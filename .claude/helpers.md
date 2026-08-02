@@ -328,12 +328,21 @@ Variable resolution and the cache object types behind it.
 
 ## src/regex.zig
 
+The pcre2 foundation. Kept out of `src/commands/` because `heap.zig` drives the
+context lifecycle, and the foundation must not import from the command layer.
+
 - `regex.initGlobals()` / `regex.deinitGlobals()` -- Set up and tear down the pcre2 general context (wired into `heap.initGlobals`/`deinitGlobals`).
+- `regex.pcre2_ctx` / `regex.pcre2_match_ctx` -- The global contexts. Read them through `regex.` at the point of use; aliasing one at container scope captures the pre-`initGlobals` value.
 - `Regexp.shimmerFrom(det, shim, compile_opts)` -- Compile `shim`'s string into a pcre2 pattern. `Regexp`'s `duplicate` is `Object.duplicateStringOnly`, so a duplicate recompiles on next use.
-- `regex.doesStringMatch(det, re, bytes)` -- Boolean match against a compiled pattern.
-- `regex.matchToList(...)` -- Run a match and build the result list.
-- `regex.createIndexPair(start, end)` -- Build the two-element `{start end}` list used by `-indices`.
-- `regex.regexpCmd` / `regex.regsubCmd` -- The [regexp] and [regsub] command implementations.
+- `regex.doesStringMatch(det, re, bytes)` -- Boolean match against a compiled pattern. Used by [switch] `-regexp` as well as by the regex commands.
+
+---
+
+## src/commands/regex.zig
+
+- `regexpCmd` / `regsubCmd` -- The [regexp] and [regsub] implementations, registered by `registerCommands`.
+- `matchToList(...)` -- Run a match and build the result list.
+- `createIndexPair(start, end)` -- Build the two-element `{start end}` list used by `-indices`. Both indices are inclusive, unlike pcre2's ovector end.
 
 ---
 

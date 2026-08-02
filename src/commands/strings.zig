@@ -202,7 +202,7 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
                 const map_list = try interp.getList(&sub_args[sub_args.len - 2]);
                 const str_handle = &sub_args[sub_args.len - 1];
 
-                if (map_list.items.len != 0) {
+                if (map_list.items.len % 2 != 0) {
                     try interp.setResultString("list must contain an even number of elements");
                     return error.EvalError;
                 }
@@ -329,4 +329,120 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "append", appendCmd, "varName ?value ...?", 1, null, null);
     try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null, null);
+}
+
+const testing = std.testing;
+
+test "append basic" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Append a single value to a new variable.
+    try interp.testExpectScriptResult("hello", "append x hello");
+    // Appending again accumulates.
+    try interp.testExpectScriptResult("hello world", "append x { world}");
+}
+
+test "append multiple values" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // All values are concatenated in order.
+    try interp.testExpectScriptResult("abc", "append x a b c");
+    try interp.testExpectScriptResult("abcdef", "append x d e f");
+}
+
+test "append to unset variable" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Variable doesn't exist yet, so it should be created as empty then appended to.
+    try interp.testExpectScriptResult("new", "append unset_var new");
+    try interp.testExpectScriptResult("new", "set unset_var");
+}
+
+test "append no values" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // No values: returns current content without modifying it.
+    try interp.testExpectScriptResult("hi",
+        \\ set x hi
+        \\ append x
+    );
+    // No values on an unset variable: creates it as empty string.
+    try interp.testExpectScriptResult("",
+        \\ append never_set
+    );
+}
+
+test "append return value" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // The return value of append is the new variable contents.
+    try interp.testExpectScriptResult("foobar",
+        \\ set x foo
+        \\ set y [append x bar]
+        \\ set y
+    );
+}
+
+test "string map basic" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Single-character replacement.
+    try interp.testExpectScriptResult("bbbb", "string map {a b} abba");
+
+    // Single-character replacement on single-char string.
+    try interp.testExpectScriptResult("b", "string map {a b} a");
+
+    // Multiple replacements with overlapping prefixes.
+    // Longer keys are tried first, so "abc" matches before "ab" or "a".
+    try interp.testExpectScriptResult("A321*A*321*", "string map {abc 321 ab * a A} aabcabaababcab");
+}
+
+test "string map -nocase" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Case-insensitive single-character replacement.
+    try interp.testExpectScriptResult("bbbb", "string map -nocase {a b} Abba");
+
+    // Case-insensitive with overlapping prefixes.
+    try interp.testExpectScriptResult("A321*A*321*", "string map -nocase {aBc 321 Ab * a A} aabcabaababcab");
+
+    // One-pair case: longer key wins regardless of case.
+    try interp.testExpectScriptResult("a32aBaAb32Ab", "string map -nocase {abc 32} aAbCaBaAbAbcAb");
+
+    // One-pair case with shorter key.
+    try interp.testExpectScriptResult("a4321C4321a43214321c4321", "string map -nocase {ab 4321} aAbCaBaAbAbcAb");
+}
+
+test "string map error cases" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Odd number of elements in the mapping list is an error.
+    try interp.testExpectScriptError(error.EvalError, "list must contain an even number of elements", "string map {a b c} abba");
+}
+
+test "string map empty keys" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Empty key is skipped; the string is returned unchanged.
+    try interp.testExpectScriptResult("foo", "string map -nocase {{} abc} foo");
+
+    // Empty key followed by a real key still replaces the real key.
+    try interp.testExpectScriptResult("baroo", "string map -nocase {{} abc f bar {} def} foo");
+}
+
+test "string map case sensitive" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Case-sensitive: "Ab" only matches "Ab", not "ab" or "aB".
+    try interp.testExpectScriptResult("a4321CaBa43214321c4321", "string map {Ab 4321} aAbCaBaAbAbcAb");
 }

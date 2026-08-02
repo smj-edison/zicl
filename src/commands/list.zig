@@ -349,6 +349,18 @@ test "concat joins lists and strings" {
     try interp.testExpectScriptResult("a b", "concat {a} {} {b}");
     try interp.testExpectScriptResult("", "concat");
     try interp.testExpectScriptResult("", "concat {} {}");
+
+    // A single argument comes back as itself, trimmed.
+    try interp.testExpectScriptResult("hello", "concat hello");
+    try interp.testExpectScriptResult("hello", "concat {  hello  }");
+
+    // More than two arguments, with and without padding.
+    try interp.testExpectScriptResult("a b c", "concat a b c");
+    try interp.testExpectScriptResult("a b c", "concat {  a  } {  b  } {  c  }");
+
+    // Multi-element arguments flatten into one sequence.
+    try interp.testExpectScriptResult("1 2 3 4", "concat {1 2} {3 4}");
+    try interp.testExpectScriptResult("1 2 3", "concat {1 2 3} {}");
 }
 
 test "lmap maps a body over a list" {
