@@ -169,6 +169,69 @@ test "unset of a shadowing local exposes the lexical it shadowed" {
     );
 }
 
+test "dict sugar reads and writes through a variable" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Each assertion uses a fresh variable, since they share one interpreter and
+    // a leftover dict would be descended into by the next path.
+
+    // `one::b` names key `b` of the dict in variable `one`.
+    try interp.testExpectScriptResult("b value", "set one::b value; set one");
+    try interp.testExpectScriptResult("value", "set two::b value; set two::b");
+
+    // A second key joins the same dict rather than replacing it.
+    try interp.testExpectScriptResult("b 1 c 2", "set three::b 1; set three::c 2; set three");
+
+    // Nested paths build nested dicts.
+    try interp.testExpectScriptResult("deep", "set four::b::c deep; set four::b::c");
+    try interp.testExpectScriptResult("c deep", "set five::b::c deep; set five::b");
+}
+
+test "dict sugar copies when the dict is shared" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // `other` holds the same dict, so writing through sugar must copy rather
+    // than mutate in place, leaving `other` alone.
+    try interp.testExpectScriptResult("b 1",
+        \\ set a {b 1}
+        \\ set other $a
+        \\ set a::b 2
+        \\ return $other
+    );
+    try interp.testExpectScriptResult("b 2", "return $a");
+}
+
+test "unset removes a dict sugar element" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Only the named key goes; the rest of the dict stays.
+    try interp.testExpectScriptResult("c 2", "set a::b 1; set a::c 2; unset a::b; set a");
+
+    // Removing a key that was never there is an error.
+    try interp.testExpectScriptError(
+        error.EvalError,
+        "can't unset \"a::missing\": no such element in dictionary",
+        "set a::b 1; unset a::missing",
+    );
+}
+
+test "unset of a shared dict element copies rather than mutating" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Same copy-on-write requirement as writing, on the removal path.
+    try interp.testExpectScriptResult("b 1 c 2",
+        \\ set a {b 1 c 2}
+        \\ set other $a
+        \\ unset a::b
+        \\ return $other
+    );
+    try interp.testExpectScriptResult("c 2", "return $a");
+}
+
 test "upvar reads and writes through a link" {
     var interp = try common.testStart(testing.allocator);
     defer common.testFinish(&interp);

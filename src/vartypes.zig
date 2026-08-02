@@ -314,6 +314,17 @@ pub const DictSugar = struct {
     };
 };
 
+/// Dict sugar reports a malformed dictionary as a failed lookup, since from the
+/// script's side the path simply did not resolve. Spelled out rather than using
+/// an `else`, so that a new error in the dictionary operations has to be
+/// considered here rather than being silently folded into `LookupFailed`.
+fn asLookupFailure(err: error{ OutOfMemory, BadDict }) error{ OutOfMemory, LookupFailed } {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadDict => error.LookupFailed,
+    };
+}
+
 const VariableLookupResult = enum { not_found, dict_sugar, normal };
 pub const VariableValue = union(enum) {
     local_variable: struct {
@@ -495,53 +506,26 @@ pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
             var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
             defer dict_name.discardChanges(); // Shouldn't happen in practice, since `dict_name` is threadlocal.
 
-            if (try getVariable(interp, det, call_frame_idx, &dict_name)) |existing_dict| {
-                var existing_dict_shim: Shimmerable = .{ .original = existing_dict };
-                defer existing_dict_shim.discardChanges();
-                _ = Dictionary.shimmerFrom(det, &existing_dict_shim) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => return error.LookupFailed,
-                };
+            const path = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
 
-                if (existing_dict_shim.shimmered.isNone() and existing_dict.canMutate()) {
-                    // Mutate in place.
-                    const as_dict_mut = existing_dict.asType(Dictionary).?;
-                    as_dict_mut.putRecursively(
-                        det,
-                        objects.ValueSliceContext{ .items = dict_sugar.dict_path.items },
-                        value,
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.BadDict => return error.LookupFailed,
-                    };
+            if (try getVariable(interp, det, call_frame_idx, &dict_name)) |existing_dict| {
+                const maybe_mut = existing_dict.asMutableInPlace(Dictionary, det) catch |err| return asLookupFailure(err);
+                if (maybe_mut) |dict_mut| {
+                    dict_mut.putRecursively(det, path, value) catch |err| return asLookupFailure(err);
                 } else {
-                    const new_dict = existing_dict_shim.getMutable(Dictionary, det) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.BadDict => return error.LookupFailed,
-                    };
-                    defer new_dict.asHead().release();
-                    new_dict.putRecursively(
-                        det,
-                        objects.ValueSliceContext{ .items = dict_sugar.dict_path.items },
-                        value,
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.BadDict => return error.LookupFailed,
-                    };
-                    try setVariable(interp, det, call_frame_idx, &dict_name, new_dict.asHead().asValue());
+                    const duped = existing_dict.duplicateAsType(Dictionary, det) catch |err| return asLookupFailure(err);
+                    defer duped.asHead().release();
+                    duped.putRecursively(det, path, value) catch |err| return asLookupFailure(err);
+                    try setVariable(interp, det, call_frame_idx, &dict_name, duped.asHead().asValue());
                 }
             } else {
                 // Create a new dictionary, since this variable doesn't exist.
                 const new_dict = try Dictionary.new(&.{});
                 defer new_dict.asHead().release();
 
-                new_dict.putRecursively(
-                    det,
-                    objects.ValueSliceContext{ .items = dict_sugar.dict_path.items },
-                    value,
-                ) catch |err| switch (err) {
+                new_dict.putRecursively(det, path, value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.BadDict => unreachable,
+                    error.BadDict => unreachable, // Freshly built, so it is a dict.
                 };
 
                 try setVariable(interp, det, call_frame_idx, &dict_name, new_dict.asHead().asValue());
@@ -704,40 +688,25 @@ pub fn unsetVariable(
                 };
                 return error.VariableNotFound;
             };
-            var resolved_dict_shim: Shimmerable = .{ .original = resolved_dict };
-            defer resolved_dict_shim.discardChanges();
-            _ = try Dictionary.shimmerFrom(det, &resolved_dict_shim);
+            const path = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
 
-            const dict_items = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
             const did_remove = blk: {
-                if (resolved_dict_shim.current().canMutate()) {
-                    const as_dict_mut = resolved_dict_shim.current().asType(Dictionary).?;
-                    const did_remove = as_dict_mut.removeRecursively(null, dict_items) catch |err| switch (err) {
+                if (try resolved_dict.asMutableInPlace(Dictionary, det)) |dict_mut| {
+                    break :blk dict_mut.removeRecursively(null, path) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => {
-                            if (det) |details| details.* = .{ .message = try allocPrintZ(
-                                "can't unset \"{s}\": no such element in dictionary",
-                                .{try name.current().getString()},
-                            ) };
-                            return error.VariableNotFound;
-                        },
+                        else => false,
                     };
-                    break :blk did_remove;
                 } else {
-                    const new_dict = try resolved_dict_shim.getMutable(Dictionary, det);
-                    defer new_dict.asHead().release();
-                    const did_remove = new_dict.removeRecursively(det, dict_items) catch |err| switch (err) {
+                    const duped = try resolved_dict.duplicateAsType(Dictionary, det);
+                    defer duped.asHead().release();
+                    const removed = duped.removeRecursively(null, path) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => {
-                            if (det) |details| details.* = .{ .message = try allocPrintZ(
-                                "can't unset \"{s}\": no such element in dictionary",
-                                .{try name.current().getString()},
-                            ) };
-                            return error.VariableNotFound;
-                        },
+                        else => false,
                     };
-                    try setVariable(interp, null, call_frame_idx, &dict_name_shim, new_dict.asHead().asValue());
-                    break :blk did_remove;
+                    if (removed) {
+                        try setVariable(interp, null, call_frame_idx, &dict_name_shim, duped.asHead().asValue());
+                    }
+                    break :blk removed;
                 }
             };
 
