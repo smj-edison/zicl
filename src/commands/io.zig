@@ -121,8 +121,6 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             try interp.setResultString(root);
         },
         .join => {
-            // The parts are scratch that dies with the command, so they go in the
-            // arena; the joined path becomes the result, so it is owned and moved.
             var path_parts = try std.ArrayList([]const u8).initCapacity(heap.local_arena, args.len - 2);
             for (args[2..]) |arg| {
                 path_parts.appendAssumeCapacity(try arg.getString());
@@ -261,9 +259,6 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 };
                 defer file.close(heap.global_io);
 
-                // The buffer already holds exactly the result, so move it rather
-                // than copying. `toOwnedSliceSentinel` empties the list, which
-                // leaves the `defer deinit` above a no-op.
                 try interp.setResultStringOwning(try path_buf.toOwnedSliceSentinel(heap.global_gpa, 0));
                 return;
             }

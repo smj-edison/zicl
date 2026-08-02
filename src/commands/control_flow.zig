@@ -64,7 +64,8 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 /// Shared implementation of [foreach] and [lmap].
-fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, map }) Interp.Error!void {
+/// Shared by [foreach] here and [lmap] in `list.zig`.
+pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, map }) Interp.Error!void {
     const body = &args[args.len - 1];
 
     // [foreach] can simultaneously loop over multiple lists, so it's easiest to

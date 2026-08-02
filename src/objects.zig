@@ -1481,12 +1481,14 @@ pub const List = struct {
         const old_len = list.items.len;
         list.items = list.backingSlice()[0..(old_len + 1)];
         list.items[old_len] = value;
+        list.asHead().invalidateString();
     }
 
     /// `list` must be mutable.
     pub fn set(list: *List, index: usize, value: Value) !void {
         assert(list.asHead().canMutate());
         list.items[index].swap(value);
+        list.asHead().invalidateString();
     }
 
     /// `list` must be mutable.

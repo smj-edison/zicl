@@ -1217,6 +1217,12 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
+    // Registered before any other defer so it runs last, after `args_raw` (which
+    // itself lives in the arena) has been deinited. Covers straight-line scripts,
+    // where `evalObjectInner`'s reset would not fire until the script ended.
+    const arena_snapshot = heap.local_arena_instance.snapshot();
+    defer heap.local_arena_instance.rewind(arena_snapshot);
+
     const tags = parsed.tags;
 
     // First token of the command is always .parsed_script_command.
@@ -1303,6 +1309,12 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
 }
 
 pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) evaltypes.EvalError!void {
+    // A loop evaluates its body through here once per iteration, which is what
+    // keeps an iterating script from accumulating. Nesting is safe, since an
+    // inner evaluation snapshots at a higher watermark than an outer one.
+    const arena_snapshot = heap.local_arena_instance.snapshot();
+    defer heap.local_arena_instance.rewind(arena_snapshot);
+
     // Try to get the script, parsing if necessary.
     const parsed = (try interp.getScript(script, cache_key));
     defer parsed.asHead().release(); // `parsed` was borrowed by `getScript`.

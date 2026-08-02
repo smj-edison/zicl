@@ -26,7 +26,9 @@ pub var init_mutex: std.Io.Mutex = .init;
 pub var running_leak_check: bool = false;
 
 pub var global_gpa: mem.Allocator = undefined;
-threadlocal var local_arena_instance: memutil.RewindableArena = undefined;
+/// Backing of `local_arena`. Used for snapshotting + rewinding to
+/// have a scoped arena. Currently snapshotted and rewound at eval boundaries.
+pub threadlocal var local_arena_instance: memutil.RewindableArena = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var nativefn_registry: NativeFnRegistry = .{};

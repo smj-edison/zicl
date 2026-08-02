@@ -339,6 +339,56 @@ test "fn shadows a lexical with a local of the same name" {
     );
 }
 
+test "evaluation recycles arena scratch instead of accumulating it" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Every `$i` interpolation stringifies an inline integer into the arena, and
+    // every command allocates its argument array there, so this loop is the
+    // shape that used to grow without bound.
+    const loop =
+        \\ set total 0
+        \\ for {set i 0} {$i < 40} {incr i} {
+        \\   set label "value $i"
+        \\   set total [+ $total $i]
+        \\ }
+        \\ return $total
+    ;
+
+    // Warm up first: the arena has to reach its steady-state chunk count before
+    // the comparison means anything, since early rounds legitimately allocate.
+    try interp.testExpectScriptResult("780", loop);
+    const warmed = heap.local_arena_instance.queryCapacity();
+
+    // Far more work than the warmup. Without a rewind this grows every round.
+    for (0..20) |_| try interp.testExpectScriptResult("780", loop);
+
+    try std.testing.expectEqual(warmed, heap.local_arena_instance.queryCapacity());
+}
+
+test "arena scratch does not scale with the work a script does" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    // A loop reclaims per iteration, since its body is its own evaluation.
+    try interp.testExpectScriptResult("", "for {set i 0} {$i < 10} {incr i} { set s \"v $i\" }");
+    const small_loop = heap.local_arena_instance.queryCapacity();
+    try interp.testExpectScriptResult("", "for {set i 0} {$i < 400} {incr i} { set s \"v $i\" }");
+    try std.testing.expectEqual(small_loop, heap.local_arena_instance.queryCapacity());
+
+    // A long flat script is the case the two reset points differ on: it is one
+    // evaluation, so only the per-command reset keeps it from accumulating every
+    // command's argument array until the script ends.
+    var flat: std.ArrayList(u8) = .empty;
+    defer flat.deinit(heap.global_gpa);
+    for (0..400) |n| {
+        var line: [64]u8 = undefined;
+        try flat.appendSlice(heap.global_gpa, try std.fmt.bufPrint(&line, "set v{} {}\n", .{ n, n }));
+    }
+    _ = try interp.testRunScript(flat.items);
+    try std.testing.expectEqual(small_loop, heap.local_arena_instance.queryCapacity());
+}
+
 test "subst reports a parse error without faulting" {
     var interp = try common.testStart(std.testing.allocator);
     defer common.testFinish(&interp);

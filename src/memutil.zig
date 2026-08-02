@@ -225,7 +225,28 @@ pub const RewindableArena = struct {
 
     /// Restore the arena to `snap`. Chunks linked after `snap`'s node stay
     /// in place and are overwritten as later allocations reach them.
+    ///
+    /// Everything allocated since `snap` is invalid afterwards. In safety
+    /// builds the reclaimed bytes are poisoned, so a slice held across the
+    /// rewind reads as `undefined` rather than as stale but plausible data.
+    /// Without that, a lifetime bug here is silent.
     pub fn rewind(arena: *RewindableArena, snap: Snapshot) void {
+        const start_node = snap.current orelse arena.first;
+        const start_index = if (snap.current != null) snap.end_index else 0;
+
+        if (std.debug.runtime_safety) {
+            // Poison from the watermark to the end of that chunk, then all of
+            // every chunk after it, since allocation only ever moves forward.
+            var it = start_node;
+            var from = start_index;
+            while (it) |node| : (it = node.next) {
+                const chunk = node.buf();
+                if (from < node.end_index) @memset(chunk[from..node.end_index], undefined);
+                from = 0;
+                if (node == arena.current) break;
+            }
+        }
+
         if (snap.current) |node| {
             arena.current = node;
             node.end_index = snap.end_index;
