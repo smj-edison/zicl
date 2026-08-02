@@ -1997,8 +1997,7 @@ pub fn signalMaskToList(mask: u64) !Value {
     errdefer list.asHead().release();
     inline for (signal_name_map) |entry| {
         if (mask & (@as(u64, 1) << entry.num) != 0) {
-            const str = heap.createInternedString(entry.name).get();
-            list.appendAssumeCapacity(str);
+            list.appendAssumeCapacity(heap.InternedString.newValue(entry.name));
         }
     }
     return list.asHead().asValue();

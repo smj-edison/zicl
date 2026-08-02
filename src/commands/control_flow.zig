@@ -527,3 +527,19 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
     try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
 }
+
+test "return exits a closure early" {
+    var interp = try common.testStart(std.testing.allocator);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("42",
+        \\ fn getval {} { return 42; set x 99 }
+        \\ getval
+    );
+
+    // A bare `return` yields the empty result rather than the last value.
+    try interp.testExpectScriptResult("",
+        \\ fn nothing {} { set x 99; return }
+        \\ nothing
+    );
+}

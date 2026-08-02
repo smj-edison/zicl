@@ -1,18 +1,38 @@
+const std = @import("std");
+const assert = std.debug.assert;
+
+const common = @import("common.zig");
+const heap = common.heap;
+const objects = common.objects;
+const Value = common.Value;
+const OptionalValue = heap.OptionalValue;
+const Dictionary = objects.Dictionary;
+const Interp = common.Interp;
+const Shimmerable = common.Shimmerable;
+const registerCommand = common.registerCommand;
+
+const interned_code = heap.InternedString.newValue("-code");
+const interned_level = heap.InternedString.newValue("-level");
+const interned_errorstack = heap.InternedString.newValue("-errorstack");
+const interned_errorcode = heap.InternedString.newValue("-errorcode");
+const interned_during = heap.InternedString.newValue("-during");
+
 fn buildErrorOptions(
     interp: *Interp,
     exit_code: Interp.ReturnCode,
-    stack_trace: OptionalHandle,
-    error_code: OptionalHandle,
-    during: OptionalHandle,
-) error{OutOfMemory}!Handle {
-    const options = try objutil.newDictWithCapacity(10);
+    stack_trace: OptionalValue,
+    error_code: OptionalValue,
+    during: OptionalValue,
+) error{OutOfMemory}!Value {
+    const options = try Dictionary.newWithCapacity(&.{}, 10);
+    errdefer options.asHead().release();
 
     // The return code surfaced to the caller.
     const visible_code: i64 = code: {
         // .return is an internal return type, so it should never be surfaced to the callee.
         if (exit_code == .@"return") {
             if (interp.return_propagate.return_at_end) |to_return| {
-                break :code @intFromEnum(Interp.ReturnCode.fromErrorUnion(to_return));
+                break :code @intFromEnum(Interp.ReturnCode.fromError(to_return));
             } else {
                 break :code @intFromEnum(@as(Interp.ReturnCode, .ok));
             }
@@ -21,39 +41,28 @@ fn buildErrorOptions(
         }
     };
 
-    objutil.dictPutAssumeCapacity(options, Heap.local_heap.getInternedString(.@"-code"), objutil.integerObject(visible_code));
-    objutil.dictPutAssumeCapacity(
-        options,
-        Heap.local_heap.getInternedString(.@"-level"),
-        objutil.integerObject(interp.return_propagate.left_to_go),
-    );
+    try options.put(interned_code, objects.Integer.new(visible_code));
+    try options.put(interned_level, objects.Integer.new(interp.return_propagate.left_to_go));
 
     if (exit_code == .@"error") {
-        if (stack_trace.toHandle()) |val| {
-            objutil.dictPutAssumeCapacity(options, Heap.local_heap.getInternedString(.@"-errorstack"), val.reference());
-        }
-
-        if (error_code.toHandle()) |val| {
-            objutil.dictPutAssumeCapacity(options, Heap.local_heap.getInternedString(.@"-errorcode"), val.reference());
-        }
+        if (stack_trace.asValue()) |val| try options.put(interned_errorstack, val);
+        if (error_code.asValue()) |val| try options.put(interned_errorcode, val);
     }
 
-    if (during.toHandle()) |val| {
-        objutil.dictPutAssumeCapacity(options, Heap.local_heap.getInternedString(.@"-during"), val.reference());
-    }
+    if (during.asValue()) |val| try options.put(interned_during, val);
 
-    return options;
+    return options.asHead().asValue();
 }
 
 fn buildErrorOptionsBestEffort(
     interp: *Interp,
     exit_code: Interp.ReturnCode,
-    stack_trace: OptionalHandle,
-    error_code: OptionalHandle,
-    during: OptionalHandle,
-) Handle {
+    stack_trace: OptionalValue,
+    error_code: OptionalValue,
+    during: OptionalValue,
+) Value {
     return buildErrorOptions(interp, exit_code, stack_trace, error_code, during) catch {
-        return Heap.local_heap.oom_error_options_dict.?.borrow();
+        return heap.oom_error_options_dict.?.borrow();
     };
 }
 
@@ -119,16 +128,16 @@ fn catchTryHelper(
                 // Evaluated just fine.
                 break :blk .ok;
             } else |err| {
-                break :blk Interp.ReturnCode.fromErrorUnion(err);
+                break :blk Interp.ReturnCode.fromError(err);
             }
         }
     };
     var error_code = interp.pending_error_code;
     interp.pending_error_code = .none;
-    defer error_code.decrOptional();
+    defer error_code.release();
     const stack_trace = interp.stack_trace;
     interp.stack_trace = .none;
-    defer stack_trace.decrOptional();
+    defer stack_trace.release();
 
     // In this next section, we need to find if there's a script that we need to run
     // to handle the associated error. The following logic determines what branch
@@ -141,21 +150,21 @@ fn catchTryHelper(
     // If `branch_matched` is true, but `handler_script` is null, it means we've hit a
     // branch but haven't found its script yet.
     var branch_matched = false;
-    var handler_script: ?Handle = null;
-    defer if (handler_script) |val| val.decrRefCount();
-    var finally_script: ?Handle = null;
-    defer if (finally_script) |val| val.decrRefCount();
-    var message_var_name: ?Handle = null;
-    defer if (message_var_name) |val| val.decrRefCount();
-    var options_var_name: ?Handle = null;
-    defer if (options_var_name) |val| val.decrRefCount();
+    var handler_script: ?Value = null;
+    defer if (handler_script) |val| val.release();
+    var finally_script: ?Value = null;
+    defer if (finally_script) |val| val.release();
+    var message_var_name: ?Value = null;
+    defer if (message_var_name) |val| val.release();
+    var options_var_name: ?Value = null;
+    defer if (options_var_name) |val| val.release();
 
     if (mode == .@"try") {
         // For [try], we need to find either a matching `on` or a matching `trap`.
         // We also need to see if there's a `finally`. If we find a matching branch,
         // we set `handler_script`, as well as `message_var_name` and `options_var_name`
         // if present. We also set `finally_script` if there's a `finally` branch.
-        const TryOptions = objutil.TclEnum(enum { on, trap, finally }, "try options", false);
+        const TryOptions = objects.EnumConstructor(enum { on, trap, finally }, false);
 
         outer: while (arg_index < args.len) {
             const option = TryOptions.get(null, &args[arg_index]) catch |err| switch (err) {
@@ -193,9 +202,9 @@ fn catchTryHelper(
 
                     handler_script = on_params[3].current().borrow();
 
-                    const vars_to_bind_len = try interp.getListLength(&on_params[2]);
-                    if (vars_to_bind_len > 0) message_var_name = objutil.listItem(on_params[2].current(), 0).borrow();
-                    if (vars_to_bind_len > 1) options_var_name = objutil.listItem(on_params[2].current(), 1).borrow();
+                    const vars_to_bind = try interp.getList(&on_params[2]);
+                    if (vars_to_bind.items.len > 0) message_var_name = vars_to_bind.items[0].borrow();
+                    if (vars_to_bind.items.len > 1) options_var_name = vars_to_bind.items[1].borrow();
                 },
                 .trap => {
                     if (args.len - arg_index < 4) return error.WrongUsage;
@@ -211,19 +220,19 @@ fn catchTryHelper(
                         // Don't check the trap if no error was reported.
                         if (exit_code != .@"error") continue;
 
-                        if (error_code.toHandleRef()) |code| {
-                            const code_len = try interp.getListLengthInPlace(code);
+                        if (error_code.asValue()) |code| {
+                            var code_shim: Shimmerable = .{ .original = code };
+                            defer code_shim.discardChanges();
+                            const code_list = try interp.getList(&code_shim);
                             const match_code = &trap_params[1]; // Error code to match against.
-                            const match_code_len = try interp.getListLength(match_code);
+                            const match_list = try interp.getList(match_code);
 
                             // If the code we're wanting to check is longer than the returned
                             // error code, it obviously doesn't match.
-                            if (match_code_len > code_len) continue;
+                            if (match_list.items.len > code_list.items.len) continue;
 
-                            for (0..match_code_len) |i| {
-                                const code_item = objutil.listItem(code.*, @intCast(i));
-                                const match_item = objutil.listItem(match_code.current(), @intCast(i));
-                                if (!try Heap.checkIfEqual(code_item, match_item)) {
+                            for (match_list.items, code_list.items[0..match_list.items.len]) |match_item, code_item| {
+                                if (!try code_item.equals(match_item)) {
                                     // Not the same, since this item wasn't the same.
                                     continue :outer;
                                 }
@@ -240,9 +249,9 @@ fn catchTryHelper(
 
                     handler_script = trap_params[3].current().borrow();
 
-                    const vars_to_bind_len = try interp.getListLength(&trap_params[2]);
-                    if (vars_to_bind_len > 0) message_var_name = objutil.listItem(trap_params[2].current(), 0).borrow();
-                    if (vars_to_bind_len > 1) options_var_name = objutil.listItem(trap_params[2].current(), 1).borrow();
+                    const vars_to_bind = try interp.getList(&trap_params[2]);
+                    if (vars_to_bind.items.len > 0) message_var_name = vars_to_bind.items[0].borrow();
+                    if (vars_to_bind.items.len > 1) options_var_name = vars_to_bind.items[1].borrow();
                 },
                 .finally => {
                     if (args.len - arg_index != 2) return error.WrongUsage;
@@ -285,26 +294,25 @@ fn catchTryHelper(
     }
 
     if (message_var_name) |var_name| if ((try var_name.getString()).len > 0) {
-        var var_name_wb: Shimmerable = .{ .original = var_name };
-        defer var_name_wb.discardChanges();
+        var var_name_shim: Shimmerable = .{ .original = var_name };
+        defer var_name_shim.discardChanges();
 
         const current_error = interp.result;
-        try interp.setVariableTo(&var_name_wb, current_error);
+        try interp.setVariable(&var_name_shim, current_error);
     };
 
-    var options_dict: OptionalHandle = .none;
-    defer options_dict.decrOptional();
+    var options_dict: OptionalValue = .none;
+    defer options_dict.release();
 
     if (options_var_name) |var_name| if ((try var_name.getString()).len > 0) {
-        var var_name_wb: Shimmerable = .{ .original = var_name };
-        defer var_name_wb.discardChanges();
+        var var_name_shim: Shimmerable = .{ .original = var_name };
+        defer var_name_shim.discardChanges();
 
-        if (options_dict == .none) {
-            const options = buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none);
-            options_dict = options.toOptional();
+        if (options_dict.isNone()) {
+            options_dict.swap(buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none));
         }
 
-        try interp.setVariableTo(&var_name_wb, options_dict.toHandle().?);
+        try interp.setVariable(&var_name_shim, options_dict.asValue().?);
     };
 
     var script_result: Interp.Error!void = exit_code.toError();
@@ -318,15 +326,14 @@ fn catchTryHelper(
             // we can't use `try` in this scenario.
             script_result = err;
 
-            if (options_dict == .none) {
-                const options = buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none);
-                options_dict = options.toOptional();
+            if (options_dict.isNone()) {
+                options_dict.swap(buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none));
             }
 
-            interp.pending_error_during.swap(options_dict.toHandle().?.borrow());
+            interp.pending_error_during.swap(options_dict.asValue().?.borrow());
             options_dict.swap(buildErrorOptionsBestEffort(
                 interp,
-                Interp.ReturnCode.fromErrorUnion(err),
+                Interp.ReturnCode.fromError(err),
                 interp.stack_trace,
                 interp.pending_error_code,
                 options_dict,
@@ -338,19 +345,18 @@ fn catchTryHelper(
         // Save the previous result, so if the `finally` runs successfully,
         // we restore the previous result.
         const previous_result = interp.result.borrow();
-        defer previous_result.decrRefCount();
+        defer previous_result.release();
 
         if (interp.evalObject(finally)) {
             interp.setResult(previous_result);
         } else |err| {
             script_result = err;
 
-            if (options_dict == .none) {
-                const options = buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none);
-                options_dict = options.toOptional();
+            if (options_dict.isNone()) {
+                options_dict.swap(buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none));
             }
 
-            interp.pending_error_during.swap(options_dict.toHandle().?.borrow());
+            interp.pending_error_during.swap(options_dict.asValue().?.borrow());
         }
     }
 
@@ -373,4 +379,176 @@ pub fn catchCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 /// [try script ?handler ...? ?finally body?]
 pub fn tryCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     return catchTryHelper(interp, .@"try", args);
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerCommand(interp, "catch", catchCmd, "?options? script ?resultVar? ?optionsVar?", 1, null, null);
+    try registerCommand(interp, "try", tryCmd, "?options? body ?handler ...? ?finally script?", 1, null, null);
+}
+
+const testing = std.testing;
+
+test "catch and error" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // Basic catch -- normal return gives code 0.
+    try interp.testExpectScriptResult("0",
+        \\ catch { set x 42 }
+    );
+
+    // Catch an error -- code 1.
+    try interp.testExpectScriptResult("1",
+        \\ catch { error "boom" }
+    );
+
+    // Capture result variable.
+    try interp.testExpectScriptResult("boom",
+        \\ catch { error "boom" } msg
+        \\ set msg
+    );
+
+    // Capture opts variable and check -code.
+    try interp.testExpectScriptResult("1",
+        \\ catch { error "boom" } msg opts
+        \\ dict get $opts -code
+    );
+
+    // [error] with a custom error code.
+    try interp.testExpectScriptResult("MY CODE",
+        \\ catch { error "boom" {MY CODE} } msg opts
+        \\ dict get $opts -errorcode
+    );
+}
+
+test "try command" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // try with on handler matching error.
+    try interp.testExpectScriptResult("caught: boom",
+        \\ try {
+        \\   error "boom"
+        \\ } on error {msg} {
+        \\   set msg "caught: $msg"
+        \\ }
+    );
+
+    // try with finally. The two bodies write distinguishable values, so this
+    // fails if either one is skipped or if they run in the wrong order.
+    try interp.testExpectScriptResult("body",
+        \\ set marker none
+        \\ try { set marker body } finally { set marker "$marker,finally" }
+    );
+    // The body's result survives the finally, but the finally still ran.
+    try interp.testExpectScriptResult("body,finally", "set marker");
+
+    // try with on ok handler.
+    try interp.testExpectScriptResult("ok result",
+        \\ try { set result "ok result" } on ok {val} { set val }
+    );
+}
+
+test "try trap matches an error code prefix" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // A trap pattern matches when it is a prefix of the raised -errorcode.
+    try interp.testExpectScriptResult("trapped: boom",
+        \\ try {
+        \\   error "boom" {ARITH DIVZERO}
+        \\ } trap {ARITH} {msg} {
+        \\   set msg "trapped: $msg"
+        \\ }
+    );
+
+    // An exact match works too.
+    try interp.testExpectScriptResult("trapped",
+        \\ try { error "boom" {ARITH DIVZERO} } trap {ARITH DIVZERO} {msg} { return trapped }
+    );
+
+    // A pattern longer than the code cannot match, so this falls to [on error].
+    try interp.testExpectScriptResult("fell through",
+        \\ try {
+        \\   error "boom" {ARITH}
+        \\ } trap {ARITH DIVZERO} {msg} {
+        \\   return trapped
+        \\ } on error {msg} {
+        \\   return "fell through"
+        \\ }
+    );
+
+    // A pattern that differs on an element does not match either.
+    try interp.testExpectScriptResult("fell through",
+        \\ try {
+        \\   error "boom" {ARITH DIVZERO}
+        \\ } trap {POSIX ENOENT} {msg} {
+        \\   return trapped
+        \\ } on error {msg} {
+        \\   return "fell through"
+        \\ }
+    );
+}
+
+test "try falls through a handler whose body is a dash" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // `-` means "use the next handler's body", which is how Tcl shares one
+    // implementation across several codes.
+    try interp.testExpectScriptResult("shared",
+        \\ try {
+        \\   error "boom"
+        \\ } on error {msg} - on break {msg} {
+        \\   return shared
+        \\ }
+    );
+}
+
+test "try runs finally on both success and failure" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // The finally body runs even when a handler caught an error, and the
+    // handler's result survives it.
+    try interp.testExpectScriptResult("handled",
+        \\ set marker none
+        \\ try { error "boom" } on error {msg} { return handled } finally { set marker ran }
+    );
+    try interp.testExpectScriptResult("ran", "set marker");
+
+    // An error inside finally replaces the original result.
+    try interp.testExpectScriptError(error.EvalError, "from finally",
+        \\ try { set x fine } finally { error "from finally" }
+    );
+}
+
+test "the preallocated OOM fallback is a usable options dict" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // `buildErrorOptionsBestEffort` hands this out when it cannot allocate, and
+    // the [try] logic reads codes straight out of it, so it has to already be a
+    // dictionary rather than a string that would need shimmering to become one.
+    const fallback = heap.oom_error_options_dict.?;
+    try testing.expect(fallback.asType(Dictionary) != null);
+
+    var name: Shimmerable = .{ .original = try objects.String.newValue("opts") };
+    defer name.deinit();
+    try interp.setVariable(&name, fallback);
+
+    try interp.testExpectScriptResult("1", "dict get $opts -code");
+    try interp.testExpectScriptResult("0", "dict get $opts -level");
+    // `ZICL OOM` rather than Tcl's `NONE`, so a script can tell this fallback
+    // apart from a genuine error that simply carried no code.
+    try interp.testExpectScriptResult("ZICL OOM", "dict get $opts -errorcode");
+}
+
+test "catch reports the code of non-error outcomes" {
+    var interp = try common.testStart(testing.allocator);
+    defer common.testFinish(&interp);
+
+    // 3 is `break`, 4 is `continue`.
+    try interp.testExpectScriptResult("3", "catch { break }");
+    try interp.testExpectScriptResult("4", "catch { continue }");
 }

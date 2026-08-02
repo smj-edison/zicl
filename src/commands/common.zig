@@ -42,6 +42,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try @import("dict.zig").registerCommands(interp);
     try @import("io.zig").registerCommands(interp);
     try @import("list.zig").registerCommands(interp);
+    try @import("try_catch.zig").registerCommands(interp);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
@@ -66,4 +67,5 @@ test {
     _ = @import("variables.zig");
     _ = @import("io.zig");
     _ = @import("list.zig");
+    _ = @import("try_catch.zig");
 }

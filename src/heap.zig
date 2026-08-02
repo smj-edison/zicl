@@ -36,8 +36,10 @@ pub var registered_hashes: HashRegistry = .{};
 
 var trace_mutex: std.Io.Mutex = .init;
 /// Preallocated fallback used by `[catch]` when a script OOMs and building
-/// the real opts dict also OOMs.
-var oom_error_options_dict: ?Value = null;
+/// the real opts dict also OOMs. Built up front precisely because that path
+/// cannot allocate, and the `[try]` logic needs a real dictionary rather than
+/// something that would have to be shimmered into one.
+pub var oom_error_options_dict: ?Value = null;
 
 /// Initialize global heap state. Must be called once per process (or test).
 pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
@@ -54,8 +56,27 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
 
     leak_check.init();
     try regex.initGlobals();
+    errdefer regex.deinitGlobals();
+
+    // Shared across threads, so it ref counts atomically. Being cross-thread
+    // also freezes it, which is what we want for a value every `[catch]` may
+    // hand out: a caller that mutates it copies instead.
+    const oom_dict = try objects.Dictionary.new(&.{
+        InternedString.newValue("-code"),      Value.newInt(1),
+        InternedString.newValue("-level"),     Value.newInt(0),
+        InternedString.newValue("-errorcode"), InternedString.newValue("ZICL OOM"),
+    });
+    oom_dict.asHead().makeCrossthread();
+    oom_error_options_dict = oom_dict.asHead().asValue();
 
     initialized = true;
+}
+
+/// Release the preallocated fallback. Separate from `deinitGlobals` because the
+/// leak check has to run after it, and `deinitGlobals` tears the leak check down.
+fn freeOomErrorOptionsDict() void {
+    if (oom_error_options_dict) |dict| dict.release();
+    oom_error_options_dict = null;
 }
 
 /// Tear down global heap state. After this call, `initGlobals` may be called again.
@@ -64,6 +85,8 @@ pub fn deinitGlobals() void {
     defer init_mutex.unlock(global_io);
 
     if (!initialized) return;
+
+    freeOomErrorOptionsDict();
 
     leak_check.deinit();
     regex.deinitGlobals();
@@ -90,6 +113,9 @@ pub fn testStart(gpa: Allocator, io: std.Io) !void {
 }
 
 pub fn testFinish() void {
+    // Ahead of the leak check, or the preallocated fallback is still live and
+    // reports as a leak in every single test.
+    freeOomErrorOptionsDict();
     if (options.trace_mem) leak_check.dumpLeaks() catch {};
     deinitThread();
     deinitGlobals();
