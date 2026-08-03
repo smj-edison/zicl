@@ -249,7 +249,7 @@ pub const MyType = struct {
     }
 
     fn enumerateStruct(obj: *const heap.Object, ctx: memutil.StructIterator, info: *const memutil.StructIterator.NodeInfo) memutil.StructIterator.Error!void {
-        try ctx.addField(i64, info, "field", "{}", obj.asTypeConst(MyType).?.field);
+        try ctx.addField(i64, info, "field", "{}", .{obj.asTypeConst(MyType).?.field});
     }
 
     pub const vtable: heap.Object.VTable = .{

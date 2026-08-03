@@ -17,6 +17,7 @@ const ioutil = @import("ioutil.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
+const capability = @import("capability.zig");
 
 pub var initialized: bool = false;
 /// Use to lock `custom_types` or `script_metadata` when adding or removing
@@ -41,8 +42,16 @@ var trace_mutex: std.Io.Mutex = .init;
 /// something that would have to be shimmered into one.
 pub var oom_error_options_dict: ?Value = null;
 
+/// Settings an embedder can override at startup, grouped by the subsystem that
+/// reads them. Every field defaults, so `.{}` is the ordinary call. Named
+/// `Config` rather than `Options` because `options` here is the build-time
+/// options module.
+pub const Config = struct {
+    capability: capability.Options = .{},
+};
+
 /// Initialize global heap state. Must be called once per process (or test).
-pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
+pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
     init_mutex.lockUncancelable(io);
     defer init_mutex.unlock(io);
 
@@ -57,6 +66,8 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
     leak_check.init();
     try regex.initGlobals();
     errdefer regex.deinitGlobals();
+    try capability.initGlobals(config.capability);
+    errdefer capability.deinitGlobals();
 
     // Shared across threads, so it ref counts atomically. Being cross-thread
     // also freezes it, which is what we want for a value every `[catch]` may
@@ -74,7 +85,9 @@ pub fn initGlobals(gpa: Allocator, io: std.Io) !void {
 
 /// Release the preallocated fallback. Separate from `deinitGlobals` because the
 /// leak check has to run after it, and `deinitGlobals` tears the leak check down.
-fn freeOomErrorOptionsDict() void {
+/// Only safe once no script can run again: `[catch]` reaches for this dict with
+/// `.?`, so a caller that frees it and keeps evaluating panics on the next OOM.
+pub fn freeOomErrorOptionsDict() void {
     if (oom_error_options_dict) |dict| dict.release();
     oom_error_options_dict = null;
 }
@@ -89,6 +102,7 @@ pub fn deinitGlobals() void {
     freeOomErrorOptionsDict();
 
     leak_check.deinit();
+    capability.deinitGlobals();
     regex.deinitGlobals();
 
     nativefn_registry.deinit(global_gpa);
@@ -108,7 +122,7 @@ pub fn deinitThread() void {
 }
 
 pub fn testStart(gpa: Allocator, io: std.Io) !void {
-    try initGlobals(gpa, io);
+    try initGlobals(gpa, io, .{});
     initThread();
 }
 
@@ -952,10 +966,20 @@ pub const Object = extern struct {
     pub fn noopMakeCrossthread(_: *Object) void {}
 
     pub fn makeCrossthread(obj: *Object) void {
+        // Marking is one-way and always covers the whole subgraph, so an object
+        // that is already marked has already had its children marked too. Bail
+        // out rather than walking them again: scope dictionaries chain through
+        // `~parent` to every enclosing scope, so re-walking on each capture
+        // turns marking a closure's scope into a walk of the entire chain.
+        if (obj.metadata.cross_thread) return;
+
+        // Marked before recursing, so a graph that reaches back into itself
+        // terminates on the check above rather than recursing forever.
+        obj.metadata.cross_thread = true;
+
         // A null entry means the type cannot cross threads, so the unwrap
         // intentionally panics when it doesn't have an impl.
         obj.vtable.make_crossthread.?(obj);
-        obj.metadata.cross_thread = true;
     }
 
     pub fn enumerateStruct(

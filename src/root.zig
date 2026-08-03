@@ -26,6 +26,7 @@ test {
     _ = @import("ioutil.zig");
     _ = @import("leak_check.zig");
 
+    _ = @import("capability.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("Interp.zig");
     _ = @import("expr_parse.zig");

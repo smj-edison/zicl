@@ -878,7 +878,7 @@ pub const Expression = struct {
                     inline else => unreachable,
                 };
 
-                return Value.newInt(if (result) 1 else 0);
+                return Value.newBool(result);
             },
             .ternary_conditional => {
                 const children = node.data.ternary;
@@ -914,7 +914,7 @@ pub const Expression = struct {
                 const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
 
                 if (lhs_as_bool) {
-                    var rhs_value = try evalNode(interp, nodes, children.@"0");
+                    var rhs_value = try evalNode(interp, nodes, children.@"1");
                     defer rhs_value.release();
                     const rhs_as_bool = try interp.getBooleanInPlace(&rhs_value);
                     return Value.newBool(rhs_as_bool);
@@ -933,7 +933,7 @@ pub const Expression = struct {
                     // Short circuit and never evaluate rhs.
                     return Value.newBool(true);
                 } else {
-                    var rhs_value = try evalNode(interp, nodes, children.@"0");
+                    var rhs_value = try evalNode(interp, nodes, children.@"1");
                     defer rhs_value.release();
                     const rhs_as_bool = try interp.getBooleanInPlace(&rhs_value);
                     return Value.newBool(rhs_as_bool);
@@ -1539,11 +1539,20 @@ pub const Closure = struct {
         try helper.follow(Content, "closure", closure.content);
     }
 
+    fn makeCrossthread(obj: *Object) void {
+        const content = obj.asType(Closure).?.content;
+        content.arg_names.inner.makeCrossthread();
+        if (content.optional_values) |optional| optional.inner.makeCrossthread();
+        content.body.makeCrossthread();
+        content.name.makeCrossthread();
+        if (content.scope_hash_ref) |scope| scope.inner.makeCrossthread();
+    }
+
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
-        .make_crossthread = null,
+        .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
         .name = @typeName(@This()),
     };
