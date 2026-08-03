@@ -280,6 +280,7 @@ const result = try processData(data);  // Ownership transferred on success.
 This project has comprehensive tracing for all memory operations. _Always_ read the complete trace before jumping into the code -- the trace often holds the answer. With `trace_mem` enabled, `leak_check.dumpLeaks` prints a dot graph of leaked objects (showing what is leaking and how it is reachable) and a per-object operation history (showing the refcount operations that left it alive). On a panic, `dumpLastTouchedTrace` prints the history of the most recently touched object, which is the prime suspect for use-after-free and refcount bugs.
 
 ## Style guide
+-   Write for a reader who is fluent in low-level programming but knows nothing about this project, and who was not present for the discussion that produced the code. Assume they can read Zig and reason about atomics, ownership, and memory layout. Do not assume they know why some alternative was rejected, what a symbol used to be called, which bug prompted a line, or what any of it looked like an hour ago. A comment that only makes sense to someone who watched the code being written is scratch work, not documentation.
 -   Write Tcl as Tcl, not TCL.
 -   Prefer commas or parenthesis over em-dashes. Also, write in ASCII characters exclusively (i.e. no — or →). Double hypens, --, can substitute for a proper em dash.
 -   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
