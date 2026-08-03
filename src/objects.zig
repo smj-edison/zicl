@@ -306,7 +306,7 @@ pub const None = struct {
 
     pub const vtable: Object.VTable = .{
         .duplicate = duplicate,
-        .make_crossthread = null,
+        .make_crossthread = Object.noopMakeCrossthread,
         .free_internal_rep = null,
         .update_string = null,
         .enumerate_struct = null,
@@ -453,7 +453,7 @@ pub const String = struct {
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = null,
-        .make_crossthread = null,
+        .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = enumerateStruct,
         .name = @typeName(String),
     };
@@ -654,6 +654,10 @@ pub const HashReference = struct {
         try obj.setStringDuplicatingIgnoreRace(&encoded);
     }
 
+    fn makeCrossthread(obj: *Object) void {
+        obj.asType(HashReference).?.ref.makeCrossthread();
+    }
+
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const hash_ref = obj.asTypeConst(HashReference).?;
         const helper: IterHelper = .{ .ctx = ctx, .info = info };
@@ -664,7 +668,7 @@ pub const HashReference = struct {
         .duplicate = duplicate,
         .update_string = updateString,
         .free_internal_rep = freeInternalRep,
-        .make_crossthread = null,
+        .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
         .name = @typeName(HashReference),
     };
@@ -802,7 +806,7 @@ pub const Index = struct {
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
-        .make_crossthread = null,
+        .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = null,
         .name = @typeName(Index),
     };
@@ -905,7 +909,7 @@ pub const Float = struct {
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
-        .make_crossthread = null,
+        .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = null,
         .name = @typeName(Float),
     };
@@ -1018,7 +1022,7 @@ pub const Integer = struct {
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
-        .make_crossthread = null,
+        .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = null,
         .name = @typeName(Integer),
     };
@@ -1148,7 +1152,7 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
             .duplicate = duplicate,
             .free_internal_rep = null,
             .update_string = null,
-            .make_crossthread = null,
+            .make_crossthread = Object.noopMakeCrossthread,
             .enumerate_struct = null,
             .name = @typeName(Self),
         };
@@ -1707,10 +1711,10 @@ pub const Dictionary = struct {
     table: Table,
 
     /// This table is always used in a way that ensures that any
-    /// key inserted already has its string generated.
+    /// key inserted will always be able to generate a quick hash.
     const Table = std.HashMapUnmanaged(Value, usize, struct {
         pub fn hash(_: @This(), key: Value) u64 {
-            return @truncate(key.getHashNoRegister() catch unreachable);
+            return heap.hashutil.quickHash(key) catch unreachable;
         }
         pub fn eql(_: @This(), a: Value, b: Value) bool {
             return a.equals(b) catch unreachable;
@@ -1776,7 +1780,7 @@ pub const Dictionary = struct {
         while (item_index < items.len) : (item_index += 2) {
             // Note that if a key appears multiple times, the last instance
             // of that key will win.
-            _ = try items[item_index].getHashNoRegister(); // Make sure it has a hash in advance.
+            try heap.hashutil.cacheQuickHash(items[item_index]); // Make sure it has a hash in advance.
             try table.put(heap.global_gpa, items[item_index], item_index + 1);
         }
         return table;
@@ -1814,13 +1818,13 @@ pub const Dictionary = struct {
     }
 
     pub fn getNoFollow(self: *const Dictionary, key: Value) !OptionalValue {
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        try heap.hashutil.cacheQuickHash(key);
         if (self.table.get(key)) |idx| return self.items[idx].asOptional();
         return .none;
     }
 
     pub fn getPtrNoFollow(self: *const Dictionary, key: Value) !?*Value {
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        try heap.hashutil.cacheQuickHash(key);
         if (self.table.get(key)) |idx| return &self.items[idx];
         return .none;
     }
@@ -1834,7 +1838,7 @@ pub const Dictionary = struct {
 
         // Ensure the key already has a hash, since the table requires everything used
         // to have a precomputed hash.
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        try heap.hashutil.cacheQuickHash(key);
         const value_index = dict.table.get(key).?; // Key is replaced in place, so it must exist.
         dict.items[value_index].swap(value.borrow());
 
@@ -1852,7 +1856,7 @@ pub const Dictionary = struct {
 
         // Ensure the key already has a hash, since the table requires everything used
         // to have a precomputed hash.
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        try heap.hashutil.cacheQuickHash(key);
         if (dict.table.get(key)) |existing_value_index| {
             // Key exists, so replace the value in place.
             dict.items[existing_value_index].swap(value.borrow());
@@ -1904,7 +1908,7 @@ pub const Dictionary = struct {
     /// keeps the table live (clearing and re-putting into the same allocation).
     pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) error{ OutOfMemory, LookupFailed }!bool {
         assert(dict.asHead().canMutate());
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        try heap.hashutil.cacheQuickHash(key);
 
         // Locate the first key. We have to do a scan instead of using `dict.get`, since
         // `dict.get` only returns the last key.
@@ -1932,7 +1936,7 @@ pub const Dictionary = struct {
 
         if (in_parent_dict.isSome()) {
             // Key was found in the parent, so we do need to flatten.
-            dict.flatten(det) catch |err| switch (err) {
+            dict.flattenForKey(det, key) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadDict, error.NotHashReference, error.HashLookupFailed => return error.LookupFailed,
             };
@@ -2035,9 +2039,26 @@ pub const Dictionary = struct {
         return to_track_new_location;
     }
 
-    pub fn flatten(dict: *Dictionary, det: ?*ErrorDetails) !void {
+    /// Collapse just enough of the `~parent` chain that `key` appears only in
+    /// `dict`, leaving everything past the last holder of `key` still linked.
+    ///
+    /// Only the part of the chain that shadows `key` has to be flattened, so
+    /// given
+    ///
+    /// ```
+    /// 1: {c 30}
+    /// 2: {a 20 ~parent 1}
+    /// 3: {a 10 ~parent 2}
+    /// ```
+    ///
+    /// flattening 3 for `a` yields `{a 10 ~parent 1}`: 2 is absorbed because it
+    /// also holds `a`, while 1 stays a link. Collapsing 1 as well would copy its
+    /// pairs for nothing and, more importantly, break the sharing that makes the
+    /// deeper scopes cheap, since those are the ones most likely to be
+    /// hash-registered and reachable from other threads.
+    pub fn flattenForKey(dict: *Dictionary, det: ?*ErrorDetails, key: Value) !void {
         assert(dict.asHead().canMutate());
-        if (try dict.flattenInner(det)) |new_dict| {
+        if (try dict.flattenForKeyInner(det, key)) |new_dict| {
             // Steal the values from `new_dict` directly.
             freeInternalRep(dict.asHead());
             dict.* = .{
@@ -2051,33 +2072,43 @@ pub const Dictionary = struct {
     }
 
     /// Remove all links from a dict and combine them into one dict.
-    pub fn flattenInner(dict: *const Dictionary, det: ?*ErrorDetails) !?*Dictionary {
-        if ((try dict.getNoFollow(interned_tilde_parent)).asValue()) |parent_hash_ref| {
-            var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
-            defer parent_hash_ref_shim.discardChanges();
-            const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
-            var parent_shim: Shimmerable = .{ .original = parent.asValue() };
-            defer parent_shim.discardChanges();
-            const parent_as_dict = try shimmerFrom(det, &parent_shim);
-
-            const new_dict = try parent_as_dict.flattenInner(det);
-            const to_add_to = if (new_dict) |val| val else (try parent_shim.current().duplicate()).asType(Dictionary).?;
-            errdefer to_add_to.asHead().release();
-
-            var pair_index: u32 = 0;
-            while (pair_index < dict.items.len) : (pair_index += 2) {
-                if (try dict.items[pair_index].equalsString("~parent")) continue;
-                try to_add_to.put(dict.items[pair_index], dict.items[pair_index + 1]);
-            }
-
-            return to_add_to;
-        } else {
+    /// Returns null when no ancestor of `dict` holds `key`, meaning
+    /// the chain already only shadows it here and nothing needs collapsing.
+    pub fn flattenForKeyInner(dict: *const Dictionary, det: ?*ErrorDetails, key: Value) !?*Dictionary {
+        const parent_hash_ref = (try dict.getNoFollow(interned_tilde_parent)).asValue() orelse {
             return null; // We've reached the end, so no need to flatten.
+        };
+
+        var parent_hash_ref_shim: Shimmerable = .{ .original = parent_hash_ref };
+        defer parent_hash_ref_shim.discardChanges();
+        const parent = (try HashReference.shimmerFrom(det, &parent_hash_ref_shim)).ref; // Resolve to value of hash.
+        var parent_shim: Shimmerable = .{ .original = parent.asValue() };
+        defer parent_shim.discardChanges();
+        const parent_as_dict = try shimmerFrom(det, &parent_shim);
+
+        const deeper = try parent_as_dict.flattenForKeyInner(det, key);
+        if (deeper == null and (try parent_as_dict.getNoFollow(key)).isNone()) {
+            // Neither this parent nor anything past it holds `key`, so the link
+            // from here on can stay as it is.
+            return null;
         }
+
+        // Duplicating the parent rather than taking `deeper` keeps the parent's
+        // own `~parent`, which is what leaves the rest of the chain linked.
+        const to_add_to = deeper orelse (try parent_shim.current().duplicate()).asType(Dictionary).?;
+        errdefer to_add_to.asHead().release();
+
+        var pair_index: u32 = 0;
+        while (pair_index < dict.items.len) : (pair_index += 2) {
+            if (try dict.items[pair_index].equalsString("~parent")) continue;
+            try to_add_to.put(dict.items[pair_index], dict.items[pair_index + 1]);
+        }
+
+        return to_add_to;
     }
 
     pub fn getFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LookupFailed }!OptionalValue {
-        if (key.asPtr()) |obj| _ = try obj.getHashNoRegister();
+        try heap.hashutil.cacheQuickHash(key);
 
         var dict = shimmerFrom(det, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2218,7 +2249,7 @@ pub const Dictionary = struct {
         /// A key->value map, with parent keys inserted before child keys.
         mapping: std.array_hash_map.Custom(Value, Value, struct {
             pub fn hash(_: @This(), key: Value) u32 {
-                return @truncate(key.getHashNoRegister() catch unreachable);
+                return @truncate(heap.hashutil.quickHash(key) catch unreachable);
             }
             pub fn eql(_: @This(), a: Value, b: Value, _: usize) bool {
                 return a.equals(b) catch unreachable;

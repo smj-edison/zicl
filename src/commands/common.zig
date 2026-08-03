@@ -65,6 +65,8 @@ test {
     _ = @import("strings.zig");
     _ = @import("math.zig");
     _ = @import("eval.zig");
+    _ = @import("dict.zig");
+    _ = @import("misc.zig");
     _ = @import("variables.zig");
     _ = @import("io.zig");
     _ = @import("list.zig");

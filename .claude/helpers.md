@@ -54,7 +54,7 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Value.getStringWithBuffer(value, buf)` -- Like `getString` but takes a `*[350]u8` stack buffer so primitives never allocate. Only OOMs when the value is an object that OOMs generating its string.
 - `Value.equals(a, b)` -- Deep string equality, with fast paths per tag pair (compares hashes when both sides are special strings).
 - `Value.equalsString(value, str)` -- Compare a value's string rep to a byte slice.
-- `Value.getHashNoRegister(value)` -- Return the `u256` Blake3 content hash without registering in the hash registry.
+- `Value.getHashNoRegister(value)` -- Return the `u256` Blake3 content hash without registering in the hash registry. This is the hash that travels between machines; for a hash table's index use `heap.indexHash` instead.
 - `Value.trace(value, fmt, args)` -- Append a trace entry (only when `trace_mem` is enabled).
 
 ### OptionalValue
@@ -107,7 +107,7 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Object.setStringIgnoreRace(obj, bytes)` -- Take ownership of `bytes`; on `OtherThreadSet` or OOM, free `bytes` and return.
 - `Object.setStringDuplicatingIgnoreRace(obj, bytes)` -- Copy `bytes` and set; tolerates races.
 - `Object.setStringDuplicating(obj, bytes)` -- Copy `bytes` and set; propagates `OtherThreadSet` and OOM.
-- `Object.setStringOwning(obj, bytes)` -- Take ownership of `bytes`; scans for hash refs and promotes to `SpecialString` when needed; `error.OtherThreadSet` if another thread set the string first.
+- `Object.setStringOwning(obj, bytes)` -- Take ownership of `bytes`; scans for hash refs and stores them as a `SpecialString` when needed; `error.OtherThreadSet` if another thread set the string first.
 - `Object.setStringLocalObject(obj, bytes)` -- Non-atomic set for a known thread-local object (asserts not cross-thread).
 - `Object.getRefCount(obj)` -- Atomic load for cross-thread objects, plain read otherwise.
 - `Object.incrRefCount(obj)` -- Increment (atomic for cross-thread).
@@ -128,6 +128,12 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `hashutil.scanStringForHashRefs(arena, bytes)` -- Find all `blake3~<hash>` occurrences; returns an `ArrayList(HashInstance)`.
 - `hashutil.parseHashReference(bytes)` -- Parse a string that is exactly one `blake3~<hash>` reference; return the `u256` or null.
 - `hashutil.scanAndResolveHashRefs(arena, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, borrowing representatives; returns `[]SpecialString.HashAndInfo`.
+
+### Index hashing (for hash tables, not for content addressing)
+- `heap.indexHash(value)` -- Hash a value for a table's index. Wyhash below `index_hash_cutoff`, the cached Blake3 at or above it. Infallible, so it can be called from a hash context; run `ensureIndexHashable` first.
+- `heap.ensureIndexHashable(value)` -- Prepare a key so `indexHash` and `Value.equals` cannot allocate. Primitives need nothing; an object needs its string rep, and a long one also needs its content hash forced.
+- `heap.hasIndexHash(value)` -- Whether the above has been done. For asserting the precondition where it is relied on.
+- `heap.index_hash_cutoff` (1024) -- The switch point. Chosen on length, not object type, because a `SpecialString` will not imply a large string once mmapped strings exist.
 
 ### Refcount primitives
 - `heap.incrRefCountOf(T, ref, is_atomic)` -- Generic ref count increment; returns the new count.

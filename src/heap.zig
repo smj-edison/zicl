@@ -944,7 +944,16 @@ pub const Object = extern struct {
         }
     }
 
+    /// For a type whose body reaches no other object, so sharing it needs
+    /// nothing done. Deliberately explicit rather than leaving the vtable entry
+    /// null: null means the type cannot cross threads at all, and a type that
+    /// simply has no children would otherwise be indistinguishable from one that
+    /// must never be shared.
+    pub fn noopMakeCrossthread(_: *Object) void {}
+
     pub fn makeCrossthread(obj: *Object) void {
+        // A null entry means the type cannot cross threads, so the unwrap
+        // intentionally panics when it doesn't have an impl.
         obj.vtable.make_crossthread.?(obj);
         obj.metadata.cross_thread = true;
     }
@@ -1203,8 +1212,9 @@ pub const Object = extern struct {
         if (new_ref_count <= 1) {
             const metadata = obj.hash_metadata.load(.monotonic);
             if (metadata.is_representative) {
-                // It's impossible for this to not have a string, since if the hash
-                // was registered, we know that it has a string.
+                // It's impossible for this to not have a registered hash,
+                // since we just checked that `is_representative` is true,
+                // which means that the hash was registered.
                 const hash = obj.getHashNoRegister() catch unreachable;
                 registered_hashes.unregister(hash, obj);
             }
@@ -1251,9 +1261,21 @@ pub const Object = extern struct {
     }
 
     pub fn getHashNoRegister(obj: *Object) !u256 {
+        // We need to generate the string before checking its details, since it
+        // may generate as a `SpecialString` instead of as a normal string. If
+        // it generates as a `SpecialString`, we need to have the
+        // `SpecialString` store its hash.
+        const bytes = try obj.getString();
+
         switch (obj.getStringDetails()) {
-            .special => |special| return try special.getHash(),
-            .none, .normal => {
+            .special => |special| {
+                const hash = try special.getHash();
+                if (obj.asType(objects.Source) == null) return hash;
+                // It was a Source object, so we need to fall through to the
+                // later code which sets the hash on Source as well.
+            },
+            .none => unreachable, // `getString` above just produced one.
+            .normal => {
                 // Fall through.
             },
         }
@@ -1262,7 +1284,7 @@ pub const Object = extern struct {
             if (source.hash.load(.monotonic)) |hash| {
                 return hash.*;
             } else {
-                const hash = hashutil.hashBytes(try obj.getString());
+                const hash = hashutil.hashBytes(bytes);
                 const hash_ptr = try global_gpa.create(u256);
                 hash_ptr.* = hash;
                 if (source.hash.cmpxchgStrong(null, hash_ptr, .release, .acquire)) |other_set| {
@@ -1273,7 +1295,7 @@ pub const Object = extern struct {
             }
         }
 
-        return hashutil.hashBytes(try obj.getString());
+        return hashutil.hashBytes(bytes);
     }
 
     pub fn getHashRegistering(obj: *Object) !u256 {
@@ -1282,39 +1304,27 @@ pub const Object = extern struct {
         return hash;
     }
 
-    /// Force everything `getHashNoRegister` would otherwise allocate lazily, so
-    /// that later calls can run from a context that cannot fail (a hash map's
-    /// `hash`/`eql`, for instance).
-    ///
-    /// This is deliberately cheaper than calling `getHashNoRegister` outright.
-    /// Only a `SpecialString` and a `Source` cache a hash out of line, and only
-    /// those two allocate; every other object hashes its bytes on demand, which
-    /// never allocates once the string rep exists. Calling `getHashNoRegister`
-    /// to prepare would therefore hash the bytes once here and again at every
-    /// later use, since that result is not cached for ordinary objects.
-    pub fn ensureInfallibleHashing(obj: *Object) error{OutOfMemory}!void {
-        _ = try obj.getString();
-        switch (obj.getStringDetails()) {
-            .none => unreachable, // `getString` above just produced one.
-            .special => |special| _ = try special.getHash(),
-            .normal => if (obj.asType(objects.Source)) |_| {
-                _ = try obj.getHashNoRegister();
-            },
+    /// Whether `getHashNoRegister` can return the object's hash without
+    /// allocating (e.g. potentially returning OOM).
+    fn hashIsCached(obj: *const Object) bool {
+        if (obj.asTypeConst(objects.Source)) |source| {
+            if (source.hash.load(.monotonic) == null) return false;
+            // Note that if the source has a hash, we also need to make sure
+            // that if it is a `SpecialString`, it also has a cached hash.
         }
-    }
 
-    /// Whether `getHashNoRegister` is now guaranteed not to allocate. Intended
-    /// for asserting the `ensureInfallibleHashing` precondition at the point
-    /// that depends on it, so a missed call fails loudly instead of turning
-    /// into an unreachable on an allocation failure.
-    pub fn hasInfallibleHash(obj: *const Object) bool {
         switch (obj.getStringDetails()) {
             .none => return false,
             .special => |special| return special.hash.load(.monotonic) != null,
-            .normal => {},
+            .normal => return true,
         }
-        if (obj.asTypeConst(objects.Source)) |source| return source.hash.load(.monotonic) != null;
-        return true;
+    }
+
+    /// Force whatever `getHashNoRegister` would otherwise allocate lazily. Guarded
+    /// on `hashIsCached` so an ordinary object is not made to hash its bytes here
+    /// for a result nothing keeps.
+    fn cacheHash(obj: *Object) error{OutOfMemory}!void {
+        if (!obj.hashIsCached()) _ = try obj.getHashNoRegister();
     }
 
     pub fn duplicateHeadOnto(src: *const Object, dest: *Object) error{OutOfMemory}!void {
@@ -1435,6 +1445,32 @@ pub const hashutil = struct {
 
         return resolved_hashes;
     }
+
+    // Quick hashes are used internally for structures like dictionary keys and
+    // variable tables. They're not cryptographically secure, so they're not used
+    // for content addressing, but there's no point in wasting compute on a secure
+    // hash when it's not used in a secure setting.
+
+    /// Strings below this length get hashed with wyhash, while above this length
+    /// they use their blake3 hash (truncated to fit in a u64).
+    pub const quick_hash_cutoff = 1024;
+
+    /// Use only for hash tables and similar data structures that also use equality,
+    /// as this is not cryptographically secure.
+    pub fn quickHash(value: Value) !u64 {
+        var buf: [350]u8 = undefined;
+        const bytes = try value.getStringWithBuffer(&buf);
+        if (bytes.len < quick_hash_cutoff) return std.hash.Wyhash.hash(0, bytes);
+        return @truncate(try value.getHashNoRegister());
+    }
+
+    /// This ensures that `quickHash` is guaranteed not to OOM when hashed in the
+    /// future.
+    pub fn cacheQuickHash(value: Value) error{OutOfMemory}!void {
+        const obj = value.asPtr() orelse return;
+        const bytes = try obj.getString();
+        if (bytes.len >= quick_hash_cutoff) try obj.cacheHash();
+    }
 };
 
 pub fn incrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) T {
@@ -1538,4 +1574,30 @@ fn testDuplicateObject(ta: std.mem.Allocator) !void {
 
 test "object duplicate" {
     try testing.checkAllAllocationFailures(testing.allocator, testDuplicateObject, .{});
+}
+
+fn testSpecialSourceHash(ta: std.mem.Allocator) !void {
+    try testStart(ta, testing.io);
+    defer testFinish();
+
+    // Over 1024 bytes, so the string rep is stored as a `SpecialString` and both
+    // it and `Source.hash` have a slot to fill. A `Source` is the only type where
+    // the two coexist, so it is the only place they can disagree.
+    const script = "set x 1\n" ** 200;
+    comptime assert(script.len > hashutil.quick_hash_cutoff);
+    const source = try objects.Source.new(script, .none, 1);
+    defer source.asHead().release();
+
+    const hash = try source.asHead().getHashRegistering();
+
+    // Both slots filled, and filled with the same hash. Registering leaves the
+    // object frozen, so `release` below can only unregister without allocating
+    // if this holds.
+    try testing.expect(source.asHead().hashIsCached());
+    try testing.expectEqual(hash, source.hash.load(.monotonic).?.*);
+    try testing.expectEqual(hash, try source.asHead().getStringDetails().asSpecial().?.getHash());
+}
+
+test "source with a special string hashes both slots" {
+    try testing.checkAllAllocationFailures(testing.allocator, testSpecialSourceHash, .{});
 }

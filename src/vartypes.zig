@@ -64,25 +64,17 @@ pub const VariableSlot = union(enum) {
 pub const VarTable = struct {
     map: Map,
 
+    /// Both of these are infallible, since `cacheQuickHash` ensured
+    /// that hashes exist, and by extension, that they both have a string rep.
     const Context = struct {
-        /// Both of these are infallible. `ensureHashable` is what makes that
-        /// safe, so each asserts its own precondition rather than letting a
-        /// missed call surface as an unreachable on allocation failure.
         pub fn hash(_: Context, key: Value) u32 {
-            if (key.asPtr()) |obj| assert(obj.hasInfallibleHash());
-            return @truncate(key.getHashNoRegister() catch unreachable);
+            return @truncate(heap.hashutil.quickHash(key) catch unreachable);
         }
         pub fn eql(_: Context, a: Value, b: Value, _: usize) bool {
-            if (a.asPtr()) |obj| assert(obj.hasInfallibleHash());
-            if (b.asPtr()) |obj| assert(obj.hasInfallibleHash());
             return a.equals(b) catch unreachable;
         }
     };
 
-    /// `store_hash` is on because hashing a key means hashing its string with
-    /// Blake3, which is far more expensive than the extra `u32` per entry.
-    // TODO PERF variable names are short, so a cheaper hash over the string
-    // would beat Blake3 for essentially every key we see here.
     const Map = std.array_hash_map.Custom(Value, VariableSlot, Context, true);
 
     pub const empty: VarTable = .{ .map = .empty };
@@ -106,16 +98,8 @@ pub const VarTable = struct {
         return table.map.count();
     }
 
-    /// The table's hash context cannot fail, so every key has to arrive already
-    /// able to hash and compare without allocating. Generating the string rep
-    /// alone is not enough: a `SpecialString` can carry a string while its hash
-    /// is still unallocated.
-    fn ensureHashable(name: Value) error{OutOfMemory}!void {
-        if (name.asPtr()) |obj| try obj.ensureInfallibleHashing();
-    }
-
     pub fn getIndex(table: *const VarTable, name: Value) error{OutOfMemory}!?usize {
-        try ensureHashable(name);
+        try heap.hashutil.cacheQuickHash(name);
         return table.map.getIndex(name);
     }
 
@@ -127,7 +111,7 @@ pub const VarTable = struct {
     /// contents. Returns the entry's index, which is stable until a variable is
     /// removed from this frame (which bumps the frame's call epoch).
     pub fn put(table: *VarTable, name: Value, slot: VariableSlot) !usize {
-        try ensureHashable(name);
+        try heap.hashutil.cacheQuickHash(name);
         const result = try table.map.getOrPut(heap.global_gpa, name);
         if (result.found_existing) {
             result.value_ptr.release();
@@ -141,7 +125,7 @@ pub const VarTable = struct {
     /// Remove `name`, returning whether it was present. Ordered so that the
     /// iteration order the capture hash depends on survives the removal.
     pub fn remove(table: *VarTable, name: Value) error{OutOfMemory}!bool {
-        try ensureHashable(name);
+        try heap.hashutil.cacheQuickHash(name);
         const entry = table.map.fetchOrderedRemove(name) orelse return false;
         entry.key.release();
         entry.value.release();

@@ -310,3 +310,57 @@ test "dict keys" {
     // Order: parent keys first (foo, bar), then new child keys (baz).
     try interp.testExpectScriptResult("foo bar baz", "dict keys $d");
 }
+
+/// Build `{ <key> <value> }` linked to `parent`, and register `parent` so the
+/// link resolves. The caller owns the returned dictionary.
+fn linkedDict(parent: *objects.Dictionary, key: heap.Value, value: heap.Value) !*objects.Dictionary {
+    _ = try parent.asHead().getHashRegistering();
+    const hash_ref = try objects.HashReference.new(parent.asHead());
+    defer hash_ref.asHead().release();
+
+    const child = try objects.Dictionary.new(&.{ key, value });
+    errdefer child.asHead().release();
+    try child.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
+    return child;
+}
+
+fn testPartialFlatten(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Interned keys and inline values throughout, because registering a parent
+    // marks it cross-thread, and a `String` object declares no
+    // `make_crossthread` and so cannot be shared. See the task about leaf types.
+    const a = heap.InternedString.newValue("a");
+    const c = heap.InternedString.newValue("c");
+
+    // 1: {c 30}  <-  2: {a 20}  <-  3: {a 10}
+    // Removing `a` from 3 has to absorb 2, which also holds `a`, but must leave
+    // 1 linked since nothing there shadows `a`.
+    const gp = try objects.Dictionary.new(&.{ c, objects.Integer.new(30) });
+    defer gp.asHead().release();
+    const parent = try linkedDict(gp, a, objects.Integer.new(20));
+    defer parent.asHead().release();
+    const child = try linkedDict(parent, a, objects.Integer.new(10));
+    defer child.asHead().release();
+
+    var det: ErrorDetails = undefined;
+    try std.testing.expect(try child.remove(&det, a));
+
+    // `a` is gone even though a parent held it.
+    try std.testing.expect((try child.getNoFollow(a)).isNone());
+    var child_shim: Shimmerable = .{ .original = child.asHead().asValue() };
+    defer child_shim.discardChanges();
+    try std.testing.expect((try Dictionary.getFollowingLinks(&det, &child_shim, a)).isNone());
+
+    // The grandparent was not absorbed: the link survives and its key is still
+    // reachable through it. A full flatten would have copied `c` in and dropped
+    // `~parent` entirely.
+    try std.testing.expect((try child.getNoFollow(objects.interned_tilde_parent)).isSome());
+    try std.testing.expect((try child.getNoFollow(c)).isNone());
+    try std.testing.expect((try Dictionary.getFollowingLinks(&det, &child_shim, c)).isSome());
+}
+
+test "dict remove flattens only as far as the key reaches" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPartialFlatten, .{});
+}
