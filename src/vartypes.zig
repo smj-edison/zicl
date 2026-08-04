@@ -857,7 +857,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
 }
 
 test "variable basics" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariables, .{});
+    try memutil.checkAllocationFailures(.exhaustive, testVariables, .{});
 }
 
 fn testVariableLink(ta: std.mem.Allocator) !void {
@@ -892,5 +892,5 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
 }
 
 test "variable link" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariableLink, .{});
+    try memutil.checkAllocationFailures(.exhaustive, testVariableLink, .{});
 }

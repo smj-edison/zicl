@@ -15,6 +15,7 @@ const List = objects.List;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 pub fn exprCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const result = try interp.evalExpression(args[1].current());
@@ -251,8 +252,8 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null, null);
 }
 
-test "fn named" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testFnNamed(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("30",
@@ -261,8 +262,12 @@ test "fn named" {
     );
 }
 
-test "fn anonymous" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn named" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnNamed, .{});
+}
+
+fn testFnAnonymous(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("30",
@@ -270,8 +275,12 @@ test "fn anonymous" {
     );
 }
 
-test "fn scope capture" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn anonymous" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnAnonymous, .{});
+}
+
+fn testFnScopeCapture(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("15",
@@ -281,8 +290,12 @@ test "fn scope capture" {
     );
 }
 
-test "fn nested closure scope" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn scope capture" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnScopeCapture, .{});
+}
+
+fn testFnNestedClosureScope(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `bar` is returned from `foo` and captures both `inner` and `outer`.
@@ -298,8 +311,12 @@ test "fn nested closure scope" {
     );
 }
 
-test "fn nests lexical scopes three levels deep" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn nested closure scope" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnNestedClosureScope, .{});
+}
+
+fn testFnNestsLexicalScopesThreeLevelsDeep(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Every nesting level adds a `~parent` link, so this fails if capturing a
@@ -320,8 +337,12 @@ test "fn nests lexical scopes three levels deep" {
     );
 }
 
-test "fn shadows a lexical with a local of the same name" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn nests lexical scopes three levels deep" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnNestsLexicalScopesThreeLevelsDeep, .{});
+}
+
+fn testFnShadowsALexicalWithALocalOfTheSameName(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("inner",
@@ -339,8 +360,12 @@ test "fn shadows a lexical with a local of the same name" {
     );
 }
 
-test "evaluation recycles arena scratch instead of accumulating it" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn shadows a lexical with a local of the same name" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnShadowsALexicalWithALocalOfTheSameName, .{});
+}
+
+fn testEvaluationRecyclesArenaScratchInsteadOfAccumulatingIt(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Every `$i` interpolation stringifies an inline integer into the arena, and
@@ -366,8 +391,12 @@ test "evaluation recycles arena scratch instead of accumulating it" {
     try std.testing.expectEqual(warmed, heap.local_arena_instance.queryCapacity());
 }
 
-test "arena scratch does not scale with the work a script does" {
-    var interp = try common.testStart(std.testing.allocator);
+test "evaluation recycles arena scratch instead of accumulating it" {
+    try memutil.checkAllocationFailures(.exhaustive, testEvaluationRecyclesArenaScratchInsteadOfAccumulatingIt, .{});
+}
+
+fn testArenaScratchDoesNotScaleWithTheWorkAScriptDoes(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // A loop reclaims per iteration, since its body is its own evaluation.
@@ -389,15 +418,23 @@ test "arena scratch does not scale with the work a script does" {
     try std.testing.expectEqual(small_loop, heap.local_arena_instance.queryCapacity());
 }
 
-test "subst reports a parse error without faulting" {
-    var interp = try common.testStart(std.testing.allocator);
-    defer common.testFinish(&interp);
-
-    try std.testing.expectError(error.EvalError, interp.testRunScript("subst {[}"));
+test "arena scratch does not scale with the work a script does" {
+    try memutil.checkAllocationFailures(.exhaustive, testArenaScratchDoesNotScaleWithTheWorkAScriptDoes, .{});
 }
 
-test "subst basic" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testSubstReportsAParseErrorWithoutFaulting(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try memutil.expectErrorOrOom(error.EvalError, interp.testRunScript("subst {[}"));
+}
+
+test "subst reports a parse error without faulting" {
+    try memutil.checkAllocationFailures(.exhaustive, testSubstReportsAParseErrorWithoutFaulting, .{});
+}
+
+fn testSubstBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("$x", "subst {\\$x}");
@@ -409,8 +446,12 @@ test "subst basic" {
     , "subst a b c");
 }
 
-test "parsing" {
-    var interp = try common.testStart(std.testing.allocator);
+test "subst basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testSubstBasic, .{});
+}
+
+fn testParsing(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Make sure we handle "character after close brace" correctly. It's fine for
@@ -438,8 +479,12 @@ test "parsing" {
     );
 }
 
-test "fn optional args" {
-    var interp = try common.testStart(std.testing.allocator);
+test "parsing" {
+    try memutil.checkAllocationFailures(.exhaustive, testParsing, .{});
+}
+
+fn testFnOptionalArgs(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     _ = try interp.testRunScript("fn greet {a {b 3}} { + $a $b }");
@@ -447,8 +492,12 @@ test "fn optional args" {
     try interp.testExpectScriptResult("7", "greet 3 4");
 }
 
-test "fn varargs" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn optional args" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnOptionalArgs, .{});
+}
+
+fn testFnVarargs(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("10 20 30",
@@ -457,8 +506,12 @@ test "fn varargs" {
     );
 }
 
-test "fn in dict" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn varargs" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnVarargs, .{});
+}
+
+fn testFnInDict(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Exercises the path where a closure lives inside a dict and is retrieved
@@ -470,8 +523,12 @@ test "fn in dict" {
     );
 }
 
-test "fn parsing" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn in dict" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnInDict, .{});
+}
+
+fn testFnParsing(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // A manually-constructed fn string exercises parseClosure directly, since
@@ -482,8 +539,12 @@ test "fn parsing" {
     );
 }
 
-test "method as fn" {
-    var interp = try common.testStart(std.testing.allocator);
+test "fn parsing" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnParsing, .{});
+}
+
+fn testMethodAsFn(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptError(error.EvalError,
@@ -494,8 +555,12 @@ test "method as fn" {
     );
 }
 
-test "method anonymous via applymethod" {
-    var interp = try common.testStart(std.testing.allocator);
+test "method as fn" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodAsFn, .{});
+}
+
+fn testMethodAnonymousViaApplymethod(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("{counter 8} 8",
@@ -507,8 +572,12 @@ test "method anonymous via applymethod" {
     );
 }
 
-test "method arbitrary self name" {
-    var interp = try common.testStart(std.testing.allocator);
+test "method anonymous via applymethod" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodAnonymousViaApplymethod, .{});
+}
+
+fn testMethodArbitrarySelfName(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("fido",
@@ -518,8 +587,12 @@ test "method arbitrary self name" {
     );
 }
 
-test "method updates self" {
-    var interp = try common.testStart(std.testing.allocator);
+test "method arbitrary self name" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodArbitrarySelfName, .{});
+}
+
+fn testMethodUpdatesSelf(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("rex",
@@ -532,8 +605,12 @@ test "method updates self" {
     );
 }
 
-test "method parseable by applymethod" {
-    var interp = try common.testStart(std.testing.allocator);
+test "method updates self" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodUpdatesSelf, .{});
+}
+
+fn testMethodParseableByApplymethod(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("{x 5} 10",
@@ -542,8 +619,12 @@ test "method parseable by applymethod" {
     );
 }
 
-test "method lexical scope capture" {
-    var interp = try common.testStart(std.testing.allocator);
+test "method parseable by applymethod" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodParseableByApplymethod, .{});
+}
+
+fn testMethodLexicalScopeCapture(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("55",
@@ -554,8 +635,12 @@ test "method lexical scope capture" {
     );
 }
 
-test "method in nested object" {
-    var interp = try common.testStart(std.testing.allocator);
+test "method lexical scope capture" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodLexicalScopeCapture, .{});
+}
+
+fn testMethodInNestedObject(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("15",
@@ -566,6 +651,10 @@ test "method in nested object" {
         \\ }
         \\ outer::inner::frobnicate 10
     );
+}
+
+test "method in nested object" {
+    try memutil.checkAllocationFailures(.exhaustive, testMethodInNestedObject, .{});
 }
 
 test "method object copying" {
@@ -591,8 +680,8 @@ fn traceString(interp: *Interp) ![]const u8 {
     return try trace.getString();
 }
 
-test "apply named closure" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testApplyNamedClosure(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("30",
@@ -601,8 +690,12 @@ test "apply named closure" {
     );
 }
 
-test "apply anonymous closure" {
-    var interp = try common.testStart(std.testing.allocator);
+test "apply named closure" {
+    try memutil.checkAllocationFailures(.exhaustive, testApplyNamedClosure, .{});
+}
+
+fn testApplyAnonymousClosure(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("hello world",
@@ -610,8 +703,12 @@ test "apply anonymous closure" {
     );
 }
 
-test "stack trace in global frame" {
-    var interp = try common.testStart(std.testing.allocator);
+test "apply anonymous closure" {
+    try memutil.checkAllocationFailures(.exhaustive, testApplyAnonymousClosure, .{});
+}
+
+fn testStackTraceInGlobalFrame(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     const script =
@@ -623,8 +720,12 @@ test "stack trace in global frame" {
     try testing.expectEqualStrings("{} {} 3 {/ 1 0}", try traceString(&interp));
 }
 
-test "stack trace in nested closure" {
-    var interp = try common.testStart(std.testing.allocator);
+test "stack trace in global frame" {
+    try memutil.checkAllocationFailures(.exhaustive, testStackTraceInGlobalFrame, .{});
+}
+
+fn testStackTraceInNestedClosure(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     const script =
@@ -637,8 +738,12 @@ test "stack trace in nested closure" {
     try testing.expectEqualStrings("bad {} 2 {/ 1 0} {} {} 4 bad", try traceString(&interp));
 }
 
-test "stack trace in command substitution" {
-    var interp = try common.testStart(std.testing.allocator);
+test "stack trace in nested closure" {
+    try memutil.checkAllocationFailures(.exhaustive, testStackTraceInNestedClosure, .{});
+}
+
+fn testStackTraceInCommandSubstitution(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Both the command-substitution eval frame and the outer eval frame share the same call
@@ -653,8 +758,12 @@ test "stack trace in command substitution" {
     try testing.expectEqualStrings("{} {} 2 {/ 1 0}", try traceString(&interp));
 }
 
-test "stack trace line number correct dedup" {
-    var interp = try common.testStart(std.testing.allocator);
+test "stack trace in command substitution" {
+    try memutil.checkAllocationFailures(.exhaustive, testStackTraceInCommandSubstitution, .{});
+}
+
+fn testStackTraceLineNumberCorrectDedup(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // foo and bar have identical body text. Each closure has a unique cache_id, so each
@@ -694,8 +803,12 @@ test "stack trace line number correct dedup" {
     try testing.expectEqualStrings("bar {} 5 {/ 1 0} {} {} 7 bar", try traceString(&interp));
 }
 
-test "unknown" {
-    var interp = try common.testStart(std.testing.allocator);
+test "stack trace line number correct dedup" {
+    try memutil.checkAllocationFailures(.exhaustive, testStackTraceLineNumberCorrectDedup, .{});
+}
+
+fn testUnknown(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult(
@@ -706,8 +819,12 @@ test "unknown" {
     );
 }
 
-test "arg expansion" {
-    var interp = try common.testStart(std.testing.allocator);
+test "unknown" {
+    try memutil.checkAllocationFailures(.exhaustive, testUnknown, .{});
+}
+
+fn testArgExpansion(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult(
@@ -716,4 +833,8 @@ test "arg expansion" {
         \\ foo bar baz
         ,
     );
+}
+
+test "arg expansion" {
+    try memutil.checkAllocationFailures(.exhaustive, testArgExpansion, .{});
 }

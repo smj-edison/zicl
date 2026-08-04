@@ -12,6 +12,7 @@ const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 const regex = @import("../regex.zig");
 const Regexp = regex.Regexp;
@@ -408,7 +409,8 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const substituted = try result.toOwnedSlice(heap.global_gpa);
     const substituted_str = blk: {
         errdefer heap.global_gpa.free(substituted);
-        break :blk try String.newOwning(substituted[0 .. substituted.len - 1 :0]);
+        // `NoFree`, since the errdefer above already frees `substituted`.
+        break :blk try String.newOwningNoFree(substituted[0 .. substituted.len - 1 :0]);
     };
     defer substituted_str.asHead().release();
 
@@ -460,8 +462,8 @@ fn applySubstitution(
     }
 }
 
-test "regexp basic match" {
-    var interp = try common.testStart(testing.allocator);
+fn testRegexpBasicMatch(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true",
@@ -472,8 +474,12 @@ test "regexp basic match" {
     );
 }
 
-test "regexp -nocase" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp basic match" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpBasicMatch, .{});
+}
+
+fn testRegexpNocase(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true",
@@ -484,8 +490,12 @@ test "regexp -nocase" {
     );
 }
 
-test "regexp capture variables" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -nocase" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpNocase, .{});
+}
+
+fn testRegexpCaptureVariables(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("helloworld",
@@ -498,8 +508,12 @@ test "regexp capture variables" {
     );
 }
 
-test "regexp -all" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp capture variables" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpCaptureVariables, .{});
+}
+
+fn testRegexpAll(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("2",
@@ -510,8 +524,12 @@ test "regexp -all" {
     );
 }
 
-test "regexp -all with capture variables" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -all" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpAll, .{});
+}
+
+fn testRegexpAllWithCaptureVariables(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Variables get the values from the last match.
@@ -521,8 +539,12 @@ test "regexp -all with capture variables" {
     );
 }
 
-test "regexp -inline" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -all with capture variables" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpAllWithCaptureVariables, .{});
+}
+
+fn testRegexpInline(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("helloworld world",
@@ -533,8 +555,12 @@ test "regexp -inline" {
     );
 }
 
-test "regexp -all -inline" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -inline" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpInline, .{});
+}
+
+fn testRegexpAllInline(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("o o",
@@ -542,8 +568,12 @@ test "regexp -all -inline" {
     );
 }
 
-test "regexp -indices" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -all -inline" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpAllInline, .{});
+}
+
+fn testRegexpIndices(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("0 9",
@@ -556,8 +586,12 @@ test "regexp -indices" {
     );
 }
 
-test "regexp -inline -indices" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -indices" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpIndices, .{});
+}
+
+fn testRegexpInlineIndices(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("{0 4}",
@@ -565,8 +599,12 @@ test "regexp -inline -indices" {
     );
 }
 
-test "regexp -start" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -inline -indices" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpInlineIndices, .{});
+}
+
+fn testRegexpStart(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("world",
@@ -575,8 +613,12 @@ test "regexp -start" {
     );
 }
 
-test "regexp basic operation" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -start" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpStart, .{});
+}
+
+fn testRegexpBasicOperation(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true",
@@ -596,8 +638,12 @@ test "regexp basic operation" {
     );
 }
 
-test "regexp capture variables basic" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp basic operation" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpBasicOperation, .{});
+}
+
+fn testRegexpCaptureVariablesBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true abbbbc",
@@ -622,8 +668,12 @@ test "regexp capture variables basic" {
     );
 }
 
-test "regexp capture variables optional groups" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp capture variables basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpCaptureVariablesBasic, .{});
+}
+
+fn testRegexpCaptureVariablesOptionalGroups(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true a a {} {}",
@@ -636,8 +686,12 @@ test "regexp capture variables optional groups" {
     );
 }
 
-test "regexp -indices capture variables" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp capture variables optional groups" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpCaptureVariablesOptionalGroups, .{});
+}
+
+fn testRegexpIndicesCaptureVariables(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true {0 5}",
@@ -665,8 +719,12 @@ test "regexp -indices capture variables" {
     );
 }
 
-test "regexp -nocase capture" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -indices capture variables" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpIndicesCaptureVariables, .{});
+}
+
+fn testRegexpNocaseCapture(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true aBbbxYXxxZ Bbb xYXxx",
@@ -677,8 +735,12 @@ test "regexp -nocase capture" {
     );
 }
 
-test "regexp -all with -inline" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -nocase capture" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpNocaseCapture, .{});
+}
+
+fn testRegexpAllWithInline(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("b b b b b b",
@@ -689,8 +751,12 @@ test "regexp -all with -inline" {
     );
 }
 
-test "regexp -all -inline -indices" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -all with -inline" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpAllWithInline, .{});
+}
+
+fn testRegexpAllInlineIndices(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("{0 4} {1 3} {2 2} {-1 -1} {5 9} {6 8} {-1 -1} {7 7}",
@@ -698,8 +764,12 @@ test "regexp -all -inline -indices" {
     );
 }
 
-test "regexp -all with capture vars gets last match" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -all -inline -indices" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpAllInlineIndices, .{});
+}
+
+fn testRegexpAllWithCaptureVarsGetsLastMatch(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("aefgh efg {} f {}",
@@ -708,8 +778,12 @@ test "regexp -all with capture vars gets last match" {
     );
 }
 
-test "regexp -start edge cases" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -all with capture vars gets last match" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpAllWithCaptureVarsGetsLastMatch, .{});
+}
+
+fn testRegexpStartEdgeCases(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true 1",
@@ -732,8 +806,12 @@ test "regexp -start edge cases" {
     );
 }
 
-test "regexp -inline no matches" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -start edge cases" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpStartEdgeCases, .{});
+}
+
+fn testRegexpInlineNoMatches(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("",
@@ -744,8 +822,12 @@ test "regexp -inline no matches" {
     );
 }
 
-test "regexp -inline with captures" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -inline no matches" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpInlineNoMatches, .{});
+}
+
+fn testRegexpInlineWithCaptures(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("b b",
@@ -756,8 +838,12 @@ test "regexp -inline with captures" {
     );
 }
 
-test "regexp empty string" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp -inline with captures" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpInlineWithCaptures, .{});
+}
+
+fn testRegexpEmptyString(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("true",
@@ -774,8 +860,12 @@ test "regexp empty string" {
     );
 }
 
-test "regsub basic operation" {
-    var interp = try common.testStart(testing.allocator);
+test "regexp empty string" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegexpEmptyString, .{});
+}
+
+fn testRegsubBasicOperation(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("1 xax111aaa222xaa",
@@ -798,8 +888,12 @@ test "regsub basic operation" {
     );
 }
 
-test "regsub capture groups" {
-    var interp = try common.testStart(testing.allocator);
+test "regsub basic operation" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubBasicOperation, .{});
+}
+
+fn testRegsubCaptureGroups(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("1 xax1aa22aaxaa",
@@ -822,8 +916,12 @@ test "regsub capture groups" {
     );
 }
 
-test "regsub no match and anchored" {
-    var interp = try common.testStart(testing.allocator);
+test "regsub capture groups" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubCaptureGroups, .{});
+}
+
+fn testRegsubNoMatchAndAnchored(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("0 xyz",
@@ -840,8 +938,12 @@ test "regsub no match and anchored" {
     );
 }
 
-test "regsub -nocase" {
-    var interp = try common.testStart(testing.allocator);
+test "regsub no match and anchored" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubNoMatchAndAnchored, .{});
+}
+
+fn testRegsubNocase(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("1 xaAAaAAay",
@@ -858,8 +960,12 @@ test "regsub -nocase" {
     );
 }
 
-test "regsub -all" {
-    var interp = try common.testStart(testing.allocator);
+test "regsub -nocase" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubNocase, .{});
+}
+
+fn testRegsubAll(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("4 a|xxx|b|xx|c|x|d|x|",
@@ -879,8 +985,12 @@ test "regsub -all" {
     );
 }
 
-test "regsub without varName returns value" {
-    var interp = try common.testStart(testing.allocator);
+test "regsub -all" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubAll, .{});
+}
+
+fn testRegsubWithoutVarNameReturnsValue(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("aXaca",
@@ -897,8 +1007,12 @@ test "regsub without varName returns value" {
     );
 }
 
-test "regsub -start" {
-    var interp = try common.testStart(testing.allocator);
+test "regsub without varName returns value" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubWithoutVarNameReturnsValue, .{});
+}
+
+fn testRegsubStart(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("4 a1b/2c/3d/4e/5",
@@ -916,4 +1030,8 @@ test "regsub -start" {
     try interp.testExpectScriptResult("0 abc",
         \\ list [regsub -start 0 -start 2 a abc c x] $x
     );
+}
+
+test "regsub -start" {
+    try memutil.checkAllocationFailures(.exhaustive, testRegsubStart, .{});
 }

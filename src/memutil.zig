@@ -2,6 +2,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const options = @import("options");
 const math = std.math;
 const heap = std.heap;
 const mem = std.mem;
@@ -582,6 +583,32 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
     }
 
     try testing.expectError(expected_error, actual_error_union);
+}
+
+/// How a test takes part in allocation-failure testing.
+pub const OomTesting = union(enum) {
+    exhaustive,
+    unsupported: []const u8,
+};
+
+/// This only does full sweeping when -Dfull-oom-testing is enabled.
+/// Use `checkAllAllocationFailures` directly when a test is cheap enough
+/// to always sweep.
+pub fn checkAllocationFailures(
+    comptime mode: OomTesting,
+    comptime func: anytype,
+    args: anytype,
+) !void {
+    const sweep = switch (mode) {
+        .exhaustive => options.full_oom_testing,
+        .unsupported => false,
+    };
+
+    if (sweep) {
+        try testing.checkAllAllocationFailures(testing.allocator, func, args);
+    } else {
+        try @call(.auto, func, .{testing.allocator} ++ args);
+    }
 }
 
 /// Context is a standard hash map context

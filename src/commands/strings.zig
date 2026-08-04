@@ -12,6 +12,7 @@ const List = objects.List;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 /// [append]
 pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
@@ -333,8 +334,8 @@ pub fn registerCommands(interp: *Interp) !void {
 
 const testing = std.testing;
 
-test "append basic" {
-    var interp = try common.testStart(testing.allocator);
+fn testAppendBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Append a single value to a new variable.
@@ -343,8 +344,12 @@ test "append basic" {
     try interp.testExpectScriptResult("hello world", "append x { world}");
 }
 
-test "append multiple values" {
-    var interp = try common.testStart(testing.allocator);
+test "append basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testAppendBasic, .{});
+}
+
+fn testAppendMultipleValues(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // All values are concatenated in order.
@@ -352,8 +357,12 @@ test "append multiple values" {
     try interp.testExpectScriptResult("abcdef", "append x d e f");
 }
 
-test "append to unset variable" {
-    var interp = try common.testStart(testing.allocator);
+test "append multiple values" {
+    try memutil.checkAllocationFailures(.exhaustive, testAppendMultipleValues, .{});
+}
+
+fn testAppendToUnsetVariable(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Variable doesn't exist yet, so it should be created as empty then appended to.
@@ -361,8 +370,12 @@ test "append to unset variable" {
     try interp.testExpectScriptResult("new", "set unset_var");
 }
 
-test "append no values" {
-    var interp = try common.testStart(testing.allocator);
+test "append to unset variable" {
+    try memutil.checkAllocationFailures(.exhaustive, testAppendToUnsetVariable, .{});
+}
+
+fn testAppendNoValues(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // No values: returns current content without modifying it.
@@ -376,8 +389,12 @@ test "append no values" {
     );
 }
 
-test "append return value" {
-    var interp = try common.testStart(testing.allocator);
+test "append no values" {
+    try memutil.checkAllocationFailures(.exhaustive, testAppendNoValues, .{});
+}
+
+fn testAppendReturnValue(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // The return value of append is the new variable contents.
@@ -388,8 +405,12 @@ test "append return value" {
     );
 }
 
-test "string map basic" {
-    var interp = try common.testStart(testing.allocator);
+test "append return value" {
+    try memutil.checkAllocationFailures(.exhaustive, testAppendReturnValue, .{});
+}
+
+fn testStringMapBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Single-character replacement.
@@ -403,8 +424,12 @@ test "string map basic" {
     try interp.testExpectScriptResult("A321*A*321*", "string map {abc 321 ab * a A} aabcabaababcab");
 }
 
-test "string map -nocase" {
-    var interp = try common.testStart(testing.allocator);
+test "string map basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testStringMapBasic, .{});
+}
+
+fn testStringMapNocase(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Case-insensitive single-character replacement.
@@ -420,16 +445,24 @@ test "string map -nocase" {
     try interp.testExpectScriptResult("a4321C4321a43214321c4321", "string map -nocase {ab 4321} aAbCaBaAbAbcAb");
 }
 
-test "string map error cases" {
-    var interp = try common.testStart(testing.allocator);
+test "string map -nocase" {
+    try memutil.checkAllocationFailures(.exhaustive, testStringMapNocase, .{});
+}
+
+fn testStringMapErrorCases(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Odd number of elements in the mapping list is an error.
     try interp.testExpectScriptError(error.EvalError, "list must contain an even number of elements", "string map {a b c} abba");
 }
 
-test "string map empty keys" {
-    var interp = try common.testStart(testing.allocator);
+test "string map error cases" {
+    try memutil.checkAllocationFailures(.exhaustive, testStringMapErrorCases, .{});
+}
+
+fn testStringMapEmptyKeys(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Empty key is skipped; the string is returned unchanged.
@@ -439,10 +472,18 @@ test "string map empty keys" {
     try interp.testExpectScriptResult("baroo", "string map -nocase {{} abc f bar {} def} foo");
 }
 
-test "string map case sensitive" {
-    var interp = try common.testStart(testing.allocator);
+test "string map empty keys" {
+    try memutil.checkAllocationFailures(.exhaustive, testStringMapEmptyKeys, .{});
+}
+
+fn testStringMapCaseSensitive(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Case-sensitive: "Ab" only matches "Ab", not "ab" or "aB".
     try interp.testExpectScriptResult("a4321CaBa43214321c4321", "string map {Ab 4321} aAbCaBaAbAbcAb");
+}
+
+test "string map case sensitive" {
+    try memutil.checkAllocationFailures(.exhaustive, testStringMapCaseSensitive, .{});
 }

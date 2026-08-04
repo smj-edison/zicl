@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
     const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse !static_link;
     const trace_mem = b.option(bool, "trace-mem", "Trace object memory operations") orelse (optimize == .Debug);
+    const capture_stack_trace = b.option(bool, "capture-stack-trace", "Capture stack trace when tracing mem") orelse trace_mem;
     const expensive_checks = b.option(bool, "expensive-checks", "Whether expensive internal state checks are enabled") orelse (optimize == .Debug);
     const test_filters = b.option(
         [][]const u8,
@@ -17,11 +18,7 @@ pub fn build(b: *std.Build) void {
     ) orelse &[0][]const u8{};
     const token_debugging = b.option(bool, "token-debugging", "Whether to print tokens when they're parsed") orelse false;
     const threading = b.option(bool, "threading", "Whether threading is enabled") orelse true;
-    const full_oom_testing = b.option(
-        bool,
-        "full-oom-testing",
-        "Run the allocation-failure sweep on tests that drive a whole interpreter, which is slow enough to be worth doing periodically rather than every build",
-    ) orelse false;
+    const full_oom_testing = b.option(bool, "full-oom-testing", "Enable all incremental OOM tests (slow)") orelse false;
 
     const target = b.standardTargetOptions(.{
         .default_target = if (static_link) .{ .abi = .musl } else .{},
@@ -34,6 +31,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "trace_mem", trace_mem);
     options.addOption(bool, "expensive_checks", expensive_checks);
     options.addOption(bool, "full_oom_testing", full_oom_testing);
+    options.addOption(bool, "capture_stack_trace", capture_stack_trace);
     const options_mod = options.createModule();
 
     // deps

@@ -573,7 +573,7 @@ fn testFileReportsAUsageErrorForABadSubcommand(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    try testing.expectError(error.EvalError, interp.testRunScript("file bogus /"));
+    try memutil.expectErrorOrOom(error.EvalError, interp.testRunScript("file bogus /"));
 }
 
 test "file reports a usage error for a bad subcommand" {

@@ -9,6 +9,7 @@ const List = objects.List;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 /// [incr]
 pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -139,8 +140,8 @@ pub fn registerCommands(interp: *Interp) !void {
 
 const testing = std.testing;
 
-test "unset removes a variable" {
-    var interp = try common.testStart(testing.allocator);
+fn testUnsetRemovesAVariable(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("", "set x 5; unset x");
@@ -148,8 +149,12 @@ test "unset removes a variable" {
     try interp.testExpectScriptResult("", "set x 5; unset x; unset -nocomplain x");
 }
 
-test "unset of a shadowing local exposes the lexical it shadowed" {
-    var interp = try common.testStart(testing.allocator);
+test "unset removes a variable" {
+    try memutil.checkAllocationFailures(.exhaustive, testUnsetRemovesAVariable, .{});
+}
+
+fn testUnsetOfAShadowingLocalExposesTheLexicalItShadowed(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Removing the local has to expose the captured scope underneath rather than
@@ -169,8 +174,12 @@ test "unset of a shadowing local exposes the lexical it shadowed" {
     );
 }
 
-test "dict sugar reads and writes through a variable" {
-    var interp = try common.testStart(testing.allocator);
+test "unset of a shadowing local exposes the lexical it shadowed" {
+    try memutil.checkAllocationFailures(.exhaustive, testUnsetOfAShadowingLocalExposesTheLexicalItShadowed, .{});
+}
+
+fn testDictSugarReadsAndWritesThroughAVariable(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Each assertion uses a fresh variable, since they share one interpreter and
@@ -188,8 +197,12 @@ test "dict sugar reads and writes through a variable" {
     try interp.testExpectScriptResult("c deep", "set five::b::c deep; set five::b");
 }
 
-test "dict sugar copies when the dict is shared" {
-    var interp = try common.testStart(testing.allocator);
+test "dict sugar reads and writes through a variable" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictSugarReadsAndWritesThroughAVariable, .{});
+}
+
+fn testDictSugarCopiesWhenTheDictIsShared(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `other` holds the same dict, so writing through sugar must copy rather
@@ -203,8 +216,12 @@ test "dict sugar copies when the dict is shared" {
     try interp.testExpectScriptResult("b 2", "return $a");
 }
 
-test "unset removes a dict sugar element" {
-    var interp = try common.testStart(testing.allocator);
+test "dict sugar copies when the dict is shared" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictSugarCopiesWhenTheDictIsShared, .{});
+}
+
+fn testUnsetRemovesADictSugarElement(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Only the named key goes; the rest of the dict stays.
@@ -218,8 +235,12 @@ test "unset removes a dict sugar element" {
     );
 }
 
-test "unset of a shared dict element copies rather than mutating" {
-    var interp = try common.testStart(testing.allocator);
+test "unset removes a dict sugar element" {
+    try memutil.checkAllocationFailures(.exhaustive, testUnsetRemovesADictSugarElement, .{});
+}
+
+fn testUnsetOfASharedDictElementCopiesRatherThanMutating(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Same copy-on-write requirement as writing, on the removal path.
@@ -232,8 +253,12 @@ test "unset of a shared dict element copies rather than mutating" {
     try interp.testExpectScriptResult("c 2", "return $a");
 }
 
-test "upvar reads and writes through a link" {
-    var interp = try common.testStart(testing.allocator);
+test "unset of a shared dict element copies rather than mutating" {
+    try memutil.checkAllocationFailures(.exhaustive, testUnsetOfASharedDictElementCopiesRatherThanMutating, .{});
+}
+
+fn testUpvarReadsAndWritesThroughALink(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Reading through a link.
@@ -260,8 +285,12 @@ test "upvar reads and writes through a link" {
     );
 }
 
-test "upvar at level 0 rejects cycles and redefinition" {
-    var interp = try common.testStart(testing.allocator);
+test "upvar reads and writes through a link" {
+    try memutil.checkAllocationFailures(.exhaustive, testUpvarReadsAndWritesThroughALink, .{});
+}
+
+fn testUpvarAtLevel0RejectsCyclesAndRedefinition(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptError(error.EvalError, "can't upvar from variable to itself", "upvar 0 x x");
@@ -269,8 +298,12 @@ test "upvar at level 0 rejects cycles and redefinition" {
     try interp.testExpectScriptError(error.EvalError, "variable \"y\" already exists", "set y 1; upvar 0 x y");
 }
 
-test "upvar resolves to a value when its scope is captured" {
-    var interp = try common.testStart(testing.allocator);
+test "upvar at level 0 rejects cycles and redefinition" {
+    try memutil.checkAllocationFailures(.exhaustive, testUpvarAtLevel0RejectsCyclesAndRedefinition, .{});
+}
+
+fn testUpvarResolvesToAValueWhenItsScopeIsCaptured(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `make` holds `linked` only as an upvar into its caller. The closure it
@@ -286,4 +319,8 @@ test "upvar resolves to a value when its scope is captured" {
         \\ set grab [make]
         \\ grab
     );
+}
+
+test "upvar resolves to a value when its scope is captured" {
+    try memutil.checkAllocationFailures(.exhaustive, testUpvarResolvesToAValueWhenItsScopeIsCaptured, .{});
 }

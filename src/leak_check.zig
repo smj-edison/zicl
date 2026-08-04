@@ -59,9 +59,12 @@ pub inline fn globalTrace(category: LogCategory, value: Value, comptime fmt: []c
         }
 
         const slot = next_debug_location.fetchAdd(1, .monotonic);
-        const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &debug_log[slot].addrs);
+        const stack_trace: std.debug.StackTrace = if (options.capture_stack_trace)
+            std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &debug_log[slot].addrs)
+        else
+            .{ .return_addresses = &.{}, .skipped = .unknown };
         debug_log[slot].category = category;
-        debug_log[slot].stack_trace = st;
+        debug_log[slot].stack_trace = stack_trace;
         debug_log[slot].value = value;
         debug_log[slot].message = std.fmt.allocPrint(debug_gpa, fmt, args) catch unreachable;
         debug_log[slot].initialized.store(true, .release);
@@ -362,7 +365,7 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
 
     const entries = next_debug_location.load(.monotonic);
     if (entries == 0) {
-        debug.print("(no operations logged)\n", .{});
+        ioutil.debug("(no operations logged)\n", .{});
         return;
     }
 
@@ -371,7 +374,7 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
         if (!entry.initialized.load(.acquire)) continue;
         const obj = entry.value.asPtr() orelse continue;
         if (@intFromPtr(obj) == addr) {
-            debug.print("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
+            ioutil.debug("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
             counter += 1;
         }
     }
@@ -382,11 +385,15 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
             if (!entry.initialized.load(.acquire)) continue;
             const obj = entry.value.asPtr() orelse continue;
             if (@intFromPtr(obj) == addr) {
-                debug.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)});
-                debug.print("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
-                const stderr = heap.global_io.lockStderr(&.{}, .no_color) catch continue;
-                defer heap.global_io.unlockStderr();
-                std.debug.writeStackTrace(&entry.stack_trace, stderr.terminal()) catch {};
+                ioutil.debug("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)});
+                ioutil.debug("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
+
+                const stderr = ioutil.lockStderr();
+                defer ioutil.unlockStderr();
+                var buffer: [256]u8 = undefined;
+                var writer = stderr.writer(heap.global_io, &buffer);
+                const terminal: std.Io.Terminal = .{ .writer = &writer.interface, .mode = .no_color };
+                std.debug.writeStackTrace(&entry.stack_trace, terminal) catch {};
                 counter += 1;
             }
         }

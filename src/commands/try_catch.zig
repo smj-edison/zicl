@@ -10,6 +10,7 @@ const Dictionary = objects.Dictionary;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 const interned_code = heap.InternedString.newValue("-code");
 const interned_level = heap.InternedString.newValue("-level");
@@ -75,6 +76,9 @@ fn catchTryHelper(
     // By default these return codes are ignored, e.g. propagated.
     to_propagate.insert(.exit);
     to_propagate.insert(.signal);
+    // Out of memory belongs to the allocator's caller, not the script: catching it
+    // would report code 7 as an ordinary result and hide that anything failed.
+    to_propagate.insert(.oom);
 
     // The caller may have specified a different set of codes to propagate/catch. The
     // format is -no"code", or -"code". For example, -nobreak would propagate break,
@@ -96,7 +100,7 @@ fn catchTryHelper(
             } else return error.WrongUsage;
         } else {
             if (Interp.ReturnCodeEnum.map.get(str_value[1..])) |val| {
-                to_propagate.insert(val);
+                to_propagate.remove(val);
             } else return error.WrongUsage;
         }
     }
@@ -354,6 +358,13 @@ fn catchTryHelper(
         }
     }
 
+    // The handler and finally scripts run past the `to_propagate` check above, so an
+    // OOM in either still has to escape.
+    script_result catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    };
+
     switch (mode) {
         .@"catch" => {
             try interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromErrorUnion(script_result)));
@@ -382,8 +393,8 @@ pub fn registerCommands(interp: *Interp) !void {
 
 const testing = std.testing;
 
-test "catch and error" {
-    var interp = try common.testStart(testing.allocator);
+fn testCatchAndError(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Basic catch -- normal return gives code 0.
@@ -415,8 +426,16 @@ test "catch and error" {
     );
 }
 
-test "try command" {
-    var interp = try common.testStart(testing.allocator);
+test "catch and error" {
+    try memutil.checkAllocationFailures(
+        .{ .unsupported = "reading the options dict goes through `buildErrorOptionsBestEffort`, which answers a failed allocation with the preallocated fallback dict, so an injected failure changes what the script reads instead of raising" },
+        testCatchAndError,
+        .{},
+    );
+}
+
+fn testTryCommand(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // try with on handler matching error.
@@ -443,8 +462,12 @@ test "try command" {
     );
 }
 
-test "try trap matches an error code prefix" {
-    var interp = try common.testStart(testing.allocator);
+test "try command" {
+    try memutil.checkAllocationFailures(.exhaustive, testTryCommand, .{});
+}
+
+fn testTryTrapMatchesAnErrorCodePrefix(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // A trap pattern matches when it is a prefix of the raised -errorcode.
@@ -484,8 +507,16 @@ test "try trap matches an error code prefix" {
     );
 }
 
-test "try falls through a handler whose body is a dash" {
-    var interp = try common.testStart(testing.allocator);
+test "try trap matches an error code prefix" {
+    try memutil.checkAllocationFailures(
+        .{ .unsupported = "the handler's [return] goes through `buildErrorOptionsBestEffort`, which absorbs a failed allocation into the preallocated fallback dict, so the test still passes and the injection never reaches the harness" },
+        testTryTrapMatchesAnErrorCodePrefix,
+        .{},
+    );
+}
+
+fn testTryFallsThroughAHandlerWhoseBodyIsADash(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `-` means "use the next handler's body", which is how Tcl shares one
@@ -499,8 +530,16 @@ test "try falls through a handler whose body is a dash" {
     );
 }
 
-test "try runs finally on both success and failure" {
-    var interp = try common.testStart(testing.allocator);
+test "try falls through a handler whose body is a dash" {
+    try memutil.checkAllocationFailures(
+        .{ .unsupported = "the handler's [return] goes through `buildErrorOptionsBestEffort`, which absorbs a failed allocation into the preallocated fallback dict, so the test still passes and the injection never reaches the harness" },
+        testTryFallsThroughAHandlerWhoseBodyIsADash,
+        .{},
+    );
+}
+
+fn testTryRunsFinallyOnBothSuccessAndFailure(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // The finally body runs even when a handler caught an error, and the
@@ -517,8 +556,16 @@ test "try runs finally on both success and failure" {
     );
 }
 
-test "the preallocated OOM fallback is a usable options dict" {
-    var interp = try common.testStart(testing.allocator);
+test "try runs finally on both success and failure" {
+    try memutil.checkAllocationFailures(
+        .{ .unsupported = "the handler's [return] goes through `buildErrorOptionsBestEffort`, which absorbs a failed allocation into the preallocated fallback dict, so the test still passes and the injection never reaches the harness" },
+        testTryRunsFinallyOnBothSuccessAndFailure,
+        .{},
+    );
+}
+
+fn testThePreallocatedOOMFallbackIsAUsableOptionsDict(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `buildErrorOptionsBestEffort` hands this out when it cannot allocate, and
@@ -538,8 +585,12 @@ test "the preallocated OOM fallback is a usable options dict" {
     try interp.testExpectScriptResult("ZICL OOM", "dict get $opts -errorcode");
 }
 
-test "catch reports the code of non-error outcomes" {
-    var interp = try common.testStart(testing.allocator);
+test "the preallocated OOM fallback is a usable options dict" {
+    try memutil.checkAllocationFailures(.exhaustive, testThePreallocatedOOMFallbackIsAUsableOptionsDict, .{});
+}
+
+fn testCatchReportsTheCodeOfNonErrorOutcomes(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // 2 is `return`. [catch] observes it because a body is not a closure call,
@@ -556,4 +607,12 @@ test "catch reports the code of non-error outcomes" {
     // 3 is `break`, 4 is `continue`.
     try interp.testExpectScriptResult("3", "catch { break }");
     try interp.testExpectScriptResult("4", "catch { continue }");
+}
+
+test "catch reports the code of non-error outcomes" {
+    try memutil.checkAllocationFailures(
+        .{ .unsupported = "reading the options dict goes through `buildErrorOptionsBestEffort`, which answers a failed allocation with the preallocated fallback dict, so an injected failure changes what the script reads instead of raising" },
+        testCatchReportsTheCodeOfNonErrorOutcomes,
+        .{},
+    );
 }

@@ -4,6 +4,8 @@ pub const assert = std.debug.assert;
 pub const heap = @import("../heap.zig");
 pub const Value = heap.Value;
 
+pub const memutil = @import("../memutil.zig");
+
 pub const objects = @import("../objects.zig");
 pub const AlwaysCanBeType = objects.AlwaysCanBeType;
 pub const ErrorDetails = objects.ErrorDetails;

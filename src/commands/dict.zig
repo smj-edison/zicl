@@ -10,6 +10,7 @@ const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 const Dictionary = objects.Dictionary;
 
@@ -199,8 +200,8 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "dict", dictCmd, "subcommand ?arg ...?", 1, null, null);
 }
 
-test "dict unset" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testDictUnset(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Dictionaries can be created by unsetting.
@@ -208,8 +209,12 @@ test "dict unset" {
     try interp.testExpectScriptResult("", "set nonexistent"); // Shouldn't error.
 }
 
-test "dict commands" {
-    var interp = try common.testStart(std.testing.allocator);
+test "dict unset" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictUnset, .{});
+}
+
+fn testDictCommands(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptError(error.EvalError,
@@ -225,8 +230,12 @@ test "dict commands" {
     );
 }
 
-test "dict parent links" {
-    var interp = try common.testStart(std.testing.allocator);
+test "dict commands" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictCommands, .{});
+}
+
+fn testDictParentLinks(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("value",
@@ -236,8 +245,12 @@ test "dict parent links" {
     );
 }
 
-test "dict link command" {
-    var interp = try common.testStart(std.testing.allocator);
+test "dict parent links" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictParentLinks, .{});
+}
+
+fn testDictLinkCommand(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("value",
@@ -248,8 +261,12 @@ test "dict link command" {
     );
 }
 
-test "dict sugar" {
-    var interp = try common.testStart(std.testing.allocator);
+test "dict link command" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictLinkCommand, .{});
+}
+
+fn testDictSugar(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("a b y 10",
@@ -259,8 +276,12 @@ test "dict sugar" {
     );
 }
 
-test "dict keys" {
-    var interp = try common.testStart(std.testing.allocator);
+test "dict sugar" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictSugar, .{});
+}
+
+fn testDictKeys(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Basic dict keys.
@@ -309,6 +330,10 @@ test "dict keys" {
     // baz is only in child.
     // Order: parent keys first (foo, bar), then new child keys (baz).
     try interp.testExpectScriptResult("foo bar baz", "dict keys $d");
+}
+
+test "dict keys" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictKeys, .{});
 }
 
 /// Build `{ <key> <value> }` linked to `parent`, and register `parent` so the
@@ -362,5 +387,5 @@ fn testPartialFlatten(ta: std.mem.Allocator) !void {
 }
 
 test "dict remove flattens only as far as the key reaches" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPartialFlatten, .{});
+    try memutil.checkAllocationFailures(.exhaustive, testPartialFlatten, .{});
 }

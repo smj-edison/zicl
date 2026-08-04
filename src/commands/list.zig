@@ -11,6 +11,7 @@ const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 /// [lmap]
 pub fn lmapCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -175,8 +176,8 @@ pub fn registerCommands(interp: *Interp) !void {
 
 const testing = std.testing;
 
-test "lassign basic" {
-    var interp = try common.testStart(testing.allocator);
+fn testLassignBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("", "lassign {a b c} v1 v2 v3");
@@ -185,8 +186,12 @@ test "lassign basic" {
     try interp.testExpectScriptResult("c", "set v3");
 }
 
-test "lassign remaining" {
-    var interp = try common.testStart(testing.allocator);
+test "lassign basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLassignBasic, .{});
+}
+
+fn testLassignRemaining(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Unassigned elements are returned.
@@ -197,8 +202,12 @@ test "lassign remaining" {
     try interp.testExpectScriptResult("b", "set v2");
 }
 
-test "lassign not enough elements" {
-    var interp = try common.testStart(testing.allocator);
+test "lassign remaining" {
+    try memutil.checkAllocationFailures(.exhaustive, testLassignRemaining, .{});
+}
+
+fn testLassignNotEnoughElements(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // When the list is shorter than the variable count, remaining vars get empty.
@@ -210,8 +219,12 @@ test "lassign not enough elements" {
     try interp.testExpectScriptResult("", "set v3");
 }
 
-test "lassign can assign back over the variable its list came from" {
-    var interp = try common.testStart(testing.allocator);
+test "lassign not enough elements" {
+    try memutil.checkAllocationFailures(.exhaustive, testLassignNotEnoughElements, .{});
+}
+
+fn testLassignCanAssignBackOverTheVariableItsListCameFrom(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `l` is reassigned partway through, which releases the list still being
@@ -224,16 +237,24 @@ test "lassign can assign back over the variable its list came from" {
     try interp.testExpectScriptResult("a", "return $l");
 }
 
-test "lassign no variables" {
-    var interp = try common.testStart(testing.allocator);
+test "lassign can assign back over the variable its list came from" {
+    try memutil.checkAllocationFailures(.exhaustive, testLassignCanAssignBackOverTheVariableItsListCameFrom, .{});
+}
+
+fn testLassignNoVariables(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // With no variable names, the whole list is returned unchanged.
     try interp.testExpectScriptResult("a b c", "lassign {a b c}");
 }
 
-test "list command basic" {
-    var interp = try common.testStart(testing.allocator);
+test "lassign no variables" {
+    try memutil.checkAllocationFailures(.exhaustive, testLassignNoVariables, .{});
+}
+
+fn testListCommandBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // No args returns empty list.
@@ -246,8 +267,12 @@ test "list command basic" {
     try interp.testExpectScriptResult("a b c", "list a b c");
 }
 
-test "list command preserves strings" {
-    var interp = try common.testStart(testing.allocator);
+test "list command basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testListCommandBasic, .{});
+}
+
+fn testListCommandPreservesStrings(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Strings with spaces are treated as single elements.
@@ -257,8 +282,12 @@ test "list command preserves strings" {
     try interp.testExpectScriptResult("a {} b", "list a {} b");
 }
 
-test "list command nesting" {
-    var interp = try common.testStart(testing.allocator);
+test "list command preserves strings" {
+    try memutil.checkAllocationFailures(.exhaustive, testListCommandPreservesStrings, .{});
+}
+
+fn testListCommandNesting(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Nested lists are preserved as elements.
@@ -268,8 +297,12 @@ test "list command nesting" {
     try interp.testExpectScriptResult("2", "llength [list {a b} {c d}]");
 }
 
-test "join basic" {
-    var interp = try common.testStart(testing.allocator);
+test "list command nesting" {
+    try memutil.checkAllocationFailures(.exhaustive, testListCommandNesting, .{});
+}
+
+fn testJoinBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Default join string is a space.
@@ -294,8 +327,12 @@ test "join basic" {
     try interp.testExpectScriptResult("a--b--c", "join {a b c} --");
 }
 
-test "lappend appends to a variable" {
-    var interp = try common.testStart(testing.allocator);
+test "join basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testJoinBasic, .{});
+}
+
+fn testLappendAppendsToAVariable(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("a b c", "set l {a b}; lappend l c");
@@ -312,8 +349,12 @@ test "lappend appends to a variable" {
     try interp.testExpectScriptResult("a b", "set l {a b}; lappend l");
 }
 
-test "lappend copies when the list is shared" {
-    var interp = try common.testStart(testing.allocator);
+test "lappend appends to a variable" {
+    try memutil.checkAllocationFailures(.exhaustive, testLappendAppendsToAVariable, .{});
+}
+
+fn testLappendCopiesWhenTheListIsShared(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `other` holds the same list, so appending to `l` must copy rather than
@@ -327,8 +368,12 @@ test "lappend copies when the list is shared" {
     try interp.testExpectScriptResult("a b c", "return $l");
 }
 
-test "concat joins lists and strings" {
-    var interp = try common.testStart(testing.allocator);
+test "lappend copies when the list is shared" {
+    try memutil.checkAllocationFailures(.exhaustive, testLappendCopiesWhenTheListIsShared, .{});
+}
+
+fn testConcatJoinsListsAndStrings(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Every argument is already a list here, which takes the list fast path.
@@ -363,8 +408,12 @@ test "concat joins lists and strings" {
     try interp.testExpectScriptResult("1 2 3", "concat {1 2 3} {}");
 }
 
-test "lmap maps a body over a list" {
-    var interp = try common.testStart(testing.allocator);
+test "concat joins lists and strings" {
+    try memutil.checkAllocationFailures(.exhaustive, testConcatJoinsListsAndStrings, .{});
+}
+
+fn testLmapMapsABodyOverAList(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("2 3 4", "lmap x {1 2 3} { + $x 1 }");
@@ -372,4 +421,8 @@ test "lmap maps a body over a list" {
 
     // The loop variable survives as the last element, matching [foreach].
     try interp.testExpectScriptResult("3", "lmap x {1 2 3} { + $x 1 }; return $x");
+}
+
+test "lmap maps a body over a list" {
+    try memutil.checkAllocationFailures(.exhaustive, testLmapMapsABodyOverAList, .{});
 }

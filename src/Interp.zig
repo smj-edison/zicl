@@ -641,8 +641,11 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure
     const variables = try vartypes.VarTable.create();
     errdefer variables.destroy();
 
+    // Reserved up front, since a failing append would strand the references in its argument.
+    try interp.call_frames.ensureUnusedCapacity(heap.global_gpa, 1);
+
     const new_call_frame_idx = interp.call_frames.items.len;
-    try interp.call_frames.append(heap.global_gpa, .{
+    interp.call_frames.appendAssumeCapacity(.{
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
         .signature = .{
@@ -1946,7 +1949,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
 }
 
 test "recursive dict removal" {
-    try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDictRemoval, .{});
+    try memutil.checkAllocationFailures(.exhaustive, testRecursiveDictRemoval, .{});
 }
 
 pub fn testRunScript(interp: *Interp, script: []const u8) !Value {
@@ -1961,6 +1964,9 @@ pub fn testExpectScriptResult(interp: *Interp, expected: []const u8, script: []c
     if (result) |success| {
         try testing.expectEqualStrings(expected, try success.getString());
     } else |err| {
+        // Need to propagate error.OutOfMemory for OOM stress testing.
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+
         ioutil.debug("Test failed with zig error {}", .{err});
         ioutil.debug(" and error message \"{s}\"\n", .{try interp.result.getString()});
         return err;

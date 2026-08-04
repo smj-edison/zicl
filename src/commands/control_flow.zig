@@ -13,6 +13,7 @@ const List = objects.List;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.Error!enum { @"continue", @"break", none } {
     if (result) |_| {
@@ -153,8 +154,8 @@ pub fn foreachCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     return foreachMapHelper(interp, args, .foreach);
 }
 
-test "loop commands" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testLoopCommands(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Basic loop.
@@ -232,6 +233,10 @@ test "loop commands" {
     try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
         \\ foreach {} {1 2} { puts hi }
     );
+}
+
+test "loop commands" {
+    try memutil.checkAllocationFailures(.exhaustive, testLoopCommands, .{});
 }
 
 /// [if]
@@ -526,8 +531,8 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
 }
 
-test "return escapes a nested body to leave the closure" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testReturnEscapesANestedBodyToLeaveTheClosure(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // `-level` counts closure calls, so an intervening body must not swallow the
@@ -551,8 +556,12 @@ test "return escapes a nested body to leave the closure" {
     );
 }
 
-test "return -code raises that code instead of returning" {
-    var interp = try common.testStart(std.testing.allocator);
+test "return escapes a nested body to leave the closure" {
+    try memutil.checkAllocationFailures(.exhaustive, testReturnEscapesANestedBodyToLeaveTheClosure, .{});
+}
+
+fn testReturnCodeRaisesThatCodeInsteadOfReturning(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("1", "fn f {} { return -code error boom }; catch { f }");
@@ -568,8 +577,12 @@ test "return -code raises that code instead of returning" {
     );
 }
 
-test "return -level skips out of several closures" {
-    var interp = try common.testStart(std.testing.allocator);
+test "return -code raises that code instead of returning" {
+    try memutil.checkAllocationFailures(.exhaustive, testReturnCodeRaisesThatCodeInsteadOfReturning, .{});
+}
+
+fn testReturnLevelSkipsOutOfSeveralClosures(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Level 2 leaves both `inner` and `outer`, so `outer`'s trailing command
@@ -587,8 +600,12 @@ test "return -level skips out of several closures" {
     );
 }
 
-test "return exits a closure early" {
-    var interp = try common.testStart(std.testing.allocator);
+test "return -level skips out of several closures" {
+    try memutil.checkAllocationFailures(.exhaustive, testReturnLevelSkipsOutOfSeveralClosures, .{});
+}
+
+fn testReturnExitsAClosureEarly(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("42",
@@ -601,4 +618,8 @@ test "return exits a closure early" {
         \\ fn nothing {} { set x 99; return }
         \\ nothing
     );
+}
+
+test "return exits a closure early" {
+    try memutil.checkAllocationFailures(.exhaustive, testReturnExitsAClosureEarly, .{});
 }

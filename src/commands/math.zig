@@ -10,6 +10,7 @@ const Float = objects.Float;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { add, mul }) Interp.Error!void {
     // This will break out of the block early if not all arguments are ints.
@@ -185,8 +186,8 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "/", divCmd, "?number ...?", 1, null, null);
 }
 
-test "arithmetic addition" {
-    var interp = try common.testStart(std.testing.allocator);
+fn testArithmeticAddition(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("10", "+ 5 5");
@@ -198,12 +199,20 @@ test "arithmetic addition" {
     , "+ 9223372036854775807 9223372036854775807");
 }
 
-test "arithmetic division" {
-    var interp = try common.testStart(std.testing.allocator);
+test "arithmetic addition" {
+    try memutil.checkAllocationFailures(.exhaustive, testArithmeticAddition, .{});
+}
+
+fn testArithmeticDivision(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Make sure it stays as an integer.
     try interp.testExpectScriptResult("2", "/ 12 5");
     try interp.testExpectScriptResult("0", "/ 2 2 2");
     try interp.testExpectScriptError(error.EvalError, "division by zero", "/ 5 0");
+}
+
+test "arithmetic division" {
+    try memutil.checkAllocationFailures(.exhaustive, testArithmeticDivision, .{});
 }

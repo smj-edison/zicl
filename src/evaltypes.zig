@@ -379,12 +379,13 @@ pub const Script = struct {
             script_command.word_count = command_arg_count;
         }
 
+        const script_obj = try Object.newObject(Script);
+        errdefer script_obj.head.freeBacking();
+
         const tags_slice = try new_token_tags.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(tags_slice);
         const values_slice = try new_token_values.toOwnedSlice(heap.global_gpa);
-        errdefer heap.global_gpa.free(values_slice);
 
-        const script_obj = try Object.newObject(Script);
         script_obj.body.* = .{
             .tags = tags_slice,
             .values = values_slice,
@@ -534,12 +535,13 @@ pub const Substitution = struct {
             }
         }
 
+        const subst_obj = try Object.newObject(Substitution);
+        errdefer subst_obj.head.freeBacking();
+
         const tags_slice = try new_token_tags.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(tags_slice);
         const values_slice = try new_token_values.toOwnedSlice(heap.global_gpa);
-        errdefer heap.global_gpa.free(values_slice);
 
-        const subst_obj = try Object.newObject(Substitution);
         subst_obj.body.* = .{
             .tags = tags_slice,
             .values = values_slice,
@@ -587,7 +589,7 @@ pub const Expression = struct {
 
         // The expression object we'll store the result in.
         const expr_obj = try Object.newObject(Expression);
-        errdefer expr_obj.head.release();
+        errdefer expr_obj.head.freeBacking();
 
         // Parse all the tokens of the expr, handling any errors that come up.
         const bytes = try value.getString();
@@ -1421,11 +1423,15 @@ pub const Closure = struct {
                     return error.BadClosure;
                 }
 
+                // Reserved up front, since a failing append would strand the borrow in its argument.
+                try optional_values.ensureUnusedCapacity(heap.global_gpa, 1);
+                try arg_names.ensureUnusedCapacity(heap.global_gpa, 1);
+
                 // Add the optional parameter onto the optional parameters list.
-                try optional_values.append(heap.global_gpa, arg_as_list.items[1].borrow());
+                optional_values.appendAssumeCapacity(arg_as_list.items[1].borrow());
 
                 // Pull out the name from the default list (`{name default}`).
-                try arg_names.append(heap.global_gpa, arg_as_list.items[0].borrow());
+                arg_names.appendAssumeCapacity(arg_as_list.items[0].borrow());
             } else {
                 if (optional_values.items.len > 0) {
                     if (det) |details| details.* = .{
@@ -1436,7 +1442,8 @@ pub const Closure = struct {
 
                 if (try arg_as_list.items[0].equalsString("args")) args_parameter_found = true;
 
-                try arg_names.append(heap.global_gpa, arg_as_list.items[0].borrow());
+                try arg_names.ensureUnusedCapacity(heap.global_gpa, 1);
+                arg_names.appendAssumeCapacity(arg_as_list.items[0].borrow());
             }
         }
 
