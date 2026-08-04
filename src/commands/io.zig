@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const ioutil = @import("../ioutil.zig");
+const capability = @import("../capability.zig");
 
 const common = @import("common.zig");
 const heap = common.heap;
@@ -10,41 +11,73 @@ const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
+const memutil = common.memutil;
 
 /// [puts]
+///
+/// `puts ?-nonewline? ?channel? string`. With two arguments left after the flag
+/// the first is a channel, which is how the ambiguity with the flag is settled:
+/// a bare `puts -nonewline foo` still writes `foo` to stdout.
 pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
-    const to_print, const print_newline = blk: {
-        if (args.len == 3) {
-            const first_arg_str = try args[1].getString();
-            if (!std.mem.eql(u8, first_arg_str, "-nonewline")) {
-                try interp.setResultString("The second argument must be -nonewline");
-                return error.EvalError;
-            } else {
-                break :blk .{ try args[2].getString(), false };
-            }
-        } else {
-            break :blk .{ try args[1].getString(), true };
-        }
-    };
+    var rest = args[1..];
+
+    // Compared through the value rather than its bytes, so a short string can be
+    // matched without its rendering being materialized.
+    const print_newline = if (rest.len > 1 and try rest[0].current().equalsString("-nonewline")) blk: {
+        rest = rest[1..];
+        break :blk false;
+    } else true;
+
+    if (rest.len > 2) {
+        try interp.setResultString("wrong # args: should be \"puts ?-nonewline? ?channel? string\"");
+        return error.EvalError;
+    }
+
+    // A capability always begins with '<', so a leading '-' here is a mistyped
+    // option rather than a channel, and saying so beats complaining that the
+    // option is not a capability.
+    if (rest.len == 2 and std.mem.startsWith(u8, try rest[0].getString(), "-")) {
+        try interp.setResultString("The second argument must be -nonewline");
+        return error.EvalError;
+    }
+
+    const to_print = try rest[rest.len - 1].getString();
+
+    if (rest.len == 2) {
+        var det: ErrorDetails = undefined;
+        const cap = try interp.wrapError(&det, capability.Capability.shimmerFrom(&det, &rest[0]));
+        const body = try interp.wrapError(&det, cap.getBody(FileBody, &det));
+
+        // Streaming, so writes land at the file's own position. A positional
+        // writer starts each call from offset zero, which would make every
+        // write to a channel overwrite the one before it.
+        var buf: [1024]u8 = undefined;
+        var writer = body.file.writerStreaming(heap.global_io, &buf);
+
+        writer.interface.writeAll(to_print) catch return writeError(interp, &writer);
+        if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, &writer);
+        writer.flush() catch return writeError(interp, &writer);
+        return;
+    }
 
     const stdout = ioutil.lockStdout();
     defer ioutil.unlockStdout();
     var buf: [64]u8 = undefined;
     var writer = stdout.writer(heap.global_io, &buf);
-    writer.interface.print("{s}", .{to_print}) catch {
-        try interp.setResultFormatted("failed to print: {}", .{writer.err.?});
-        return error.EvalError;
-    };
-    if (print_newline) {
-        writer.interface.writeAll("\n") catch {
-            try interp.setResultFormatted("failed to print: {}", .{writer.err.?});
-            return error.EvalError;
-        };
-    }
-    writer.flush() catch {
-        try interp.setResultFormatted("failed to print: {}", .{writer.err.?});
-        return error.EvalError;
-    };
+
+    writer.interface.writeAll(to_print) catch return writeError(interp, &writer);
+    if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, &writer);
+    writer.flush() catch return writeError(interp, &writer);
+}
+
+/// Reports a failed write, for `catch return writeError(interp, &writer)`.
+///
+/// Every write and every flush fails the same way and wants the same message,
+/// and the error they return is a placeholder: `writer.err` is where the cause
+/// actually lands, whichever call it was.
+fn writeError(interp: *Interp, writer: *const std.Io.File.Writer) Interp.Error {
+    interp.setResultFormatted("failed to write: {}", .{writer.err.?}) catch |err| return err;
+    return error.EvalError;
 }
 
 /// [pid]
@@ -269,10 +302,125 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     }
 }
 
+/// The body of a file capability: what `[fopen]` hands out and `[close]` takes
+/// back. Nothing but the file, since the capability machinery carries identity
+/// and lifetime on its own.
+pub const FileBody = struct {
+    pub const capability_name = "file-handle";
+
+    file: std.Io.File,
+
+    pub fn deinit(self: *FileBody) void {
+        self.file.close(heap.global_io);
+    }
+};
+
+/// Whether the platform lets us ask for `O_APPEND`.
+///
+/// `std.Io` does not expose it, so the flag has to be set through the posix
+/// layer, which only exists on platforms that have one. Checked by looking for
+/// the field rather than by naming operating systems, since the flag is the
+/// thing actually needed.
+const has_posix_append = switch (@typeInfo(std.posix.O)) {
+    .@"struct" => @hasField(std.posix.O, "APPEND"),
+    else => false,
+};
+
+/// Opens `path` for appending, creating it if it is not there.
+///
+/// With `O_APPEND` every write moves to the true end of the file atomically, so
+/// two writers appending to one file cannot land on top of each other. Without
+/// it the cursor is placed at the end once, at open, and goes stale as soon as
+/// anything else writes; a caller wanting a shared log then has to serialize for
+/// itself.
+fn openForAppend(path: []const u8, readable: bool) !std.Io.File {
+    if (has_posix_append) {
+        // Bypasses `heap.global_io` for this one call, which is the price of a
+        // flag the `Io` layer has no way to pass along.
+        const handle = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = if (readable) .RDWR else .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+        }, 0o666);
+        // `nonblocking` has to describe the descriptor rather than be a request:
+        // `O_NONBLOCK` is not set above, so anything reading this field would be
+        // misled by saying otherwise.
+        return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+    }
+
+    // Turning truncation off keeps what is already there, but leaves the cursor
+    // at the start, so it has to be moved by hand.
+    const file = try std.Io.Dir.cwd().createFile(heap.global_io, path, .{
+        .truncate = false,
+        .read = readable,
+    });
+    errdefer file.close(heap.global_io);
+
+    const size = (try file.stat(heap.global_io)).size;
+    var seeker = file.writerStreaming(heap.global_io, &.{});
+    try seeker.seekToUnbuffered(size);
+    return file;
+}
+
+/// How `[fopen]` is asked for access, in the spelling Tcl uses.
+const Mode = objects.EnumConstructor(enum {
+    r,
+    w,
+    a,
+    @"r+",
+    @"w+",
+    @"a+",
+}, false);
+
+/// [fopen]
+pub fn fopenCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    const path = try args[1].getString();
+
+    var det: ErrorDetails = undefined;
+    const mode = if (args.len == 3) try interp.wrapError(&det, Mode.get(&det, &args[2])) else .r;
+
+    const dir = std.Io.Dir.cwd();
+    const file = switch (mode) {
+        .r => dir.openFile(heap.global_io, path, .{ .mode = .read_only }),
+        .@"r+" => dir.openFile(heap.global_io, path, .{ .mode = .read_write }),
+        .w => dir.createFile(heap.global_io, path, .{}),
+        .@"w+" => dir.createFile(heap.global_io, path, .{ .read = true }),
+        .a => openForAppend(path, false),
+        .@"a+" => openForAppend(path, true),
+    } catch |err| {
+        try interp.setResultFormatted("could not open \"{s}\": {t}", .{ path, err });
+        return error.EvalError;
+    };
+    errdefer file.close(heap.global_io);
+
+    const cap = try capability.Capability.new(FileBody, .{ .file = file });
+    interp.setResultOwning(cap.asHead().asValue());
+}
+
+/// [close]
+///
+/// Works on any capability, not just files, since closing needs nothing from
+/// the body beyond the vtable entry that finalizes it.
+pub fn closeCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    var det: ErrorDetails = undefined;
+    // Shimmered rather than resolved by name, so a capability that has never
+    // been rendered as a string is not forced to mint an identifier and enter
+    // the registry purely so that it can be looked up and closed.
+    const cap = try interp.wrapError(&det, capability.Capability.shimmerFrom(&det, &args[1]));
+
+    // Casting away const to close is sound: `shimmerFrom` returns a pointer into
+    // the object `args[1]` holds, and closing mutates the head behind it rather
+    // than the object itself, which stays a capability naming the same thing.
+    @constCast(cap).close();
+    interp.setEmptyResult();
+}
+
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "puts", putsCmd, "?-nonewline? string", 1, 2, null);
+    try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3, null);
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
+    try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2, null);
+    try registerCommand(interp, "close", closeCmd, "capability", 1, 1, null);
 }
 
 const testing = std.testing;
@@ -300,8 +448,8 @@ fn captureStdout(interp: *Interp, script: []const u8) ![]u8 {
     return try tmp.dir.readFileAlloc(heap.global_io, "stdout", heap.global_gpa, .unlimited);
 }
 
-test "puts writes a line to stdout" {
-    var interp = try common.testStart(testing.allocator);
+fn testPutsWritesALineToStdout(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     const written = try captureStdout(&interp, "puts hello");
@@ -309,8 +457,12 @@ test "puts writes a line to stdout" {
     try testing.expectEqualStrings("hello\n", written);
 }
 
-test "puts -nonewline omits the trailing newline" {
-    var interp = try common.testStart(testing.allocator);
+test "puts writes a line to stdout" {
+    try memutil.checkAllocationFailures(.exhaustive, testPutsWritesALineToStdout, .{});
+}
+
+fn testPutsNonewlineOmitsTheTrailingNewline(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     const written = try captureStdout(&interp, "puts -nonewline hello");
@@ -318,8 +470,12 @@ test "puts -nonewline omits the trailing newline" {
     try testing.expectEqualStrings("hello", written);
 }
 
-test "puts rejects an unknown option" {
-    var interp = try common.testStart(testing.allocator);
+test "puts -nonewline omits the trailing newline" {
+    try memutil.checkAllocationFailures(.exhaustive, testPutsNonewlineOmitsTheTrailingNewline, .{});
+}
+
+fn testPutsRejectsAnUnknownOption(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptError(
@@ -329,8 +485,12 @@ test "puts rejects an unknown option" {
     );
 }
 
-test "pid reports this process" {
-    var interp = try common.testStart(testing.allocator);
+test "puts rejects an unknown option" {
+    try memutil.checkAllocationFailures(.exhaustive, testPutsRejectsAnUnknownOption, .{});
+}
+
+fn testPidReportsThisProcess(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     var expected: [32]u8 = undefined;
@@ -338,8 +498,12 @@ test "pid reports this process" {
     try interp.testExpectScriptResult(rendered, "pid");
 }
 
-test "file splits a path into its parts" {
-    var interp = try common.testStart(testing.allocator);
+test "pid reports this process" {
+    try memutil.checkAllocationFailures(.exhaustive, testPidReportsThisProcess, .{});
+}
+
+fn testFileSplitsAPathIntoItsParts(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("/usr/lib", "file dirname /usr/lib/thing.so");
@@ -351,22 +515,26 @@ test "file splits a path into its parts" {
     try interp.testExpectScriptResult(".", "file dirname thing.so");
 }
 
-test "file join builds a path from parts" {
-    var interp = try common.testStart(testing.allocator);
+test "file splits a path into its parts" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileSplitsAPathIntoItsParts, .{});
+}
+
+fn testFileJoinBuildsAPathFromParts(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("a/b/c", "file join a b c");
     try interp.testExpectScriptResult("a", "file join a");
 }
 
-test "file exists distinguishes present from absent paths" {
-    var interp = try common.testStart(testing.allocator);
+test "file join builds a path from parts" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileJoinBuildsAPathFromParts, .{});
+}
+
+fn testFileExistsDistinguishesPresentFromAbsentPaths(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    // These render as "true"/"false" rather than Tcl's "1"/"0", deliberately:
-    // mixing booleans and numbers is an anti-pattern, so zicl keeps them
-    // distinct. Tcl's boolean parsing accepts both spellings, so the difference
-    // only shows when a script prints or string-compares the value.
     try interp.testExpectScriptResult("true", "file exists /");
     try interp.testExpectScriptResult("true", "file isdirectory /");
     try interp.testExpectScriptResult("false", "file exists /nonexistent-zicl-test-path");
@@ -375,8 +543,12 @@ test "file exists distinguishes present from absent paths" {
     try interp.testExpectScriptResult("yes", "if {[file exists /]} { return yes } else { return no }");
 }
 
-test "file tempfile creates a file and returns its path" {
-    var interp = try common.testStart(testing.allocator);
+test "file exists distinguishes present from absent paths" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileExistsDistinguishesPresentFromAbsentPaths, .{});
+}
+
+fn testFileTempfileCreatesAFileAndReturnsItsPath(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // The result is borrowed from the interpreter, so copy the path before the
@@ -393,9 +565,135 @@ test "file tempfile creates a file and returns its path" {
     try interp.testExpectScriptResult("true", "file exists $path");
 }
 
-test "file reports a usage error for a bad subcommand" {
-    var interp = try common.testStart(testing.allocator);
+test "file tempfile creates a file and returns its path" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileTempfileCreatesAFileAndReturnsItsPath, .{});
+}
+
+fn testFileReportsAUsageErrorForABadSubcommand(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     try testing.expectError(error.EvalError, interp.testRunScript("file bogus /"));
+}
+
+test "file reports a usage error for a bad subcommand" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileReportsAUsageErrorForABadSubcommand, .{});
+}
+
+/// Creates a temporary file and returns its path, for tests that need a real
+/// file to work against. The caller owns the bytes and should delete the file.
+///
+/// Goes through `[file tempfile]` rather than building a path by hand, so that
+/// tests do not have to invent their own collision-avoidance and cannot collide
+/// with each other.
+fn testTempPath(interp: *Interp, ta: std.mem.Allocator) ![]u8 {
+    const result = try interp.testRunScript("file tempfile");
+    // Copied, since the next script run replaces the interpreter's result.
+    return ta.dupe(u8, try result.getString());
+}
+
+fn testFileAppend(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    const path = try testTempPath(&interp, ta);
+    defer ta.free(path);
+    defer std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch {};
+
+    // The second write is shorter than the first, which is what makes this
+    // catch a cursor left at the start: overwriting from offset zero keeps the
+    // bytes past the overwrite, so the file still looks plausible. Appending
+    // gives "0123456789abc" and overwriting gives "abc3456789".
+    const script = try std.fmt.allocPrint(ta,
+        \\set fd [fopen {s} w]
+        \\puts -nonewline $fd "0123456789"
+        \\close $fd
+        \\set fd [fopen {s} a]
+        \\puts -nonewline $fd "abc"
+        \\close $fd
+    , .{ path, path });
+    defer ta.free(script);
+
+    _ = try interp.testRunScript(script);
+
+    const written = try std.Io.Dir.cwd().readFileAlloc(heap.global_io, path, ta, .limited(1024));
+    defer ta.free(written);
+    try testing.expectEqualStrings("0123456789abc", written);
+}
+
+test "opening a file for append writes past the existing contents" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileAppend, .{});
+}
+
+fn testFileCapability(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    const path = try testTempPath(&interp, ta);
+    defer ta.free(path);
+    defer std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch {};
+
+    const script = try std.fmt.allocPrint(ta,
+        \\set fd [fopen {s} w]
+        \\puts $fd "first line"
+        \\puts -nonewline $fd "no newline"
+        \\close $fd
+        \\set fd
+    , .{path});
+    defer ta.free(script);
+
+    // Borrowed, since `testRunScript` hands back the interpreter's result
+    // without taking a reference, and the failing script at the end of this
+    // test replaces that result while `name` below is still in use.
+    const handle = (try interp.testRunScript(script)).borrow();
+    defer handle.release();
+
+    // The capability renders as a delimited URL naming this machine.
+    const name = try handle.getString();
+    try testing.expect(std.mem.startsWith(u8, name, "<" ++ capability.scheme));
+    try testing.expect(std.mem.indexOf(u8, name, "/file-handle/") != null);
+
+    const written = try std.Io.Dir.cwd().readFileAlloc(heap.global_io, path, ta, .limited(1024));
+    defer ta.free(written);
+    try testing.expectEqualStrings("first line\nno newline", written);
+
+    // Closing takes the name out of circulation, so writing through it fails as
+    // an unknown name rather than as something reporting itself closed.
+}
+
+test "file capability round trip" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileCapability, .{});
+}
+
+fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    const path = try testTempPath(&interp, ta);
+    defer ta.free(path);
+    defer std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch {};
+
+    const script = try std.fmt.allocPrint(testing.allocator,
+        \\set fd [fopen {s} w]
+        \\close $fd
+        \\set fd
+    , .{path});
+    defer testing.allocator.free(script);
+
+    const handle = (try interp.testRunScript(script)).borrow();
+    defer handle.release();
+
+    // Closing takes the name out of circulation, so writing through it fails as
+    // an unknown name rather than as something reporting itself closed.
+    const stale_message = try std.fmt.allocPrint(
+        testing.allocator,
+        "capability \"{s}\" is stale",
+        .{try handle.getString()},
+    );
+    defer testing.allocator.free(stale_message);
+    try interp.testExpectScriptError(error.EvalError, stale_message, "puts $fd x");
+}
+
+test "writing to a closed capability reports it as stale" {
+    try memutil.checkAllocationFailures(.exhaustive, testWritingToAClosedCapabilityReportsItAsStale, .{});
 }

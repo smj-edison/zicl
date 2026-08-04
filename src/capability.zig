@@ -8,6 +8,15 @@
 //!
 //! Capabilities lazily generate their id, so most of the time a capability will
 //! only be an object allocation + the capability allocation.
+//!
+//! Rendering a capability as a string _escapes_ it, in the sense escape analysis
+//! uses. Until then its identifier does not exist and nothing outside its
+//! holders can name it, so the runtime is free to reason about it locally. Once
+//! rendered, the identifier is loose in the world: it can be stored, sent
+//! somewhere else, or fed back in by a caller who was never given it, so
+//! anything downstream has to assume the pessimistic case. That boundary is why
+//! assigning an id and registering it happen at the moment of rendering rather
+//! than at creation.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,35 +44,43 @@ const encoded_id_len = std.base64.url_safe_no_pad.Encoder.calcSize(@sizeOf(Id));
 /// `body` is recovered using @parentFieldPtr on the `head` pointer.
 pub const Head = struct {
     vtable: *const VTable,
+    /// The capability's identifier, generated lazily and registered the first
+    /// time its string rep is generated. It is not registered in the case that
+    /// the capability has already been closed by then.
+    ///
+    /// Whether the registry holds it is therefore derivable rather than stored:
+    /// a head is in the registry exactly when its identifier is set and it is
+    /// not closed.
     id: struct {
         /// Set to maxInt by default to be poisoned.
         raw: Id = std.math.maxInt(Id),
+        /// Tracks one thing only: whether `raw` has been written yet.
+        ///
         /// Must always monotonically increase through the states.
         state: std.atomic.Value(enum(u8) {
             not_set,
-            registering,
-            registered,
+            setting,
+            id_set,
         }) = .init(.not_set),
 
         pub fn get(self: *const @This()) ?Id {
             // We always synchronize on `state`.
-            var register_state = self.state.load(.acquire);
-            if (register_state == .not_set) return null;
+            var current = self.state.load(.acquire);
+            if (current == .not_set) return null;
 
-            while (register_state == .registering) {
-                // Spin until the registering finishes. Registering is just setting a value, so
-                // it shouldn't take long at all.
-                register_state = self.state.load(.acquire);
+            while (current == .setting) {
+                // Spin until the write finishes. It is a single store, so it
+                // shouldn't take long at all.
+                current = self.state.load(.acquire);
             }
-            assert(register_state == .registered);
+            assert(current == .id_set);
             return self.raw; // Happens-after the .release on `self.state`.
         }
 
         pub fn set(self: *@This(), value: Id) !void {
-            if (self.state.cmpxchgStrong(.not_set, .registering, .monotonic, .monotonic)) |_| return error.OtherThreadSet;
-            // We successfully set state to registering, so now we'll do the actual registration.
+            if (self.state.cmpxchgStrong(.not_set, .setting, .monotonic, .monotonic)) |_| return error.OtherThreadSet;
             self.raw = value;
-            self.state.store(.registered, .release);
+            self.state.store(.id_set, .release);
         }
     },
     /// When closed, it means the capability is dead. We need this because there may still be
@@ -83,8 +100,8 @@ pub const Head = struct {
     /// does not imply the head is alive. A head whose count has reached zero is
     /// on its way to being destroyed but stays findable until it deregisters,
     /// and handing it out would revive an object mid-teardown. Declining to
-    /// count up from zero closes that window without `release` having to hold
-    /// the registry lock.
+    /// count up from zero closes that window, which is what lets a teardown
+    /// deregister without having to exclude lookups for its whole duration.
     fn tryBorrow(head: *Head) ?*Head {
         var current = head.ref_count.load(.monotonic);
         while (current != 0) {
@@ -97,19 +114,23 @@ pub const Head = struct {
         if (head.ref_count.fetchSub(1, .release) != 1) return;
         _ = head.ref_count.load(.acquire);
 
-        // Nothing names this any more. A caller may never have closed it, so
-        // close now; the body would otherwise be leaked.
+        // Nothing references this any more. A caller may never have closed it,
+        // so close now; the body would otherwise be leaked. No registry work is
+        // needed here either way: `close` removes a registered identifier, and
+        // one assigned after a close was never registered.
         head.close();
         head.vtable.destroyBacking(head);
     }
 
-    /// Deinits the body and removes the capability from the registry, so
-    /// that its name stops resolving from here on. Idempotent.
+    /// Deinits the body and takes the capability out of the registry, so that
+    /// its string rep stops resolving from here on. Idempotent.
     pub fn close(head: *Head) void {
         if (head.closed.swap(true, .acq_rel) == true) return;
 
         // An identifier exists only once the capability has been rendered as a
-        // string, and most never are, so most closes take no lock.
+        // string, and most never are, so most closes take no lock. Note that it
+        // is possible for identifiers to be assigned after closing, but those
+        // are never registered, so this is the only removal a head ever needs.
         if (head.id.get()) |id| {
             registry.mutex.lockUncancelable(heap.global_io);
             _ = registry.heads.remove(id);
@@ -120,32 +141,95 @@ pub const Head = struct {
     }
 
     pub fn isClosed(head: *const Head) bool {
-        // Monotonic load because the flag carries nothing with it: seeing false says
-        // only that the capability was open at some point during the call. A close
-        // running concurrently with a use is a caller error under any ordering,
-        // since lifetimes here are managed by hand.
+        // Monotonic load because the flag carries nothing with it: seeing false
+        // says only that the capability was open at some point during the call,
+        // and nothing else is published alongside it that a stronger ordering
+        // would make visible.
+        //
+        // A caller might expect this to make a read or write that follows it
+        // safe against a concurrent close. It does not, and no ordering could:
+        // the body can be deinited between this returning false and the caller
+        // touching it. Lifetimes here are managed by hand, so not closing a
+        // capability another thread is using is the caller's job.
         return head.closed.load(.monotonic);
     }
 
+    pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const head: *const Head = @ptrCast(@alignCast(info.node));
+        const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.addField([]const u8, "kind", "{s}", .{head.vtable.name});
+        try helper.addField(bool, "closed", "{}", .{head.isClosed()});
+        try helper.addField(u32, "ref_count", "{}", .{head.ref_count.load(.monotonic)});
+    }
+
     pub const VTable = struct {
-        /// Path segment a name uses, such as "file-handle".
+        /// Path segment a string rep uses, such as "file-handle".
         name: []const u8,
         /// Deinits the underlying body. Runs exactly once, from `close`.
         deinitBody: *const fn (head: *Head) void,
-        /// Frees the backing itself, once nothing names it any more. Separate from
+        /// Frees the backing itself, once nothing references it any more. Separate from
         /// `deinit` because the two happen at different times: a closed
         /// capability still has to exist in order to report that it is closed.
         destroyBacking: *const fn (head: *Head) void,
     };
+
+    /// Builds the vtable for capabilities over `Body`, which must declare the path
+    /// segment its names use and how to let go of itself:
+    /// ```zig
+    /// const FileHandle = struct {
+    ///     pub const capability_name = "file-handle";
+    ///     file: std.Io.File,
+    ///     pub fn deinit(self: *FileHandle) void { self.file.close(); }
+    /// };
+    /// ```
+    /// Its address is what identifies the kind at runtime, so every capability over
+    /// the same body shares one vtable and no two kinds share one.
+    pub fn vtableFor(Body: type) *const VTable {
+        comptime {
+            // The segment goes into a URL unescaped, so anything needing escaping
+            // would produce a string rep that does not round-trip through
+            // `parseName`.
+            for (Body.capability_name) |char| {
+                const is_unreserved = std.ascii.isAlphanumeric(char) or
+                    char == '-' or char == '.' or char == '_' or char == '~';
+                if (!is_unreserved) @compileError(
+                    "capability_name must be URI-unreserved, but \"" ++
+                        Body.capability_name ++ "\" is not",
+                );
+            }
+        }
+
+        const VTableAndFns = struct {
+            const table: VTable = .{
+                .name = Body.capability_name,
+                .deinitBody = deinitBody,
+                .destroyBacking = destroyBacking,
+            };
+
+            fn deinitBody(head: *Head) void {
+                const backing: *Backing(Body) = @fieldParentPtr("header", head);
+                backing.body.deinit();
+            }
+
+            fn destroyBacking(head: *Head) void {
+                const backing: *Backing(Body) = @fieldParentPtr("header", head);
+                heap.global_gpa.destroy(backing);
+            }
+        };
+
+        return &VTableAndFns.table;
+    }
 };
 
-/// Maps identifiers onto heads. A head appears here only once its capability
-/// has been rendered as a string, which is when an identifier is minted, and
-/// leaves when the capability is closed.
+/// Maps identifiers onto heads. A head appears here only once its capability has
+/// been rendered as a string, which is when its identifier is assigned, and
+/// leaves the registry when the capability is closed. A capability closed before
+/// it was ever rendered never appears at all, though it still gets an identifier
+/// to render with.
 ///
-/// A plain mutex is enough because lookups are rare: resolving a name converts
-/// the object holding it into a `Capability` in place, so a given name is
-/// looked up once when it first arrives as text and never again.
+/// A plain mutex is enough because lookups are rare: resolving a string rep
+/// shimmers the object holding it into a `Capability`, so a given one is looked
+/// up when it first arrives as text and never again.
 pub const Registry = struct {
     mutex: std.Io.Mutex = .init,
     /// Holds its heads without owning them; see `Head.tryBorrow`.
@@ -154,19 +238,37 @@ pub const Registry = struct {
     /// usual default-seeded generator.
     csprng: std.Random.DefaultCsprng = undefined,
 
-    /// Creates an identifier for `head` and registers it. Idempotent: a head that
-    /// already has one keeps it, so a capability's string never changes.
-    pub fn register(self: *Registry, head: *Head) !Id {
+    /// Gives `head` an identifier, and registers it if the head is still open.
+    /// Idempotent: a head that already has one keeps it, so a capability's
+    /// string rep never changes.
+    ///
+    /// An identifier given to a closed head is _born stale_: unique and well
+    /// formed, and resolving to nothing. That is what a closed capability
+    /// renders as, since it still has to render as something.
+    pub fn assignIdMaybeRegister(self: *Registry, head: *Head) !Id {
         self.mutex.lockUncancelable(heap.global_io);
         defer self.mutex.unlock(heap.global_io);
 
-        if (head.id.get()) |id| return id; // ID already set.
+        if (head.id.get()) |id| return id; // Identifier already set.
 
         const id = self.csprng.random().int(Id);
         head.id.set(id) catch |err| switch (err) {
-            error.OtherThreadSet => return head.id.get().?, // Reload the new ID.
+            error.OtherThreadSet => return head.id.get().?, // Reload the new identifier.
         };
-        // Only register if we were the ones to successfully set the ID.
+
+        // Registering a closed head would leave an entry outliving what it
+        // points at, closing being the only thing that removes one.
+        //
+        // This has to be checked here, under the lock, and the ordering is why.
+        // `close` sets the flag and then reads the identifier to know what to
+        // remove, while this sets the identifier and then reads the flag, with
+        // both map operations under the lock. So whichever runs first, either
+        // `close` finds an identifier to remove or this finds a closed head and
+        // declines to register. Checking before the call instead leaves a
+        // registry entry pointing at freed memory.
+        if (head.isClosed()) return id;
+
+        // Only register if we were the ones to successfully set the identifier.
         try self.heads.put(heap.global_gpa, id, head);
         return id;
     }
@@ -184,7 +286,7 @@ pub const Registry = struct {
 
 pub var registry: Registry = .{};
 
-/// The authority part of a name. A hostname is neither stable nor
+/// The authority part of a string rep. A hostname is neither stable nor
 /// authenticated, so it serves only to tell a reader which machine a capability
 /// came from; nothing trusts it.
 ///
@@ -223,7 +325,7 @@ pub fn initGlobals(options: Options) !void {
 /// capability is deinitialized here, so a thread holding one would have it
 /// closed underneath it.
 pub fn deinitGlobals() void {
-    // We move it out under the lock, so that `close` below is free to take the
+    // The map is moved out under the lock, so that `close` below is free to take the
     // lock for itself without deadlocking, and so that removing entries cannot
     // invalidate the iterator walking them.
     registry.mutex.lockUncancelable(heap.global_io);
@@ -257,12 +359,12 @@ pub const ParsedName = struct {
 
 /// Errors come in exactly two kinds, and the split is deliberate.
 ///
-/// `BadCapability` means the string cannot name a capability of this type on
+/// error.BadCapability means the string cannot name a capability of this type on
 /// this machine. Everything it covers is decidable from the string alone, so
 /// its messages can be specific without telling the caller anything they could
 /// not already work out for themselves.
 ///
-/// `StaleCapability` means the string is a well-formed local name, but nothing
+/// error.StaleCapability means the string is a well-formed local name, but nothing
 /// live answers to it. Deciding that requires the registry, so every way of
 /// reaching it reports the same thing. Whether an identifier is unknown, closed,
 /// or in use by a capability of another type is state belonging to whoever holds
@@ -284,9 +386,8 @@ fn staleError(details: ?*ErrorDetails, name: []const u8) error{ OutOfMemory, Sta
 
 pub fn parseName(det: ?*ErrorDetails, bytes: []const u8) !ParsedName {
     // Angle brackets delimit the URI, as RFC 3986 recommends for one embedded
-    // in running text. Every value here is transparently a string, so a
-    // capability regularly ends up inside a larger one, and the brackets are
-    // what mark where it starts and stops.
+    // in running text. They are what mark where a capability starts and stops
+    // for a human reading one out of a larger string.
     if (bytes.len < 2 or bytes[0] != '<' or bytes[bytes.len - 1] != '>') {
         return parseError(det, bytes);
     }
@@ -296,15 +397,20 @@ pub fn parseName(det: ?*ErrorDetails, bytes: []const u8) !ParsedName {
     if (!std.mem.eql(u8, uri.scheme, scheme_name)) return parseError(det, bytes);
 
     // Taken as written, never percent-decoded, so that parsing allocates
-    // nothing. A name minted by `updateString` contains nothing that needs
+    // nothing. A string rep built by `updateString` contains nothing that needs
     // escaping: `capability_name` is checked against the URI-unreserved set at
     // comptime, and the identifier is base64url.
     //
-    // An escaped name therefore did not come from here, and falls out below
-    // when its identifier fails to decode. That direction matters: an escaped
+    // An escaped one therefore did not come from here, and falls out below when
+    // its identifier fails to decode. That direction matters: an escaped
     // spelling of a real identifier is refused rather than decoded into some
     // other capability, which is the only property worth having in a string
     // that confers authority.
+    //
+    // The two tags below are not the distinction they look like. `.percent_encoded`
+    // does not mean the parser found a '%'; it is what `std.Uri.parse` labels
+    // every component it did not decode, escapes present or not. So both arms
+    // hold the same thing, the bytes exactly as they were written.
     const host_component = uri.host orelse return parseError(det, bytes);
     const host = switch (host_component) {
         .raw, .percent_encoded => |written| written,
@@ -331,212 +437,184 @@ pub fn parseName(det: ?*ErrorDetails, bytes: []const u8) !ParsedName {
     };
 }
 
-/// Builds the object type for capabilities using `Body`, which must declare
-/// the path segment its names use and how to let go of itself:
-/// ```zig
-/// const FileHandle = struct {
-///     pub const capability_name = "file-handle";
-///     file: std.Io.File,
-///     pub fn deinit(self: *FileHandle) void { self.file.close(); }
-/// };
-/// const FileCapability = capability.Capability(FileHandle);
-/// ```
-/// Each body gets its own object type, so it keeps its real shape rather
-/// than being flattened into a word, and so holding the wrong kind of
-/// capability is caught at compile time.
-pub fn Capability(Body: type) type {
-    comptime {
-        // The name goes into a URL unescaped, so anything needing escaping
-        // would produce a name that does not round-trip through `parseName`.
-        for (Body.capability_name) |char| {
-            const is_unreserved = std.ascii.isAlphanumeric(char) or
-                char == '-' or char == '.' or char == '_' or char == '~';
-            if (!is_unreserved) @compileError(
-                "capability_name must be URI-unreserved, but \"" ++
-                    Body.capability_name ++ "\" is not",
-            );
-        }
-    }
-
+/// The head and its body share one allocation, so the registry can hold every
+/// kind of capability uniformly as a `*Head` while each capability type recovers
+/// its own body from that pointer. Field order is left to the compiler:
+/// `@fieldParentPtr` works from whatever offset it picks.
+fn Backing(Body: type) type {
     return struct {
-        const Self = @This();
-
-        /// The head and its body share one allocation, so the registry can hold
-        /// every kind of capability uniformly as a `*Head` while each capability
-        /// type recovers its own body from that pointer. Field order is left to
-        /// the compiler: `@fieldParentPtr` works from whatever offset it picks.
-        const Backing = struct {
-            header: Head,
-            body: Body,
-        };
-
-        const capability_vtable: Head.VTable = .{
-            .name = Body.capability_name,
-            .deinitBody = deinitBody,
-            .destroyBacking = destroyBacking,
-        };
-
-        head: *Head,
-
-        fn deinitBody(head: *Head) void {
-            const backing: *Backing = @fieldParentPtr("header", head);
-            backing.body.deinit();
-        }
-
-        fn destroyBacking(head: *Head) void {
-            const backing: *Backing = @fieldParentPtr("header", head);
-            heap.global_gpa.destroy(backing);
-        }
-
-        pub fn asHead(self: *Self) *Object {
-            return Object.from(Self, self);
-        }
-
-        /// Creates a capability owning `body`. The object is the caller's.
-        pub fn create(body: Body) !*Self {
-            const backing = try heap.global_gpa.create(Backing);
-            errdefer heap.global_gpa.destroy(backing);
-            backing.* = .{
-                .header = .{
-                    .vtable = &capability_vtable,
-                    .id = .{},
-                    .closed = .init(false),
-                    .ref_count = .init(1),
-                },
-                .body = body,
-            };
-
-            const new_obj = try Object.newObject(Self);
-            new_obj.body.* = .{ .head = &backing.header };
-            return new_obj.body;
-        }
-
-        /// Returns the body, or reports that this capability no longer names a
-        /// live body. The pointer stays valid for as long as the caller
-        /// holds the object, which owns a reference to the head for its whole
-        /// life, so there is nothing further to synchronize or release.
-        pub fn getBody(self: *const Self, det: ?*ErrorDetails) !*Body {
-            if (self.head.isClosed()) {
-                // The same wording a name that fails to resolve gets. Holding a
-                // closed capability and holding a name for one that was never
-                // yours are different situations, but they are the same answer:
-                // this does not name anything usable.
-                const obj = Object.fromConst(Self, self);
-                return staleError(det, obj.maybeGetString() orelse "");
-            }
-            const backing: *Backing = @fieldParentPtr("header", self.head);
-            return &backing.body;
-        }
-
-        pub fn close(self: *Self) void {
-            self.head.close();
-        }
-
-        /// Resolves a name into the capability it refers to. Only capabilities
-        /// of this type on this machine resolve; anything else is reported
-        /// rather than being silently treated as local.
-        pub fn shimmerFrom(det: ?*ErrorDetails, shim: *objects.Shimmerable) !*const Self {
-            if (shim.current().asType(Self)) |existing| return existing;
-
-            const bytes = try shim.getString();
-            const parsed = try parseName(det, bytes);
-
-            // A name states which machine its body lives on, and that
-            // statement is binding: without this, a name belonging to another
-            // machine would resolve to whichever local capability happened to
-            // share its identifier.
-            if (!std.mem.eql(u8, parsed.host, host_name)) {
-                if (det) |details| details.* = .{
-                    .message = try objects.allocPrintZ(
-                        "capability \"{s}\" belongs to {s}, and capabilities cannot be used across machines",
-                        .{ bytes, parsed.host },
-                    ),
-                };
-                return error.BadCapability;
-            }
-
-            // Checked against the name as written, which keeps names canonical:
-            // exactly one spelling refers to any given capability, and a typo in
-            // the type segment is reported as such instead of surviving to the
-            // identifier.
-            if (!std.mem.eql(u8, parsed.type_name, Body.capability_name)) {
-                if (det) |details| details.* = .{
-                    .message = try objects.allocPrintZ(
-                        "capability \"{s}\" names a {s}, not a {s}",
-                        .{ bytes, parsed.type_name, Body.capability_name },
-                    ),
-                };
-                return error.BadCapability;
-            }
-
-            const head = registry.resolve(parsed.id) orelse return staleError(det, bytes);
-            errdefer head.release();
-
-            // The name spells this type but its identifier belongs to another,
-            // so the name was assembled rather than minted. Reported exactly as
-            // an unknown identifier is: the caller does not hold whatever this
-            // identifier names, so what it is, or that it is anything, is not
-            // theirs to find out by asking.
-            if (head.vtable != &capability_vtable) return staleError(det, bytes);
-
-            const body = try shim.prepareToShimmer(Self);
-            body.* = .{ .head = head };
-            return body;
-        }
-
-        /// Minting the identifier here rather than at creation is what makes the
-        /// public name lazy: a capability that is never rendered never gets one.
-        fn updateString(obj: *Object) !void {
-            const self = obj.asType(Self).?;
-            const id = try registry.register(self.head);
-
-            var id_bytes: [@sizeOf(Id)]u8 = undefined;
-            std.mem.writeInt(Id, &id_bytes, id, .big);
-            var encoded: [encoded_id_len]u8 = undefined;
-            _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &id_bytes);
-
-            const bytes = try objects.allocPrintZ("<{s}{s}/{s}/{s}>", .{
-                scheme,
-                host_name,
-                Body.capability_name,
-                encoded,
-            });
-            try obj.setStringIgnoreRace(bytes);
-        }
-
-        /// A duplicate aliases the same body rather than copying it, which
-        /// is the opposite of every other type here. Copying would have to mean
-        /// duplicating the body itself, and two handles onto one file with
-        /// independent positions is not what duplicating a value should mean.
-        fn duplicate(src: *const Object) !*Object {
-            const new_obj = try Object.newObjectUninitialized(Self);
-            errdefer new_obj.head.freeBacking();
-            try src.duplicateHeadOnto(new_obj.head);
-            new_obj.body.* = .{ .head = src.asTypeConst(Self).?.head.borrow() };
-            return new_obj.head;
-        }
-
-        fn freeInternalRep(obj: *Object) void {
-            obj.asType(Self).?.head.release();
-        }
-
-        fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-            const self = obj.asTypeConst(Self).?;
-            try ctx.addField(bool, info, "closed", "{}", .{self.head.isClosed()});
-        }
-
-        pub const vtable: Object.VTable = .{
-            .duplicate = duplicate,
-            .free_internal_rep = freeInternalRep,
-            .update_string = updateString,
-            // The head is atomically reference counted and holds no Values, so
-            // there is nothing below this to mark.
-            .make_crossthread = Object.noopMakeCrossthread,
-            .enumerate_struct = enumerateStruct,
-            .name = @typeName(Self),
-        };
+        header: Head,
+        body: Body,
     };
 }
+
+/// We use one object type for all capabilities, with the kind carried by the
+/// head's vtable rather than by the object's.
+///
+/// Carrying the kind at runtime lets code reach a head without knowing what sort
+/// of capability it holds, which is what `[close]` needs: it takes the head
+/// straight from the object, so closing never renders a string rep.
+pub const Capability = struct {
+    head: *Head,
+
+    pub fn asHead(self: *Capability) *Object {
+        return Object.from(Capability, self);
+    }
+
+    /// Creates a capability owning `body`. The object is the caller's.
+    pub fn new(Body: type, body: Body) !*Capability {
+        const backing = try heap.global_gpa.create(Backing(Body));
+        errdefer heap.global_gpa.destroy(backing);
+        backing.* = .{
+            .header = .{
+                .vtable = Head.vtableFor(Body),
+                .id = .{},
+                .closed = .init(false),
+                .ref_count = .init(1),
+            },
+            .body = body,
+        };
+
+        const new_obj = try Object.newObject(Capability);
+        new_obj.body.* = .{ .head = &backing.header };
+        return new_obj.body;
+    }
+
+    /// Returns the body, given the kind the caller expects. Reports a capability
+    /// of the wrong kind, and one that has been closed.
+    ///
+    /// The pointer stays valid for as long as the caller holds the object, which
+    /// owns a reference to the head for its whole life, so there is nothing
+    /// further to synchronize or release.
+    pub fn getBody(self: *const Capability, Body: type, det: ?*ErrorDetails) !*Body {
+        if (self.head.vtable != Head.vtableFor(Body)) {
+            if (det) |details| details.* = .{
+                .message = try objects.allocPrintZ(
+                    "expected a {s} but got a {s}",
+                    .{ Body.capability_name, self.head.vtable.name },
+                ),
+            };
+            return error.BadCapability;
+        }
+
+        if (self.head.isClosed()) {
+            // The same wording a name that fails to resolve gets. Holding a
+            // closed capability and holding a name for one that was never yours
+            // are different situations, but they are the same answer: this does
+            // not name anything usable.
+            const obj = Object.fromConst(Capability, self);
+            return staleError(det, obj.maybeGetString() orelse "");
+        }
+
+        const backing: *Backing(Body) = @fieldParentPtr("header", self.head);
+        return &backing.body;
+    }
+
+    pub fn close(self: *Capability) void {
+        self.head.close();
+    }
+
+    /// Resolves a name into the capability it refers to, whatever kind that is.
+    /// Only capabilities on this machine resolve; anything else is reported
+    /// rather than being silently treated as local.
+    ///
+    /// A value that is already a capability is returned as it stands, without
+    /// its name being rendered.
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *objects.Shimmerable) !*const Capability {
+        if (shim.current().asType(Capability)) |existing| return existing;
+
+        const bytes = try shim.getString();
+        const parsed = try parseName(det, bytes);
+
+        // A name states which machine its body lives on, and that statement is
+        // binding: without this, a name belonging to another machine would
+        // resolve to whichever local capability happened to share its
+        // identifier.
+        if (!std.mem.eql(u8, parsed.host, host_name)) {
+            if (det) |details| details.* = .{
+                .message = try objects.allocPrintZ(
+                    "capability \"{s}\" belongs to {s}, and capabilities cannot be used across machines",
+                    .{ bytes, parsed.host },
+                ),
+            };
+            return error.BadCapability;
+        }
+
+        const head = registry.resolve(parsed.id) orelse return staleError(det, bytes);
+        errdefer head.release();
+
+        // The name carries its kind, so a name whose kind disagrees with what
+        // its identifier resolves to was assembled rather than created. Reported
+        // exactly as an unknown identifier is: the caller does not hold whatever
+        // this identifier names, so what it is, or that it is anything at all,
+        // is not theirs to find out by asking.
+        if (!std.mem.eql(u8, parsed.type_name, head.vtable.name)) {
+            return staleError(det, bytes);
+        }
+
+        const body = try shim.prepareToShimmer(Capability);
+        body.* = .{ .head = head };
+        return body;
+    }
+
+    /// This is where a capability escapes: assigning the identifier here rather
+    /// than at creation is what keeps one that is never rendered from ever
+    /// having a name that something else could hold.
+    fn updateString(obj: *Object) !void {
+        const self = obj.asType(Capability).?;
+        // Not conditional on the capability being open: a closed one still has
+        // to render, and `assignIdMaybeRegister` is what decides whether the
+        // string rep it renders can be resolved.
+        const id = try registry.assignIdMaybeRegister(self.head);
+
+        var id_bytes: [@sizeOf(Id)]u8 = undefined;
+        std.mem.writeInt(Id, &id_bytes, id, .big);
+        var encoded: [encoded_id_len]u8 = undefined;
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &id_bytes);
+
+        const bytes = try objects.allocPrintZ("<{s}{s}/{s}/{s}>", .{
+            scheme,
+            host_name,
+            self.head.vtable.name,
+            encoded,
+        });
+        try obj.setStringIgnoreRace(bytes);
+    }
+
+    /// Duplicating gives back a second reference to the same body, where every
+    /// other type here would give back an independent copy.
+    ///
+    /// A capability names a resource that exists once. Copying the body would
+    /// mean a second file descriptor onto the same file, with its own position,
+    /// which is not what a caller duplicating a value is asking for.
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObjectUninitialized(Capability);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+        new_obj.body.* = .{ .head = src.asTypeConst(Capability).?.head.borrow() };
+        return new_obj.head;
+    }
+
+    fn freeInternalRep(obj: *Object) void {
+        obj.asType(Capability).?.head.release();
+    }
+
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const self = obj.asTypeConst(Capability).?;
+        try ctx.followNode(Head, info, "head", self.head);
+    }
+
+    pub const vtable: Object.VTable = .{
+        .duplicate = duplicate,
+        .free_internal_rep = freeInternalRep,
+        .update_string = updateString,
+        // The head is atomically reference counted and holds no Values, so there
+        // is nothing below this to mark.
+        .make_crossthread = Object.noopMakeCrossthread,
+        .enumerate_struct = enumerateStruct,
+        .name = @typeName(Capability),
+    };
+};
 
 const testing = std.testing;
 
@@ -568,14 +646,12 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
     try heap.testStart(ta, testing.io);
     defer heap.testFinish();
 
-    const TestCapability = Capability(TestBody);
-
     var deinited = false;
-    const cap = try TestCapability.create(.{ .deinited = &deinited, .payload = .{ 1, 2, 3 } });
+    const cap = try Capability.new(TestBody, .{ .deinited = &deinited, .payload = .{ 1, 2, 3 } });
     defer cap.asHead().release();
 
     // The body survives the trip through the type-erased head.
-    const body = try cap.getBody(null);
+    const body = try cap.getBody(TestBody, null);
     try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &body.payload);
 
     const name = try cap.asHead().getString();
@@ -586,8 +662,8 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
     // The name resolves back to the same body, which is the whole point.
     var shim: objects.Shimmerable = .{ .original = try objects.String.newValue(name) };
     defer shim.deinit();
-    const resolved = try TestCapability.shimmerFrom(null, &shim);
-    try testing.expectEqual(body, try resolved.getBody(null));
+    const resolved = try Capability.shimmerFrom(null, &shim);
+    try testing.expectEqual(body, try resolved.getBody(TestBody, null));
 
     // A name keeps the same string once minted, so it stays resolvable.
     try testing.expectEqualStrings(name, try cap.asHead().getString());
@@ -604,7 +680,7 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
     defer ta.free(escaped);
     var escaped_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(escaped) };
     defer escaped_shim.deinit();
-    try memutil.expectErrorOrOom(error.BadCapability, TestCapability.shimmerFrom(null, &escaped_shim));
+    try memutil.expectErrorOrOom(error.BadCapability, Capability.shimmerFrom(null, &escaped_shim));
 
     // A name asserting another machine does not resolve here, even when the
     // identifier is one this machine would recognise. There is no remote
@@ -615,26 +691,31 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
     defer ta.free(elsewhere);
     var elsewhere_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(elsewhere) };
     defer elsewhere_shim.deinit();
-    try memutil.expectErrorOrOom(error.BadCapability, TestCapability.shimmerFrom(null, &elsewhere_shim));
+    try memutil.expectErrorOrOom(error.BadCapability, Capability.shimmerFrom(null, &elsewhere_shim));
 
     // The type segment is part of the name, not decoration, so a live
     // identifier under the wrong one does not resolve. Without this exactly one
     // spelling would refer to a capability, and every other would too.
+    //
+    // Reported as staleness rather than as a malformed name, because deciding
+    // it needs the registry: the segment is checked against what the identifier
+    // actually resolves to, which is not something the caller could have worked
+    // out from the string alone.
     const wrong_type = try std.fmt.allocPrint(ta, "<{s}{s}/other-handle/{s}>", .{
         scheme, host_name, encoded_id,
     });
     defer ta.free(wrong_type);
     var wrong_type_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(wrong_type) };
     defer wrong_type_shim.deinit();
-    try memutil.expectErrorOrOom(error.BadCapability, TestCapability.shimmerFrom(null, &wrong_type_shim));
+    try memutil.expectErrorOrOom(error.StaleCapability, Capability.shimmerFrom(null, &wrong_type_shim));
 
     // A forged name: correct in every part a reader could check, but carrying
     // an identifier that belongs to a capability of another type. It must be
     // refused exactly as an unknown identifier is, and the message must not
     // reveal what the identifier really names, since the caller does not hold
     // it and could not otherwise find out.
-    const OtherCapability = Capability(OtherBody);
-    const other = try OtherCapability.create(.{});
+
+    const other = try Capability.new(OtherBody, .{});
     defer other.asHead().release();
     defer other.close();
 
@@ -648,7 +729,7 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
     defer forged_shim.deinit();
 
     var det: ErrorDetails = undefined;
-    try memutil.expectErrorOrOom(error.StaleCapability, TestCapability.shimmerFrom(&det, &forged_shim));
+    try memutil.expectErrorOrOom(error.StaleCapability, Capability.shimmerFrom(&det, &forged_shim));
     defer heap.global_gpa.free(det.message);
     try testing.expect(std.mem.indexOf(u8, det.message, OtherBody.capability_name) == null);
 
@@ -658,7 +739,7 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
 
     // Closing frees the body but not the name: it still reports staleness
     // rather than resolving to something else.
-    try testing.expectError(error.StaleCapability, cap.getBody(null));
+    try testing.expectError(error.StaleCapability, cap.getBody(TestBody, null));
 }
 
 test "capability round trip" {

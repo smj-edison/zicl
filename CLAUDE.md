@@ -56,6 +56,36 @@ zig build -Duse-llvm=true
 zig build -Dtoken-debugging=true
 ```
 
+Run the allocation-failure sweep on the slow tests:
+
+```bash
+# Does anything leak? Roughly six times faster than Debug.
+zig build test -Dfull-oom-testing -Doptimize=ReleaseSafe
+
+# Why does it leak? Keeps the leak graph and per-object history, which
+# ReleaseSafe would otherwise switch off along with `trace_mem`.
+zig build test -Dfull-oom-testing -Doptimize=ReleaseSafe -Dtrace-mem=true
+```
+
+Tests that drive a whole interpreter re-run once per allocation they make under
+`testing.checkAllAllocationFailures`, which costs roughly the square of how much
+they allocate. Those go through `memutil.checkAllocationFailures`, which takes a
+`memutil.OomTesting` saying how that test takes part:
+
+-   `.exhaustive` -- sweep every allocation, but only under this flag. Otherwise
+    run once.
+-   `.unsupported = "reason"` -- never inject, because a failure part-way leaves
+    state that says nothing about whether the code is correct. The reason is
+    recorded so a later reader can tell whether it still holds.
+
+The mode belongs on the test rather than on the file, since whether injection
+means anything depends on what the test does. Adding a new way of injecting
+failures means adding a variant, not reclassifying files.
+
+Object-level tests are cheap enough to sweep on every build and call
+`checkAllAllocationFailures` directly. Run the flag periodically: the paths it
+reaches are reached by nothing else, and real leaks hide there.
+
 Other options: `-Dstatic-link` (statically link libc, default true), `-Duse-utf8`
 (UTF-8 support in `strutil`, default true), and `-Dthreading` (default true).
 
@@ -280,12 +310,14 @@ const result = try processData(data);  // Ownership transferred on success.
 This project has comprehensive tracing for all memory operations. _Always_ read the complete trace before jumping into the code -- the trace often holds the answer. With `trace_mem` enabled, `leak_check.dumpLeaks` prints a dot graph of leaked objects (showing what is leaking and how it is reachable) and a per-object operation history (showing the refcount operations that left it alive). On a panic, `dumpLastTouchedTrace` prints the history of the most recently touched object, which is the prime suspect for use-after-free and refcount bugs.
 
 ## Style guide
--   Write for a reader who is fluent in low-level programming but knows nothing about this project, and who was not present for the discussion that produced the code. Assume they can read Zig and reason about atomics, ownership, and memory layout. Do not assume they know why some alternative was rejected, what a symbol used to be called, which bug prompted a line, or what any of it looked like an hour ago. A comment that only makes sense to someone who watched the code being written is scratch work, not documentation.
+-   Write for a reader who is fluent in low-level programming, but only has a high level understanding of this project, and who was not present for the discussion that produced the code actively being written. Assume they can read Zig and reason about atomics, ownership, and memory layout. Do not assume they know why some alternative was rejected, what a symbol used to be called, which bug prompted a line, or what any of it looked like an hour ago. A comment that only makes sense to someone who watched the code being written is scratch work, not documentation.
 -   Write Tcl as Tcl, not TCL.
 -   Prefer commas or parenthesis over em-dashes. Also, write in ASCII characters exclusively (i.e. no — or →). Double hypens, --, can substitute for a proper em dash.
 -   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
+-   Split a function's comments by what the reader needs. The doc comment on the signature says how to call it: what it takes, what it gives back, what the caller is then responsible for, plus whatever rationale a caller has to know to use it correctly. Everything about _how_ it works goes in the body, next to the code it explains. A signature that opens with three paragraphs on lock ordering is telling callers something they cannot act on and burying it from the person changing the implementation.
 -   Comment the exceptions, not the conventions. If a reader who knows this codebase would already predict what a line does, leave it alone; spend the comment where the code departs from what they'd predict. This is the "what" comment rule applied to design rules rather than to syntax: that `interp.getInteger` reports its own errors is the convention and needs no note, whereas a call site that deliberately bypasses it does.
--   Give a complicated edge case a concrete example, in a triple-backtick block under the prose that introduces it (see `DictSugar` in `src/vartypes.zig`). If a comment describes a situation the reader has to construct in their head (an aliased variable, a shared object, a specific argument shape), show the two or three lines of Tcl that produce it. A reader who can see the case can check the reasoning; one who cannot has to take it on faith. An edge case worth an example is usually also worth a test.
+-   Seek for brevity in all comments. Unnecessary details and only tenously related points make it harder to follow.
+-   Give a complicated edge case a concrete example, in a triple-backtick block under the prose that introduces it (see `DictSugar` in `src/vartypes.zig`). If a comment describes a situation the reader has to construct in their head (an aliased variable, a shared object, a specific argument shape), show the two or three lines of Tcl that produce it. An edge case worth an example is usually also worth a test.
 -   End every comment with a period, exclaimation point, or similar (what's important is that the thought is properly terminated).
 -   Don't use UPPERCASE, instead use _emphasis_. TODO, FIXME, PERF, HACK, etc are exceptions to this rule, as they're used for grepping.
 -   If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.

@@ -17,6 +17,11 @@ pub fn build(b: *std.Build) void {
     ) orelse &[0][]const u8{};
     const token_debugging = b.option(bool, "token-debugging", "Whether to print tokens when they're parsed") orelse false;
     const threading = b.option(bool, "threading", "Whether threading is enabled") orelse true;
+    const full_oom_testing = b.option(
+        bool,
+        "full-oom-testing",
+        "Run the allocation-failure sweep on tests that drive a whole interpreter, which is slow enough to be worth doing periodically rather than every build",
+    ) orelse false;
 
     const target = b.standardTargetOptions(.{
         .default_target = if (static_link) .{ .abi = .musl } else .{},
@@ -28,6 +33,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "threading", threading);
     options.addOption(bool, "trace_mem", trace_mem);
     options.addOption(bool, "expensive_checks", expensive_checks);
+    options.addOption(bool, "full_oom_testing", full_oom_testing);
     const options_mod = options.createModule();
 
     // deps

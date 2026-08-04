@@ -482,7 +482,26 @@ fn testDouble(ta: std.mem.Allocator) !void {
 }
 
 test "double" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDouble, .{});
+    try memutil.checkAllocationFailures(.exhaustive, testDouble, .{});
+}
+```
+
+A test that stands up an interpreter allocates enough that sweeping it on every
+build is painful, so those go through `memutil.checkAllocationFailures` with
+`.exhaustive`: run once normally, sweep under `-Dfull-oom-testing`. Object-level
+tests are cheap enough to sweep always and call `checkAllAllocationFailures`
+directly.
+
+A test whose lifetimes cannot survive a failure part-way says so instead, and the
+reason travels with it:
+
+```zig
+test "closure cache under pressure" {
+    try memutil.checkAllocationFailures(
+        .{ .unsupported = "a half-built closure stays in the cache, so a later iteration sees state the code never produces on its own" },
+        testClosureCache,
+        .{},
+    );
 }
 ```
 
