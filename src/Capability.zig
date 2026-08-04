@@ -22,12 +22,122 @@ const StructIterator = memutil.StructIterator;
 const objects = @import("objects.zig");
 const ErrorDetails = objects.ErrorDetails;
 
+const Capability = @This();
 pub const scheme_name = "zicl";
 pub const scheme = scheme_name ++ "://";
 
 /// Capability identifier. We use 128 bits since that is enough to be effectively unforgable.
 const Id = i128;
 const encoded_id_len = std.base64.url_safe_no_pad.Encoder.calcSize(@sizeOf(Id));
+
+head: *Head,
+
+pub fn asHead(self: *Capability) *Object {
+    return Object.from(Capability, self);
+}
+
+pub fn new(head: *Head) !*Capability {
+    try registry.register(head);
+    errdefer registry.deregister(head);
+
+    const new_obj = try Object.newObject(Capability);
+    new_obj.body.* = .{ .head = head };
+    return new_obj.body;
+}
+
+pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !*Backing {
+    if (self.head.vtable != &Backing.vtable) {
+        if (det) |details| details.* = .{
+            .message = try objects.allocPrintZ(
+                "expected a {s} but got a {s}",
+                .{ Backing.vtable.name, self.head.vtable.name },
+            ),
+        };
+        return error.BadCapability;
+    }
+
+    if (self.head.isClosed()) return staleError(det, try @constCast(self).asHead().getString());
+
+    const backing: *Backing = @fieldParentPtr("head", self.head);
+    return backing;
+}
+
+pub fn close(self: *Capability) void {
+    self.head.close();
+}
+
+pub fn shimmerFrom(det: ?*ErrorDetails, shim: *objects.Shimmerable) !*const Capability {
+    if (shim.current().asType(Capability)) |cap| return cap;
+
+    const bytes = try shim.getString();
+    const parsed = try parseName(det, bytes);
+
+    if (!std.mem.eql(u8, parsed.host, host_name)) {
+        if (det) |details| details.* = .{ .message = try objects.allocPrintZ(
+            "capability \"{s}\" belongs to {s}, and capabilities cannot be used across machines",
+            .{ bytes, parsed.host },
+        ) };
+        return error.BadCapability;
+    }
+
+    const head = registry.resolve(parsed.id) orelse return staleError(det, bytes);
+    errdefer head.release();
+
+    if (!std.mem.eql(u8, parsed.type_name, head.vtable.name)) {
+        // Capability type name and parsed type name aren't the same. We consider
+        // this to be a stale error, so the details on whether it's registered or
+        // not are not visible.
+        return staleError(det, bytes);
+    }
+
+    const as_cap = try shim.prepareToShimmer(Capability);
+    as_cap.* = .{ .head = head };
+    return as_cap;
+}
+
+fn updateString(obj: *Object) !void {
+    const self = obj.asType(Capability).?;
+
+    var id_bytes: [@sizeOf(Id)]u8 = undefined;
+    std.mem.writeInt(Id, &id_bytes, self.head.id, .big);
+    var encoded: [encoded_id_len]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &id_bytes);
+
+    const bytes = try objects.allocPrintZ("<{s}{s}/{s}/{s}>", .{
+        scheme,
+        host_name,
+        self.head.vtable.name,
+        encoded,
+    });
+    try obj.setStringIgnoreRace(bytes);
+}
+
+fn duplicate(src: *const Object) !*Object {
+    const new_obj = try Object.newObjectUninitialized(Capability);
+    errdefer new_obj.head.freeBacking();
+    try src.duplicateHeadOnto(new_obj.head);
+    new_obj.body.* = .{ .head = src.asTypeConst(Capability).?.head.borrow() };
+    return new_obj.head;
+}
+
+fn freeInternalRep(obj: *Object) void {
+    obj.asType(Capability).?.head.release();
+}
+
+fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+    const self = obj.asTypeConst(Capability).?;
+    try ctx.followNode(Head, info, "head", self.head);
+}
+
+pub const vtable: Object.VTable = .{
+    .duplicate = duplicate,
+    .free_internal_rep = freeInternalRep,
+    .update_string = updateString,
+    // The head is atomically reference counted and holds no Values.
+    .make_crossthread = Object.noopMakeCrossthread,
+    .enumerate_struct = enumerateStruct,
+    .name = @typeName(Capability),
+};
 
 /// Heads are the generic part of a capability. Capabilities are the combination
 /// of a Head and a Body, where Body is a custom type. This is currently
@@ -244,117 +354,6 @@ pub fn parseName(det: ?*ErrorDetails, bytes: []const u8) !ParsedName {
         .id = std.mem.readInt(Id, &id_bytes, .big),
     };
 }
-
-pub const Capability = struct {
-    head: *Head,
-
-    pub fn asHead(self: *Capability) *Object {
-        return Object.from(Capability, self);
-    }
-
-    pub fn new(head: *Head) !*Capability {
-        try registry.register(head);
-        errdefer registry.deregister(head);
-
-        const new_obj = try Object.newObject(Capability);
-        new_obj.body.* = .{ .head = head };
-        return new_obj.body;
-    }
-
-    pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !*Backing {
-        if (self.head.vtable != &Backing.vtable) {
-            if (det) |details| details.* = .{
-                .message = try objects.allocPrintZ(
-                    "expected a {s} but got a {s}",
-                    .{ Backing.vtable.name, self.head.vtable.name },
-                ),
-            };
-            return error.BadCapability;
-        }
-
-        if (self.head.isClosed()) return staleError(det, try @constCast(self).asHead().getString());
-
-        const backing: *Backing = @fieldParentPtr("head", self.head);
-        return backing;
-    }
-
-    pub fn close(self: *Capability) void {
-        self.head.close();
-    }
-
-    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *objects.Shimmerable) !*const Capability {
-        if (shim.current().asType(Capability)) |cap| return cap;
-
-        const bytes = try shim.getString();
-        const parsed = try parseName(det, bytes);
-
-        if (!std.mem.eql(u8, parsed.host, host_name)) {
-            if (det) |details| details.* = .{ .message = try objects.allocPrintZ(
-                "capability \"{s}\" belongs to {s}, and capabilities cannot be used across machines",
-                .{ bytes, parsed.host },
-            ) };
-            return error.BadCapability;
-        }
-
-        const head = registry.resolve(parsed.id) orelse return staleError(det, bytes);
-        errdefer head.release();
-
-        if (!std.mem.eql(u8, parsed.type_name, head.vtable.name)) {
-            // Capability type name and parsed type name aren't the same. We consider
-            // this to be a stale error, so the details on whether it's registered or
-            // not are not visible.
-            return staleError(det, bytes);
-        }
-
-        const as_cap = try shim.prepareToShimmer(Capability);
-        as_cap.* = .{ .head = head };
-        return as_cap;
-    }
-
-    fn updateString(obj: *Object) !void {
-        const self = obj.asType(Capability).?;
-
-        var id_bytes: [@sizeOf(Id)]u8 = undefined;
-        std.mem.writeInt(Id, &id_bytes, self.head.id, .big);
-        var encoded: [encoded_id_len]u8 = undefined;
-        _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &id_bytes);
-
-        const bytes = try objects.allocPrintZ("<{s}{s}/{s}/{s}>", .{
-            scheme,
-            host_name,
-            self.head.vtable.name,
-            encoded,
-        });
-        try obj.setStringIgnoreRace(bytes);
-    }
-
-    fn duplicate(src: *const Object) !*Object {
-        const new_obj = try Object.newObjectUninitialized(Capability);
-        errdefer new_obj.head.freeBacking();
-        try src.duplicateHeadOnto(new_obj.head);
-        new_obj.body.* = .{ .head = src.asTypeConst(Capability).?.head.borrow() };
-        return new_obj.head;
-    }
-
-    fn freeInternalRep(obj: *Object) void {
-        obj.asType(Capability).?.head.release();
-    }
-
-    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
-        const self = obj.asTypeConst(Capability).?;
-        try ctx.followNode(Head, info, "head", self.head);
-    }
-
-    pub const vtable: Object.VTable = .{
-        .duplicate = duplicate,
-        .free_internal_rep = freeInternalRep,
-        .update_string = updateString,
-        // The head is atomically reference counted and holds no Values.
-        .make_crossthread = Object.noopMakeCrossthread,
-        .enumerate_struct = enumerateStruct,
-        .name = @typeName(Capability),
-    };
-};
 
 const TestCapability = struct {
     deinited_ptr: *bool,

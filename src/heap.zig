@@ -17,7 +17,7 @@ const ioutil = @import("ioutil.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
-const capability = @import("capability.zig");
+const Capability = @import("Capability.zig");
 
 pub var initialized: bool = false;
 /// Use to lock `custom_types` or `script_metadata` when adding or removing
@@ -47,7 +47,7 @@ pub var oom_error_options_dict: ?Value = null;
 /// `Config` rather than `Options` because `options` here is the build-time
 /// options module.
 pub const Config = struct {
-    capability: capability.Options = .{},
+    capability: Capability.Options = .{},
 };
 
 /// Initialize global heap state. Must be called once per process (or test).
@@ -66,8 +66,8 @@ pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
     leak_check.init();
     try regex.initGlobals();
     errdefer regex.deinitGlobals();
-    try capability.initGlobals(config.capability);
-    errdefer capability.deinitGlobals();
+    try Capability.initGlobals(config.capability);
+    errdefer Capability.deinitGlobals();
 
     // Shared across threads, so it ref counts atomically. Being cross-thread
     // also freezes it, which is what we want for a value every `[catch]` may
@@ -102,7 +102,7 @@ pub fn deinitGlobals() void {
     freeOomErrorOptionsDict();
 
     leak_check.deinit();
-    capability.deinitGlobals();
+    Capability.deinitGlobals();
     regex.deinitGlobals();
 
     nativefn_registry.deinit(global_gpa);

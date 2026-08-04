@@ -169,8 +169,16 @@ pub fn errorinfoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setResultOwning(error_message);
 }
 
+/// [close], closes a capability.
+pub fn closeCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    var det: ErrorDetails = undefined;
+    const cap = try interp.wrapError(&det, common.Capability.shimmerFrom(&det, &args[1]));
+    @constCast(cap).close();
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "breakpoint", breakpointCmd, "", 0, 0, null);
+    try registerCommand(interp, "close", closeCmd, "capability", 1, 1, null);
     try registerCommand(interp, "deref", derefCmd, "hash", 1, 1, null);
     try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);

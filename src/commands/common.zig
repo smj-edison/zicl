@@ -16,6 +16,9 @@ pub const Interp = @import("../Interp.zig");
 const evaltypes = @import("../evaltypes.zig");
 pub const Expression = evaltypes.Expression;
 
+pub const Capability = @import("../Capability.zig");
+pub const capabilities = @import("../capabilities.zig");
+
 pub fn registerCommand(
     interp: *Interp,
     name: []const u8,

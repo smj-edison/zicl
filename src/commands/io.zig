@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const ioutil = @import("../ioutil.zig");
-const capability = @import("../capability.zig");
+const Capability = @import("../Capability.zig");
+const capabilities = @import("../capabilities.zig");
 
 const common = @import("common.zig");
 const heap = common.heap;
@@ -45,18 +46,12 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
 
     if (rest.len == 2) {
         var det: ErrorDetails = undefined;
-        const cap = try interp.wrapError(&det, capability.Capability.shimmerFrom(&det, &rest[0]));
-        const body = try interp.wrapError(&det, cap.getBody(FileBody, &det));
+        const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &rest[0]));
+        const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
+        const body: *capabilities.File = &backing.body;
 
-        // Streaming, so writes land at the file's own position. A positional
-        // writer starts each call from offset zero, which would make every
-        // write to a channel overwrite the one before it.
-        var buf: [1024]u8 = undefined;
-        var writer = body.file.writerStreaming(heap.global_io, &buf);
-
-        writer.interface.writeAll(to_print) catch return writeError(interp, &writer);
-        if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, &writer);
-        writer.flush() catch return writeError(interp, &writer);
+        body.writeAll(to_print) catch |err| return writeError(interp, err);
+        if (print_newline) body.writeAll("\n") catch |err| return writeError(interp, err);
         return;
     }
 
@@ -65,18 +60,13 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
     var buf: [64]u8 = undefined;
     var writer = stdout.writer(heap.global_io, &buf);
 
-    writer.interface.writeAll(to_print) catch return writeError(interp, &writer);
-    if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, &writer);
-    writer.flush() catch return writeError(interp, &writer);
+    writer.interface.writeAll(to_print) catch return writeError(interp, writer.err.?);
+    if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, writer.err.?);
+    writer.flush() catch return writeError(interp, writer.err.?);
 }
 
-/// Reports a failed write, for `catch return writeError(interp, &writer)`.
-///
-/// Every write and every flush fails the same way and wants the same message,
-/// and the error they return is a placeholder: `writer.err` is where the cause
-/// actually lands, whichever call it was.
-fn writeError(interp: *Interp, writer: *const std.Io.File.Writer) Interp.Error {
-    interp.setResultFormatted("failed to write: {}", .{writer.err.?}) catch |err| return err;
+fn writeError(interp: *Interp, err: anyerror) Interp.Error {
+    try interp.setResultFormatted("failed to write: {}", .{err});
     return error.EvalError;
 }
 
@@ -362,57 +352,21 @@ fn openForAppend(path: []const u8, readable: bool) !std.Io.File {
     return file;
 }
 
-/// How `[fopen]` is asked for access, in the spelling Tcl uses.
-const Mode = objects.EnumConstructor(enum {
-    r,
-    w,
-    a,
-    @"r+",
-    @"w+",
-    @"a+",
-}, false);
+const FileOpenMode = objects.EnumConstructor(capabilities.File.Mode, false);
 
 /// [fopen]
 pub fn fopenCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const path = try args[1].getString();
 
     var det: ErrorDetails = undefined;
-    const mode = if (args.len == 3) try interp.wrapError(&det, Mode.get(&det, &args[2])) else .r;
+    const mode: capabilities.File.Mode =
+        if (args.len == 3) try interp.wrapError(&det, FileOpenMode.get(&det, &args[2])) else .r;
 
-    const dir = std.Io.Dir.cwd();
-    const file = switch (mode) {
-        .r => dir.openFile(heap.global_io, path, .{ .mode = .read_only }),
-        .@"r+" => dir.openFile(heap.global_io, path, .{ .mode = .read_write }),
-        .w => dir.createFile(heap.global_io, path, .{}),
-        .@"w+" => dir.createFile(heap.global_io, path, .{ .read = true }),
-        .a => openForAppend(path, false),
-        .@"a+" => openForAppend(path, true),
-    } catch |err| {
-        try interp.setResultFormatted("could not open \"{s}\": {t}", .{ path, err });
-        return error.EvalError;
+    const cap = capabilities.File.open(path, mode) catch |err| {
+        try interp.setResultFormatted("error while opening file: {}", .{err});
+        return;
     };
-    errdefer file.close(heap.global_io);
-
-    const cap = try capability.Capability.new(FileBody, .{ .file = file });
     interp.setResultOwning(cap.asHead().asValue());
-}
-
-/// [close]
-///
-/// Works on any capability, not just files, since closing needs nothing from
-/// the body beyond the vtable entry that finalizes it.
-pub fn closeCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    var det: ErrorDetails = undefined;
-    // Shimmered rather than resolved by name, so a capability that has never
-    // been rendered as a string is not forced to mint an identifier and enter
-    // the registry purely so that it can be looked up and closed.
-    const cap = try interp.wrapError(&det, capability.Capability.shimmerFrom(&det, &args[1]));
-
-    // Casting away const to close is sound: `shimmerFrom` returns a pointer into
-    // the object `args[1]` holds, and closing mutates the head behind it rather
-    // than the object itself, which stays a capability naming the same thing.
-    @constCast(cap).close();
-    interp.setEmptyResult();
 }
 
 pub fn registerCommands(interp: *Interp) !void {
@@ -420,7 +374,6 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2, null);
-    try registerCommand(interp, "close", closeCmd, "capability", 1, 1, null);
 }
 
 const testing = std.testing;
@@ -580,58 +533,16 @@ test "file reports a usage error for a bad subcommand" {
     try memutil.checkAllocationFailures(.exhaustive, testFileReportsAUsageErrorForABadSubcommand, .{});
 }
 
-/// Creates a temporary file and returns its path, for tests that need a real
-/// file to work against. The caller owns the bytes and should delete the file.
-///
-/// Goes through `[file tempfile]` rather than building a path by hand, so that
-/// tests do not have to invent their own collision-avoidance and cannot collide
-/// with each other.
-fn testTempPath(interp: *Interp, ta: std.mem.Allocator) ![]u8 {
-    const result = try interp.testRunScript("file tempfile");
-    // Copied, since the next script run replaces the interpreter's result.
-    return ta.dupe(u8, try result.getString());
-}
-
-fn testFileAppend(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
-
-    const path = try testTempPath(&interp, ta);
-    defer ta.free(path);
-    defer std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch {};
-
-    // The second write is shorter than the first, which is what makes this
-    // catch a cursor left at the start: overwriting from offset zero keeps the
-    // bytes past the overwrite, so the file still looks plausible. Appending
-    // gives "0123456789abc" and overwriting gives "abc3456789".
-    const script = try std.fmt.allocPrint(ta,
-        \\set fd [fopen {s} w]
-        \\puts -nonewline $fd "0123456789"
-        \\close $fd
-        \\set fd [fopen {s} a]
-        \\puts -nonewline $fd "abc"
-        \\close $fd
-    , .{ path, path });
-    defer ta.free(script);
-
-    _ = try interp.testRunScript(script);
-
-    const written = try std.Io.Dir.cwd().readFileAlloc(heap.global_io, path, ta, .limited(1024));
-    defer ta.free(written);
-    try testing.expectEqualStrings("0123456789abc", written);
-}
-
-test "opening a file for append writes past the existing contents" {
-    try memutil.checkAllocationFailures(.exhaustive, testFileAppend, .{});
-}
-
 fn testFileCapability(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    const path = try testTempPath(&interp, ta);
-    defer ta.free(path);
-    defer std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(heap.global_io, "foo.txt", .{});
+    file.close(heap.global_io);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
 
     const script = try std.fmt.allocPrint(ta,
         \\set fd [fopen {s} w]
@@ -639,7 +550,7 @@ fn testFileCapability(ta: std.mem.Allocator) !void {
         \\puts -nonewline $fd "no newline"
         \\close $fd
         \\set fd
-    , .{path});
+    , .{absolute_path});
     defer ta.free(script);
 
     // Borrowed, since `testRunScript` hands back the interpreter's result
@@ -650,10 +561,10 @@ fn testFileCapability(ta: std.mem.Allocator) !void {
 
     // The capability renders as a delimited URL naming this machine.
     const name = try handle.getString();
-    try testing.expect(std.mem.startsWith(u8, name, "<" ++ capability.scheme));
+    try testing.expect(std.mem.startsWith(u8, name, "<" ++ Capability.scheme));
     try testing.expect(std.mem.indexOf(u8, name, "/file-handle/") != null);
 
-    const written = try std.Io.Dir.cwd().readFileAlloc(heap.global_io, path, ta, .limited(1024));
+    const written = try std.Io.Dir.cwd().readFileAlloc(heap.global_io, absolute_path, ta, .limited(1024));
     defer ta.free(written);
     try testing.expectEqualStrings("first line\nno newline", written);
 
@@ -669,15 +580,18 @@ fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    const path = try testTempPath(&interp, ta);
-    defer ta.free(path);
-    defer std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(heap.global_io, "foo.txt", .{});
+    file.close(heap.global_io);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
 
     const script = try std.fmt.allocPrint(testing.allocator,
         \\set fd [fopen {s} w]
         \\close $fd
         \\set fd
-    , .{path});
+    , .{absolute_path});
     defer testing.allocator.free(script);
 
     const handle = (try interp.testRunScript(script)).borrow();

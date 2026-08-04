@@ -19,17 +19,19 @@ fn panicAndPrintTraces(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 test {
-    _ = @import("heap.zig");
-    _ = @import("objects.zig");
     _ = @import("memutil.zig");
     _ = @import("strutil.zig");
     _ = @import("ioutil.zig");
     _ = @import("leak_check.zig");
 
-    _ = @import("capability.zig");
+    _ = @import("heap.zig");
     _ = @import("Tokenizer.zig");
+    _ = @import("objects.zig");
+    _ = @import("Capability.zig");
+    _ = @import("capabilities.zig");
     _ = @import("Interp.zig");
     _ = @import("expr_parse.zig");
     _ = @import("regex.zig");
+
     _ = @import("commands/common.zig");
 }
