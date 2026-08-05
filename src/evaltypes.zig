@@ -37,14 +37,13 @@ pub const ParsedScriptCommand = struct {
         try ctx.addField(u32, info, "word_count", "{}", .{command.word_count});
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(ParsedScriptCommand), .{
         .duplicate = null,
         .update_string = null,
         .free_internal_rep = null,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(ParsedScriptCommand),
-    };
+    });
 };
 
 /// This is the script object internal representation. It is an array
@@ -373,14 +372,13 @@ pub const Script = struct {
         try helper.followFieldSlice(Tokenizer.Token.Tag, "tags", "{}", as_script.tags);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(@This()), .{
         .duplicate = null,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(@This()),
-    };
+    });
 };
 
 pub const Substitution = struct {
@@ -502,14 +500,13 @@ pub const Substitution = struct {
         try helper.followFieldSlice(Tokenizer.Token.Tag, "tags", "{}", as_subst.tags);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(@This()), .{
         .duplicate = null,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(@This()),
-    };
+    });
 };
 
 pub const Expression = struct {
@@ -1063,14 +1060,13 @@ pub const Expression = struct {
         try ctx.followNode(expr_parse.Parsed, info, "parsed", &as_expr.parsed);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(@This()), .{
         .duplicate = null,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(@This()),
-    };
+    });
 };
 
 pub const Closure = struct {
@@ -1491,14 +1487,13 @@ pub const Closure = struct {
         if (content.scope_hash_ref) |scope| scope.inner.makeCrossthread();
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(@This()), .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(@This()),
-    };
+    });
 };
 
 pub const NativeCommand = struct {

@@ -25,6 +25,10 @@ pub fn launderCmd(interp: *Interp, args: []Shimmerable) !void {
     try interp.setResultString(str);
 }
 
+pub fn identityCmd(interp: *Interp, args: []Shimmerable) !void {
+    interp.setResult(args[1].current());
+}
+
 pub fn breakpointCmd(_: *Interp, _: []Shimmerable) Interp.Error!void {
     @breakpoint();
 }
@@ -145,7 +149,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .type => {
             if (args[1].current().asPtr()) |obj| {
-                try interp.setResultString(obj.vtable.name);
+                try interp.setResultString(std.mem.span(obj.vtable.name));
             } else {
                 try interp.setResultString(@tagName(args[1].current().raw.tag));
             }
@@ -181,6 +185,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "close", closeCmd, "capability", 1, 1, null);
     try registerCommand(interp, "deref", derefCmd, "hash", 1, 1, null);
     try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
+    try registerCommand(interp, "identity", identityCmd, "anything", 1, 1, null);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
     try registerCommand(interp, "ref", refCmd, "string", 1, 1, null);

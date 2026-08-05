@@ -65,7 +65,13 @@ pub const Error = EvalError || error{
 };
 
 /// Return code values matching Tcl's convention.
-pub const ReturnCode = enum(u8) {
+///
+/// Backed by `c_int` rather than `u8` so that functions exported through the C
+/// ABI (and C commands, whose signature is `CCommandFn`) return a value the C
+/// side reads as a full `int`. With a `u8` backing, a non-zero code left the
+/// upper bits of `eax` undefined and a C caller comparing against a specific
+/// `ZICL_*` constant saw garbage.
+pub const ReturnCode = enum(c_int) {
     ok = 0,
     @"error" = 1,
     @"return" = 2,
@@ -883,17 +889,37 @@ pub const Object = extern struct {
     pub const body_max_size = 48;
     pub const body_align = 8;
 
-    pub const VTable = struct {
-        duplicate: ?*const fn (src: *const Object) error{OutOfMemory}!*Object,
-        free_internal_rep: ?*const fn (obj: *Object) void,
-        update_string: ?*const fn (obj: *Object) error{ OutOfMemory, OtherThreadSet }!void,
-        make_crossthread: ?*const fn (obj: *Object) void,
-        enumerate_struct: ?*const fn (
-            obj: *const Object,
-            ctx: StructIterator,
-            node_info: *const StructIterator.NodeInfo,
-        ) StructIterator.Error!void,
-        name: [:0]const u8,
+    pub const VTable = extern struct {
+        is_c_vtable: bool = false,
+        name: [*:0]const u8,
+        as: extern union {
+            c: extern struct {
+                duplicate: ?*const fn (src: *const Object) ?*Object,
+                free_internal_rep: ?*const fn (obj: *Object) void,
+                update_string: ?*const fn (obj: *Object) ReturnCode,
+                make_crossthread: ?*const fn (obj: *Object) void,
+                enumerate_struct: ?*const fn (
+                    obj: *const Object,
+                    ctx: StructIterator,
+                    node_info: *const StructIterator.NodeInfo,
+                ) ReturnCode,
+            },
+            zig: extern struct {
+                duplicate: ?*const fn (src: *const Object) error{OutOfMemory}!*Object,
+                free_internal_rep: ?*const fn (obj: *Object) void,
+                update_string: ?*const fn (obj: *Object) error{ OutOfMemory, OtherThreadSet }!void,
+                make_crossthread: ?*const fn (obj: *Object) void,
+                enumerate_struct: ?*const fn (
+                    obj: *const Object,
+                    ctx: StructIterator,
+                    node_info: *const StructIterator.NodeInfo,
+                ) StructIterator.Error!void,
+            },
+        },
+
+        pub fn zig(name: [*:0]const u8, as_zig: @FieldType(@FieldType(VTable, "as"), "zig")) VTable {
+            return .{ .name = name, .as = .{ .zig = as_zig } };
+        }
     };
 
     pub const Metadata = packed struct(u8) {
@@ -1017,11 +1043,12 @@ pub const Object = extern struct {
     }
 
     pub fn duplicate(obj: *const Object) !*Object {
-        if (obj.vtable.duplicate) |duplicate_fn| {
-            return try duplicate_fn(obj);
+        if (obj.vtable.is_c_vtable) {
+            if (obj.vtable.as.c.duplicate) |dup| return dup(obj) orelse error.OutOfMemory;
         } else {
-            debug.panic("Could not duplicate {s}", .{obj.vtable.name});
+            if (obj.vtable.as.zig.duplicate) |dup| return try dup(obj);
         }
+        debug.panic("Could not duplicate {s}", .{obj.vtable.name});
     }
 
     /// For a type whose body reaches no other object, so sharing it needs
@@ -1045,7 +1072,11 @@ pub const Object = extern struct {
 
         // A null entry means the type cannot cross threads, so the unwrap
         // intentionally panics when it doesn't have an impl.
-        obj.vtable.make_crossthread.?(obj);
+        if (obj.vtable.is_c_vtable) {
+            obj.vtable.as.c.make_crossthread.?(obj);
+        } else {
+            obj.vtable.as.zig.make_crossthread.?(obj);
+        }
     }
 
     pub fn enumerateStruct(
@@ -1068,7 +1099,7 @@ pub const Object = extern struct {
             .none => {},
         }
         try ctx.addField(Metadata, info, "metadata", "{any}", .{obj.metadata});
-        if (obj.vtable.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
+        if (obj.vtable.as.zig.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
     }
 
     pub fn freeBacking(obj: *Object) void {
@@ -1131,7 +1162,7 @@ pub const Object = extern struct {
                 // No string set (at least that we saw), so we'll go ahead and generate it
                 // and attempt to set it. If we fail it's fine, since strings are always
                 // generated the same way.
-                const update_str_fn = obj.vtable.update_string orelse {
+                const update_str_fn = obj.vtable.as.zig.update_string orelse {
                     debug.panic("Can't generate string for {s} (should always have a string rep)", .{obj.vtable.name});
                 };
                 update_str_fn(obj) catch |err| switch (err) {
@@ -1347,7 +1378,7 @@ pub const Object = extern struct {
 
     pub fn invalidateInternalRep(obj: *Object) void {
         obj.asValue().trace("Invalidate body", .{});
-        if (obj.vtable.free_internal_rep) |free_fn| free_fn(obj);
+        if (obj.vtable.as.zig.free_internal_rep) |free_fn| free_fn(obj);
     }
 
     pub fn getHashNoRegister(obj: *Object) !u256 {

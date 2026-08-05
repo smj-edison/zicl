@@ -52,12 +52,12 @@ pub const File = struct {
         head: Capability.Head,
         body: File,
 
-        fn deinitBody(head: *Capability.Head) void {
+        fn deinitBody(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             backing.body.file.close(heap.global_io);
         }
 
-        fn destroyBacking(head: *Capability.Head) void {
+        fn destroyBacking(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             heap.global_gpa.destroy(backing);
         }
@@ -203,7 +203,7 @@ pub const Process = struct {
 
         /// Kills whatever is still running, since a closed capability can no
         /// longer be named and nothing could ever wait for its children.
-        fn deinitBody(head: *Capability.Head) void {
+        fn deinitBody(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             const self = &backing.body;
 
@@ -215,7 +215,7 @@ pub const Process = struct {
         /// Runs at ref count zero rather than at close, so a thread holding the
         /// body through a `getBacking` that raced the close still reads valid
         /// memory.
-        fn destroyBacking(head: *Capability.Head) void {
+        fn destroyBacking(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             heap.global_gpa.free(backing.body.stages);
             heap.global_gpa.destroy(backing);

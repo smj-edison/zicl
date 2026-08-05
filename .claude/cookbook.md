@@ -252,7 +252,7 @@ pub const MyType = struct {
         try ctx.addField(i64, info, "field", "{}", .{obj.asTypeConst(MyType).?.field});
     }
 
-    pub const vtable: heap.Object.VTable = .{
+    pub const vtable: heap.Object.VTable = .zig(.{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,

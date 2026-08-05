@@ -304,14 +304,13 @@ pub const None = struct {
         return new_obj.head;
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(None), .{
         .duplicate = duplicate,
         .make_crossthread = Object.noopMakeCrossthread,
         .free_internal_rep = null,
         .update_string = null,
         .enumerate_struct = null,
-        .name = @typeName(None),
-    };
+    });
 };
 
 pub const String = struct {
@@ -449,14 +448,13 @@ pub const String = struct {
         try ctx.addField(usize, info, "codepoint_length", "{}", .{string.codepoint_length.load(.monotonic)});
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(String), .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = null,
         .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(String),
-    };
+    });
 };
 
 fn testString(ta: std.mem.Allocator) !void {
@@ -541,14 +539,13 @@ pub const Source = struct {
         if (source.hash.load(.monotonic)) |hash| try ctx.followNode(u256, info, "hash", hash);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(Source), .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(Source),
-    };
+    });
 };
 
 pub const HashReference = struct {
@@ -664,14 +661,13 @@ pub const HashReference = struct {
         try helper.follow(Object, "ref", hash_ref.ref);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(HashReference), .{
         .duplicate = duplicate,
         .update_string = updateString,
         .free_internal_rep = freeInternalRep,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(HashReference),
-    };
+    });
 };
 
 pub const Index = struct {
@@ -802,14 +798,13 @@ pub const Index = struct {
         try obj.setStringIgnoreRace(bytes);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(Index), .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = null,
-        .name = @typeName(Index),
-    };
+    });
 };
 
 pub const Float = struct {
@@ -905,14 +900,13 @@ pub const Float = struct {
         return new_obj.head;
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(Float), .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = null,
-        .name = @typeName(Float),
-    };
+    });
 };
 
 pub const Integer = struct {
@@ -1018,14 +1012,13 @@ pub const Integer = struct {
         return new_obj.head;
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(Integer), .{
         .duplicate = duplicate,
         .free_internal_rep = null,
         .update_string = updateString,
         .make_crossthread = Object.noopMakeCrossthread,
         .enumerate_struct = null,
-        .name = @typeName(Integer),
-    };
+    });
 };
 
 /// Generic helper functions to deal with numbers.
@@ -1148,14 +1141,13 @@ pub fn EnumConstructor(comptime E: type, include_numbers: bool) type {
             return new_obj.head;
         }
 
-        pub const vtable: Object.VTable = .{
+        pub const vtable: Object.VTable = .zig(@typeName(Self), .{
             .duplicate = duplicate,
             .free_internal_rep = null,
             .update_string = null,
             .make_crossthread = Object.noopMakeCrossthread,
             .enumerate_struct = null,
-            .name = @typeName(Self),
-        };
+        });
     };
 }
 
@@ -1623,14 +1615,13 @@ pub const List = struct {
         try helper.followValueSlice("items", as_list.items);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(List), .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(List),
-    };
+    });
 };
 
 pub fn valuesToShimmerables(gpa: std.mem.Allocator, values: []Value) ![]Shimmerable {
@@ -2363,14 +2354,13 @@ pub const Dictionary = struct {
         try helper.followValueSlice("items", as_dict.items);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(Dictionary), .{
         .duplicate = duplicate,
         .free_internal_rep = freeInternalRep,
         .update_string = updateString,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(Dictionary),
-    };
+    });
 };
 
 fn testDicts(ta: std.mem.Allocator) !void {

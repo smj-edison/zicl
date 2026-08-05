@@ -27,7 +27,7 @@ pub const scheme_name = "zicl";
 pub const scheme = scheme_name ++ "://";
 
 /// Capability identifier. We use 128 bits since that is enough to be effectively unforgable.
-const Id = i128;
+pub const Id = i128;
 const encoded_id_len = std.base64.url_safe_no_pad.Encoder.calcSize(@sizeOf(Id));
 
 head: *Head,
@@ -83,7 +83,7 @@ pub fn shimmerFrom(det: ?*ErrorDetails, shim: *objects.Shimmerable) !*const Capa
     const head = registry.resolve(parsed.id) orelse return staleError(det, bytes);
     errdefer head.release();
 
-    if (!std.mem.eql(u8, parsed.type_name, head.vtable.name)) {
+    if (!std.mem.eql(u8, parsed.type_name, std.mem.span(head.vtable.name))) {
         // Capability type name and parsed type name aren't the same. We consider
         // this to be a stale error, so the details on whether it's registered or
         // not are not visible.
@@ -129,21 +129,24 @@ fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructI
     try ctx.followNode(Head, info, "head", self.head);
 }
 
-pub const vtable: Object.VTable = .{
+pub const vtable: Object.VTable = .zig(@typeName(Capability), .{
     .duplicate = duplicate,
     .free_internal_rep = freeInternalRep,
     .update_string = updateString,
     // The head is atomically reference counted and holds no Values.
     .make_crossthread = Object.noopMakeCrossthread,
     .enumerate_struct = enumerateStruct,
-    .name = @typeName(Capability),
-};
+});
 
 /// Heads are the generic part of a capability. Capabilities are the combination
 /// of a Head and a Body, where Body is a custom type. This is currently
 /// implemented as `const Backing = struct { head: Head, body: Body }`, and
 /// `body` is recovered using @parentFieldPtr on the `head` pointer.
-pub const Head = struct {
+///
+/// `extern` so a C program can embed a `Zicl_Head` as the first field of its own
+/// backing struct and register it through the C API; the vtable-identity check
+/// in `getBacking` then works uniformly for Zig- and C-created capabilities.
+pub const Head = extern struct {
     vtable: *const VTable,
     id: Id,
     /// Whether the capability is dead. Needed because a capability can be
@@ -183,19 +186,20 @@ pub const Head = struct {
     pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const head: *const Head = @ptrCast(@alignCast(info.node));
         const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
-        try helper.addField([]const u8, "type", "{s}", .{head.vtable.name});
+        try helper.addField([]const u8, "type", "{s}", .{std.mem.span(head.vtable.name)});
         try helper.addField(bool, "closed", "{}", .{head.isClosed()});
         try helper.addField(u32, "ref_count", "{}", .{head.ref_count.load(.monotonic)});
     }
 
-    pub const VTable = struct {
-        /// Path segment a string rep uses, such as "file-handle".
-        name: []const u8,
+    pub const VTable = extern struct {
+        /// Path segment a string rep uses, such as "file-handle". NUL-terminated
+        /// so the vtable is layout-compatible with C (see `Zicl_HeadVTable`).
+        name: [*:0]const u8,
         /// Deinits the underlying body. Runs exactly once, from `close`.
-        deinitBody: *const fn (head: *Head) void,
+        deinitBody: *const fn (head: *Head) callconv(.c) void,
         /// This may be called much later than `deinitBody`, as closing the capability
         /// is not the same thing as freeing the entry and body.
-        destroyBacking: *const fn (head: *Head) void,
+        destroyBacking: *const fn (head: *Head) callconv(.c) void,
     };
 };
 
@@ -374,12 +378,12 @@ const TestCapability = struct {
         head: Head,
         body: TestCapability,
 
-        fn deinitBody(head: *Head) void {
+        fn deinitBody(head: *Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             backing.body.deinited_ptr.* = true;
         }
 
-        fn destroyBacking(head: *Head) void {
+        fn destroyBacking(head: *Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             heap.global_gpa.destroy(backing);
         }

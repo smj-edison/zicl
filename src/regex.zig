@@ -68,14 +68,13 @@ pub const Regexp = struct {
         try ctx.followNode(pcre2.pcre2_code_8, info, "regexp", regexp.regexp);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(Regexp), .{
         .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = freeInternalRep,
         .make_crossthread = null,
         .enumerate_struct = enumerateStruct,
-        .name = @typeName(Regexp),
-    };
+    });
 };
 
 fn pcreMalloc(size: usize, userdata: ?*anyopaque) callconv(.c) ?*anyopaque {

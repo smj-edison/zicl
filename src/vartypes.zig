@@ -150,7 +150,7 @@ pub const CachedLocalVar = struct {
         return self.table_in.slotAt(self.index);
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(CachedLocalVar), .{
         .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = null,
@@ -158,8 +158,7 @@ pub const CachedLocalVar = struct {
         // TODO it would be nice to be able to walk the cached local var,
         // but we'd need the call epoch invalidation logic embedded in it.
         .enumerate_struct = null,
-        .name = @typeName(CachedLocalVar),
-    };
+    });
 };
 
 pub const CachedLexicalVar = struct {
@@ -176,15 +175,14 @@ pub const CachedLexicalVar = struct {
         obj.vtable = &objects.None.vtable;
     }
 
-    pub const vtable: Object.VTable = .{
+    pub const vtable: Object.VTable = .zig(@typeName(CachedLexicalVar), .{
         .duplicate = Object.duplicateStringOnly,
         .update_string = null,
         .free_internal_rep = null,
         .make_crossthread = makeCrossthread,
         // TODO same issue as `CachedLocalVar.vtable`.
         .enumerate_struct = null,
-        .name = @typeName(CachedLexicalVar),
-    };
+    });
 };
 
 /// `dict_name` points to an object that contains the name of the dictionary
@@ -288,14 +286,13 @@ pub const DictSugar = struct {
         try helper.follow(Object, "dict_path", dict_sugar.dict_path.asHead());
     }
 
-    pub const vtable: Object.VTable = .{
-        .name = @typeName(DictSugar),
+    pub const vtable: Object.VTable = .zig(@typeName(DictSugar), .{
         .duplicate = Object.duplicateStringOnly,
         .free_internal_rep = freeInternalRep,
         .update_string = null,
         .make_crossthread = makeCrossthread,
         .enumerate_struct = enumerateStruct,
-    };
+    });
 };
 
 /// Dict sugar reports a malformed dictionary as a failed lookup, since from the
