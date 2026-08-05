@@ -37,6 +37,7 @@ const ScriptError = error{
     MissingCloseBracket,
     MissingCloseBrace,
     MissingCloseQuote,
+    MissingCloseParen,
     CharactersAfterCloseBrace,
     TrailingBackslash,
     NotVariable,
@@ -453,6 +454,11 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
         return Error.NotVariable;
     }
 
+    if (self.current() == '(') {
+        // Expression sugar (e.g. `$(1 + 1)`).
+        return try self.nextExpressionSugarToken();
+    }
+
     var token = self.newToken();
     token.tag = .variable_subst;
 
@@ -516,6 +522,57 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
     }
 
     return token;
+}
+
+/// Called with `self` pointing at the '('. Captures the value between
+/// the parentheses.
+fn nextExpressionSugarToken(self: *Tokenizer) Error!Token {
+    // Save in case the paren is not matched for better error message.
+    const index = self.index;
+    const line_no = self.line_no;
+
+    // Skip opening '('
+    self.advance(1);
+    var paren_depth: u32 = 1;
+
+    var token = self.newToken();
+    token.tag = .expression_sugar;
+
+    while (!self.atEnd()) {
+        switch (self.current()) {
+            '\\' => {
+                // Skip character after escape
+                self.advance(1);
+                try self.errorIfAtEndAfterBackslash();
+            },
+            '(' => {
+                paren_depth += 1;
+            },
+            ')' => {
+                paren_depth -= 1;
+                if (paren_depth == 0) {
+                    token.loc.end = self.index;
+
+                    // make sure to advance past the closing paren
+                    self.advance(1);
+
+                    return token;
+                }
+            },
+            else => {},
+        }
+
+        self.advance(1);
+    }
+
+    // If we reached here, it means we reached the end of the input
+    // without balancing our parens. Thus, a missing paren error
+    // is needed.
+    self.error_details = .{
+        .index = index,
+        .line_no = line_no,
+    };
+    return Error.MissingCloseParen;
 }
 
 pub fn nextCommandToken(self: *Tokenizer) Error!Token {
@@ -855,6 +912,21 @@ pub fn nextExpressionToken(self: *Tokenizer) Error!Token {
         ',' => return self.singleCharToken(.comma),
         '[' => return self.nextCommandToken(),
         '$' => {
+            // `$(...)` means "evaluate this as an expression", but we're already
+            // in an evaluation context, so, we'll just treat this as normal
+            // left parenthesis token.
+            // ```
+            // expr {$(1 + 3) * 2}
+            //       ^^ Treated as a single paren, effectively becoming this:
+            // expr { (1 + 3) * 2}
+            //        ^ This is what is emitted, omitting the dollar sign.
+            // ```
+            // This way parenthesis precedence is maintained.
+            if (self.peek(1) == '(') {
+                self.advance(1);
+                return self.singleCharToken(.l_paren);
+            }
+
             if (self.nextVariableToken()) |val| {
                 return val;
             } else |err| switch (err) {
@@ -1078,6 +1150,7 @@ pub fn convertTokenizerError(gpa: std.mem.Allocator, err: Tokenizer.Error) error
         error.MissingCloseBrace => try gpa.dupeSentinel(u8, "missing close-brace", 0),
         error.MissingCloseBracket => try gpa.dupeSentinel(u8, "unmatched \"[\"", 0),
         error.MissingCloseQuote => try gpa.dupeSentinel(u8, "missing quote", 0),
+        error.MissingCloseParen => try gpa.dupeSentinel(u8, "unmatched \"(\"", 0),
         error.TrailingBackslash => try gpa.dupeSentinel(u8, "no character after \\", 0),
         error.FunctionMissingParentheses => try gpa.dupeSentinel(u8, "function missing parentheses", 0),
         error.NotOperator => try gpa.dupeSentinel(u8, "not operator", 0),

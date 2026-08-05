@@ -450,6 +450,69 @@ test "subst basic" {
     try memutil.checkAllocationFailures(.exhaustive, testSubstBasic, .{});
 }
 
+fn testExpressionSugar(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("2", "return $(1 + 1)");
+    try interp.testExpectScriptResult("7", "set x 3; return $($x * 2 + 1)");
+
+    // Ends at the balancing paren, not the first one.
+    try interp.testExpectScriptResult("9", "return $((1 + 2) * 3)");
+
+    // It substitutes like any other word.
+    try interp.testExpectScriptResult("a2b", "return a$(1 + 1)b");
+    try interp.testExpectScriptResult("4", "return $([+ 1 1] * 2)");
+    try interp.testExpectScriptResult("2", "return \"$(1 + 1)\"");
+    try interp.testExpectScriptResult("$(1 + 1)", "return {$(1 + 1)}");
+
+    // Nested in an expression it's just grouping.
+    try interp.testExpectScriptResult("8", "return [expr {$(1 + 3) * 2}]");
+    try interp.testExpectScriptResult("8", "return [expr {2 * $(1 + 3)}]");
+    try interp.testExpectScriptResult("6", "return $($(1 + 1) * 3)");
+}
+
+test "expression sugar" {
+    try memutil.checkAllocationFailures(.exhaustive, testExpressionSugar, .{});
+}
+
+fn testExpressionSugarDoesNotCaptureDictSugar(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // After a name the '(' is ordinary text, so this is `foo` followed by "(bar)".
+    try interp.testExpectScriptResult("1(bar)", "set foo 1; return $foo(bar)");
+}
+
+test "expression sugar does not capture dict sugar" {
+    try memutil.checkAllocationFailures(.exhaustive, testExpressionSugarDoesNotCaptureDictSugar, .{});
+}
+
+fn testExpressionSugarErrors(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptError(error.EvalError, "unmatched \"(\"", "return $(1 + 1");
+    try interp.testExpectScriptError(error.EvalError, "unmatched \"(\"", "return $(");
+
+    // Scans to end of input, then reports against the '(' rather than whatever
+    // it swallowed on the way.
+    try interp.testExpectScriptError(error.EvalError, "unmatched \"(\"",
+        \\ set x $(1 + 1
+        \\ puts hello
+    );
+
+    try memutil.expectErrorOrOom(error.EvalError, interp.testRunScript("return $(1 +)"));
+
+    // Empty is an error, not the empty string. Message is pinned in `expr_parse.zig`.
+    try memutil.expectErrorOrOom(error.EvalError, interp.testRunScript("return $()"));
+    try memutil.expectErrorOrOom(error.EvalError, interp.testRunScript("return [expr {}]"));
+}
+
+test "expression sugar errors" {
+    try memutil.checkAllocationFailures(.exhaustive, testExpressionSugarErrors, .{});
+}
+
 fn testParsing(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);

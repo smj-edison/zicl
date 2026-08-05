@@ -688,7 +688,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !
             return var_target.borrow();
         },
         .expression_sugar => {
-            @panic("Expression sugar unimplemented");
+            return try interp.evalExpression(value);
         },
         .command_subst => {
             const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
@@ -1304,10 +1304,12 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
             };
 
             if (argument_expansion) {
+                // `getListInPlace` can fail, so we put the `defer` here.
+                defer resultant_word.release();
+
                 // Argument expansion, so we'll need to shimmer the result to a list.
                 const as_list = try interp.getListInPlace(&resultant_word);
                 const expansion_len = as_list.items.len;
-                defer resultant_word.release();
 
                 if (expansion_len != 1) {
                     // Expanded into multiple tokens, so we'll need to resize args.

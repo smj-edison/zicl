@@ -535,22 +535,12 @@ pub const Parser = struct {
     }
 
     pub fn parseExpr(p: *Parser) error{ OutOfMemory, ParseError }!Parsed {
-        if (try p.parseExprPrecedence(0, .{})) |root_node| {
-            const parsed: Parsed = .{
-                .nodes = try p.nodes.toOwnedSlice(p.gpa),
-                .root_node = root_node,
-            };
-            return parsed;
-        } else {
-            // Nothing was returned, so make the expression have a single node that just returns the empty string.
-            try p.nodes.append(p.gpa, .{ .tag = .value, .data = .{ .value = heap.interned_empty_string } });
-            const root_node: Node.Index = @enumFromInt(p.nodes.items.len - 1);
-            const parsed: Parsed = .{
-                .nodes = try p.nodes.toOwnedSlice(p.gpa),
-                .root_node = root_node,
-            };
-            return parsed;
-        }
+        const root_node = try p.parseExprPrecedence(0, .{}) orelse return p.fail(.empty_expression);
+
+        return .{
+            .nodes = try p.nodes.toOwnedSlice(p.gpa),
+            .root_node = root_node,
+        };
     }
 
     pub fn init(gpa: std.mem.Allocator, source_file_name: OptionalValue, source: []const u8, tokens: Tokens) Parser {
@@ -578,6 +568,7 @@ pub const Parser = struct {
         token: TokenIndex,
 
         const Tag = enum {
+            empty_expression,
             missing_operand,
             colon_without_question_mark,
             missing_colon,
@@ -648,6 +639,7 @@ pub const Parser = struct {
 
         try w.writeAll("error: ");
         switch (parse_error.tag) {
+            .empty_expression => try w.writeAll("empty expression"),
             .missing_operand => try w.writeAll("missing operand"),
             .colon_without_question_mark => try w.writeAll("\":\" without \"?\" in expression"),
             .missing_operator => try w.writeAll("missing operator"),
@@ -837,6 +829,8 @@ test "expr parsing" {
     );
 
     // Test error messages.
+    try testExprParseError(ta, "", .empty_expression, "error: empty expression\n  |\n1 | \n  | ^");
+    try testExprParseError(ta, "   ", .empty_expression, null);
     try testExprParseError(ta, "1 + ", .missing_operand,
         \\error: missing operand
         \\  |
