@@ -115,6 +115,9 @@ const OperInfo = struct {
 };
 
 const unary_precedence: i8 = 125;
+/// Below every binary operator in `binary_oper_table`, since `?:` binds loosest
+/// of anything in a Tcl expression.
+const ternary_precedence: i8 = 5;
 const binary_oper_table = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, .{ .prec = -1, .tag = Node.Tag.none }, 0, .{
     .asterisk_asterisk = .{ .prec = 120, .tag = Node.Tag.pow, .assoc = .right },
 
@@ -471,6 +474,8 @@ pub const Parser = struct {
                     }
                 },
                 .question_mark => {
+                    if (ternary_precedence < min_prec) return node;
+
                     p.token_i += 1;
                     const value_if_true = try p.parseExprPrecedence(0, .{
                         .ternary = .true_branch,
@@ -697,7 +702,7 @@ pub const Parsed = struct {
         try parsed.renderInner(writer, parsed.root_node);
     }
 
-    fn renderInner(parsed: *const Parsed, writer: *Writer, node_index: Node.Index) !void {
+    pub fn renderInner(parsed: *const Parsed, writer: *Writer, node_index: Node.Index) !void {
         const tag = parsed.nodes[@intFromEnum(node_index)].tag;
         const data = parsed.nodes[@intFromEnum(node_index)].data;
         switch (tag) {
@@ -822,6 +827,13 @@ test "expr parsing" {
     // Various stress tests.
     try testExprParse(ta, "1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");
     try testExprParse(ta, "1 ? 10 : 5", "(.ternary_conditional 1 10 5)");
+    // `?:` binds loosest, so the condition takes the whole comparison.
+    try testExprParse(ta, "1 eq 1 ? 10 : 5", "(.ternary_conditional (1 .string_equal 1) 10 5)");
+    try testExprParse(ta, "1 + 2 ? 10 : 5", "(.ternary_conditional (1 .add 2) 10 5)");
+    try testExprParse(ta, "1 || 0 ? 10 : 5", "(.ternary_conditional (1 .bool_or 0) 10 5)");
+    // Right associative, and the branches still take whole expressions.
+    try testExprParse(ta, "1 ? 2 : 0 ? 3 : 4", "(.ternary_conditional 1 2 (.ternary_conditional 0 3 4))");
+    try testExprParse(ta, "1 ? 2 + 3 : 4 + 5", "(.ternary_conditional 1 (2 .add 3) (4 .add 5))");
     try testExprParse(
         ta,
         "atan2(1 ? 10 : 5, int(0 ? 5 : 2))",

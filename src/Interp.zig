@@ -31,9 +31,9 @@ const Expression = evaltypes.Expression;
 const Substitution = evaltypes.Substitution;
 
 // We re-export these so callers only need to import Interp and not evaltypes.
-pub const ReturnCode = evaltypes.ReturnCode;
+pub const ReturnCode = heap.ReturnCode;
+pub const Error = heap.Error;
 pub const ReturnCodeEnum = evaltypes.ReturnCodeEnum;
-pub const Error = evaltypes.Error;
 
 const Interp = @This();
 
@@ -120,7 +120,7 @@ const interned_scope = heap.InternedString.newValue("scope");
 const interned_zicl_oom = heap.InternedString.newValue("ZICL OOM");
 const interned_oom = heap.InternedString.newValue("out of memory");
 
-pub fn narrowError(err: anyerror) evaltypes.EvalError {
+pub fn narrowError(err: anyerror) heap.EvalError {
     return switch (err) {
         error.Break => error.Break,
         error.Continue => error.Continue,
@@ -133,7 +133,7 @@ pub fn narrowError(err: anyerror) evaltypes.EvalError {
 }
 pub fn narrowToEvalError(result: anytype) blk: {
     const info = @typeInfo(@TypeOf(result));
-    break :blk if (info == .error_set) evaltypes.EvalError else evaltypes.EvalError!info.error_union.payload;
+    break :blk if (info == .error_set) heap.EvalError else heap.EvalError!info.error_union.payload;
 } {
     if (@typeInfo(@TypeOf(result)) == .error_set) {
         return narrowError(result);
@@ -429,6 +429,11 @@ pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
 
 pub fn setResultError(interp: *Interp, value: Value) error{EvalError} {
     interp.setResult(value);
+    return error.EvalError;
+}
+
+pub fn setErrorFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) error{ OutOfMemory, EvalError } {
+    try interp.setResultFormatted(fmt, args);
     return error.EvalError;
 }
 
@@ -900,7 +905,7 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     try interp.invokeCommand(&unknown_cmd, new_args);
 }
 
-const CommandError = evaltypes.Error || error{InfiniteRecursion};
+const CommandError = heap.Error || error{InfiniteRecursion};
 fn invokeCommand(interp: *Interp, command_or_closure: *CommandOrClosure, args: []Shimmerable) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
@@ -986,10 +991,14 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
     return Expression.evalNode(interp, expr.parsed.nodes, expr.parsed.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => {
+            var alloc_writer: std.Io.Writer.Allocating = .init(heap.global_gpa);
+            defer alloc_writer.deinit();
+            expr.parsed.render(&alloc_writer.writer) catch return error.OutOfMemory;
+
             // Give the caller some context for what failed.
             try interp.setResultFormatted(
-                "error occured when evaluating expression {s}: {s}",
-                .{ try value.getString(), try interp.result.getString() },
+                "error occured when evaluating expression {s}: {s}, parse tree: {s}",
+                .{ try value.getString(), try interp.result.getString(), alloc_writer.writer.buffered() },
             );
             return error.EvalError;
         },
@@ -1337,7 +1346,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     try interp.invokeCommandMaybeMethod(args_raw);
 }
 
-pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) evaltypes.EvalError!void {
+pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) heap.EvalError!void {
     // A loop evaluates its body through here once per iteration, which is what
     // keeps an iterating script from accumulating. Nesting is safe, since an
     // inner evaluation snapshots at a higher watermark than an outer one.
@@ -1411,21 +1420,21 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
 /// embedder call. A `[return]` reaching this boundary has no closure left to
 /// return from, so it ends the script and keeps its result instead of escaping
 /// as an error. This is the only place a leftover level is discarded.
-pub fn evalTopLevel(interp: *Interp, script: Value) evaltypes.EvalError!void {
+pub fn evalTopLevel(interp: *Interp, script: Value) heap.EvalError!void {
     interp.evalObject(script) catch |err| switch (err) {
         error.PropagateResult => interp.return_propagate = .{},
         else => return err,
     };
 }
 
-pub fn evalObject(interp: *Interp, script: Value) evaltypes.EvalError!void {
+pub fn evalObject(interp: *Interp, script: Value) heap.EvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHashNoRegister();
     return evalObjectInner(interp, interp.callFrameIdx(), script, cache_key);
 }
 
-pub fn evalFile(interp: *Interp, filename: []const u8) evaltypes.EvalError!void {
+pub fn evalFile(interp: *Interp, filename: []const u8) heap.EvalError!void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         heap.global_io,
         filename,
@@ -1699,12 +1708,12 @@ pub fn unsetVariableSilent(interp: *Interp, name: *Shimmerable) !void {
     try vartypes.unsetVariable(interp, null, interp.callFrameIdx(), name);
 }
 
-pub fn getDictValue(interp: *Interp, dict: *Shimmerable, key: Value) evaltypes.Error!?Value {
+pub fn getDictValue(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!?Value {
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, objects.Dictionary.getFollowingLinks(&det, dict, key));
 }
 
-pub fn getDictValueOrError(interp: *Interp, dict: *Shimmerable, key: Value) evaltypes.Error!Value {
+pub fn getDictValueOrError(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!Value {
     const result = try interp.getDictValue(dict, key);
     if (result) |val| return val;
 
@@ -1720,12 +1729,12 @@ pub fn getDictValueInPlace(interp: *Interp, dict: *Value, key: Value) !?Value {
     return result;
 }
 
-pub fn getDictValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) evaltypes.Error!OptionalValue {
+pub fn getDictValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!OptionalValue {
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, objects.Dictionary.getRecursively(&det, shim, context));
 }
 
-pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, context: anytype) evaltypes.Error!Value {
+pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!Value {
     const result = try interp.getDictValueRecursively(shim, context);
     if (result.asValue()) |val| return val;
 
@@ -1744,7 +1753,7 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, conte
     return error.EvalError;
 }
 
-pub fn putDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype, value: Value) evaltypes.Error!void {
+pub fn putDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype, value: Value) heap.Error!void {
     var det: ErrorDetails = undefined;
     try interp.wrapError(&det, dict.putRecursively(&det, context, value));
 }
@@ -1755,7 +1764,7 @@ pub fn removeDictValue(interp: *Interp, dict: *Dictionary, key: Value) !bool {
     return try interp.wrapError(&det, dict.remove(&det, key));
 }
 
-pub fn removeDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype) evaltypes.Error!bool {
+pub fn removeDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype) heap.Error!bool {
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, dict.removeRecursively(&det, context));
 }

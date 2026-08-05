@@ -90,9 +90,9 @@ export fn Zicl_String(value: Value) callconv(.c) ?[*:0]const u8 {
     return value.getString() catch return null;
 }
 
-export fn Zicl_GetString(value: Value, len: *c_int) callconv(.c) ?[*:0]const u8 {
+export fn Zicl_GetString(value: Value, len: ?*c_int) callconv(.c) ?[*:0]const u8 {
     const str = value.getString() catch return null;
-    len.* = @intCast(str.len);
+    if (len) |ptr| ptr.* = @intCast(str.len);
     return str;
 }
 
@@ -102,6 +102,15 @@ export fn Zicl_DecrRefCount(value: Value) callconv(.c) void {
 
 export fn Zicl_IncrRefCount(value: Value) callconv(.c) Value {
     return value.borrow();
+}
+
+export fn Zicl_AsPtr(value: Value) callconv(.c) ?*heap.Object {
+    return value.asPtr();
+}
+
+// `Shimmerable.current` exposed under the name the C header declares.
+export fn Zicl_Current(shim: Shimmerable) callconv(.c) Value {
+    return shim.current();
 }
 
 // Number functions. Primitives are inline, so these never allocate and cannot fail.

@@ -6,6 +6,7 @@ const Capability = @import("../Capability.zig");
 const capabilities = @import("../capabilities.zig");
 
 const common = @import("common.zig");
+const exec = @import("exec.zig");
 const heap = common.heap;
 const objects = common.objects;
 const ErrorDetails = common.ErrorDetails;
@@ -71,12 +72,32 @@ fn writeError(interp: *Interp, err: anyerror) Interp.Error {
 }
 
 /// [pid]
+///
+/// With no arguments, this process. With a process capability, the pids of its
+/// stages, for reaching a child through something other than the capability, a
+/// signal being the usual reason. A stage already waited for contributes
+/// nothing, its number having stopped meaning anything.
 pub fn pidCmd(interp: *Interp, args: []Shimmerable) !void {
-    if (args.len != 1) {
-        try interp.setResultString("wrong # args: should be \"pid\"");
-        return error.EvalError;
+    if (args.len == 1) {
+        try interp.setResultInteger(@intCast(std.os.linux.getpid()));
+        return;
     }
-    try interp.setResultInteger(@intCast(std.os.linux.getpid()));
+
+    var det: ErrorDetails = undefined;
+    const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
+    const backing = try interp.wrapError(&det, cap.getBacking(capabilities.Process.Backing, &det));
+
+    var pid_buffer: [exec.max_pipeline_stages]?std.process.Child.Id = undefined;
+    const pids = backing.body.pids(&pid_buffer);
+
+    var values: std.ArrayList(heap.Value) = .empty;
+    defer values.deinit(heap.local_arena);
+    for (pids) |maybe_pid| {
+        if (maybe_pid) |pid| try values.append(heap.local_arena, objects.Integer.new(@intCast(pid)));
+    }
+
+    const list = try objects.List.new(values.items);
+    interp.setResultOwning(list.asHead().asValue());
 }
 
 pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -216,94 +237,106 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .tempfile => {
             const template = if (args.len > 2) try args[2].getString() else null;
 
-            var path_buf: std.ArrayList(u8) = .empty;
-            defer path_buf.deinit(heap.global_gpa);
-
-            if (template) |t| {
-                try path_buf.appendSlice(heap.global_gpa, t);
-            } else {
-                const tmpdir = switch (builtin.os.tag) {
-                    .windows => blk: {
-                        const env_vars = &[_][]const u8{ "TMP", "TEMP", "LOCALAPPDATA", "USERPROFILE" };
-                        for (env_vars) |name| {
-                            if (std.c.getenv(name.ptr)) |val| {
-                                const slice = std.mem.span(val);
-                                if (slice.len > 0) break :blk slice;
-                            }
-                        }
-                        break :blk "C:\\Windows\\Temp";
-                    },
-                    else => blk: {
-                        if (std.c.getenv("TMPDIR")) |val| {
-                            const slice = std.mem.span(val);
-                            if (slice.len > 0) break :blk slice;
-                        }
-                        break :blk "/tmp";
-                    },
-                };
-                try path_buf.appendSlice(heap.global_gpa, tmpdir);
-                if (!std.mem.endsWith(u8, path_buf.items, std.fs.path.sep_str)) {
-                    try path_buf.append(heap.global_gpa, std.fs.path.sep);
-                }
-                try path_buf.appendSlice(heap.global_gpa, "tcl.tmp.");
-            }
-
-            const base_len = path_buf.items.len;
-            const has_template = if (template) |val| std.mem.endsWith(u8, val, "XXXXXX") else false;
-            const suffix_start = if (has_template) base_len - 6 else base_len;
-            const suffix_len: usize = if (has_template) 6 else 8;
-
-            if (!has_template) {
-                try path_buf.resize(heap.global_gpa, base_len + suffix_len);
-            }
-
-            const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            var random_bytes: [8]u8 = undefined;
-
-            var retries: u32 = 0;
-            const max_retries = 100;
-            while (retries < max_retries) : (retries += 1) {
-                heap.global_io.random(&random_bytes);
-
-                for (0..suffix_len) |i| {
-                    path_buf.items[suffix_start + i] = alnum[random_bytes[i] % alnum.len];
-                }
-
-                const file = std.Io.Dir.createFileAbsolute(heap.global_io, path_buf.items, .{
-                    .read = true,
-                    .truncate = false,
-                    .exclusive = true,
-                }) catch |err| switch (err) {
-                    error.PathAlreadyExists => continue,
-                    else => {
-                        try interp.setResultFormatted("could not create temp file: {s}", .{@errorName(err)});
-                        return error.EvalError;
-                    },
-                };
-                defer file.close(heap.global_io);
-
-                try interp.setResultStringOwning(try path_buf.toOwnedSliceSentinel(heap.global_gpa, 0));
-                return;
-            }
-
-            try interp.setResultString("could not create a unique temporary file");
-            return error.EvalError;
+            var temp = createTempFile(template) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NoUniqueName => {
+                    try interp.setResultString("could not create a unique temporary file");
+                    return error.EvalError;
+                },
+                else => {
+                    try interp.setResultFormatted("could not create temp file: {s}", .{@errorName(err)});
+                    return error.EvalError;
+                },
+            };
+            temp.file.close(heap.global_io);
+            try interp.setResultStringOwning(temp.path);
         },
     }
 }
 
-/// The body of a file capability: what `[fopen]` hands out and `[close]` takes
-/// back. Nothing but the file, since the capability machinery carries identity
-/// and lifetime on its own.
-pub const FileBody = struct {
-    pub const capability_name = "file-handle";
-
+/// A temporary file, open and named. The caller owns both: close the file, and
+/// free the path with `heap.global_gpa`.
+pub const TempFile = struct {
     file: std.Io.File,
-
-    pub fn deinit(self: *FileBody) void {
-        self.file.close(heap.global_io);
-    }
+    path: [:0]u8,
 };
+
+/// Creates a fresh temporary file, open for reading and writing. `template`
+/// names where it goes: a trailing `XXXXXX` is replaced with random characters,
+/// and anything else is a prefix. With no template the file lands in the
+/// platform's temporary directory under `tcl.tmp.`.
+///
+/// Created exclusively, since a name that merely looked free when it was
+/// generated could be claimed before it was opened.
+pub fn createTempFile(template: ?[]const u8) !TempFile {
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(heap.global_gpa);
+
+    if (template) |t| {
+        try path_buf.appendSlice(heap.global_gpa, t);
+    } else {
+        const tmpdir = switch (builtin.os.tag) {
+            .windows => blk: {
+                const env_vars = &[_][]const u8{ "TMP", "TEMP", "LOCALAPPDATA", "USERPROFILE" };
+                for (env_vars) |name| {
+                    if (std.c.getenv(name.ptr)) |val| {
+                        const slice = std.mem.span(val);
+                        if (slice.len > 0) break :blk slice;
+                    }
+                }
+                break :blk "C:\\Windows\\Temp";
+            },
+            else => blk: {
+                if (std.c.getenv("TMPDIR")) |val| {
+                    const slice = std.mem.span(val);
+                    if (slice.len > 0) break :blk slice;
+                }
+                break :blk "/tmp";
+            },
+        };
+        try path_buf.appendSlice(heap.global_gpa, tmpdir);
+        if (!std.mem.endsWith(u8, path_buf.items, std.fs.path.sep_str)) {
+            try path_buf.append(heap.global_gpa, std.fs.path.sep);
+        }
+        try path_buf.appendSlice(heap.global_gpa, "tcl.tmp.");
+    }
+
+    const base_len = path_buf.items.len;
+    const has_template = if (template) |val| std.mem.endsWith(u8, val, "XXXXXX") else false;
+    const suffix_start = if (has_template) base_len - 6 else base_len;
+    const suffix_len: usize = if (has_template) 6 else 8;
+
+    if (!has_template) {
+        try path_buf.resize(heap.global_gpa, base_len + suffix_len);
+    }
+
+    const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    var random_bytes: [8]u8 = undefined;
+
+    var retries: u32 = 0;
+    const max_retries = 100;
+    while (retries < max_retries) : (retries += 1) {
+        heap.global_io.random(&random_bytes);
+
+        for (0..suffix_len) |i| {
+            path_buf.items[suffix_start + i] = alnum[random_bytes[i] % alnum.len];
+        }
+
+        const file = std.Io.Dir.createFileAbsolute(heap.global_io, path_buf.items, .{
+            .read = true,
+            .truncate = false,
+            .exclusive = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => |other| return other,
+        };
+        errdefer file.close(heap.global_io);
+
+        return .{ .file = file, .path = try path_buf.toOwnedSliceSentinel(heap.global_gpa, 0) };
+    }
+
+    return error.NoUniqueName;
+}
 
 /// Whether the platform lets us ask for `O_APPEND`.
 ///
@@ -323,7 +356,7 @@ const has_posix_append = switch (@typeInfo(std.posix.O)) {
 /// it the cursor is placed at the end once, at open, and goes stale as soon as
 /// anything else writes; a caller wanting a shared log then has to serialize for
 /// itself.
-fn openForAppend(path: []const u8, readable: bool) !std.Io.File {
+pub fn openForAppend(path: []const u8, readable: bool) !std.Io.File {
     if (has_posix_append) {
         // Bypasses `heap.global_io` for this one call, which is the price of a
         // flag the `Io` layer has no way to pass along.
@@ -371,7 +404,7 @@ pub fn fopenCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3, null);
-    try registerCommand(interp, "pid", pidCmd, "", 0, 0, null);
+    try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1, null);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
     try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2, null);
 }

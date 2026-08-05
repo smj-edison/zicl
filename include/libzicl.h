@@ -68,6 +68,33 @@ _Static_assert(sizeof(Zicl_Value) == 16, "Zicl_Value must match heap.Value");
 _Static_assert(sizeof(Zicl_OptionalValue) == 16, "Zicl_OptionalValue must match heap.OptionalValue");
 #endif
 
+/* The working buffer for shimmering. `original` is the value the caller handed
+ * in; `shimmered` holds a duplicated object when the original could not be
+ * converted in place. `Zicl_Current` returns whichever is effective. Mirrors
+ * `objects.Shimmerable` on the Zig side, so the two must be kept in step. */
+typedef struct Zicl_Shimmerable {
+    Zicl_Value original;
+    Zicl_OptionalValue shimmered;
+} Zicl_Shimmerable;
+
+#ifndef __cplusplus
+_Static_assert(sizeof(Zicl_Shimmerable) == 32, "Zicl_Shimmerable must match objects.Shimmerable");
+#endif
+
+/* Build a shimmerable around a single value, with no shimmered duplicate. The
+ * caller owns `value` for the lifetime of the shimmerable. */
+static inline Zicl_Shimmerable Zicl_MakeShimmerable(Zicl_Value value) {
+    Zicl_Shimmerable shim;
+    shim.original = value;
+    shim.shimmered = ZICL_NONE;
+    return shim;
+}
+
+/* Return the effective value of a shimmerable: the shimmered duplicate when one
+ * exists, otherwise the original. The result is non-owning; borrow it with
+ * `Zicl_IncrRefCount` if it must outlive the shimmerable. */
+Zicl_Value Zicl_Current(Zicl_Shimmerable shim);
+
 /* Ownership and error propagation.
  *
  * Zicl treats running out of memory as recoverable, which in C means every
@@ -119,6 +146,11 @@ _Static_assert(sizeof(Zicl_OptionalValue) == 16, "Zicl_OptionalValue must match 
 #define ZICL_USAGE 8
 #define ZICL_TAILCALL 9
 
+/* A ref-counted heap object. Opaque because its layout carries atomic fields
+ * and a type-erased body that C cannot usefully touch directly; reach its state
+ * through the accessors below (`Zicl_AsPtr`, `Zicl_RefCount`, ...). */
+typedef struct Zicl_Object Zicl_Object;
+
 typedef struct Zicl_Interp Zicl_Interp;
 
 typedef int (*Zicl_CCommandFn)(Zicl_Interp *interp, int argc, Zicl_Value *argv);
@@ -145,6 +177,8 @@ const char *Zicl_String(Zicl_Value object);
 const char *Zicl_GetString(Zicl_Value object, int *len);
 void Zicl_DecrRefCount(Zicl_Value value);
 Zicl_Value Zicl_IncrRefCount(Zicl_Value value);
+/* The heap object a pointer-tagged value refers to, or NULL for primitives. */
+Zicl_Object *Zicl_AsPtr(Zicl_Value value);
 
 /* Number functions. Primitives are stored inline, so these cannot fail. */
 Zicl_Value Zicl_NewInt(int64_t value);

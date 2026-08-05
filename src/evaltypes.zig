@@ -22,74 +22,10 @@ const vartypes = @import("vartypes.zig");
 
 const options = @import("options");
 
-pub const EvalError = error{
-    OutOfMemory,
-    EvalError,
-    PropagateResult,
-    Break,
-    Continue,
-    Signal,
-    Exit,
-};
-pub const Error = EvalError || error{
-    WrongUsage,
-    Tailcall,
-};
-
-/// Return code values matching Tcl's convention.
-pub const ReturnCode = enum(u8) {
-    ok = 0,
-    @"error" = 1,
-    @"return" = 2,
-    @"break" = 3,
-    @"continue" = 4,
-    signal = 5,
-    exit = 6,
-    oom = 7,
-    usage = 8,
-    tailcall = 9,
-
-    pub fn fromErrorUnion(value: Error!void) ReturnCode {
-        if (value) {
-            return .ok;
-        } else |err| {
-            return ReturnCode.fromError(err);
-        }
-    }
-
-    pub fn fromError(err: Error) ReturnCode {
-        return switch (err) {
-            error.EvalError => .@"error",
-            error.PropagateResult => .@"return",
-            error.Break => .@"break",
-            error.Continue => .@"continue",
-            error.Signal => .signal,
-            error.Exit => .exit,
-            error.OutOfMemory => .oom,
-            error.WrongUsage => .usage,
-            error.Tailcall => .tailcall,
-        };
-    }
-
-    pub fn toError(self: ReturnCode) Error!void {
-        switch (self) {
-            .ok => return,
-            .@"error" => return error.EvalError,
-            .@"return" => return error.PropagateResult,
-            .@"break" => return error.Break,
-            .@"continue" => return error.Continue,
-            .signal => return error.Signal,
-            .exit => return error.Exit,
-            .oom => return error.OutOfMemory,
-            .usage => return error.WrongUsage,
-            .tailcall => return error.Tailcall,
-        }
-    }
-};
-pub const ReturnCodeEnum = objects.EnumConstructor(ReturnCode, true);
+pub const ReturnCodeEnum = objects.EnumConstructor(heap.ReturnCode, true);
 
 pub const CommandFn = fn (interp: *Interp, args: []Shimmerable) Interp.Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Value) callconv(.c) Interp.ReturnCode;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Value) callconv(.c) heap.ReturnCode;
 
 pub const ParsedScriptCommand = struct {
     line: u32,

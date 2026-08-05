@@ -45,6 +45,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try @import("math.zig").registerCommands(interp);
     try @import("misc.zig").registerCommands(interp);
     try @import("dict.zig").registerCommands(interp);
+    try @import("exec.zig").registerCommands(interp);
     try @import("io.zig").registerCommands(interp);
     try @import("list.zig").registerCommands(interp);
     try @import("try_catch.zig").registerCommands(interp);
@@ -71,6 +72,7 @@ test {
     _ = @import("math.zig");
     _ = @import("eval.zig");
     _ = @import("dict.zig");
+    _ = @import("exec.zig");
     _ = @import("misc.zig");
     _ = @import("variables.zig");
     _ = @import("io.zig");

@@ -513,6 +513,23 @@ test "expression sugar errors" {
     try memutil.checkAllocationFailures(.exhaustive, testExpressionSugarErrors, .{});
 }
 
+fn testTernaryPrecedence(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // The condition is the whole comparison, not just its right operand.
+    try interp.testExpectScriptResult("-Wall",
+        \\ set os linux
+        \\ return [expr {$os eq "linux" ? {-Wall} : {}}]
+    );
+    try interp.testExpectScriptResult("", "set os mac; return [expr {$os eq \"linux\" ? {-Wall} : {}}]");
+    try interp.testExpectScriptResult("yes", "return [expr {1 + 1 == 2 ? \"yes\" : \"no\"}]");
+}
+
+test "ternary precedence" {
+    try memutil.checkAllocationFailures(.exhaustive, testTernaryPrecedence, .{});
+}
+
 fn testParsing(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
