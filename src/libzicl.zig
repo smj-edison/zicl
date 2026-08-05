@@ -1,15 +1,19 @@
 const std = @import("std");
 
-const Heap = @import("Heap.zig");
-const Handle = Heap.Handle;
-const OptionalHandle = Heap.OptionalHandle;
-const objutil = @import("objutil.zig");
-const Shimmerable = objutil.Shimmerable;
-const Mutable = objutil.Mutable;
+const heap = @import("heap.zig");
+const Value = heap.Value;
+const OptionalValue = heap.OptionalValue;
+const objects = @import("objects.zig");
+const Shimmerable = objects.Shimmerable;
+const ErrorDetails = objects.ErrorDetails;
+const List = objects.List;
+const Dictionary = objects.Dictionary;
 const Interp = @import("Interp.zig");
 const narrowError = Interp.narrowError;
-const ReturnCode = Interp.ReturnCode;
-const commands = @import("commands.zig");
+const evaltypes = @import("evaltypes.zig");
+const ReturnCode = evaltypes.ReturnCode;
+const commands = @import("commands/common.zig");
+const leak_check = @import("leak_check.zig");
 const ioutil = @import("ioutil.zig");
 
 // Allow user to change the default logging fd.
@@ -25,7 +29,7 @@ pub fn ziclLog(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    const io = Heap.global_io;
+    const io = heap.global_io;
 
     const file = ioutil.lockStderr();
     defer ioutil.unlockStderr();
@@ -57,7 +61,7 @@ fn ziclPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
         0 => {
             zicl_panic_stage = 1;
             dumpLastTouchedTrace(file.handle);
-            var file_writer = file.writerStreaming(Heap.global_io, &.{});
+            var file_writer = file.writerStreaming(heap.global_io, &.{});
             const terminal: std.Io.Terminal = .{ .writer = &file_writer.interface, .mode = .escape_codes };
             const thread_id = std.Thread.getCurrentId();
             file_writer.interface.print("thread {d} panic: {s}\n", .{ thread_id, msg }) catch {};
@@ -68,158 +72,211 @@ fn ziclPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
         },
         1 => {
             zicl_panic_stage = 2;
-            std.Io.File.writeStreamingAll(file, Heap.global_io, "aborting due to recursive panic\n") catch {};
+            std.Io.File.writeStreamingAll(file, heap.global_io, "aborting due to recursive panic\n") catch {};
         },
         else => {},
     }
     std.process.abort();
 }
 
-fn errorToOptional(result: anyerror!Handle) OptionalHandle {
-    if (result) |handle| {
-        return handle.toOptional();
-    } else |_| {
-        return .none;
-    }
-}
-
 // Basic object commands.
-export fn Zicl_NewString(ptr: [*:0]const u8, len: c_int) callconv(.c) OptionalHandle {
+export fn Zicl_NewString(out: *Value, ptr: [*:0]const u8, len: c_int) callconv(.c) ReturnCode {
     const bytes = if (len < 0) std.mem.span(ptr) else ptr[0..@intCast(len)];
-    return errorToOptional(objutil.newString(bytes));
+    out.* = objects.String.newValue(bytes) catch return .oom;
+    return .ok;
 }
 
-export fn Zicl_String(object: Handle) callconv(.c) ?[*:0]const u8 {
-    return object.getString() catch return null;
+export fn Zicl_String(value: Value) callconv(.c) ?[*:0]const u8 {
+    return value.getString() catch return null;
 }
 
-export fn Zicl_GetString(object: Handle, len: *c_int) callconv(.c) ?[*:0]const u8 {
-    const str = object.getString() catch return null;
+export fn Zicl_GetString(value: Value, len: *c_int) callconv(.c) ?[*:0]const u8 {
+    const str = value.getString() catch return null;
     len.* = @intCast(str.len);
     return str;
 }
 
-export fn Zicl_DecrRefCount(handle: Handle) callconv(.c) void {
-    handle.decrRefCount();
+export fn Zicl_DecrRefCount(value: Value) callconv(.c) void {
+    value.release();
 }
 
-// List functions.
-export fn Zicl_NewList(handles: ?[*]Handle, n_handles: c_int) callconv(.c) OptionalHandle {
-    if (handles) |val| {
-        const new_list = objutil.newList(val[0..@intCast(n_handles)]) catch return .none;
-        return new_list.toOptional();
-    } else {
-        return (objutil.newList(&.{}) catch return .none).toOptional();
-    }
+export fn Zicl_IncrRefCount(value: Value) callconv(.c) Value {
+    return value.borrow();
 }
 
-export fn Zicl_ListGetItem(list: Handle, index: u32) callconv(.c) Handle {
-    return objutil.listItem(list, index);
+// Number functions. Primitives are inline, so these never allocate and cannot fail.
+export fn Zicl_NewInt(value: i64) callconv(.c) Value {
+    return objects.Integer.new(value);
 }
 
-export fn Zicl_ListLength(interp: *Interp, list: *Handle) callconv(.c) c_int {
-    const len = interp.getListLengthInPlace(list) catch return -1;
-    return @intCast(len);
+export fn Zicl_NewDouble(value: f64) callconv(.c) Value {
+    return objects.Float.new(value);
 }
 
-export fn Zicl_ListAppend(interp: *Interp, list: *Handle, item: Handle) callconv(.c) ReturnCode {
-    _ = interp.listAppendInPlace(list, item) catch |err| return ReturnCode.fromError(err);
+export fn Zicl_NewBool(value: bool) callconv(.c) Value {
+    return objects.Boolean.new(value);
+}
+
+export fn Zicl_GetLong(interp: *Interp, value: *Value, out: *c_long) callconv(.c) ReturnCode {
+    out.* = interp.getIntegerInPlace(value) catch |err| return ReturnCode.fromError(err);
     return .ok;
 }
 
-// Dict functions.
-export fn Zicl_NewDict(handles: ?[*]Handle, n_handles: c_int) callconv(.c) OptionalHandle {
-    if (handles) |val| {
-        const new_list = objutil.newDict(val[0..@intCast(n_handles)]) catch return .none;
-        return new_list.toOptional();
-    } else {
-        return (objutil.newDict(&.{}) catch return .none).toOptional();
-    }
-}
-
-export fn Zicl_DictPut(interp: *Interp, dict: *Handle, key: Handle, value: Handle) callconv(.c) ReturnCode {
-    _ = interp.putDictValueInPlace(dict, key, value) catch |err| return ReturnCode.fromError(err);
+export fn Zicl_GetDouble(interp: *Interp, value: *Value, out: *f64) callconv(.c) ReturnCode {
+    var shim: Shimmerable = .{ .original = value.* };
+    errdefer shim.discardChanges();
+    out.* = interp.getFloat(&shim) catch |err| return ReturnCode.fromError(err);
+    value.* = shim.consume();
     return .ok;
 }
 
-// Number functions.
-export fn Zicl_GetLong(interp: *Interp, handle: *Handle, out: *c_long) callconv(.c) ReturnCode {
-    out.* = interp.getIntegerInPlace(handle) catch |err| return ReturnCode.fromError(err);
-    return .ok;
-}
-
-export fn Zicl_GetDouble(interp: *Interp, handle: *Handle, out: *f64) callconv(.c) ReturnCode {
-    var wb: Shimmerable = .{ .original = handle.* };
-    out.* = interp.getFloat(&wb) catch |err| return ReturnCode.fromError(err);
-    handle.* = wb.consume();
-    return .ok;
-}
-
-export fn Zicl_GetBoolean(interp: *Interp, handle: *Handle, out: *c_int) callconv(.c) ReturnCode {
-    const result = interp.getBooleanInPlace(handle) catch |err| return ReturnCode.fromError(err);
+export fn Zicl_GetBoolean(interp: *Interp, value: *Value, out: *c_int) callconv(.c) ReturnCode {
+    const result = interp.getBooleanInPlace(value) catch |err| return ReturnCode.fromError(err);
     out.* = if (result) 1 else 0;
     return .ok;
 }
 
+// List functions.
+export fn Zicl_NewList(out: *Value, values: ?[*]Value, n_values: c_int) callconv(.c) ReturnCode {
+    const items = if (values) |ptr| ptr[0..@intCast(n_values)] else &.{};
+    const list = List.new(items) catch return .oom;
+    out.* = list.asHead().asValue();
+    return .ok;
+}
+
+export fn Zicl_ListLength(interp: *Interp, list: *Value) callconv(.c) c_int {
+    const as_list = interp.getListInPlace(list) catch return -1;
+    return @intCast(as_list.items.len);
+}
+
+/// The returned value is borrowed from the list, so it is only valid while the
+/// list holds it. Callers that outlive the list need `Zicl_IncrRefCount`.
+export fn Zicl_ListGetItem(interp: *Interp, list: *Value, index: u32) callconv(.c) OptionalValue {
+    const as_list = interp.getListInPlace(list) catch return .none;
+    if (index >= as_list.items.len) return .none;
+    return as_list.items[index].asOptional();
+}
+
+export fn Zicl_ListAppend(interp: *Interp, list: *Value, item: Value) callconv(.c) ReturnCode {
+    var det: ErrorDetails = undefined;
+    if (interp.wrapError(&det, list.asMutableInPlace(List, &det))) |maybe_mut| {
+        if (maybe_mut) |list_mut| {
+            list_mut.append(item) catch |err| return ReturnCode.fromError(narrowError(err));
+        } else {
+            const list_mut = interp.wrapError(&det, list.duplicateAsType(List, &det)) catch |err| {
+                return ReturnCode.fromError(err);
+            };
+            list_mut.append(item) catch |err| {
+                list_mut.asHead().release();
+                return ReturnCode.fromError(narrowError(err));
+            };
+            // The copy is ours, so handing it to the caller's slot transfers
+            // our reference along with it.
+            list.swap(list_mut.asHead().asValue());
+        }
+    } else |err| return ReturnCode.fromError(err);
+    return .ok;
+}
+
+// Dict functions.
+export fn Zicl_NewDict(out: *Value, values: ?[*]Value, n_values: c_int) callconv(.c) ReturnCode {
+    const items = if (values) |ptr| ptr[0..@intCast(n_values)] else &.{};
+    const dict = Dictionary.new(items) catch return .oom;
+    out.* = dict.asHead().asValue();
+    return .ok;
+}
+
+export fn Zicl_DictPut(interp: *Interp, dict: *Value, key: Value, value: Value) callconv(.c) ReturnCode {
+    var det: ErrorDetails = undefined;
+    if (interp.wrapError(&det, dict.asMutableInPlace(Dictionary, &det))) |maybe_mut| {
+        if (maybe_mut) |dict_mut| {
+            dict_mut.put(key, value) catch |err| return ReturnCode.fromError(narrowError(err));
+        } else {
+            const dict_mut = interp.wrapError(&det, dict.duplicateAsType(Dictionary, &det)) catch |err| {
+                return ReturnCode.fromError(err);
+            };
+            dict_mut.put(key, value) catch |err| {
+                dict_mut.asHead().release();
+                return ReturnCode.fromError(narrowError(err));
+            };
+            dict.swap(dict_mut.asHead().asValue());
+        }
+    } else |err| return ReturnCode.fromError(err);
+    return .ok;
+}
+
 // Source functions.
-export fn Zicl_SourceGetFilename(source: Handle) callconv(.c) ?[*:0]const u8 {
-    if (objutil.getSourceInfo(source)) |info| if (info.file_name.toHandle()) |name| {
-        return name.getString() catch return null;
-    };
-    return null;
+export fn Zicl_SourceGetFilename(source: Value) callconv(.c) ?[*:0]const u8 {
+    const as_source = source.asType(objects.Source) orelse return null;
+    const file_name = as_source.file_name.asValue() orelse return null;
+    return file_name.getString() catch return null;
 }
 
-export fn Zicl_SourceGetLine(source: Handle) callconv(.c) c_int {
-    if (objutil.getSourceInfo(source)) |info| {
-        return @intCast(info.line_no);
-    } else return -1;
+export fn Zicl_SourceGetLine(source: Value) callconv(.c) c_int {
+    const as_source = source.asType(objects.Source) orelse return -1;
+    return @intCast(as_source.line_no);
 }
 
-/// Attaches source location to a handle so that evaluation errors report the
-/// correct file and line. The `filename` string is heap-allocated and owned
-/// by the source extra-data; `destroyExtraData` releases it.
-export fn Zicl_SourceSetInfo(handle: Handle, filename: [*:0]const u8, line_no: c_int) callconv(.c) ReturnCode {
-    const file_handle = objutil.newString(std.mem.span(filename)) catch return .oom;
-    // `file_handle` starts at refcount 1. `setSourceInfo` borrows it without
-    // incrementing, so that single count is owned by the extra-data. When the
-    // extra-data is destroyed or replaced, it calls `decrOptional()` to release it.
-    objutil.setSourceInfo(handle, .{
-        .file_name = file_handle.toOptional(),
-        .line_no = @intCast(line_no),
-    }) catch {
-        file_handle.decrRefCount();
-        return .oom;
-    };
+/// Replace `value` with one carrying the given source location, so evaluation
+/// errors report the right file and line. A `Source` fixes its location at
+/// construction, so this cannot annotate the existing object; the slot gets a
+/// copy and the caller's original reference is released on success.
+export fn Zicl_AttachSource(value: *Value, filename: [*:0]const u8, line_no: c_int) callconv(.c) ReturnCode {
+    const bytes = value.getString() catch return .oom;
+
+    const file_name = objects.String.newValue(std.mem.span(filename)) catch return .oom;
+    // `Source.new` borrows `file_name`, so the constructing reference is ours
+    // to release either way.
+    defer file_name.release();
+
+    const source = objects.Source.new(bytes, file_name.asOptional(), @intCast(line_no)) catch return .oom;
+    value.swap(source.asHead().asValue());
     return .ok;
 }
 
 // Global init functions.
 var global_threaded: std.Io.Threaded = undefined;
-export fn Zicl_InitGlobals() ReturnCode {
+
+/// `host_name` is the name this machine goes by in the capabilities it hands
+/// out. Null asks the system for it.
+export fn Zicl_InitGlobals(host_name: ?[*:0]const u8) callconv(.c) ReturnCode {
     global_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
-    Heap.initGlobals(std.heap.c_allocator, global_threaded.io()) catch return ReturnCode.@"error";
+    heap.initGlobals(std.heap.c_allocator, global_threaded.io(), .{
+        .capability = .{
+            .host_name = if (host_name) |name| std.mem.span(name) else null,
+        },
+    }) catch return .@"error";
     return .ok;
 }
 
-export fn Zicl_InitLocalHeap() ReturnCode {
-    Heap.initLocalHeap() catch return ReturnCode.@"error";
+export fn Zicl_InitThread() callconv(.c) ReturnCode {
+    heap.initThread();
     return .ok;
+}
+
+export fn Zicl_DeinitThread() callconv(.c) void {
+    heap.deinitThread();
 }
 
 export fn Zicl_DeinitAll() callconv(.c) void {
-    Heap.deinitAll();
+    heap.deinitThread();
+    heap.deinitGlobals();
 }
 
 export fn Zicl_LeakCheckAll() callconv(.c) void {
-    Heap.leakCheckAll();
+    // Ahead of the check, or the fallback `[catch]` dict that lives for the
+    // whole process reports as a leak every time. This is why the check is
+    // shutdown-only: releasing that dict makes any further evaluation unsafe.
+    heap.freeOomErrorOptionsDict();
+    leak_check.dumpLeaks() catch {};
 }
 
 // Interpreter functions.
 export fn Zicl_CreateInterp() callconv(.c) ?*Interp {
     // Store the interpreter on the heap, so it's an opaque pointer.
-    const interp = Heap.global_gpa.create(Interp) catch return null;
-    errdefer Heap.global_gpa.destroy(interp);
-    interp.* = Interp.init() catch return null;
+    const interp = heap.global_gpa.create(Interp) catch return null;
+    errdefer heap.global_gpa.destroy(interp);
+    interp.* = Interp.init(.{}) catch return null;
     errdefer interp.deinit();
 
     commands.registerCoreCommands(interp) catch return null;
@@ -229,11 +286,11 @@ export fn Zicl_CreateInterp() callconv(.c) ?*Interp {
 
 export fn Zicl_InterpDestroy(interp: *Interp) callconv(.c) void {
     interp.deinit();
-    Heap.global_gpa.destroy(interp);
+    heap.global_gpa.destroy(interp);
 }
 
-export fn Zicl_RegisterNativeFn(name: [*:0]const u8, init_fn: Heap.NativeInitFn) callconv(.c) ReturnCode {
-    Heap.nativefn_registry.register(Heap.global_gpa, std.mem.span(name), init_fn) catch |err| switch (err) {
+export fn Zicl_RegisterNativeFn(name: [*:0]const u8, init_fn: heap.NativeInitFn) callconv(.c) ReturnCode {
+    heap.nativefn_registry.register(heap.global_gpa, std.mem.span(name), init_fn) catch |err| switch (err) {
         error.OutOfMemory => return .oom,
         error.DuplicateNativeFn => return .@"error",
     };
@@ -243,7 +300,7 @@ export fn Zicl_RegisterNativeFn(name: [*:0]const u8, init_fn: Heap.NativeInitFn)
 export fn Zicl_CreateCommand(
     interp: *Interp,
     name: [*:0]const u8,
-    command: *const Interp.CCommandFn,
+    command: *const evaltypes.CCommandFn,
 ) callconv(.c) ReturnCode {
     interp.registerCommand(std.mem.span(name), .{
         .call_info = .{ .c = command },
@@ -255,45 +312,46 @@ export fn Zicl_CreateCommand(
     return .ok;
 }
 
-export fn Zicl_GetScriptBeingEvaluated(interp: *Interp) callconv(.c) Handle {
-    return interp.currentEvalFrame().currently_evaluating;
+export fn Zicl_GetScriptBeingEvaluated(interp: *Interp) callconv(.c) Value {
+    return interp.evalFrame().currently_evaluating;
 }
 
-export fn Zicl_EvalObject(interp: *Interp, script: Handle) callconv(.c) Interp.ReturnCode {
-    return Interp.ReturnCode.fromErrorUnion(interp.evalObject(script));
+export fn Zicl_EvalObject(interp: *Interp, script: Value) callconv(.c) ReturnCode {
+    return ReturnCode.fromErrorUnion(interp.evalObject(script));
 }
 
-export fn Zicl_EvalFile(interp: *Interp, filename: [*:0]const u8) callconv(.c) Interp.ReturnCode {
-    return Interp.ReturnCode.fromErrorUnion(interp.evalFile(std.mem.span(filename)));
+export fn Zicl_EvalFile(interp: *Interp, filename: [*:0]const u8) callconv(.c) ReturnCode {
+    return ReturnCode.fromErrorUnion(interp.evalFile(std.mem.span(filename)));
 }
 
-export fn Zicl_GetResult(interp: *Interp) callconv(.c) Handle {
+export fn Zicl_GetResult(interp: *Interp) callconv(.c) Value {
     return interp.result;
 }
 
-export fn Zicl_SetResult(interp: *Interp, handle: Handle) callconv(.c) void {
-    interp.setResult(handle);
+export fn Zicl_SetResult(interp: *Interp, value: Value) callconv(.c) void {
+    interp.setResult(value);
 }
 
-export fn Zicl_SetResultOwning(interp: *Interp, handle: Handle) callconv(.c) void {
-    interp.setResultOwning(handle);
+export fn Zicl_SetResultOwning(interp: *Interp, value: Value) callconv(.c) void {
+    interp.setResultOwning(value);
 }
 
-export fn Zicl_SetVariable(interp: *Interp, name: *Handle, handle: Handle) callconv(.c) ReturnCode {
-    var name_wb: Shimmerable = .{ .original = name.* };
-    interp.setVariableTo(&name_wb, handle) catch |err| return ReturnCode.fromError(err);
-    name.* = name_wb.consume();
+export fn Zicl_SetVariable(interp: *Interp, name: *Value, value: Value) callconv(.c) ReturnCode {
+    var name_shim: Shimmerable = .{ .original = name.* };
+    errdefer name_shim.discardChanges();
+    interp.setVariable(&name_shim, value) catch |err| return ReturnCode.fromError(err);
+    name.* = name_shim.consume();
     return .ok;
 }
 
-export fn Zicl_SetResultString(interp: *Interp, str: [*:0]const u8, len: c_int) ReturnCode {
+export fn Zicl_SetResultString(interp: *Interp, str: [*:0]const u8, len: c_int) callconv(.c) ReturnCode {
     const bytes = if (len < 0) std.mem.span(str) else str[0..@intCast(len)];
     interp.setResultString(bytes) catch |err| return ReturnCode.fromError(err);
     return .ok;
 }
 
-export fn Zicl_SetResultBool(interp: *Interp, value: c_int) ReturnCode {
-    interp.setResultBoolean(value != 0) catch |err| return ReturnCode.fromError(err);
+export fn Zicl_SetResultBool(interp: *Interp, value: c_int) callconv(.c) ReturnCode {
+    interp.setResultBoolean(value != 0);
     return .ok;
 }
 
@@ -307,10 +365,16 @@ export fn Zicl_SetEmptyResult(interp: *Interp) callconv(.c) void {
 }
 
 export fn Zicl_MakeErrorMessage(interp: *Interp) callconv(.c) ReturnCode {
-    const msg = Interp.makeErrorMessage(
-        interp.result,
-        interp.stack_trace.orEmpty(),
-    ) catch |err| return ReturnCode.fromError(narrowError(err));
+    // The stack is a flat list: {name file line args ...} repeated.
+    var stack_shim: Shimmerable = .{ .original = interp.stack_trace.orEmpty().borrow() };
+    defer stack_shim.deinit();
+    const as_list = interp.getList(&stack_shim) catch |err| return ReturnCode.fromError(err);
+
+    const msg = Interp.makeErrorMessage(interp.result, as_list) catch |err| switch (err) {
+        error.OutOfMemory => return .oom,
+        // Nothing to report against, so leave the result as the bare message.
+        error.WrongSize => return .ok,
+    };
     interp.setResultOwning(msg);
     return .ok;
 }
@@ -334,24 +398,12 @@ export fn Zicl_GetSigmask(interp: *Interp) callconv(.c) u64 {
 
 // Object debugging functions.
 
-export fn Zicl_Tag(handle: Handle) callconv(.c) u8 {
-    return @intFromEnum(handle.tag());
+export fn Zicl_RefCount(value: Value) callconv(.c) u32 {
+    const obj = value.asPtr() orelse return 0;
+    return obj.getRefCount();
 }
 
-export fn Zicl_Peek(handle: Handle) callconv(.c) *Heap.Object {
-    return handle.peek();
-}
-
-export fn Zicl_RefCount(handle: Handle) callconv(.c) u32 {
-    const heap = handle.getHeap();
-    const ptr = &heap.objects.items(.ref_count)[handle.index];
-    if (heap.getLocalMetadata(handle.index).cross_thread) {
-        return @atomicLoad(u32, ptr, .monotonic);
-    } else {
-        return ptr.*;
-    }
-}
-
-export fn Zicl_RefCountPtr(handle: Handle) callconv(.c) *u32 {
-    return &handle.getHeap().objects.items(.ref_count)[handle.index];
+export fn Zicl_RefCountPtr(value: Value) callconv(.c) ?*u32 {
+    const obj = value.asPtr() orelse return null;
+    return &obj.ref_count;
 }

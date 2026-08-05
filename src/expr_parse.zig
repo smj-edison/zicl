@@ -2,12 +2,14 @@ const std = @import("std");
 const testing = std.testing;
 const Writer = std.Io.Writer;
 
+const memutil = @import("memutil.zig");
+const StructIterator = memutil.StructIterator;
 const Tokenizer = @import("Tokenizer.zig");
 // Used to store parsed strings.
-const Heap = @import("Heap.zig");
-const Handle = Heap.Handle;
-const OptionalHandle = Heap.OptionalHandle;
-const objutil = @import("objutil.zig");
+const heap = @import("heap.zig");
+const Value = heap.Value;
+const OptionalValue = heap.OptionalValue;
+const objects = @import("objects.zig");
 const Token = Tokenizer.Token;
 
 const TokenIndex = u32;
@@ -24,9 +26,7 @@ pub const Node = struct {
         unary: Index,
         binary: struct { Index, Index },
         ternary: struct { Index, Index, Index },
-        object: Handle,
-        integer: i64,
-        float: f64,
+        value: Value,
     };
 
     pub const Tag = enum(u8) {
@@ -64,13 +64,9 @@ pub const Node = struct {
         // Ternary
         ternary_conditional,
         // Value
-        string,
-        integer,
-        float,
+        value,
         command_subst,
         variable_subst,
-        value_false,
-        value_true,
         // Unary operators
         bool_not,
         bit_not,
@@ -179,27 +175,27 @@ const function_arity = std.StaticStringMap(FunctionArity).initComptime([_]struct
     .{ "fmod", .{ .arity = 2, .tag = .fmod } },
 });
 
-pub const Parse = struct {
+pub const Parser = struct {
     const Tokens = std.MultiArrayList(Tokenizer.Token).Slice;
 
     gpa: std.mem.Allocator,
     source: []const u8,
-    source_file_name: OptionalHandle,
+    source_file_name: OptionalValue,
     tokens: Tokens,
-    nodes: std.MultiArrayList(Node),
+    nodes: std.ArrayList(Node),
     err: ?Error,
     token_i: TokenIndex,
 
-    fn tokenTag(p: *Parse, token_index: TokenIndex) Token.Tag {
+    fn tokenTag(p: *Parser, token_index: TokenIndex) Token.Tag {
         return p.tokens.items(.tag)[token_index];
     }
 
-    fn tokenLoc(p: *Parse, token_index: TokenIndex) Token.Location {
+    fn tokenLoc(p: *Parser, token_index: TokenIndex) Token.Location {
         return p.tokens.items(.loc)[token_index];
     }
 
-    fn addNode(p: *Parse, elem: Node) !Node.Index {
-        const new_index: Node.Index = @enumFromInt(p.nodes.len);
+    fn addNode(p: *Parser, elem: Node) !Node.Index {
+        const new_index: Node.Index = @enumFromInt(p.nodes.items.len);
         try p.nodes.append(p.gpa, elem);
         return new_index;
     }
@@ -213,7 +209,7 @@ pub const Parse = struct {
             function_no_more_args,
         } = .none,
     };
-    fn parsePrefixExpr(p: *Parse, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
+    fn parsePrefixExpr(p: *Parser, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
         const token = p.tokenTag(p.token_i);
         switch (token) {
             // Unary operator?
@@ -343,10 +339,11 @@ pub const Parse = struct {
             .integer => {
                 const loc = p.tokenLoc(p.nextToken());
                 const value = std.fmt.parseInt(i64, p.source[loc.start..loc.end], 10) catch unreachable;
+                const int_value = objects.Integer.new(value);
 
                 return try p.addNode(.{
-                    .tag = .integer,
-                    .data = .{ .integer = value },
+                    .tag = .value,
+                    .data = .{ .value = int_value },
                 });
             },
             .float => {
@@ -354,66 +351,61 @@ pub const Parse = struct {
                 const value = std.fmt.parseFloat(f64, p.source[loc.start..loc.end]) catch unreachable;
 
                 return try p.addNode(.{
-                    .tag = .float,
-                    .data = .{ .float = value },
+                    .tag = .value,
+                    .data = .{ .value = Value.newFloat(value) },
                 });
             },
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try objutil.newString(p.source[loc.start..loc.end]);
-                errdefer handle.decrRefCount();
+                const str = try objects.String.newValue(p.source[loc.start..loc.end]);
+                errdefer str.release();
 
                 return try p.addNode(.{
-                    .tag = .string,
-                    .data = .{ .object = handle },
+                    .tag = .value,
+                    .data = .{ .value = str },
                 });
             },
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const handle = try Heap.createObject();
-                errdefer handle.decrRefCount();
-                objutil.setStringFromEscaped(handle, p.source[loc.start..loc.end]) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.OtherThreadSet => unreachable,
-                };
+                const str = try objects.String.newFromEscaped(p.source[loc.start..loc.end]);
+                errdefer str.asHead().release();
 
                 return try p.addNode(.{
-                    .tag = .string,
-                    .data = .{ .object = handle },
+                    .tag = .value,
+                    .data = .{ .value = str.asHead().asValue() },
                 });
             },
             .command_subst => {
                 const loc = p.tokenLoc(p.nextToken());
-                const command_handle = try objutil.newString(p.source[loc.start..loc.end]);
-                errdefer command_handle.decrRefCount();
-
-                // Be sure to save the source info.
-                try objutil.setSourceInfo(command_handle, .{
-                    .file_name = p.source_file_name,
-                    .line_no = loc.line_no,
-                });
+                const command_obj = (try objects.Source.new(
+                    p.source[loc.start..loc.end],
+                    p.source_file_name,
+                    loc.line_no,
+                )).asHead();
+                errdefer command_obj.release();
 
                 return try p.addNode(.{
                     .tag = .command_subst,
-                    .data = .{ .object = command_handle },
+                    .data = .{ .value = command_obj.asValue() },
                 });
             },
-            .variable_subst,
+            .variable_subst => {
+                const loc = p.tokenLoc(p.nextToken());
+                var string_handle = try objects.String.newValue(p.source[loc.start..loc.end]);
+                errdefer string_handle.release();
+
+                return try p.addNode(.{
+                    .tag = .variable_subst,
+                    .data = .{ .value = string_handle },
+                });
+            },
             .keyword_false,
             .keyword_true,
             => {
-                const loc = p.tokenLoc(p.nextToken());
-                var string_handle = try objutil.newString(p.source[loc.start..loc.end]);
-                errdefer string_handle.decrRefCount();
-
+                _ = p.nextToken();
                 return try p.addNode(.{
-                    .tag = switch (token) {
-                        .variable_subst => .variable_subst,
-                        .keyword_false => .value_false,
-                        .keyword_true => .value_true,
-                        inline else => unreachable,
-                    },
-                    .data = .{ .object = string_handle },
+                    .tag = .value,
+                    .data = .{ .value = Value.newBool(token == .keyword_true) },
                 });
             },
             .end_of_file => return null,
@@ -428,7 +420,7 @@ pub const Parse = struct {
         }
     }
 
-    fn parseExprPrecedence(p: *Parse, min_prec: i32, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
+    fn parseExprPrecedence(p: *Parser, min_prec: i32, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
         var node: Node.Index = try p.parsePrefixExpr(mode) orelse return null;
         var banned_prec: i8 = -1;
 
@@ -536,20 +528,34 @@ pub const Parse = struct {
         }
     }
 
-    fn nextToken(p: *Parse) TokenIndex {
+    fn nextToken(p: *Parser) TokenIndex {
         const token_i = p.token_i;
         p.token_i += 1;
         return token_i;
     }
 
-    pub fn parseExpr(p: *Parse) error{ OutOfMemory, ParseError }!?Node.Index {
-        return p.parseExprPrecedence(0, .{});
+    pub fn parseExpr(p: *Parser) error{ OutOfMemory, ParseError }!Parsed {
+        if (try p.parseExprPrecedence(0, .{})) |root_node| {
+            const parsed: Parsed = .{
+                .nodes = try p.nodes.toOwnedSlice(p.gpa),
+                .root_node = root_node,
+            };
+            return parsed;
+        } else {
+            // Nothing was returned, so make the expression have a single node that just returns the empty string.
+            try p.nodes.append(p.gpa, .{ .tag = .value, .data = .{ .value = heap.interned_empty_string } });
+            const root_node: Node.Index = @enumFromInt(p.nodes.items.len - 1);
+            const parsed: Parsed = .{
+                .nodes = try p.nodes.toOwnedSlice(p.gpa),
+                .root_node = root_node,
+            };
+            return parsed;
+        }
     }
 
-    /// Does not borrow source_file_name.
-    pub fn init(source_file_name: OptionalHandle, source: []const u8, tokens: Tokens) Parse {
+    pub fn init(gpa: std.mem.Allocator, source_file_name: OptionalValue, source: []const u8, tokens: Tokens) Parser {
         return .{
-            .gpa = Heap.global_gpa,
+            .gpa = gpa,
             .source = source,
             .source_file_name = source_file_name,
             .tokens = tokens,
@@ -559,8 +565,12 @@ pub const Parse = struct {
         };
     }
 
-    pub fn deinit(p: *Parse) void {
-        deinitNodes(p.gpa, &p.nodes);
+    pub fn deinit(p: *Parser) void {
+        for (p.nodes.items) |node| switch (node.tag) {
+            .variable_subst, .command_subst, .value => node.data.value.release(),
+            else => {},
+        };
+        p.nodes.deinit(p.gpa);
     }
 
     const Error = struct {
@@ -579,8 +589,8 @@ pub const Parse = struct {
             missing_operator,
         };
 
-        pub fn sourceIndex(err: Error, p: *Parse) u32 {
-            if (err.token >= p.nodes.len) {
+        pub fn sourceIndex(err: Error, p: *Parser) u32 {
+            if (err.token >= p.nodes.items.len) {
                 return @intCast(p.source.len);
             } else {
                 return p.tokens.get(err.token).loc.start;
@@ -588,7 +598,7 @@ pub const Parse = struct {
         }
     };
 
-    fn fail(p: *Parse, err: Error.Tag) error{ParseError} {
+    fn fail(p: *Parser, err: Error.Tag) error{ParseError} {
         p.err = .{
             .tag = err,
             .token = p.token_i,
@@ -596,7 +606,7 @@ pub const Parse = struct {
         return error.ParseError;
     }
 
-    fn failAt(p: *Parse, err: Error.Tag, token_index: u32) error{ParseError} {
+    fn failAt(p: *Parser, err: Error.Tag, token_index: u32) error{ParseError} {
         p.err = .{
             .tag = err,
             .token = token_index,
@@ -604,7 +614,7 @@ pub const Parse = struct {
         return error.ParseError;
     }
 
-    pub fn renderError(p: *Parse, parse_error: Error, w: *Writer) Writer.Error!void {
+    pub fn renderError(p: *Parser, parse_error: Error, w: *Writer) Writer.Error!void {
         const token_loc: Token.Location = blk: {
             if (parse_error.token < p.tokens.len) {
                 break :blk p.tokenLoc(parse_error.token);
@@ -660,9 +670,44 @@ pub const Parse = struct {
         try w.splatByteAll('^', @max(1, token_loc.end - line_offset));
     }
 
-    pub fn write(p: *Parse, writer: *Writer, node: Node.Index) !void {
-        const tag: Node.Tag = p.nodes.items(.tag)[@intFromEnum(node)];
-        const data: Node.Data = p.nodes.items(.data)[@intFromEnum(node)];
+    pub fn dump(p: *Parser, node: Node.Index) void {
+        var buffer: [64]u8 = undefined;
+        const writer = std.debug.lockStderrWriter(&buffer);
+        defer std.debug.unlockStderrWriter();
+        p.write(writer, node) catch @panic("couldn't write");
+    }
+};
+
+pub const Parsed = struct {
+    nodes: []Node,
+    root_node: Node.Index,
+
+    pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const parsed: *const Parsed = @ptrCast(@alignCast(info.node));
+
+        try ctx.addField(TokenIndex, info, "root_node", "{}", .{@intFromEnum(parsed.root_node)});
+
+        var alloc_writer = std.Io.Writer.Allocating.init(ctx.arena);
+        defer alloc_writer.deinit();
+        parsed.render(&alloc_writer.writer) catch return error.OutOfMemory;
+        const nodes_node: StructIterator.NodeInfo = .{
+            .as_string = try alloc_writer.toOwnedSlice(),
+            .enumerate_struct = null,
+            .node = parsed.nodes.ptr,
+            .parent_info = info,
+            .type_name = @typeName(@FieldType(Parsed, "nodes")),
+            .is_synthetic = false,
+        };
+        try ctx.followNodeInner(std.ArrayList(Node), &nodes_node, "nodes", parsed.nodes.ptr);
+    }
+
+    pub fn render(parsed: *const Parsed, writer: *Writer) !void {
+        try parsed.renderInner(writer, parsed.root_node);
+    }
+
+    fn renderInner(parsed: *const Parsed, writer: *Writer, node_index: Node.Index) !void {
+        const tag = parsed.nodes[@intFromEnum(node_index)].tag;
+        const data = parsed.nodes[@intFromEnum(node_index)].data;
         switch (tag) {
             .none => {},
             // Binary operators
@@ -697,9 +742,9 @@ pub const Parse = struct {
             .string_greater_than_or_equal,
             => {
                 try writer.print("(", .{});
-                try p.write(writer, data.binary.@"0");
+                try parsed.renderInner(writer, data.binary.@"0");
                 try writer.print(" {} ", .{tag});
-                try p.write(writer, data.binary.@"1");
+                try parsed.renderInner(writer, data.binary.@"1");
                 try writer.print(")", .{});
             },
             // Also binary, but functions.
@@ -709,28 +754,24 @@ pub const Parse = struct {
             .fmod,
             => {
                 try writer.print("({} ", .{tag});
-                try p.write(writer, data.binary.@"0");
+                try parsed.renderInner(writer, data.binary.@"0");
                 try writer.print(" ", .{});
-                try p.write(writer, data.binary.@"1");
+                try parsed.renderInner(writer, data.binary.@"1");
                 try writer.print(")", .{});
             },
             .ternary_conditional => {
                 try writer.print("({} ", .{tag});
-                try p.write(writer, data.ternary.@"0");
+                try parsed.renderInner(writer, data.ternary.@"0");
                 try writer.print(" ", .{});
-                try p.write(writer, data.ternary.@"1");
+                try parsed.renderInner(writer, data.ternary.@"1");
                 try writer.print(" ", .{});
-                try p.write(writer, data.ternary.@"2");
+                try parsed.renderInner(writer, data.ternary.@"2");
                 try writer.print(")", .{});
             },
             // Value
-            .string => try writer.print("\"{f}\"", .{data.object}),
-            .integer => try writer.print("{}", .{data.integer}),
-            .float => try writer.print("{}", .{data.float}),
-            .command_subst => try writer.print("[{f}]", .{data.object}),
-            .variable_subst => try writer.print("${f}", .{data.object}),
-            .value_false => try writer.print("false", .{}),
-            .value_true => try writer.print("true", .{}),
+            .value => try writer.writeAll(try data.value.getString()),
+            .command_subst => try writer.print("[{s}]", .{try data.value.getString()}),
+            .variable_subst => try writer.print("${s}", .{try data.value.getString()}),
             // Unary operators
             .bool_not,
             .bit_not,
@@ -759,108 +800,92 @@ pub const Parse = struct {
             .sqrt,
             => {
                 try writer.print("({} ", .{tag});
-                try p.write(writer, data.unary);
+                try parsed.renderInner(writer, data.unary);
                 try writer.print(")", .{});
             },
         }
     }
 
-    pub fn dump(p: *Parse, node: Node.Index) void {
-        var buffer: [64]u8 = undefined;
-        const writer = std.debug.lockStderrWriter(&buffer);
-        defer std.debug.unlockStderrWriter();
-        p.write(writer, node) catch @panic("couldn't write");
+    pub fn deinit(parsed: *Parsed, gpa: std.mem.Allocator) void {
+        for (parsed.nodes) |node| switch (node.tag) {
+            .variable_subst, .command_subst, .value => node.data.value.release(),
+            else => {},
+        };
+        gpa.free(parsed.nodes);
     }
 };
 
-pub fn deinitNodes(gpa: std.mem.Allocator, nodes: *std.MultiArrayList(Node)) void {
-    for (0..nodes.len) |i| {
-        const node = nodes.get(i);
-        switch (node.tag) {
-            .variable_subst,
-            .value_false,
-            .value_true,
-            .command_subst,
-            .string,
-            => {
-                node.data.object.decrRefCount();
-            },
-            else => {},
-        }
-    }
-
-    nodes.deinit(gpa);
-}
-
 test "expr parsing" {
-    defer Heap.testFinish();
-    try Heap.testStart(testing.allocator, testing.io);
+    const ta = testing.allocator;
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
 
     // Left associativity.
-    try testExprParse("1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");
+    try testExprParse(ta, "1 + 2 + 3 + 4", "(((1 .add 2) .add 3) .add 4)");
     // Right associativity.
-    try testExprParse("1 ** 2 ** 3 ** 4", "(1 .pow (2 .pow (3 .pow 4)))");
+    try testExprParse(ta, "1 ** 2 ** 3 ** 4", "(1 .pow (2 .pow (3 .pow 4)))");
     // No associativity.
-    try testExprParseError("1 < 2 < 3", .chained_comparison_operators, null);
+    try testExprParseError(ta, "1 < 2 < 3", .chained_comparison_operators, null);
 
     // Various stress tests.
-    try testExprParse("1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");
-    try testExprParse("1 ? 10 : 5", "(.ternary_conditional 1 10 5)");
+    try testExprParse(ta, "1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");
+    try testExprParse(ta, "1 ? 10 : 5", "(.ternary_conditional 1 10 5)");
     try testExprParse(
+        ta,
         "atan2(1 ? 10 : 5, int(0 ? 5 : 2))",
         "(.atan2 (.ternary_conditional 1 10 5) (.to_int (.ternary_conditional 0 5 2)))",
     );
 
     // Test error messages.
-    try testExprParseError("1 + ", .missing_operand,
+    try testExprParseError(ta, "1 + ", .missing_operand,
         \\error: missing operand
         \\  |
         \\1 | 1 + 
         \\  |     ^
     );
-    try testExprParseError(": 5", .colon_without_question_mark,
+    try testExprParseError(ta, ": 5", .colon_without_question_mark,
         \\error: ":" without "?" in expression
         \\  |
         \\1 | : 5
         \\  | ^
     );
-    try testExprParseError("1 ? 5", .missing_colon,
+    try testExprParseError(ta, "1 ? 5", .missing_colon,
         \\error: missing operator ":"
         \\  |
         \\1 | 1 ? 5
         \\  |      ^
     );
-    try testExprParseError("atan2(1)", .too_few_arguments,
+    try testExprParseError(ta, "atan2(1)", .too_few_arguments,
         \\error: not enough arguments for function
         \\  |
         \\1 | atan2(1)
         \\  |        ^
     );
-    try testExprParseError("atan2(1, 2, 3)", .too_many_arguments,
+    try testExprParseError(ta, "atan2(1, 2, 3)", .too_many_arguments,
         \\error: too many arguments for function
         \\  |
         \\1 | atan2(1, 2, 3)
         \\  |             ^
     );
-    try testExprParseError("(5))", .too_many_r_parens,
+    try testExprParseError(ta, "(5))", .too_many_r_parens,
         \\error: unexpected closing parenthesis
         \\  |
         \\1 | (5))
         \\  |    ^
     );
-    try testExprParseError("5 < 10 > 15", .chained_comparison_operators,
+    try testExprParseError(ta, "5 < 10 > 15", .chained_comparison_operators,
         \\error: unexpected chained comparison operator
         \\  |
         \\1 | 5 < 10 > 15
         \\  |        ^
     );
-    try testExprParseError("atan2((1, 5)", .comma_outside_function,
+    try testExprParseError(ta, "atan2((1, 5)", .comma_outside_function,
         \\error: unexpected ","
         \\  |
         \\1 | atan2((1, 5)
         \\  |         ^
     );
-    try testExprParseError("10 20", .missing_operator,
+    try testExprParseError(ta, "10 20", .missing_operator,
         \\error: missing operator
         \\  |
         \\1 | 10 20
@@ -868,34 +893,35 @@ test "expr parsing" {
     );
 }
 
-fn testExprParse(expr: []const u8, comptime expected_tree: []const u8) !void {
-    var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
-    defer tokens.deinit(testing.allocator);
-    var parser = Parse.init(.none, expr, tokens.slice());
+fn testExprParse(ta: std.mem.Allocator, expr: []const u8, comptime expected_tree: []const u8) !void {
+    var tokens = tokenize(ta, expr) catch return error.TestUnexpectedResult;
+    defer tokens.deinit(ta);
+    var parser = Parser.init(ta, .none, expr, tokens.slice());
     defer parser.deinit();
-    const root_node = (parser.parseExpr() catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
+    var parsed = parser.parseExpr() catch return error.TestUnexpectedResult;
+    defer parsed.deinit(ta);
 
-    var aw = try Writer.Allocating.initCapacity(testing.allocator, expected_tree.len);
-    try parser.write(&aw.writer, root_node);
+    var aw = try Writer.Allocating.initCapacity(ta, expected_tree.len);
+    parsed.render(&aw.writer) catch return error.OutOfMemory;
     const result = try aw.toOwnedSlice();
-    defer testing.allocator.free(result);
+    defer ta.free(result);
     try testing.expectEqualStrings(expected_tree, result);
 }
 
-fn testExprParseError(expr: []const u8, expected_error: Parse.Error.Tag, message: ?[]const u8) !void {
-    var tokens = tokenize(testing.allocator, expr) catch return error.TestUnexpectedResult;
-    defer tokens.deinit(testing.allocator);
-    var parser = Parse.init(.none, expr, tokens.slice());
+fn testExprParseError(ta: std.mem.Allocator, expr: []const u8, expected_error: Parser.Error.Tag, message: ?[]const u8) !void {
+    var tokens = tokenize(ta, expr) catch return error.TestUnexpectedResult;
+    defer tokens.deinit(ta);
+    var parser = Parser.init(ta, .none, expr, tokens.slice());
     defer parser.deinit();
 
     try testing.expectError(error.ParseError, parser.parseExpr());
     try testing.expectEqual(expected_error, parser.err.?.tag);
 
     if (message) |expected_message| {
-        var aw = try Writer.Allocating.initCapacity(testing.allocator, expected_message.len);
+        var aw = try Writer.Allocating.initCapacity(ta, expected_message.len);
         try parser.renderError(parser.err.?, &aw.writer);
         const actual_message = try aw.toOwnedSlice();
-        defer testing.allocator.free(actual_message);
+        defer ta.free(actual_message);
         try testing.expectEqualStrings(expected_message, actual_message);
     }
 }

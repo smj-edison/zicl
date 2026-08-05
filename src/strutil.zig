@@ -868,3 +868,46 @@ pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escap
         },
     }
 }
+
+pub fn quoteStrings(gpa: std.mem.Allocator, items: []const []const u8) ![:0]u8 {
+    var quoting_types = try gpa.alloc(QuotingType, items.len);
+    defer gpa.free(quoting_types);
+
+    var upper_bound_len: usize = 0;
+    for (0.., items, quoting_types) |i, item, *quote_type| {
+        quote_type.* = calculateNeededQuotingType(item);
+        if (i == 0 and quote_type.* == .bare and item.len > 0 and item[0] == '#') {
+            // Make sure the first element has # escaped in braces, instead of
+            // being bare. This way a list isn't accidentally interpreted as
+            // a comment.
+            quoting_types[i] = .brace;
+        }
+
+        upper_bound_len += quoteSize(quote_type.*, item.len);
+        upper_bound_len += 1; // Space between each element.
+    }
+
+    var unfinished_str = try gpa.alloc(u8, upper_bound_len + 1);
+    errdefer gpa.free(unfinished_str);
+    var written: usize = 0;
+
+    for (0.., items, quoting_types) |i, item, quote_type| {
+        written += quoteString(quote_type, item, unfinished_str[written..], i == 0);
+
+        if (i + 1 < items.len) {
+            unfinished_str[written] = ' ';
+            written += 1;
+        }
+    }
+
+    // Slap a nul on the end.
+    unfinished_str[written] = 0x00;
+    unfinished_str = try gpa.realloc(unfinished_str, written + 1);
+
+    return unfinished_str[0..written :0];
+}
+
+test "codepointLength counts codepoints, not bytes" {
+    try std.testing.expectEqual(@as(usize, 8), codepointLength("1abc2de3"));
+    try std.testing.expectEqual(@as(usize, 8), codepointLength("abc2de3f"));
+}
