@@ -273,8 +273,7 @@ pub fn dumpLeaks() !void {
     defer leaked.deinit();
     if (leaked.nodes.count() == 0) return;
 
-    const stderr = ioutil.lockStderr();
-    defer ioutil.unlockStderr();
+    const stderr = ioutil.getStderr();
     var buffer: [256]u8 = undefined;
     var writer = stderr.writer(heap.global_io, &buffer);
     try leaked.dumpDot(&writer.interface);
@@ -388,8 +387,7 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
                 ioutil.debug("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)});
                 ioutil.debug("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
 
-                const stderr = ioutil.lockStderr();
-                defer ioutil.unlockStderr();
+                const stderr = ioutil.getStderr();
                 var buffer: [256]u8 = undefined;
                 var writer = stderr.writer(heap.global_io, &buffer);
                 const terminal: std.Io.Terminal = .{ .writer = &writer.interface, .mode = .no_color };

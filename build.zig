@@ -134,4 +134,31 @@ pub fn build(b: *std.Build) void {
     });
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
+
+    // C API smoke test. Opt-in via `zig build test-c-api`. Compiles a C program
+    // against the combined archive so the header and export signatures are
+    // regression-tested end-to-end; the Zig suite does not touch the C ABI, so
+    // without this a header rename or signature drift would land silently.
+    const test_c_api = b.step("test-c-api", "Run the C API smoke test");
+
+    const c_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_mod.addCSourceFile(.{
+        .file = b.path("c_test/c_api_test.c"),
+        .flags = &.{"-Wall"},
+    });
+    c_mod.addIncludePath(b.path("include"));
+    // The combined archive folds pcre2 in; a plain consumer links only this.
+    c_mod.addObjectFile(combined.output);
+
+    const c_test_exe = b.addExecutable(.{
+        .name = "zicl-c-api-test",
+        .root_module = c_mod,
+    });
+    const run_c_test = b.addRunArtifact(c_test_exe);
+    run_c_test.step.dependOn(combined.step);
+    test_c_api.dependOn(&run_c_test.step);
 }

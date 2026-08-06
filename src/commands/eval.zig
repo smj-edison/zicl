@@ -96,11 +96,11 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len == 2) {
-        try interp.evalObject(args[1].current());
+        try interp.evalValue(args[1].current());
     } else {
         const new = try objects.List.newFromShimmerables(args[1..]);
         defer new.asHead().release();
-        try interp.evalObject(new.asHead().asValue());
+        try interp.evalValue(new.asHead().asValue());
     }
 }
 
@@ -240,16 +240,16 @@ pub fn sourceCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null, null);
-    try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null, null);
-    try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null, null);
-    try registerCommand(interp, "expr", exprCmd, "expression", 1, 1, null);
-    try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3, null);
-    try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3, null);
-    try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1, null);
-    try registerCommand(interp, "subst", substCmd, "?options? string", 1, 4, null);
-    try registerCommand(interp, "tailcall", tailcallCmd, "command ?arg ...?", 1, null, null);
-    try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null, null);
+    try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null);
+    try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null);
+    try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null);
+    try registerCommand(interp, "expr", exprCmd, "expression", 1, 1);
+    try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3);
+    try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3);
+    try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1);
+    try registerCommand(interp, "subst", substCmd, "?options? string", 1, 4);
+    try registerCommand(interp, "tailcall", tailcallCmd, "command ?arg ...?", 1, null);
+    try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null);
 }
 
 fn testFnNamed(ta: std.mem.Allocator) !void {

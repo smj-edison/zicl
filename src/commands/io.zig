@@ -56,8 +56,7 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
         return;
     }
 
-    const stdout = ioutil.lockStdout();
-    defer ioutil.unlockStdout();
+    const stdout = ioutil.getStdout();
     var buf: [64]u8 = undefined;
     var writer = stdout.writer(heap.global_io, &buf);
 
@@ -403,10 +402,10 @@ pub fn fopenCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3, null);
-    try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1, null);
-    try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null, null);
-    try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2, null);
+    try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
+    try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1);
+    try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
+    try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2);
 }
 
 const testing = std.testing;
@@ -423,10 +422,9 @@ fn captureStdout(interp: *Interp, script: []const u8) ![]u8 {
     const file = try tmp.dir.createFile(heap.global_io, "stdout", .{});
     {
         defer file.close(heap.global_io);
-        const saved_fd = ioutil.global_stdout_fd.swap(file.handle, .monotonic);
-        // Restore even when the script fails, or the rest of the suite would
-        // write into a closed descriptor.
-        defer _ = ioutil.global_stdout_fd.swap(saved_fd, .monotonic);
+        const saved_fd = ioutil.local_stdout_fd;
+        defer ioutil.local_stdout_fd = saved_fd;
+        ioutil.local_stdout_fd = file.handle;
 
         try interp.testExpectScriptResult("", script);
     }

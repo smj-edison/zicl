@@ -159,8 +159,9 @@ pub const RewindableArena = struct {
     current: ?*Node = null,
 
     /// A point-in-time watermark. Save one with `snapshot` and restore it
-    /// with `rewind`.
-    pub const Snapshot = struct {
+    /// with `rewind`. `extern` so it can cross the C ABI by value: it is just a
+    /// pair of a pointer and a length, with no Zig-specific layout.
+    pub const Snapshot = extern struct {
         /// `null` marks a snapshot taken before any chunk existed; rewinding
         /// to it resets the arena to fully empty.
         current: ?*Node,

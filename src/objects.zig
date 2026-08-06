@@ -470,7 +470,7 @@ test "object test string" {
     try testing.checkAllAllocationFailures(testing.allocator, testString, .{});
 }
 
-pub const Source = struct {
+pub const Source = extern struct {
     file_name: OptionalValue,
     line_no: u32,
     hash: std.atomic.Value(?*u256),
@@ -505,6 +505,23 @@ pub const Source = struct {
 
     pub fn asHead(self: *Source) *Object {
         return Object.from(Source, self);
+    }
+
+    /// Shimmer a value to a Source. The file/line metadata is not derivable from
+    /// the string rep, so a shimmered-in Source starts with an empty location
+    /// (`file_name` absent, `line_no` 0); set them through the mutable view
+    /// afterwards. An existing Source is returned as-is, metadata intact.
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const Source {
+        _ = det;
+        if (shim.current().asType(Source)) |existing| return existing;
+
+        const as_source = try shim.prepareToShimmer(Source);
+        as_source.* = .{
+            .file_name = .none,
+            .line_no = 0,
+            .hash = .init(null),
+        };
+        return as_source;
     }
 
     fn duplicate(src: *const Object) !*Object {
@@ -1294,7 +1311,6 @@ pub fn SubcommandParser(
             const correct_arg_count = blk: {
                 if (args.len - 2 < subcommand.min_args) break :blk false;
                 if (subcommand.max_args) |max_args| if (args.len - 2 > max_args) break :blk false;
-                if (@mod(args.len - 2, subcommand.stride) != 0) break :blk false;
                 break :blk true;
             };
             if (!correct_arg_count) {
@@ -1487,6 +1503,20 @@ pub const List = struct {
         list.asHead().invalidateString();
     }
 
+    /// Replace the item at `index` with `value` in place, without invalidating
+    /// the string rep. The dict analogue is `Dictionary.shimmerWriteback`; like
+    /// it, this is for writing a shimmered form of an already-stored item back
+    /// into its slot, where the shimmer preserved the string rep so the list's
+    /// cached string is still valid. `index` must be in range and `list` must
+    /// not be cross-thread. Infallible: unlike the dict version there is no hash
+    /// to compute, since the slot is addressed directly.
+    pub fn shimmerWriteback(list: *List, index: usize, value: Value) void {
+        assert(!list.asHead().metadata.cross_thread);
+        list.items[index].swap(value.borrow());
+        // Don't invalidate the string: `value` is a shimmered form of the same
+        // string rep, so the list's cached string is still valid.
+    }
+
     /// `list` must be mutable.
     fn ensureCapacity(list: *List, new_capacity: usize) !void {
         assert(list.asHead().canMutate());
@@ -1663,6 +1693,19 @@ fn testLists(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("item1", try new_list.items[0].getString());
     try testing.expectEqualStrings("item 2", try new_list.items[1].getString());
     try testing.expectEqualStrings("item 3", try new_list.items[2].getString());
+
+    // shimmerWriteback replaces an item in place without invalidating the
+    // string rep, so the slice cached before the writeback is the same slice
+    // (same pointer) afterwards. `set`, by contrast, would free it.
+    const int_val = Integer.new(5);
+    var wb_list = try List.new(&.{int_val});
+    defer wb_list.asHead().release();
+    _ = try wb_list.asHead().getString();
+    const cached_before = wb_list.asHead().maybeGetString().?;
+    wb_list.shimmerWriteback(0, Integer.new(5));
+    const cached_after = wb_list.asHead().maybeGetString();
+    try testing.expect(cached_after != null);
+    try testing.expectEqual(cached_before.ptr, cached_after.?.ptr);
 }
 
 test "lists" {

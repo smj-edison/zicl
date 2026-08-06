@@ -180,10 +180,10 @@ pub fn divCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "*", mulCmd, "?number ...?", 1, null, null);
-    try registerCommand(interp, "+", addCmd, "?number ...?", 1, null, null);
-    try registerCommand(interp, "-", subCmd, "?number ...?", 1, null, null);
-    try registerCommand(interp, "/", divCmd, "?number ...?", 1, null, null);
+    try registerCommand(interp, "*", mulCmd, "?number ...?", 1, null);
+    try registerCommand(interp, "+", addCmd, "?number ...?", 1, null);
+    try registerCommand(interp, "-", subCmd, "?number ...?", 1, null);
+    try registerCommand(interp, "/", divCmd, "?number ...?", 1, null);
 }
 
 fn testArithmeticAddition(ta: std.mem.Allocator) !void {

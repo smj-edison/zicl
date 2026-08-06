@@ -26,14 +26,12 @@ pub fn registerCommand(
     description: []const u8,
     min_arity: usize,
     max_arity: ?usize,
-    stride: ?usize,
 ) !void {
     try interp.registerCommand(name, .{
         .call_info = .{ .zig = to_call },
         .description = description,
         .min_arity = min_arity,
         .max_arity = max_arity,
-        .multiple_of = stride,
     });
 }
 

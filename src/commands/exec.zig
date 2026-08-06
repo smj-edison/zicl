@@ -114,10 +114,10 @@ fn resolveHandle(interp: *Interp, name: []const u8, direction: enum { read, writ
     // writers that go through it, and the child writes on a dup of its own, so
     // taking the lock here would order nothing.
     if (std.mem.eql(u8, name, "stdout")) {
-        return .{ .handle = ioutil.global_stdout_fd.load(.monotonic), .flags = .{ .nonblocking = false } };
+        return ioutil.getStdout();
     }
     if (std.mem.eql(u8, name, "stderr")) {
-        return .{ .handle = ioutil.global_stderr_fd.load(.monotonic), .flags = .{ .nonblocking = false } };
+        return ioutil.getStderr();
     }
     if (std.mem.eql(u8, name, "stdin")) {
         return .{ .handle = std.posix.STDIN_FILENO, .flags = .{ .nonblocking = false } };
@@ -438,8 +438,8 @@ fn openSink(
         // wherever [puts] would. Plain inheritance would send it to the real
         // descriptor, past an embedder that had redirected stdout.
         .inherit => .{ .file = switch (which) {
-            .stdout => .{ .handle = ioutil.global_stdout_fd.load(.monotonic), .flags = .{ .nonblocking = false } },
-            .stderr => .{ .handle = ioutil.global_stderr_fd.load(.monotonic), .flags = .{ .nonblocking = false } },
+            .stdout => ioutil.getStdout(),
+            .stderr => ioutil.getStderr(),
         } },
         .file => |file| .{ .file = file },
         .capture => .pipe,
@@ -870,8 +870,8 @@ const interned_childsusp = heap.InternedString.newValue("CHILDSUSP");
 const interned_childunknown = heap.InternedString.newValue("CHILDUNKNOWN");
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "exec", execCmd, "?-split? ?--? command ?arg ...?", 1, null, null);
-    try registerCommand(interp, "wait", waitCmd, "process", 1, 1, null);
+    try registerCommand(interp, "exec", execCmd, "?-split? ?--? command ?arg ...?", 1, null);
+    try registerCommand(interp, "wait", waitCmd, "process", 1, 1);
 }
 
 const testing = std.testing;
@@ -1213,8 +1213,9 @@ test "background output follows the redirect cell" {
     const file = try tmp.dir.createFile(heap.global_io, "stdout", .{});
     {
         defer file.close(heap.global_io);
-        const saved_fd = ioutil.global_stdout_fd.swap(file.handle, .monotonic);
-        defer _ = ioutil.global_stdout_fd.swap(saved_fd, .monotonic);
+        const saved_fd = ioutil.local_stdout_fd;
+        defer ioutil.local_stdout_fd = saved_fd;
+        ioutil.local_stdout_fd = file.handle;
 
         // Waiting is what makes this deterministic: the child has exited and
         // flushed by the time the file is read.

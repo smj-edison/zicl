@@ -25,7 +25,7 @@ const options = @import("options");
 pub const ReturnCodeEnum = objects.EnumConstructor(heap.ReturnCode, true);
 
 pub const CommandFn = fn (interp: *Interp, args: []Shimmerable) Interp.Error!void;
-pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Value) callconv(.c) heap.ReturnCode;
+pub const CCommandFn = fn (interp: *Interp, argc: c_int, argv: [*]Shimmerable) callconv(.c) heap.ReturnCode;
 
 pub const ParsedScriptCommand = struct {
     line: u32,
@@ -1500,10 +1500,6 @@ pub const NativeCommand = struct {
     description: ?[]const u8 = "",
     min_arity: usize = 0,
     max_arity: ?usize = null,
-    /// If the command argument length needs to be a multiple of some
-    /// amount, set this. A good example is `dict create`, as it needs
-    /// an even number of arguments.
-    multiple_of: ?usize = null,
 
     call_info: union(enum) {
         zig: *const CommandFn,

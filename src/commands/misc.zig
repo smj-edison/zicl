@@ -101,9 +101,9 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     // `current + level` is always less than `current`, so we don't need to
                     // check if it's higher than the current frame.
                     const abs_frame = current + level;
-                    break :blk std.math.cast(u32, abs_frame) orelse return interp.setResultError(bad_level_err);
+                    break :blk std.math.cast(u32, abs_frame) orelse return interp.setError(bad_level_err);
                 } else {
-                    if (level >= current + 1) return interp.setResultError(bad_level_err);
+                    if (level >= current + 1) return interp.setError(bad_level_err);
                     // Since `current` is a u32, it's impossible for `level` to be bigger than a u32,
                     // hence we can safely cast it.
                     break :blk @intCast(level);
@@ -123,7 +123,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     break;
                 }
             }
-            const eval_frame = target_eval_frame orelse return interp.setResultError(bad_level_err);
+            const eval_frame = target_eval_frame orelse return interp.setError(bad_level_err);
 
             const result_dict = try objects.Dictionary.newWithCapacity(&.{}, 10);
             errdefer result_dict.asHead().release();
@@ -181,12 +181,12 @@ pub fn closeCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "breakpoint", breakpointCmd, "", 0, 0, null);
-    try registerCommand(interp, "close", closeCmd, "capability", 1, 1, null);
-    try registerCommand(interp, "deref", derefCmd, "hash", 1, 1, null);
-    try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1, null);
-    try registerCommand(interp, "identity", identityCmd, "anything", 1, 1, null);
-    try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null, null);
-    try registerCommand(interp, "launder", launderCmd, "string", 1, 1, null);
-    try registerCommand(interp, "ref", refCmd, "string", 1, 1, null);
+    try registerCommand(interp, "breakpoint", breakpointCmd, "", 0, 0);
+    try registerCommand(interp, "close", closeCmd, "capability", 1, 1);
+    try registerCommand(interp, "deref", derefCmd, "hash", 1, 1);
+    try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1);
+    try registerCommand(interp, "identity", identityCmd, "anything", 1, 1);
+    try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null);
+    try registerCommand(interp, "launder", launderCmd, "string", 1, 1);
+    try registerCommand(interp, "ref", refCmd, "string", 1, 1);
 }

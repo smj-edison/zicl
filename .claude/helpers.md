@@ -395,7 +395,7 @@ most.
 Shared imports and registration glue for the command modules. Command modules import
 this as `common` and re-use its `heap`/`objects`/`Interp` aliases.
 
-- `common.registerCommand(interp, name, to_call, description, min_arity, max_arity, stride)` -- Register a Zig command with its arity contract.
+- `common.registerCommand(interp, name, to_call, description, min_arity, max_arity)` -- Register a Zig command with its arity contract.
 - `common.registerCoreCommands(interp)` -- Register every ported command module.
 - `common.testStart(ta)` -- `heap.testStart` + `Interp.init` + `registerCoreCommands`; returns the `Interp` by value.
 - `common.testFinish(&interp)` -- `interp.deinit()` + `heap.testFinish()`.

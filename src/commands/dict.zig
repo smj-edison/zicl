@@ -197,7 +197,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "dict", dictCmd, "subcommand ?arg ...?", 1, null, null);
+    try registerCommand(interp, "dict", dictCmd, "subcommand ?arg ...?", 1, null);
 }
 
 fn testDictUnset(ta: std.mem.Allocator) !void {

@@ -270,8 +270,8 @@ fn setRegexpCaptureVars(
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "regexp", regexpCmd, "?options? exp string ?matchVar ...?", 2, null, null);
-    try registerCommand(interp, "regsub", regsubCmd, "?options? exp string subSpec ?varName?", 3, null, null);
+    try registerCommand(interp, "regexp", regexpCmd, "?options? exp string ?matchVar ...?", 2, null);
+    try registerCommand(interp, "regsub", regsubCmd, "?options? exp string subSpec ?varName?", 3, null);
 }
 
 pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {

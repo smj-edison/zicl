@@ -165,13 +165,13 @@ pub fn joinCmd(interp: *Interp, args: []Shimmerable) !void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "list", listCmd, "?arg ...?", 0, null, null);
-    try registerCommand(interp, "llength", llengthCmd, "list", 1, 1, null);
-    try registerCommand(interp, "lappend", lappendCmd, "varName ?value ...?", 1, null, null);
-    try registerCommand(interp, "lassign", lassignCmd, "list ?varName ...?", 1, null, null);
-    try registerCommand(interp, "lmap", lmapCmd, "varList list ?varList list ...? body", 3, null, null);
-    try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null, null);
-    try registerCommand(interp, "join", joinCmd, "list ?joinString?", 1, 2, null);
+    try registerCommand(interp, "list", listCmd, "?arg ...?", 0, null);
+    try registerCommand(interp, "llength", llengthCmd, "list", 1, 1);
+    try registerCommand(interp, "lappend", lappendCmd, "varName ?value ...?", 1, null);
+    try registerCommand(interp, "lassign", lassignCmd, "list ?varName ...?", 1, null);
+    try registerCommand(interp, "lmap", lmapCmd, "varList list ?varList list ...? body", 3, null);
+    try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null);
+    try registerCommand(interp, "join", joinCmd, "list ?joinString?", 1, 2);
 }
 
 const testing = std.testing;

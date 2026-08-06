@@ -132,10 +132,10 @@ pub fn upvarCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2, null);
-    try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2, null);
-    try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null, null);
-    try registerCommand(interp, "upvar", upvarCmd, "?level? otherVar myVar ?otherVar myVar ...?", 2, null, null);
+    try registerCommand(interp, "incr", incrCmd, "varName ?increment?", 1, 2);
+    try registerCommand(interp, "set", setCmd, "varName ?newValue?", 1, 2);
+    try registerCommand(interp, "unset", unsetCmd, "?-nocomplain? ?--? ?varName ...?", 0, null);
+    try registerCommand(interp, "upvar", upvarCmd, "?level? otherVar myVar ?otherVar myVar ...?", 2, null);
 }
 
 const testing = std.testing;

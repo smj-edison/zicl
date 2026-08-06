@@ -356,9 +356,6 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
         if (command.max_arity) |max_arity| {
             if (arg_count > max_arity) break :wrong_arg_count;
         }
-        if (command.multiple_of) |multiple_of| {
-            if (@mod(arg_count - command.min_arity, multiple_of) != 0) break :wrong_arg_count;
-        }
 
         switch (command.call_info) {
             // A command can also reject its arguments from inside its body, for
@@ -370,25 +367,7 @@ fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimme
                 else => return err,
             },
             .c => |to_call| {
-                const args_as_handles = try heap.local_arena.alloc(Value, args.len);
-                for (args, args_as_handles) |arg, *native_arg| native_arg.* = arg.current().borrow();
-
-                const retcode = ReturnCode.toError(to_call(interp, @intCast(args_as_handles.len), args_as_handles.ptr));
-
-                for (args, args_as_handles) |*arg, native_arg| {
-                    if (arg.current().asPtr()) |arg_obj| if (native_arg.asPtr()) |native_obj| {
-                        // We don't need to worry about this not firing with an ABA
-                        // pointer address issue, since each argument has already
-                        // been borrowed.
-                        if (arg_obj != native_obj) {
-                            arg.shimmered.swap(native_arg);
-                            continue;
-                        }
-                    };
-                    native_arg.release();
-                }
-
-                return retcode;
+                try ReturnCode.toError(to_call(interp, @intCast(args.len), args.ptr));
             },
         }
 
@@ -427,8 +406,13 @@ pub fn setResultString(interp: *Interp, bytes: []const u8) !void {
     interp.setResultOwning(try String.newValue(bytes));
 }
 
-pub fn setResultError(interp: *Interp, value: Value) error{EvalError} {
+pub fn setError(interp: *Interp, value: Value) error{EvalError} {
     interp.setResult(value);
+    return error.EvalError;
+}
+
+pub fn setErrorString(interp: *Interp, bytes: []const u8) error{ OutOfMemory, EvalError } {
+    try interp.setResultString(bytes);
     return error.EvalError;
 }
 
@@ -1421,13 +1405,13 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
 /// return from, so it ends the script and keeps its result instead of escaping
 /// as an error. This is the only place a leftover level is discarded.
 pub fn evalTopLevel(interp: *Interp, script: Value) heap.EvalError!void {
-    interp.evalObject(script) catch |err| switch (err) {
+    interp.evalValue(script) catch |err| switch (err) {
         error.PropagateResult => interp.return_propagate = .{},
         else => return err,
     };
 }
 
-pub fn evalObject(interp: *Interp, script: Value) heap.EvalError!void {
+pub fn evalValue(interp: *Interp, script: Value) heap.EvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHashNoRegister();
@@ -1630,11 +1614,11 @@ pub fn getListInPlace(interp: *Interp, ref: *Value) !*const List {
 }
 
 pub fn getDict(interp: *Interp, shim: *Shimmerable) !*const Dictionary {
-    return try interp.wrapShimmerFn(*const List, shim, Dictionary.shimmerFrom);
+    return try interp.wrapShimmerFn(*const Dictionary, shim, Dictionary.shimmerFrom);
 }
 
 pub fn getDictInPlace(interp: *Interp, ref: *Value) !*const Dictionary {
-    return try interp.wrapShimmerInPlaceFn(*const List, ref, Dictionary.shimmerFrom);
+    return try interp.wrapShimmerInPlaceFn(*const Dictionary, ref, Dictionary.shimmerFrom);
 }
 
 pub fn setVariableInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, value: Value) !void {
@@ -1710,7 +1694,8 @@ pub fn unsetVariableSilent(interp: *Interp, name: *Shimmerable) !void {
 
 pub fn getDictValue(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!?Value {
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, objects.Dictionary.getFollowingLinks(&det, dict, key));
+    const opt = try interp.wrapError(&det, objects.Dictionary.getFollowingLinks(&det, dict, key));
+    return opt.asValue();
 }
 
 pub fn getDictValueOrError(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!Value {

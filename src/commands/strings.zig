@@ -328,8 +328,8 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "append", appendCmd, "varName ?value ...?", 1, null, null);
-    try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null, null);
+    try registerCommand(interp, "append", appendCmd, "varName ?value ...?", 1, null);
+    try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null);
 }
 
 const testing = std.testing;

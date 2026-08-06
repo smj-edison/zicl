@@ -40,12 +40,12 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
 /// [for]
 pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     // Do the initialization.
-    try interp.evalObject(args[1].current());
+    try interp.evalValue(args[1].current());
 
     // Check condition.
     while (try interp.getBoolFromExpression(args[2].current())) {
         // Evaluate body.
-        switch (try propagateLoopControl(interp, interp.evalObject(args[4].current()))) {
+        switch (try propagateLoopControl(interp, interp.evalValue(args[4].current()))) {
             .@"break" => {
                 break;
             },
@@ -58,7 +58,7 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         }
 
         // Run increment.
-        try interp.evalObject(args[3].current());
+        try interp.evalValue(args[3].current());
     }
 
     interp.setEmptyResult();
@@ -67,6 +67,8 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 /// Shared implementation of [foreach] and [lmap].
 /// Shared by [foreach] here and [lmap] in `list.zig`.
 pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, map }) Interp.Error!void {
+    if (args.len % 2 != 0) return error.WrongUsage;
+
     const body = &args[args.len - 1];
 
     // [foreach] can simultaneously loop over multiple lists, so it's easiest to
@@ -133,7 +135,7 @@ pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { forea
         }
 
         // Evaluate body and handle break/continue.
-        switch (try propagateLoopControl(interp, interp.evalObject(body.current()))) {
+        switch (try propagateLoopControl(interp, interp.evalValue(body.current()))) {
             .@"break" => break,
             .@"continue" => continue,
             .none => {
@@ -249,7 +251,7 @@ pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         // Check condition.
         if (try interp.getBoolFromExpression(remaining_args[0].current())) {
             // Evaluate true branch.
-            try interp.evalObject(remaining_args[1].current());
+            try interp.evalValue(remaining_args[1].current());
             return;
         }
 
@@ -267,7 +269,7 @@ pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             // There should only be one more argument, since there shouldn't
             // be anything after "else".
             if (remaining_args.len > 2) return error.WrongUsage;
-            try interp.evalObject(remaining_args[1].current());
+            try interp.evalValue(remaining_args[1].current());
             return;
         }
 
@@ -286,7 +288,7 @@ pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 fn commandMatch(interp: *Interp, command: Value, pattern: Value, string: Value) !bool {
     const script = try objects.List.new(&.{ command, pattern, string });
     defer script.asHead().release();
-    try interp.evalObject(script.asHead().asValue());
+    try interp.evalValue(script.asHead().asValue());
     return try interp.getBooleanInPlace(&interp.result);
 }
 
@@ -413,7 +415,7 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
             break :blk switch_body[true_body_idx].current();
         } else to_run;
 
-        try interp.evalObject(to_run_fallthrough);
+        try interp.evalValue(to_run_fallthrough);
     }
 }
 
@@ -521,14 +523,14 @@ pub fn continueCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "break", breakCmd, "?level?", 0, 1, null);
-    try registerCommand(interp, "continue", continueCmd, "?level?", 0, 1, null);
-    try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2, null);
-    try registerCommand(interp, "for", forCmd, "start test next body", 4, 4, null);
-    try registerCommand(interp, "foreach", foreachCmd, "varList list ?varList list ...? body", 3, null, 2);
-    try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null, null);
-    try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null, null);
-    try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null, null);
+    try registerCommand(interp, "break", breakCmd, "?level?", 0, 1);
+    try registerCommand(interp, "continue", continueCmd, "?level?", 0, 1);
+    try registerCommand(interp, "error", errorCmd, "message ?errorCode?", 1, 2);
+    try registerCommand(interp, "for", forCmd, "start test next body", 4, 4);
+    try registerCommand(interp, "foreach", foreachCmd, "varList list ?varList list ...? body", 3, null);
+    try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null);
+    try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null);
+    try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null);
 }
 
 fn testReturnEscapesANestedBodyToLeaveTheClosure(ta: std.mem.Allocator) !void {

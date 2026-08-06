@@ -484,6 +484,49 @@ const ValueRep = extern struct {
             .float => (try objects.Float.newBoxed(rep.as.float)).asHead(),
         };
     }
+
+    /// This never falsely says that two values are equal if they're not,
+    /// but it may say two values aren't the same when they are.
+    pub fn quickEquals(a: ValueRep, b: ValueRep) bool {
+        switch (a.tag) {
+            .integer => {
+                switch (b.tag) {
+                    .integer => return a.as.integer == b.as.integer,
+                    .float, .boolean => return false,
+                    else => {
+                        // Still need to fall through, because an interned string
+                        // might contain a string value equal to a's value.
+                    },
+                }
+            },
+            .float => {
+                switch (b.tag) {
+                    .float => return a.as.float == b.as.float,
+                    .integer, .boolean => return false,
+                    else => {},
+                }
+            },
+            .boolean => {
+                switch (b.tag) {
+                    .boolean => return a.as.boolean == b.as.boolean,
+                    .integer, .float => return false,
+                    else => {},
+                }
+            },
+            .interned => {
+                switch (b.tag) {
+                    .interned => if (a.as.interned == b.as.interned) return true,
+                    else => {},
+                }
+                // If the two value string pointers weren't identical, they may
+                // be equal strings, if one pointer came from a different
+                // source. Hence, we fall through.
+            },
+            .pointer => {},
+            .none => return b.tag == .none,
+        }
+        return false;
+    }
 };
 
 pub const interned_empty_string = InternedString.newValue("");
@@ -718,44 +761,7 @@ pub const Value = extern struct {
     /// Guaranteed to return error.OutOfMemory if and only if one of the value `Value`'s
     /// is an object pointer, and that Object OOM'd while generating its string.
     pub fn equals(a: Value, b: Value) error{OutOfMemory}!bool {
-        switch (a.raw.tag) {
-            .integer => {
-                switch (b.raw.tag) {
-                    .integer => return a.raw.as.integer == b.raw.as.integer,
-                    .float, .boolean => return false,
-                    else => {
-                        // Still need to fall through, because an interned string
-                        // might contain a string value equal to a's value.
-                    },
-                }
-            },
-            .float => {
-                switch (b.raw.tag) {
-                    .float => return a.raw.as.float == b.raw.as.float,
-                    .integer, .boolean => return false,
-                    else => {},
-                }
-            },
-            .boolean => {
-                switch (b.raw.tag) {
-                    .boolean => return a.raw.as.boolean == b.raw.as.boolean,
-                    .integer, .float => return false,
-                    else => {},
-                }
-            },
-            .interned => {
-                switch (b.raw.tag) {
-                    .interned => if (a.raw.as.interned == b.raw.as.interned) return true,
-                    else => {},
-                }
-                // If the two value string pointers weren't identical, they may
-                // be equal strings, if one pointer came from a different
-                // source. Hence, we fall through to the string comparison
-                // logic.
-            },
-            .pointer => {},
-            .none => unreachable,
-        }
+        if (a.raw.quickEquals(b.raw)) return true;
 
         if (a.asPtr()) |a_ptr| if (b.asPtr()) |b_ptr| {
             // If both strings are special strings, we can compare their hashes, to avoid

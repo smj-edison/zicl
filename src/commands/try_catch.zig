@@ -122,7 +122,7 @@ fn catchTryHelper(
             // set the return code to .signal.
             break :blk .signal;
         } else {
-            if (interp.evalObject(script.current())) {
+            if (interp.evalValue(script.current())) {
                 // Evaluated just fine.
                 break :blk .ok;
             } else |err| {
@@ -277,7 +277,7 @@ fn catchTryHelper(
         if (finally_script) |val| {
             // Use `try` here, since according to Tcl, an error in `finally` should
             // replace the original error.
-            try interp.evalObject(val);
+            try interp.evalValue(val);
         }
         return exit_code.toError();
     }
@@ -317,7 +317,7 @@ fn catchTryHelper(
     if (handler_script) |handler| {
         // Now that we've set up the message and options variables,
         // the handler will have the variables it needs to run.
-        if (interp.evalObject(handler)) {
+        if (interp.evalValue(handler)) {
             script_result = {};
         } else |err| {
             // We still need to run the finally block, which is why
@@ -345,7 +345,7 @@ fn catchTryHelper(
         const previous_result = interp.result.borrow();
         defer previous_result.release();
 
-        if (interp.evalObject(finally)) {
+        if (interp.evalValue(finally)) {
             interp.setResult(previous_result);
         } else |err| {
             script_result = err;
@@ -387,8 +387,8 @@ pub fn tryCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "catch", catchCmd, "?options? script ?resultVar? ?optionsVar?", 1, null, null);
-    try registerCommand(interp, "try", tryCmd, "?options? body ?handler ...? ?finally script?", 1, null, null);
+    try registerCommand(interp, "catch", catchCmd, "?options? script ?resultVar? ?optionsVar?", 1, null);
+    try registerCommand(interp, "try", tryCmd, "?options? body ?handler ...? ?finally script?", 1, null);
 }
 
 const testing = std.testing;
