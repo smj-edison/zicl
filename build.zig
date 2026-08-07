@@ -97,6 +97,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .pic = true,
     });
     lz_mod.addImport("uucode", uucode.module("uucode"));
     lz_mod.addImport("options", options_mod);

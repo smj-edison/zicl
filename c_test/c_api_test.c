@@ -35,6 +35,16 @@ static long item_as_long(Zicl_Interp *interp, Zicl_Value *list, int index) {
     return n;
 }
 
+/* A command that asks the interpreter to stop. The check in evalObjectInner
+ * fires at the next command boundary, so the script never reaches the command
+ * after this one. */
+static int stop_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
+    (void)argc;
+    (void)argv;
+    Zicl_RequestStop(interp);
+    return ZICL_OK;
+}
+
 int main(void) {
     CHECK(Zicl_InitGlobals(NULL) == ZICL_OK);
     CHECK(Zicl_InitThread() == ZICL_OK);
@@ -236,6 +246,23 @@ int main(void) {
         Zicl_Release(lv);
     }
 
+    /* BorrowList: a list handle borrowed as a second handle to the same object,
+     * refcount incremented. The two handles are independent references, so each
+     * must be released once. Zicl_BoxList is used only as a transient view to
+     * feed the value-typed accessors; it does not change the refcount. */
+    {
+        Zicl_List *list = Zicl_NewList(NULL, 0);
+        CHECK(Zicl_ListAppend(list, Zicl_NewLong(1)) == ZICL_OK);
+        Zicl_List *bv = Zicl_BorrowList(list);  /* refcount 2 */
+        CHECK(Zicl_RefCount(Zicl_BoxList(bv)) == 2);
+        CHECK(Zicl_RefCount(Zicl_BoxList(list)) == 2);  /* same object */
+        int eq = 0;
+        CHECK(Zicl_Equals(Zicl_BoxList(bv), Zicl_BoxList(list), &eq) == ZICL_OK && eq == 1);
+        Zicl_ReleaseList(bv);
+        CHECK(Zicl_RefCount(Zicl_BoxList(list)) == 1);
+        Zicl_ReleaseList(list);
+    }
+
     /* List shimmer writeback: replace an item in place with a shimmered form of
      * the same string rep, so the list's cached string rep is preserved (the
      * second Zicl_GetString returns the same pointer as the first). Distinct
@@ -410,6 +437,26 @@ int main(void) {
         CHECK(got != NULL && len == 4 && strcmp(got, "nope") == 0);
     }
 
+    /* Eval: run a NUL-terminated script string, read the result off the
+     * interpreter. ZICL_OK on success, ZICL_ERR on a script error (with the
+     * message as the result), ZICL_OOM if boxing the string fails. */
+    {
+        CHECK(Zicl_Eval(interp, "expr {6 * 7}") == ZICL_OK);
+        int len = -1;
+        const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len == 2 && strcmp(got, "42") == 0);
+
+        /* A script error leaves the message as the result and returns ZICL_ERR. */
+        CHECK(Zicl_Eval(interp, "set") == ZICL_ERR);
+        got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len > 0);  /* usage message */
+
+        /* A top-level `return` surfaces as ZICL_PROPAGATE (not swallowed). */
+        CHECK(Zicl_Eval(interp, "return 5") == ZICL_PROPAGATE);
+        got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len == 1 && got[0] == '5');
+    }
+
     /* Local arena snapshot/rewind: rendering an inline integer's string rep
      * allocates from the thread arena, so a snapshot taken across it advances,
      * and rewinding to the earlier snapshot restores the watermark exactly. */
@@ -422,6 +469,23 @@ int main(void) {
         Zicl_LocalArenaRewind(a);
         Zicl_ArenaSnapshot c = Zicl_LocalArenaSnapshot();
         CHECK(c.current == a.current && c.end_index == a.end_index);  /* restored */
+    }
+
+    /* Cooperative stop: a command calls Zicl_RequestStop, and the eval unwinds
+     * at the next command boundary with ZICL_EXIT. The command after `stopit`
+     * never runs, and the flag persists until Zicl_ClearStop resets it. */
+    {
+        CHECK(Zicl_CreateCommand(interp, "stopit", stop_cmd, "stop the interpreter", 0, 0) == ZICL_OK);
+        CHECK(!Zicl_StopRequested(interp));
+        CHECK(Zicl_Eval(interp, "stopit; set x 99") == ZICL_EXIT);
+        CHECK(Zicl_StopRequested(interp));
+        Zicl_ClearStop(interp);
+        CHECK(!Zicl_StopRequested(interp));
+        /* Reusable after a clear: a later eval runs normally. */
+        CHECK(Zicl_Eval(interp, "expr {1 + 1}") == ZICL_OK);
+        int len = -1;
+        const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len == 1 && got[0] == '2');
     }
 
     Zicl_InterpDestroy(interp);

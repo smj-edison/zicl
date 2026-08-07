@@ -75,14 +75,13 @@ fn catchTryHelper(
     var to_propagate = std.EnumSet(Interp.ReturnCode).initEmpty();
     // By default these return codes are ignored, e.g. propagated.
     to_propagate.insert(.exit);
-    to_propagate.insert(.signal);
     // Out of memory belongs to the allocator's caller, not the script: catching it
     // would report code 7 as an ordinary result and hide that anything failed.
     to_propagate.insert(.oom);
 
     // The caller may have specified a different set of codes to propagate/catch. The
-    // format is -no"code", or -"code". For example, -nobreak would propagate break,
-    // while -signal would catch a signal return code. This loop sorts out all these flags.
+    // format is -no"code", or -"code". For example, -nobreak would propagate break.
+    // This loop sorts out all these flags.
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         const str_value = try args[arg_index].getString();
@@ -112,22 +111,11 @@ fn catchTryHelper(
     const script = args[arg_index];
     arg_index += 1;
     const exit_code: Interp.ReturnCode = blk: {
-        if (!to_propagate.contains(.signal)) interp.signal_depth += 1;
-        defer {
-            if (!to_propagate.contains(.signal)) interp.signal_depth -= 1;
-        }
-
-        if (interp.checkSignal()) {
-            // If a signal was set, don't evaluate the code, just
-            // set the return code to .signal.
-            break :blk .signal;
-        } else {
-            if (interp.evalValue(script.current())) {
-                // Evaluated just fine.
-                break :blk .ok;
-            } else |err| {
-                break :blk Interp.ReturnCode.fromError(err);
-            }
+        if (interp.evalValue(script.current())) {
+            // Evaluated just fine.
+            break :blk .ok;
+        } else |err| {
+            break :blk Interp.ReturnCode.fromError(err);
         }
     };
     var error_code = interp.pending_error_code;
@@ -280,15 +268,6 @@ fn catchTryHelper(
             try interp.evalValue(val);
         }
         return exit_code.toError();
-    }
-
-    if (!to_propagate.contains(.signal) and exit_code == .signal) {
-        // Construct the signal result here, instead of wherever the signal
-        // originated from.
-        assert(interp.signal != 0);
-        const signal_list = try Interp.signalMaskToList(interp.signal);
-        interp.setResultOwning(signal_list);
-        interp.signal = 0;
     }
 
     if (message_var_name) |var_name| if ((try var_name.getString()).len > 0) {
@@ -593,9 +572,9 @@ fn testCatchReportsTheCodeOfNonErrorOutcomes(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    // 2 is `return`. [catch] observes it because a body is not a closure call,
+    // 3 is `return`. [catch] observes it because a body is not a closure call,
     // so nothing consumed the level before it got here.
-    try interp.testExpectScriptResult("2", "catch { return foo }");
+    try interp.testExpectScriptResult("3", "catch { return foo }");
     // The caught result is still readable.
     try interp.testExpectScriptResult("foo", "catch { return foo } msg; set msg");
 
@@ -604,9 +583,9 @@ fn testCatchReportsTheCodeOfNonErrorOutcomes(ta: std.mem.Allocator) !void {
     // still outstanding because nothing has consumed it yet.
     try interp.testExpectScriptResult("0", "catch { return foo } msg opts; dict get $opts -code");
     try interp.testExpectScriptResult("1", "catch { return foo } msg opts; dict get $opts -level");
-    // 3 is `break`, 4 is `continue`.
-    try interp.testExpectScriptResult("3", "catch { break }");
-    try interp.testExpectScriptResult("4", "catch { continue }");
+    // 4 is `break`, 5 is `continue`.
+    try interp.testExpectScriptResult("4", "catch { break }");
+    try interp.testExpectScriptResult("5", "catch { continue }");
 }
 
 test "catch reports the code of non-error outcomes" {

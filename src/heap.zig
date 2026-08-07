@@ -56,7 +56,6 @@ pub const EvalError = error{
     PropagateResult,
     Break,
     Continue,
-    Signal,
     Exit,
 };
 pub const Error = EvalError || error{
@@ -66,22 +65,18 @@ pub const Error = EvalError || error{
 
 /// Return code values matching Tcl's convention.
 ///
-/// Backed by `c_int` rather than `u8` so that functions exported through the C
-/// ABI (and C commands, whose signature is `CCommandFn`) return a value the C
-/// side reads as a full `int`. With a `u8` backing, a non-zero code left the
-/// upper bits of `eax` undefined and a C caller comparing against a specific
-/// `ZICL_*` constant saw garbage.
+/// Backed by c_int rather than u8 so that functions that return
+/// to C callers don't read uninitialzed bits.
 pub const ReturnCode = enum(c_int) {
     ok = 0,
     @"error" = 1,
-    @"return" = 2,
-    @"break" = 3,
-    @"continue" = 4,
-    signal = 5,
+    oom = 2,
+    @"return" = 3,
+    @"break" = 4,
+    @"continue" = 5,
     exit = 6,
-    oom = 7,
-    usage = 8,
-    tailcall = 9,
+    usage = 7,
+    tailcall = 8,
 
     pub fn fromErrorUnion(value: Error!void) ReturnCode {
         if (value) {
@@ -95,11 +90,10 @@ pub const ReturnCode = enum(c_int) {
         return switch (err) {
             error.EvalError => .@"error",
             error.PropagateResult => .@"return",
+            error.OutOfMemory => .oom,
             error.Break => .@"break",
             error.Continue => .@"continue",
-            error.Signal => .signal,
             error.Exit => .exit,
-            error.OutOfMemory => .oom,
             error.WrongUsage => .usage,
             error.Tailcall => .tailcall,
         };
@@ -112,7 +106,6 @@ pub const ReturnCode = enum(c_int) {
             .@"return" => return error.PropagateResult,
             .@"break" => return error.Break,
             .@"continue" => return error.Continue,
-            .signal => return error.Signal,
             .exit => return error.Exit,
             .oom => return error.OutOfMemory,
             .usage => return error.WrongUsage,

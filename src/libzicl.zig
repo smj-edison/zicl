@@ -369,15 +369,22 @@ export fn Zicl_BoxList(list: *List) callconv(.c) Value {
 }
 
 /// Release an owned list handle.
-export fn Zicl_ListRelease(list: *List) callconv(.c) void {
+export fn Zicl_ReleaseList(list: *List) callconv(.c) void {
     list.asHead().release();
+}
+
+/// Borrow a list handle: the same handle with its refcount incremented. The
+/// caller owns the returned handle and must release it with `Zicl_ReleaseList`.
+export fn Zicl_BorrowList(list: *List) callconv(.c) *List {
+    list.asHead().incrRefCount();
+    return list;
 }
 
 /// Copy-on-write in-place entry point. If `value` is uniquely owned, `*out` is a
 /// borrowed mutable view of the same object (no copy); if it is shared,
 /// cross-thread, or a primitive, `*out` is NULL and the caller must
 /// `Zicl_DupAsList`. A borrowed view is not owned: do not pass it to
-/// `Zicl_ListRelease(`. Commit a duplicate back to its slot with
+/// `Zicl_ReleaseList`. Commit a duplicate back to its slot with
 /// `ZICL_SWAP(&slot, Zicl_BoxList(*out))`. (`Zicl_ListShimmerWriteback` is a
 /// different operation: it writes a shimmered child back into a list slot in
 /// place, preserving the list's string rep.)
@@ -505,16 +512,23 @@ export fn Zicl_BoxDict(dict: *Dictionary) callconv(.c) Value {
     return dict.asHead().asValue();
 }
 
-/// Release an owned dict handle (error path).
-export fn Zicl_DictRelease(dict: *Dictionary) callconv(.c) void {
+/// Release an owned dict handle.
+export fn Zicl_ReleaseDict(dict: *Dictionary) callconv(.c) void {
     dict.asHead().release();
+}
+
+/// Borrow a dict handle: the same handle with its refcount incremented. The
+/// caller owns the returned handle and must release it with `Zicl_ReleaseDict`.
+export fn Zicl_BorrowDict(dict: *Dictionary) callconv(.c) *Dictionary {
+    dict.asHead().incrRefCount();
+    return dict;
 }
 
 /// Copy-on-write in-place entry point. If `value` is uniquely owned, `*out` is a
 /// borrowed mutable view of the same object (no copy); if it is shared,
 /// cross-thread, or a primitive, `*out` is NULL and the caller must
 /// `Zicl_DupAsDict`. A borrowed view is not owned: do not pass it to
-/// `Zicl_DictRelease`. Commit a duplicate back to its slot with
+/// `Zicl_ReleaseDict`. Commit a duplicate back to its slot with
 /// `ZICL_SWAP(&slot, Zicl_BoxDict(*out))`. (`Zicl_DictShimmerWriteback` is a
 /// different operation: it writes a shimmered child back into a dict key in
 /// place, preserving the dict's string rep.)
@@ -643,9 +657,17 @@ export fn Zicl_BoxSource(source: *objects.Source) callconv(.c) Value {
     return source.asHead().asValue();
 }
 
-/// Release an owned Source handle (error path).
-export fn Zicl_SourceRelease(source: *objects.Source) callconv(.c) void {
+/// Release an owned Source handle.
+export fn Zicl_ReleaseSource(source: *objects.Source) callconv(.c) void {
     source.asHead().release();
+}
+
+/// Borrow a Source handle: the same handle with its refcount incremented. The
+/// caller owns the returned handle and must release it with
+/// `Zicl_ReleaseSource`.
+export fn Zicl_BorrowSource(source: *objects.Source) callconv(.c) *objects.Source {
+    source.asHead().incrRefCount();
+    return source;
 }
 
 export fn Zicl_SourceGetFilename(source: Value) callconv(.c) ?[*:0]const u8 {
@@ -678,8 +700,8 @@ export fn Zicl_AttachSource(value: *Value, filename: [*:0]const u8, line_no: c_i
 
 // ===== Interpreter =====
 // Registering commands, evaluating scripts, reading and writing the result,
-// setting variables, and the signal-depth machinery that defers Tcl signal
-// delivery during C callbacks that must not be interrupted.
+// setting variables, and the cooperative stop flag the runtime sets to
+// interrupt a running eval.
 
 export fn Zicl_RegisterLazyFn(name: [*:0]const u8, init_fn: heap.NativeInitFn) callconv(.c) ReturnCode {
     heap.nativefn_registry.register(heap.global_gpa, std.mem.span(name), init_fn) catch |err| switch (err) {
@@ -708,6 +730,17 @@ export fn Zicl_CreateCommand(
 
 export fn Zicl_EvalValue(interp: *Interp, script: Value) callconv(.c) ReturnCode {
     return ReturnCode.fromErrorUnion(interp.evalValue(script));
+}
+
+/// Evaluate a NUL-terminated script string. Boxes it as a `String` and delegates
+/// to `Zicl_EvalValue`, so the return code surfaces `.return`/`.break`/
+/// `.continue` rather than swallowing them (matching `Tcl_Eval`). The result is
+/// left on the interpreter; read it with `Zicl_GetResult`. Returns ZICL_OOM if
+/// boxing the string allocates and fails.
+export fn Zicl_Eval(interp: *Interp, script: [*:0]const u8) callconv(.c) ReturnCode {
+    const script_value = objects.String.newValue(std.mem.span(script)) catch return .oom;
+    defer script_value.release();
+    return Zicl_EvalValue(interp, script_value);
 }
 
 export fn Zicl_EvalFile(interp: *Interp, filename: [*:0]const u8) callconv(.c) ReturnCode {
@@ -792,21 +825,24 @@ export fn Zicl_MakeErrorMessage(interp: *Interp) callconv(.c) ReturnCode {
     return .ok;
 }
 
-/// Increments the signal depth, deferring Tcl signal delivery during C
-/// callbacks that should not be interrupted.
-export fn Zicl_IncrSignalDepth(interp: *Interp) callconv(.c) void {
-    interp.signal_depth += 1;
+// Ask the interpreter to stop evaluating. `evalObjectInner` checks this after
+// each command and returns `.exit` once it is set, so a running `Zicl_Eval` will
+// unwind at the next command boundary. The runtime sets this from whatever
+// signal-delivery path it uses; the interpreter never clears it on its own.
+export fn Zicl_RequestStop(interp: *Interp) callconv(.c) void {
+    interp.stop_executing.store(true, .monotonic);
 }
 
-/// Decrements the signal depth, re-enabling Tcl signal delivery.
-export fn Zicl_DecrSignalDepth(interp: *Interp) callconv(.c) void {
-    interp.signal_depth -= 1;
+// True once `Zicl_RequestStop` has been called. Reads are monotonic, matching the
+// store in `Zicl_RequestStop`.
+export fn Zicl_StopRequested(interp: *Interp) callconv(.c) bool {
+    return interp.stop_executing.load(.monotonic);
 }
 
-/// Returns the pending signal bitmask. Non-zero means at least one signal is
-/// waiting to be delivered.
-export fn Zicl_GetSigmask(interp: *Interp) callconv(.c) u64 {
-    return interp.signal;
+// Reset the stop flag so the interpreter can be reused after a stop. Only call
+// this when no eval is in flight on `interp`.
+export fn Zicl_ClearStop(interp: *Interp) callconv(.c) void {
+    interp.stop_executing.store(false, .monotonic);
 }
 
 // ===== Capabilities =====

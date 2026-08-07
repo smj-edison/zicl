@@ -102,14 +102,13 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
 
 #define ZICL_OK 0
 #define ZICL_ERR 1
-#define ZICL_RETURN 2
-#define ZICL_BREAK 3
-#define ZICL_CONTINUE 4
-#define ZICL_SIGNAL 5
+#define ZICL_OOM 2
+#define ZICL_PROPAGATE 3
+#define ZICL_BREAK 4
+#define ZICL_CONTINUE 5
 #define ZICL_EXIT 6
-#define ZICL_OOM 7
-#define ZICL_USAGE 8
-#define ZICL_TAILCALL 9
+#define ZICL_USAGE 7
+#define ZICL_TAILCALL 8
 
 /* Ownership and error propagation.
  *
@@ -137,7 +136,7 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
  *     int rc = 0;
  *     Zicl_List *list = Zicl_NewList(NULL, 0);
  *     if (!list) return ZICL_OOM;
- *     defer { if (rc) Zicl_ListRelease((list); }
+ *     defer { if (rc) Zicl_ReleaseList(list); }
  *     ZICL_TRY(Zicl_ListAppend(list, item), rc);
  *     *out = Zicl_BoxList(list);
  *     return ZICL_OK;
@@ -369,15 +368,18 @@ Zicl_List *Zicl_NewListFromShimmerables(const Zicl_Shimmerable *shims, int n_shi
 /* Wrap an owned list handle as a value, transferring ownership. Do not touch
  * `list` afterwards. */
 Zicl_Value Zicl_BoxList(Zicl_List *list);
-/* Release an owned list handle (error path). */
-void Zicl_ListRelease(Zicl_List *list);
+/* Release an owned list handle. */
+void Zicl_ReleaseList(Zicl_List *list);
+/* Borrow a list handle: the same handle with its refcount incremented. The
+ * caller owns the returned handle and must release it with Zicl_ReleaseList. */
+Zicl_List *Zicl_BorrowList(Zicl_List *list);
 
 /* Copy-on-write entry points. If `value` is uniquely owned, `*out` is a
  * borrowed mutable view of the same object (no copy). If it is shared,
  * cross-thread, or a primitive, `*out` is NULL and the caller must
  * Zicl_DupAsList. Returns ZICL_OOM if shimmering allocates and fails, ZICL_ERR
  * for a malformed list string. A borrowed view is not owned: do not pass it to
- * Zicl_ListRelease(. Commit a duplicate back to its slot with
+ * Zicl_ReleaseList. Commit a duplicate back to its slot with
  * ZICL_SWAP(&slot, Zicl_BoxList(*out)). */
 int Zicl_AsListMut(Zicl_Interp *interp, Zicl_Value value, Zicl_List **out);
 /* An owned mutable copy of `value` shimmered to a list. Returns ZICL_OOM on OOM
@@ -432,15 +434,18 @@ Zicl_Dict *Zicl_NewDict(const Zicl_Value *values, int n_values);
 /* Wrap an owned dict handle as a value, transferring ownership. Do not touch
  * `dict` afterwards. */
 Zicl_Value Zicl_BoxDict(Zicl_Dict *dict);
-/* Release an owned dict handle (error path). */
-void Zicl_DictRelease(Zicl_Dict *dict);
+/* Release an owned dict handle. */
+void Zicl_ReleaseDict(Zicl_Dict *dict);
+/* Borrow a dict handle: the same handle with its refcount incremented. The
+ * caller owns the returned handle and must release it with Zicl_ReleaseDict. */
+Zicl_Dict *Zicl_BorrowDict(Zicl_Dict *dict);
 
 /* Copy-on-write entry points. If `value` is uniquely owned, `*out` is a
  * borrowed mutable view of the same object (no copy). If it is shared,
  * cross-thread, or a primitive, `*out` is NULL and the caller must
  * Zicl_DupAsDict. Returns ZICL_OOM if shimmering allocates and fails, ZICL_ERR
  * for a malformed dict string (odd item count). A borrowed view is not owned:
- * do not pass it to Zicl_DictRelease. Commit a duplicate back to its slot with
+ * do not pass it to Zicl_ReleaseDict. Commit a duplicate back to its slot with
  * ZICL_SWAP(&slot, Zicl_BoxDict(*out)). */
 int Zicl_AsDictMut(Zicl_Interp *interp, Zicl_Value value, Zicl_Dict **out);
 /* An owned mutable copy of `value` shimmered to a dict. Returns ZICL_OOM on OOM
@@ -519,7 +524,7 @@ const Zicl_Source *Zicl_AsSource(Zicl_Value value);
  * change it, release the old Zicl_OptionalValue and store a borrowed one (the
  * caller owns the bookkeeping, as with any refcounted field). `_hash` is
  * internal and must not be touched. A borrowed view is not owned: do not pass it
- * to Zicl_SourceRelease. */
+ * to Zicl_ReleaseSource. */
 Zicl_Source *Zicl_AsSourceMut(Zicl_Value value);
 /* An owned mutable copy of `value` shimmered to a Source, or NULL on OOM.
  * Commit it back to the slot with ZICL_SWAP(&slot, Zicl_BoxSource(out)). A
@@ -529,8 +534,11 @@ Zicl_Source *Zicl_DupAsSource(Zicl_Value value);
 /* Wrap an owned Source handle as a value, transferring ownership. Do not touch
  * `source` afterwards. */
 Zicl_Value Zicl_BoxSource(Zicl_Source *source);
-/* Release an owned Source handle (error path). */
-void Zicl_SourceRelease(Zicl_Source *source);
+/* Release an owned Source handle. */
+void Zicl_ReleaseSource(Zicl_Source *source);
+/* Borrow a Source handle: the same handle with its refcount incremented. The
+ * caller owns the returned handle and must release it with Zicl_ReleaseSource. */
+Zicl_Source *Zicl_BorrowSource(Zicl_Source *source);
 
 const char *Zicl_SourceGetFilename(Zicl_Value source);
 int Zicl_SourceGetLine(Zicl_Value source);
@@ -542,8 +550,8 @@ int Zicl_AttachSource(Zicl_Value *value, const char *filename, int line_no);
 
 /* ===== Interpreter =====
  * Registering commands, evaluating scripts, reading and writing the result,
- * setting variables, and the signal-depth machinery that defers Tcl signal
- * delivery during C callbacks that must not be interrupted. */
+ * setting variables, and the cooperative stop flag the runtime sets to
+ * interrupt a running eval. */
 
 /* Register `command` under `name`. `description` is a short usage string.
  * `min_arity`/`max_arity` are the argument bounds excluding the command name
@@ -556,6 +564,12 @@ int Zicl_CreateCommand(Zicl_Interp *interp, const char *name, Zicl_CCommandFn co
  * is already registered, ZICL_OOM if the registry entry cannot be allocated. */
 int Zicl_RegisterLazyFn(const char *name, Zicl_NativeInitFn init_fn);
 int Zicl_EvalValue(Zicl_Interp *interp, Zicl_Value script);
+/* Evaluate a NUL-terminated script string. Boxes it as a value and delegates to
+ * Zicl_EvalValue, so a top-level `return`/`break`/`continue` surfaces as
+ * ZICL_PROPAGATE/ZICL_BREAK/ZICL_CONTINUE rather than being swallowed (matching
+ * Tcl_Eval). The result is left on the interpreter; read it with Zicl_GetResult.
+ * Returns ZICL_OOM if boxing the string allocates and fails. */
+int Zicl_Eval(Zicl_Interp *interp, const char *script);
 int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
 Zicl_Value Zicl_GetScriptBeingEvaluated(Zicl_Interp *interp);
 /* Index of the current (innermost) eval frame. Walk downwards from this to
@@ -578,9 +592,16 @@ int Zicl_SetResultLong(Zicl_Interp *interp, long value);
 int Zicl_SetEmptyResult(Zicl_Interp *interp);
 int Zicl_SetVariable(Zicl_Interp *interp, Zicl_Value *name, Zicl_Value value);
 int Zicl_MakeErrorMessage(Zicl_Interp *interp);
-void Zicl_IncrSignalDepth(Zicl_Interp *interp);
-void Zicl_DecrSignalDepth(Zicl_Interp *interp);
-uint64_t Zicl_GetSigmask(Zicl_Interp *interp);
+
+/* Ask the interpreter to stop evaluating. The next command boundary in a
+ * running Zicl_Eval/Zicl_EvalValue/Zicl_EvalFile returns ZICL_EXIT. The runtime
+ * sets this from its own signal-delivery path; the interpreter never clears it. */
+void Zicl_RequestStop(Zicl_Interp *interp);
+/* True once Zicl_RequestStop has been called. */
+bool Zicl_StopRequested(Zicl_Interp *interp);
+/* Reset the stop flag so the interpreter can be reused. Only call this when no
+ * eval is in flight on `interp`. */
+void Zicl_ClearStop(Zicl_Interp *interp);
 
 /* ===== Capabilities =====
  * A capability is an unforgeable name (a `zicl://<host>/<type>/<id>` URL) for a

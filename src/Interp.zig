@@ -62,12 +62,6 @@ max_call_depth: usize,
 unknown_depth: usize,
 /// String containing `unknown`. Used to cache unknown lookup.
 unknown_str: Value,
-/// If this is greater than 0, it means we're catching and handling
-/// signals. Otherwise signals are ignored. This gets incremented
-/// when running [catch -signal].
-signal_depth: usize,
-/// Bit mask of caught signals, or 0 if none.
-signal: u64,
 
 /// Used to propagate `error.Continue` or `error.Break` up multiple
 /// loop levels. This is a separate counter from return_propagate, since
@@ -89,6 +83,9 @@ pending_error_code: OptionalValue,
 /// lose track of the original error. So instead when this happens we store the
 /// original error in a `-pending` key, inside of the new error.
 pending_error_during: OptionalValue,
+/// Set to true if you'd like the interpreter to stop evaluating. Checked
+/// after each command evaluated.
+stop_executing: std.atomic.Value(bool),
 
 parsed_scripts: ParsedScripts,
 parsed_exprs: ParsedExpressions,
@@ -127,7 +124,6 @@ pub fn narrowError(err: anyerror) heap.EvalError {
         error.EvalError => error.EvalError,
         error.Exit => error.Exit,
         error.OutOfMemory => error.OutOfMemory,
-        error.Signal => error.Signal,
         else => error.EvalError,
     };
 }
@@ -1358,9 +1354,8 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
 
         const command_result = interp.evalCommand(call_frame, script, parsed, &command_token_i);
 
-        // TODO actually check for signals.
-        if (false) {
-            return error.Signal;
+        if (interp.stop_executing.load(.monotonic)) {
+            return error.Exit;
         } else {
             command_result catch |err| switch (err) {
                 // `-level` counts closure calls, not script evaluations, so this
@@ -1438,7 +1433,7 @@ pub fn evalFile(interp: *Interp, filename: []const u8) heap.EvalError!void {
     const source = try objects.Source.new(bytes, filename_value.asOptional(), 1);
     defer source.asHead().release();
 
-    try interp.evalTopLevel(source.asHead().asValue());
+    try interp.evalValue(source.asHead().asValue());
 }
 
 pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
@@ -1460,8 +1455,7 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
         .stack_trace = .none,
         .pending_error_code = .none,
         .pending_error_during = .none,
-        .signal_depth = 0,
-        .signal = 0,
+        .stop_executing = .init(false),
         // TODO: init per interpreter
         .prng = .init(0),
         // Caches are initialized below.
@@ -1983,48 +1977,6 @@ pub fn testExpectScriptError(interp: *Interp, expected_error: anyerror, expected
             return error.TestUnexpectedResult;
         }
     }
-}
-
-pub fn checkSignal(interp: *Interp) bool {
-    return interp.signal_depth > 0 and interp.signal != 0;
-}
-
-// Maps signal numbers to their interned name string. Only includes signals
-// available on the current platform.
-const signal_name_map = blk: {
-    const SIG = std.posix.SIG;
-    const Entry = struct { num: u6, name: []const u8 };
-    const candidates = .{
-        .{ "HUP", .SIGHUP },       .{ "INT", .SIGINT },   .{ "QUIT", .SIGQUIT },
-        .{ "ILL", .SIGILL },       .{ "TRAP", .SIGTRAP }, .{ "ABRT", .SIGABRT },
-        .{ "BUS", .SIGBUS },       .{ "FPE", .SIGFPE },   .{ "KILL", .SIGKILL },
-        .{ "USR1", .SIGUSR1 },     .{ "SEGV", .SIGSEGV }, .{ "USR2", .SIGUSR2 },
-        .{ "PIPE", .SIGPIPE },     .{ "ALRM", .SIGALRM }, .{ "TERM", .SIGTERM },
-        .{ "CHLD", .SIGCHLD },     .{ "CONT", .SIGCONT }, .{ "STOP", .SIGSTOP },
-        .{ "TSTP", .SIGTSTP },     .{ "TTIN", .SIGTTIN }, .{ "TTOU", .SIGTTOU },
-        .{ "URG", .SIGURG },       .{ "XCPU", .SIGXCPU }, .{ "XFSZ", .SIGXFSZ },
-        .{ "VTALRM", .SIGVTALRM }, .{ "PROF", .SIGPROF }, .{ "WINCH", .SIGWINCH },
-        .{ "IO", .SIGIO },         .{ "PWR", .SIGPWR },   .{ "SYS", .SIGSYS },
-    };
-    var entries: []const Entry = &.{};
-    for (candidates) |pair| {
-        if (@hasDecl(SIG, pair[0])) {
-            entries = entries ++ &[_]Entry{.{ .num = @field(SIG, pair[0]), .name = pair[0] }};
-        }
-    }
-    break :blk entries;
-};
-
-/// Build a list of signal name strings for each signal bit set in `mask`.
-pub fn signalMaskToList(mask: u64) !Value {
-    const list = try objects.List.newWithCapacity(&.{}, @popCount(mask));
-    errdefer list.asHead().release();
-    inline for (signal_name_map) |entry| {
-        if (mask & (@as(u64, 1) << entry.num) != 0) {
-            list.appendAssumeCapacity(heap.InternedString.newValue(entry.name));
-        }
-    }
-    return list.asHead().asValue();
 }
 
 pub fn nextRandomFloat(interp: *Interp) f64 {
