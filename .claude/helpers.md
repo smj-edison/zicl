@@ -18,8 +18,8 @@ this before implementing anything that might already exist.
 - `heap.initialized`, `heap.init_mutex`, `heap.running_leak_check` -- Global state flags. Lock `init_mutex` when adding or removing global registrations, not when reading them.
 
 ### Registries
-- `heap.NativeInitFn` -- Signature for a lazy native command initializer: `*const fn (interp: *anyopaque) callconv(.c) void`.
-- `heap.nativefn_registry.register(gpa, name, init_fn)` -- Register a lazy C command initializer; `error.DuplicateNativeFn` on duplicates.
+- `heap.LazyRegisterFn` -- Signature for a lazy native command initializer: `*const fn (interp: *anyopaque) callconv(.c) void`.
+- `heap.nativefn_registry.register(gpa, name, init_fn)` -- Register a lazy C command initializer; `error.DuplicateLazyFn` on duplicates.
 - `heap.nativefn_registry.get(name)` -- Look up a lazy initializer by name, or null.
 - `heap.registered_hashes.getAndBorrow(hash)` -- Look up a `u256` hash and return a borrowed `*Object` (or null). Thread-safe via shared lock.
 - `heap.registered_hashes.register(key, obj)` -- Idempotently register `obj` under `key`; marks it cross-thread and bumps the instance count.

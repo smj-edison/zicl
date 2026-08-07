@@ -188,8 +188,8 @@ typedef int (*Zicl_CCommandFn)(Zicl_Interp *interp, int argc, Zicl_Shimmerable *
 
 /* A lazy native command initializer, called the first time a registered command
  * name is looked up. It is expected to install the real command (via
- * `Zicl_CreateCommand`) and then return. Mirrors `heap.NativeInitFn`. */
-typedef void (*Zicl_NativeInitFn)(void *interp);
+ * `Zicl_CreateCommand`) and then return. Mirrors `heap.LazyRegisterFn`. */
+typedef void (*Zicl_LazyRegisterFn)(void *interp);
 
 /* ===== Lifecycle =====
  * Process and thread setup, interpreter creation, and teardown. The global
@@ -562,7 +562,12 @@ int Zicl_CreateCommand(Zicl_Interp *interp, const char *name, Zicl_CCommandFn co
 /* Register a lazy initializer for `name`. The initializer runs on first lookup,
  * and is expected to install the real command itself. Returns ZICL_ERR if `name`
  * is already registered, ZICL_OOM if the registry entry cannot be allocated. */
-int Zicl_RegisterLazyFn(const char *name, Zicl_NativeInitFn init_fn);
+/* `library` identifies the registrant (e.g. a compiled extension's own
+ * package name). Registering the same `name` again from the same `library`
+ * is a no-op -- expected when independent threads each `load` the same
+ * compiled library -- but a different `library` claiming a `name` already
+ * taken is a real collision and returns ZICL_ERR. */
+int Zicl_RegisterLazyFn(const char *name, const char *library, Zicl_LazyRegisterFn init_fn);
 int Zicl_EvalValue(Zicl_Interp *interp, Zicl_Value script);
 /* Evaluate a NUL-terminated script string. Boxes it as a value and delegates to
  * Zicl_EvalValue, so a top-level `return`/`break`/`continue` surfaces as
@@ -571,6 +576,45 @@ int Zicl_EvalValue(Zicl_Interp *interp, Zicl_Value script);
  * Returns ZICL_OOM if boxing the string allocates and fails. */
 int Zicl_Eval(Zicl_Interp *interp, const char *script);
 int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
+/* Dynamically load a compiled Zicl extension: dlopen `path`, then call its
+ * `Zicl_<pkgname>Init(interp)`, where `<pkgname>` is `path`'s basename up to
+ * (not including) its first `.` (so `foo.so` calls `Zicl_fooInit`). The
+ * library is never dlclose'd, since an extension can hand out function
+ * pointers that outlive this call. This is what the `load` Tcl command calls;
+ * use it directly to load an extension without going through script
+ * evaluation.
+ *
+ * There are no namespaces to install commands into, so `Zicl_<pkgname>Init`
+ * does not call Zicl_CreateCommand itself. Instead, for each command it
+ * provides, it calls Zicl_RegisterLazyFn(registryName, path, real_registrar)
+ * -- `real_registrar` is a plain internal function pointer, never its own
+ * exported symbol, that does the actual Zicl_CreateCommand calls the first
+ * time `registryName` is looked up on a given interp -- and returns an owned
+ * Zicl_Dict of `{cleanName registryName ...}` (Zicl_LoadLibrary releases it).
+ * The two names differ in purpose: `registryName` is whatever key was passed
+ * to Zicl_RegisterLazyFn, typically qualified with the library's own package
+ * name so unrelated libraries can't collide in the shared registry, while
+ * `cleanName` is what the *result* dict below uses as its key. This split is
+ * required, not cosmetic: dict sugar (`$lib::name`) treats `::` as its own
+ * path separator, so a registry-style qualified name could never work as a
+ * dict key. `path` doubles as Zicl_RegisterLazyFn's dedup key: re-registering
+ * the same registryName from the same path is a no-op, since independent
+ * threads may each `load` the same compiled file. On failure,
+ * `Zicl_<pkgname>Init` sets the interp's result to an error message and
+ * returns NULL.
+ *
+ * On success, Zicl_LoadLibrary turns that into `{cleanName1 {nativefn
+ * registryName1} cleanName2 {nativefn registryName2} ...}` and leaves it as
+ * the interp's result: an ordinary dict, not a namespace, and an ordinary
+ * Folk value that propagates through envs and closures like any other. A
+ * caller uses it with dict-sugar, e.g. `dict get $lib cleanName` or
+ * `$lib::cleanName arg ...`; the latter drives the exact same
+ * lazy-registration path a plain `nativefn` name would; the underlying
+ * commands materialize on whichever interp first actually calls one.
+ *
+ * Returns ZICL_ERR (with a result message) if the file can't be opened, the
+ * init symbol is missing, or the init function itself fails. */
+int Zicl_LoadLibrary(Zicl_Interp *interp, const char *path);
 Zicl_Value Zicl_GetScriptBeingEvaluated(Zicl_Interp *interp);
 /* Index of the current (innermost) eval frame. Walk downwards from this to
  * inspect the stack; pair with Zicl_EvalFrameScript. */

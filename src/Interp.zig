@@ -830,7 +830,7 @@ fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_
         }
 
         // Command not registered locally, so check the shared lazy-init registry.
-        if (heap.nativefn_registry.get(cmd_name)) |init_fn| {
+        if (heap.lazy_fn_registry.get(cmd_name)) |init_fn| {
             init_fn(@ptrCast(interp));
             // Retry after initialization.
             if (interp.global_commands.getPtr(cmd_name)) |command| {

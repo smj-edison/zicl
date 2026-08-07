@@ -14,6 +14,7 @@ const narrowError = Interp.narrowError;
 const evaltypes = @import("evaltypes.zig");
 const ReturnCode = heap.ReturnCode;
 const commands = @import("commands/common.zig");
+const load = @import("commands/load.zig");
 const leak_check = @import("leak_check.zig");
 const ioutil = @import("ioutil.zig");
 const Capability = @import("Capability.zig");
@@ -703,10 +704,10 @@ export fn Zicl_AttachSource(value: *Value, filename: [*:0]const u8, line_no: c_i
 // setting variables, and the cooperative stop flag the runtime sets to
 // interrupt a running eval.
 
-export fn Zicl_RegisterLazyFn(name: [*:0]const u8, init_fn: heap.NativeInitFn) callconv(.c) ReturnCode {
-    heap.nativefn_registry.register(heap.global_gpa, std.mem.span(name), init_fn) catch |err| switch (err) {
+export fn Zicl_RegisterLazyFn(name: [*:0]const u8, library: [*:0]const u8, init_fn: heap.LazyRegisterFn) callconv(.c) ReturnCode {
+    heap.lazy_fn_registry.register(heap.global_gpa, std.mem.span(name), std.mem.span(library), init_fn) catch |err| switch (err) {
         error.OutOfMemory => return .oom,
-        error.DuplicateNativeFn => return .@"error",
+        error.DuplicateLazyFn => return .@"error",
     };
     return .ok;
 }
@@ -745,6 +746,16 @@ export fn Zicl_Eval(interp: *Interp, script: [*:0]const u8) callconv(.c) ReturnC
 
 export fn Zicl_EvalFile(interp: *Interp, filename: [*:0]const u8) callconv(.c) ReturnCode {
     return ReturnCode.fromErrorUnion(interp.evalFile(std.mem.span(filename)));
+}
+
+/// Dynamically load a compiled Zicl extension: dlopen `path`, then call its
+/// `Zicl_<pkgname>Init(interp)`, where `<pkgname>` is `path`'s basename up to
+/// (not including) its first `.`. The library is never dlclose'd, since an
+/// extension can hand out function pointers that outlive this call. This is
+/// the same logic the `load` Tcl command uses; call it directly to load an
+/// extension without going through script evaluation.
+export fn Zicl_LoadLibrary(interp: *Interp, path: [*:0]const u8) callconv(.c) ReturnCode {
+    return ReturnCode.fromErrorUnion(load.loadLibrary(interp, std.mem.span(path)));
 }
 
 export fn Zicl_GetScriptBeingEvaluated(interp: *Interp) callconv(.c) Value {

@@ -111,7 +111,7 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 -   `Object` -- the 88-byte heap-allocated object header plus body, carrying a vtable, ref count, atomic string metadata, and hash metadata.
 -   `SpecialString` -- the wrapper for large strings (> 1024 bytes) and strings that embed hash references, ref-counted independently of their owning object.
 -   `HashRegistry` (`heap.registered_hashes`) -- a global, `RwLock`-protected, content-addressable store mapping `u256` Blake3 hashes to a representative `*Object`. Lets any thread resolve a shared object by hash, and reclaims the representative once every instance of the hash is gone.
--   `NativeFnRegistry` (`heap.nativefn_registry`) -- a global, mutex-protected map from command name to a lazy `NativeInitFn`, for lazily loading C commands.
+-   `NativeFnRegistry` (`heap.nativefn_registry`) -- a global, mutex-protected map from command name to a lazy `LazyRegisterFn`, for lazily loading C commands.
 -   `hashutil` -- Blake3 hashing, base64url encoding of hashes, and scanning strings for `blake3~<hash>` references.
 
 **Object System (src/objects.zig)**: Implements Tcl's dynamic typing through vtable-based type shimmering. Each Tcl type is a Zig struct that owns a `pub const vtable: Object.VTable` and a body that lives in the `Object`'s inline `body_backing` (at most `Object.body_max_size` = 48 bytes, aligned to `Object.body_align` = 8):

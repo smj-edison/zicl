@@ -32,7 +32,7 @@ pub var global_gpa: mem.Allocator = undefined;
 pub threadlocal var local_arena_instance: memutil.RewindableArena = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
-pub var nativefn_registry: NativeFnRegistry = .{};
+pub var lazy_fn_registry: LazyFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
 
 var trace_mutex: std.Io.Mutex = .init;
@@ -124,7 +124,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
     global_gpa = gpa;
     global_io = io;
 
-    nativefn_registry = .{};
+    lazy_fn_registry = .{};
     registered_hashes = .{};
 
     leak_check.init();
@@ -169,7 +169,7 @@ pub fn deinitGlobals() void {
     Capability.deinitGlobals();
     regex.deinitGlobals();
 
-    nativefn_registry.deinit(global_gpa);
+    lazy_fn_registry.deinit(global_gpa);
     registered_hashes.entries.deinit(global_gpa);
 
     initialized = false;
@@ -205,29 +205,57 @@ pub export fn dumpLastTouchedTrace(fd: i32) void {
 
 /// Signature for a lazy native command initializer. The interpreter pointer
 /// is opaque here to avoid a circular dependency on Interp.zig.
-pub const NativeInitFn = *const fn (interp: *anyopaque) callconv(.c) void;
+pub const LazyRegisterFn = *const fn (interp: *anyopaque) callconv(.c) void;
+
+const LazyFnEntry = struct {
+    init_fn: LazyRegisterFn,
+    /// The lazy registry makes sure that if a second function is registered
+    /// with a pre-existing name, that error.DuplicateLazyFn is returned.
+    /// But, it's possible that a .so is loaded twice, each time loading
+    /// a function with the same name. This would normally error, so we
+    /// avoid that error be keeping track of what library a function came
+    /// from. If a second function is registered with the same name _and_
+    /// the same library, we just ignore it, since it's previously been
+    /// loaded.
+    library: []const u8,
+};
+
 /// Registry for lazily loaded functions. Will call `init_fn` when the function doesn't
 /// exist as a nativefn.
-pub const NativeFnRegistry = struct {
+pub const LazyFnRegistry = struct {
     mutex: std.Io.Mutex = .init,
-    entries: std.StringHashMapUnmanaged(NativeInitFn) = .empty,
+    entries: std.StringHashMapUnmanaged(LazyFnEntry) = .empty,
 
-    pub fn register(self: *NativeFnRegistry, gpa: Allocator, name: []const u8, init_fn: NativeInitFn) !void {
+    /// error.DuplicateLazyFn is returned if a function name is registered twice,
+    /// but only if it's from a different library (this is so library loading
+    /// is idempotent).
+    pub fn register(self: *LazyFnRegistry, gpa: Allocator, name: []const u8, library: []const u8, init_fn: LazyRegisterFn) !void {
         self.mutex.lockUncancelable(global_io);
         defer self.mutex.unlock(global_io);
-        if (self.entries.contains(name)) {
-            return error.DuplicateNativeFn;
+        if (self.entries.get(name)) |existing| {
+            if (std.mem.eql(u8, existing.library, library)) return;
+            return error.DuplicateLazyFn;
         }
-        try self.entries.put(gpa, name, init_fn);
+
+        const name_owned = try global_gpa.dupe(u8, name);
+        errdefer global_gpa.free(name_owned);
+        const library_owned = try global_gpa.dupe(u8, library);
+        errdefer global_gpa.free(library_owned);
+        try self.entries.put(gpa, name_owned, .{ .init_fn = init_fn, .library = library_owned });
     }
 
-    pub fn get(self: *NativeFnRegistry, name: []const u8) ?NativeInitFn {
+    pub fn get(self: *LazyFnRegistry, name: []const u8) ?LazyRegisterFn {
         self.mutex.lockUncancelable(global_io);
         defer self.mutex.unlock(global_io);
-        return self.entries.get(name);
+        return if (self.entries.get(name)) |entry| entry.init_fn else null;
     }
 
-    pub fn deinit(self: *NativeFnRegistry, gpa: Allocator) void {
+    pub fn deinit(self: *LazyFnRegistry, gpa: Allocator) void {
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            global_gpa.free(entry.key_ptr.*);
+            global_gpa.free(entry.value_ptr.library);
+        }
         self.entries.deinit(gpa);
     }
 };
