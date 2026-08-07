@@ -45,6 +45,149 @@ static int stop_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
     return ZICL_OK;
 }
 
+/* ---- Custom native object types ----
+ * Two vtables: Point2D fits inline (well under ZICL_OBJECT_BODY_MAX_SIZE),
+ * BigStruct doesn't and boxes itself, entirely at this (C) layer -- Zicl's
+ * Object code treats both exactly the same, as 48 opaque bytes. */
+
+typedef struct { double x, y; } Point2D;
+
+static Zicl_Object *point2d_duplicate(const Zicl_Object *src);
+static void point2d_free_internal_rep(Zicl_Object *obj);
+static int point2d_update_string(Zicl_Object *obj);
+
+static const Zicl_ObjectVTable point2d_vtable = {
+    .is_c_vtable = true,
+    .name = "Point2D",
+    .duplicate = point2d_duplicate,
+    .free_internal_rep = point2d_free_internal_rep,
+    .update_string = point2d_update_string,
+    .make_crossthread = Zicl_NoopMakeCrossthread,
+    .enumerate_struct = NULL,
+};
+
+static Zicl_Object *point2d_duplicate(const Zicl_Object *src) {
+    void *body;
+    Zicl_Object *obj = Zicl_NewObject(&point2d_vtable, sizeof(Point2D), &body);
+    if (!obj) return NULL;
+    memcpy(body, Zicl_ObjectBodyConst(src), sizeof(Point2D));
+    return obj;
+}
+static void point2d_free_internal_rep(Zicl_Object *obj) { (void)obj; }
+static int point2d_update_string(Zicl_Object *obj) {
+    const Point2D *p = (const Point2D *)Zicl_ObjectBodyConst(obj);
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%.1f %.1f", p->x, p->y);
+    return Zicl_SetObjectString(obj, buf, len);
+}
+
+/* Unrelated to Point2D; never instantiated, only used by address, to check
+ * that Zicl_AsObject distinguishes types by vtable identity rather than by
+ * structural shape. */
+static const Zicl_ObjectVTable other_vtable = {
+    .is_c_vtable = true,
+    .name = "Other",
+    .duplicate = NULL,
+    .free_internal_rep = NULL,
+    .update_string = NULL,
+    .make_crossthread = Zicl_NoopMakeCrossthread,
+    .enumerate_struct = NULL,
+};
+
+/* Bigger than ZICL_OBJECT_BODY_MAX_SIZE, so its body is a BigStruct* to a
+ * separately malloc'd copy, rather than a BigStruct. sizeof(BigStruct*) is
+ * what gets passed to Zicl_NewObject, not sizeof(BigStruct). */
+typedef struct { char payload[128]; } BigStruct;
+
+static Zicl_Object *bigstruct_duplicate(const Zicl_Object *src);
+static void bigstruct_free_internal_rep(Zicl_Object *obj);
+
+static const Zicl_ObjectVTable bigstruct_vtable = {
+    .is_c_vtable = true,
+    .name = "BigStruct",
+    .duplicate = bigstruct_duplicate,
+    .free_internal_rep = bigstruct_free_internal_rep,
+    .update_string = NULL,
+    .make_crossthread = Zicl_NoopMakeCrossthread,
+    .enumerate_struct = NULL,
+};
+
+static Zicl_Object *bigstruct_duplicate(const Zicl_Object *src) {
+    void *body;
+    Zicl_Object *obj = Zicl_NewObject(&bigstruct_vtable, sizeof(BigStruct *), &body);
+    if (!obj) return NULL;
+    BigStruct *copy = (BigStruct *)malloc(sizeof(BigStruct));
+    if (!copy) return NULL;
+    BigStruct *src_data = *(BigStruct **)Zicl_ObjectBodyConst(src);
+    memcpy(copy, src_data, sizeof(BigStruct));
+    *(BigStruct **)body = copy;
+    return obj;
+}
+static void bigstruct_free_internal_rep(Zicl_Object *obj) {
+    free(*(BigStruct **)Zicl_ObjectBody(obj));
+}
+
+/* A plain (non-Zicl_Value, non-Object) nested struct, reached via
+ * Zicl_StructWalkerFollowStruct. Its enumerate_struct receives `node` as
+ * exactly the pointer FollowStruct was given -- no Object wraps it, so
+ * nothing to unwrap, unlike Wrapper's own (top-level) enumerate_struct
+ * below. */
+typedef struct { int tag; } Inner;
+
+static int inner_enumerate_struct(Zicl_StructWalker *ctx, const void *node) {
+    const Inner *inner = (const Inner *)node;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", inner->tag);
+    return Zicl_StructWalkerAddField(ctx, "tag", buf);
+}
+
+/* Exercises all three Zicl_StructWalker functions from one enumerate_struct:
+ * a plain nested struct (FollowStruct), a field that's itself a Zicl_Value
+ * (FollowValue), and (inside inner_enumerate_struct) a plain scalar field
+ * (AddField). */
+typedef struct {
+    Inner inner;
+    Zicl_Value label;
+} Wrapper;
+
+static Zicl_Object *wrapper_duplicate(const Zicl_Object *src);
+static void wrapper_free_internal_rep(Zicl_Object *obj);
+static int wrapper_enumerate_struct(Zicl_StructWalker *ctx, const void *node);
+
+static const Zicl_ObjectVTable wrapper_vtable = {
+    .is_c_vtable = true,
+    .name = "Wrapper",
+    .duplicate = wrapper_duplicate,
+    .free_internal_rep = wrapper_free_internal_rep,
+    .update_string = NULL,
+    .make_crossthread = Zicl_NoopMakeCrossthread,
+    .enumerate_struct = wrapper_enumerate_struct,
+};
+
+static Zicl_Object *wrapper_duplicate(const Zicl_Object *src) {
+    void *body;
+    Zicl_Object *obj = Zicl_NewObject(&wrapper_vtable, sizeof(Wrapper), &body);
+    if (!obj) return NULL;
+    const Wrapper *src_w = (const Wrapper *)Zicl_ObjectBodyConst(src);
+    Wrapper *dst_w = (Wrapper *)body;
+    dst_w->inner = src_w->inner;
+    dst_w->label = Zicl_Borrow(src_w->label);
+    return obj;
+}
+static void wrapper_free_internal_rep(Zicl_Object *obj) {
+    Wrapper *w = (Wrapper *)Zicl_ObjectBody(obj);
+    Zicl_Release(w->label);
+}
+static int wrapper_enumerate_struct(Zicl_StructWalker *ctx, const void *node) {
+    /* Top-level: `node` is the Zicl_Object* itself (see Zicl_EnumerateStructFn's
+     * docs), so unwrap it the same way duplicate/free_internal_rep do. */
+    Zicl_Object *obj = (Zicl_Object *)node;
+    const Wrapper *w = (const Wrapper *)Zicl_ObjectBodyConst(obj);
+    int rc = Zicl_StructWalkerFollowStruct(ctx, "inner", &w->inner, "Inner", inner_enumerate_struct);
+    if (rc != ZICL_OK) return rc;
+    return Zicl_StructWalkerFollowValue(ctx, "label", w->label);
+}
+
 int main(void) {
     CHECK(Zicl_InitGlobals(NULL) == ZICL_OK);
     CHECK(Zicl_InitThread() == ZICL_OK);
@@ -486,6 +629,76 @@ int main(void) {
         int len = -1;
         const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
         CHECK(got != NULL && len == 1 && got[0] == '2');
+    }
+
+    /* Custom native object types: a POD struct living inline in the 48-byte
+     * body, ref-counted and duplicated through the same Object machinery
+     * every built-in type uses. */
+    {
+        Point2D *body;
+        Zicl_Object *obj = Zicl_NewObject(&point2d_vtable, sizeof(Point2D), (void **)&body);
+        CHECK(obj != NULL);
+        body->x = 3.0;
+        body->y = 4.0;
+
+        Zicl_Value v = Zicl_BoxObject(obj);
+        CHECK(Zicl_RefCount(v) == 1);
+
+        /* Recognized by its own vtable, by address, not structurally. */
+        Point2D *seen = (Point2D *)Zicl_AsObject(v, &point2d_vtable);
+        CHECK(seen == body);
+        CHECK(seen->x == 3.0 && seen->y == 4.0);
+        CHECK(Zicl_AsObject(v, &other_vtable) == NULL);
+
+        /* update_string is called lazily, on first need, via Zicl_SetObjectString. */
+        const char *str = Zicl_String(v);
+        CHECK(str != NULL && strcmp(str, "3.0 4.0") == 0);
+
+        /* Duplicate goes through point2d_duplicate: independent object, same
+         * field values. */
+        Zicl_Value dup;
+        CHECK(Zicl_Duplicate(v, &dup) == ZICL_OK);
+        Point2D *dup_body = (Point2D *)Zicl_AsObject(dup, &point2d_vtable);
+        CHECK(dup_body != NULL && dup_body != body);
+        CHECK(dup_body->x == 3.0 && dup_body->y == 4.0);
+
+        Zicl_Release(dup);
+        Zicl_Release(v);
+    }
+
+    /* A struct too big to fit inline (BigStruct is 128 bytes, well over
+     * ZICL_OBJECT_BODY_MAX_SIZE): the vtable's own callbacks decide to box
+     * it, storing a pointer inline instead of the struct itself. Zicl's
+     * Object code never needs to know this one is out-of-line. */
+    {
+        BigStruct **body;
+        Zicl_Object *obj = Zicl_NewObject(&bigstruct_vtable, sizeof(BigStruct *), (void **)&body);
+        CHECK(obj != NULL);
+        *body = (BigStruct *)malloc(sizeof(BigStruct));
+        CHECK(*body != NULL);
+        memset((*body)->payload, 'a', sizeof((*body)->payload));
+
+        Zicl_Value v = Zicl_BoxObject(obj);
+        Zicl_Value dup;
+        CHECK(Zicl_Duplicate(v, &dup) == ZICL_OK);
+        BigStruct **dup_body = (BigStruct **)Zicl_AsObject(dup, &bigstruct_vtable);
+        CHECK(dup_body != NULL && *dup_body != *body);  /* independently malloc'd */
+        CHECK(memcmp((*dup_body)->payload, (*body)->payload, sizeof((*body)->payload)) == 0);
+
+        Zicl_Release(dup);
+        Zicl_Release(v);  /* exercises bigstruct_free_internal_rep */
+    }
+
+    /* enumerate_struct, exercised end to end via a deliberate, permanent
+     * leak: Zicl_LeakCheckAll (called once below, at the very end of main --
+     * see its own docs for why it's shutdown-only) walks it, driving
+     * AddField, FollowStruct, and FollowValue. Not released on purpose. */
+    {
+        Wrapper *body;
+        Zicl_Object *obj = Zicl_NewObject(&wrapper_vtable, sizeof(Wrapper), (void **)&body);
+        CHECK(obj != NULL);
+        body->inner.tag = 42;
+        CHECK(Zicl_NewString(&body->label, "leaked-on-purpose", -1) == ZICL_OK);
     }
 
     Zicl_InterpDestroy(interp);

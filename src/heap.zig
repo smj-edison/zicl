@@ -921,15 +921,11 @@ pub const Object = extern struct {
         name: [*:0]const u8,
         as: extern union {
             c: extern struct {
-                duplicate: ?*const fn (src: *const Object) ?*Object,
-                free_internal_rep: ?*const fn (obj: *Object) void,
-                update_string: ?*const fn (obj: *Object) ReturnCode,
-                make_crossthread: ?*const fn (obj: *Object) void,
-                enumerate_struct: ?*const fn (
-                    obj: *const Object,
-                    ctx: StructIterator,
-                    node_info: *const StructIterator.NodeInfo,
-                ) ReturnCode,
+                duplicate: ?*const fn (src: *const Object) callconv(.c) ?*Object,
+                free_internal_rep: ?*const fn (obj: *Object) callconv(.c) void,
+                update_string: ?*const fn (obj: *Object) callconv(.c) ReturnCode,
+                make_crossthread: ?*const fn (obj: *Object) callconv(.c) void,
+                enumerate_struct: ?memutil.StructIterator.EnumerateStructCFn,
             },
             zig: extern struct {
                 duplicate: ?*const fn (src: *const Object) error{OutOfMemory}!*Object,
@@ -1126,7 +1122,14 @@ pub const Object = extern struct {
             .none => {},
         }
         try ctx.addField(Metadata, info, "metadata", "{any}", .{obj.metadata});
-        if (obj.vtable.as.zig.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
+        if (obj.vtable.is_c_vtable) {
+            if (obj.vtable.as.c.enumerate_struct) |c_fn| {
+                var walker: memutil.StructIterator.CEnumerateContext = .{ .ctx = ctx, .info = info };
+                if (c_fn(&walker, info.node) != 0) return error.OutOfMemory;
+            }
+        } else {
+            if (obj.vtable.as.zig.enumerate_struct) |walk_fn| try walk_fn(obj, ctx, info);
+        }
     }
 
     pub fn freeBacking(obj: *Object) void {
@@ -1189,13 +1192,24 @@ pub const Object = extern struct {
                 // No string set (at least that we saw), so we'll go ahead and generate it
                 // and attempt to set it. If we fail it's fine, since strings are always
                 // generated the same way.
-                const update_str_fn = obj.vtable.as.zig.update_string orelse {
-                    debug.panic("Can't generate string for {s} (should always have a string rep)", .{obj.vtable.name});
-                };
-                update_str_fn(obj) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.OtherThreadSet => {},
-                };
+                if (obj.vtable.is_c_vtable) {
+                    const update_str_fn = obj.vtable.as.c.update_string orelse {
+                        debug.panic("Can't generate string for {s} (should always have a string rep)", .{obj.vtable.name});
+                    };
+                    switch (update_str_fn(obj)) {
+                        .ok => {},
+                        .oom => return error.OutOfMemory,
+                        else => unreachable,
+                    }
+                } else {
+                    const update_str_fn = obj.vtable.as.zig.update_string orelse {
+                        debug.panic("Can't generate string for {s} (should always have a string rep)", .{obj.vtable.name});
+                    };
+                    update_str_fn(obj) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.OtherThreadSet => {},
+                    };
+                }
 
                 switch (obj.getStringDetails()) {
                     .special => |special| return special.getString(),
@@ -1405,7 +1419,11 @@ pub const Object = extern struct {
 
     pub fn invalidateInternalRep(obj: *Object) void {
         obj.asValue().trace("Invalidate body", .{});
-        if (obj.vtable.as.zig.free_internal_rep) |free_fn| free_fn(obj);
+        if (obj.vtable.is_c_vtable) {
+            if (obj.vtable.as.c.free_internal_rep) |free_fn| free_fn(obj);
+        } else {
+            if (obj.vtable.as.zig.free_internal_rep) |free_fn| free_fn(obj);
+        }
     }
 
     pub fn getHashNoRegister(obj: *Object) !u256 {

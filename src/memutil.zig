@@ -858,6 +858,9 @@ pub const StructIterator = struct {
         parent_info: ?*const NodeInfo,
         node: *const anyopaque,
         enumerate_struct: ?*const EnumerateStructFn,
+        /// If this Node is from C, we have a C-compatible signature here.
+        /// This will be chosen over `enumerate_struct` if set.
+        enumerate_struct_c: ?EnumerateStructCFn = null,
         type_name: []const u8,
         as_string: ?[]const u8,
         /// Whether we created this node on the arena instead of pulling it from the heap.
@@ -865,6 +868,12 @@ pub const StructIterator = struct {
     };
 
     pub const EnumerateStructFn = fn (ctx: StructIterator, node_info: *const NodeInfo) Error!void;
+    /// Return code other than 0 is considered OOM.
+    pub const EnumerateStructCFn = *const fn (walker: *CEnumerateContext, node: *const anyopaque) callconv(.c) c_int;
+    pub const CEnumerateContext = struct {
+        ctx: StructIterator,
+        info: *const NodeInfo,
+    };
     pub const VTable = struct {
         visit_node: *const fn (ctx: StructIterator, node_info: *const NodeInfo, edge_coming_from: ?[]const u8) Error!void,
     };
@@ -1001,7 +1010,12 @@ pub const GraphWalker = struct {
             .as_string = info.as_string,
             .is_synthetic = info.is_synthetic,
         });
-        if (info.enumerate_struct) |follow_fn| try follow_fn(ctx, info);
+        if (info.enumerate_struct_c) |c_fn| {
+            var walker: StructIterator.CEnumerateContext = .{ .ctx = ctx, .info = info };
+            if (c_fn(&walker, info.node) != 0) return error.OutOfMemory;
+        } else if (info.enumerate_struct) |follow_fn| {
+            try follow_fn(ctx, info);
+        }
     }
 };
 

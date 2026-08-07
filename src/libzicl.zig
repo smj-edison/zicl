@@ -18,6 +18,7 @@ const load = @import("commands/load.zig");
 const leak_check = @import("leak_check.zig");
 const ioutil = @import("ioutil.zig");
 const Capability = @import("Capability.zig");
+const memutil = @import("memutil.zig");
 
 // ===== Internal: logging and panic =====
 // These are not part of the C API surface; they wire Zig's log and panic
@@ -249,6 +250,145 @@ export fn Zicl_RefCount(value: Value) callconv(.c) u32 {
 export fn Zicl_RefCountPtr(value: Value) callconv(.c) ?*u32 {
     const obj = value.asPtr() orelse return null;
     return &obj.ref_count;
+}
+
+// ===== Custom native object types =====
+// See the header comment for the split between what lives here (allocation,
+// type identity) and what a vtable's own callbacks are expected to decide
+// (whether a struct fits inline or needs out-of-line storage).
+
+export fn Zicl_NoopMakeCrossthread(obj: *heap.Object) callconv(.c) void {
+    heap.Object.noopMakeCrossthread(obj);
+}
+
+export fn Zicl_NewObject(
+    vtable: *const heap.Object.VTable,
+    size: usize,
+    out_body: *?*anyopaque,
+) callconv(.c) ?*heap.Object {
+    if (size > heap.Object.body_max_size) {
+        @panic("Zicl_NewObject: size exceeds ZICL_OBJECT_BODY_MAX_SIZE");
+    }
+
+    const obj = heap.global_gpa.create(heap.Object) catch return null;
+    obj.* = .{
+        .vtable = vtable,
+        .ref_count = 1,
+        .metadata = .{},
+        .hash_metadata = .init(.{}),
+        .string = .init(null),
+        .string_metadata = .init(.{}),
+        .body_backing = @splat(0),
+    };
+    leak_check.globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{vtable.name});
+
+    out_body.* = &obj.body_backing;
+    return obj;
+}
+
+export fn Zicl_AsObject(value: Value, vtable: *const heap.Object.VTable) callconv(.c) ?*anyopaque {
+    const obj = value.asPtr() orelse return null;
+    if (obj.vtable != vtable) return null;
+    return &obj.body_backing;
+}
+
+export fn Zicl_ObjectBody(obj: *heap.Object) callconv(.c) *anyopaque {
+    return &obj.body_backing;
+}
+
+export fn Zicl_ObjectBodyConst(obj: *const heap.Object) callconv(.c) *const anyopaque {
+    return &obj.body_backing;
+}
+
+// For use inside a vtable's `update_string` callback: computes the string
+// representation and copies it in, the C-callable counterpart to what
+// `String.updateString` (and every other built-in type's) does internally
+// via `setStringDuplicatingIgnoreRace`. Without this, `update_string` -- a
+// required callback, not an optional one -- would have no way to actually
+// fulfill its contract from C.
+export fn Zicl_SetObjectString(obj: *heap.Object, ptr: [*:0]const u8, len: c_int) callconv(.c) ReturnCode {
+    const bytes = if (len < 0) std.mem.span(ptr) else ptr[0..@intCast(len)];
+    obj.setStringDuplicatingIgnoreRace(bytes) catch return .oom;
+    return .ok;
+}
+
+// ===== Struct enumeration (leak-check dump introspection) =====
+// The C-callable counterpart to a Zig type's `enumerateStruct`: called for a
+// C-vtable object's own `enumerate_struct` (Zicl_ObjectVTable), or for a
+// plain struct field reached via Zicl_StructWalkerFollowStruct, to describe
+// that struct's own fields for Zicl_LeakCheckAll's dump.
+//
+// `Zicl_StructWalker*` is memutil.zig's `StructIterator.CEnumerateContext`, under a
+// name meaningful on the C side. A C-defined enumerate_struct only ever
+// receives one opaquely (never constructs one itself) and passes it straight
+// through to these three functions.
+
+const CEnumerateContext = memutil.StructIterator.CEnumerateContext;
+
+// Show `fieldName` as `valueStr` (already formatted) in the dump.
+export fn Zicl_StructWalkerAddField(
+    walker: *CEnumerateContext,
+    field_name: [*:0]const u8,
+    value_str: [*:0]const u8,
+) callconv(.c) ReturnCode {
+    const dummy_node = walker.ctx.arena.create(u8) catch return .oom;
+    // Duped onto the arena, not just spanned: `dumpDot`/`dumpDetails` read
+    // `as_string` later, once the whole walk has finished, so a caller who
+    // formatted this into a stack buffer (the common case -- see
+    // inner_enumerate_struct in c_api_test.c) would otherwise have its value
+    // read back out of memory that's long since been reused for something
+    // else, matching what addFieldString already does for a Zig-native type.
+    const owned_str = walker.ctx.arena.dupe(u8, std.mem.span(value_str)) catch return .oom;
+    const child_node: memutil.StructIterator.NodeInfo = .{
+        .parent_info = walker.info,
+        .node = dummy_node,
+        .enumerate_struct = null,
+        .type_name = "C field",
+        .as_string = owned_str,
+        .is_synthetic = true,
+    };
+    walker.ctx.vtable.visit_node(walker.ctx, &child_node, std.mem.span(field_name)) catch return .oom;
+    return .ok;
+}
+
+// Recurse into `fieldName`, a field that is itself a Zicl_Value (e.g. a
+// dict/list a custom type happens to hold onto). Cycle-safe and
+// dedup-tracked the same way any other Value reference is.
+export fn Zicl_StructWalkerFollowValue(
+    walker: *CEnumerateContext,
+    field_name: [*:0]const u8,
+    value: Value,
+) callconv(.c) ReturnCode {
+    const helper: objects.IterHelper = .{ .ctx = walker.ctx, .info = walker.info };
+    helper.followValue(std.mem.span(field_name), value) catch return .oom;
+    return .ok;
+}
+
+// Recurse into `fieldName`, a plain (non-Zicl_Value) struct field: `ptr` is
+// the real pointer (its identity is what dedup/cycle detection keys on, so
+// pass the actual field, not a copy), `typeName` labels it in the dump, and
+// `enumerateStruct` is the forwarding function that describes *its* fields
+// in turn -- NULL shows it as an opaque leaf (address only).
+export fn Zicl_StructWalkerFollowStruct(
+    walker: *CEnumerateContext,
+    field_name: [*:0]const u8,
+    ptr: *const anyopaque,
+    type_name: [*:0]const u8,
+    enumerate_struct: ?memutil.StructIterator.EnumerateStructCFn,
+) callconv(.c) ReturnCode {
+    // `type_name` is spanned, not duped (see the header docs): every
+    // existing caller of the underlying mechanism passes a string literal,
+    // so this one should too.
+    const child_node: memutil.StructIterator.NodeInfo = .{
+        .parent_info = walker.info,
+        .node = ptr,
+        .enumerate_struct = null,
+        .enumerate_struct_c = enumerate_struct,
+        .type_name = std.mem.span(type_name),
+        .as_string = null,
+    };
+    walker.ctx.vtable.visit_node(walker.ctx, &child_node, std.mem.span(field_name)) catch return .oom;
+    return .ok;
 }
 
 // ===== Cross-thread sharing =====

@@ -291,6 +291,163 @@ Zicl_Value Zicl_BoxObject(Zicl_Object *obj);
 uint32_t Zicl_RefCount(Zicl_Value value);
 uint32_t *Zicl_RefCountPtr(Zicl_Value value);
 
+/* ===== Custom native object types =====
+ * A C-defined type built on the same Object infrastructure every built-in
+ * type (String, List, Dict, ...) uses: ref-counted, with a small (<=
+ * ZICL_OBJECT_BODY_MAX_SIZE, currently 48 bytes) inline body and a vtable of
+ * behavior callbacks. A struct that fits lives inline with no extra
+ * allocation; a bigger one needs its own out-of-line storage, but that's a
+ * decision for the vtable's own callbacks to make, not something Zicl
+ * tracks: since sizeof(T) is a compile-time constant, `if (sizeof(T) <=
+ * ZICL_OBJECT_BODY_MAX_SIZE) ... else ...` inside a vtable callback compiles
+ * down to whichever branch is live, so one uniform pattern -- the body holds
+ * T directly, or the body holds a T* to a malloc'd copy -- costs nothing
+ * either way, and Zicl's own Object code never needs to know which case it
+ * is: to Zicl this is always just 48 opaque bytes plus callbacks that know
+ * what to do with them. */
+
+#define ZICL_OBJECT_BODY_MAX_SIZE 48
+
+/* Opaque handle a struct's own `enumerate_struct` receives (never
+ * constructs) and passes straight through to Zicl_StructWalkerAddField /
+ * Zicl_StructWalkerFollowValue / Zicl_StructWalkerFollowStruct, to describe
+ * that struct's own fields for a Zicl_LeakCheckAll dump. See those functions,
+ * declared further down after Zicl_SetObjectString. */
+typedef struct Zicl_StructWalker Zicl_StructWalker;
+/* A struct's own describe-my-fields callback, used both as
+ * Zicl_ObjectVTable's `enumerate_struct` and as the forwarding function
+ * passed to Zicl_StructWalkerFollowStruct for a nested plain struct field.
+ * Report through `ctx`, then return ZICL_OK or ZICL_OOM (any other result is
+ * treated as ZICL_OOM).
+ *
+ * `node` means something different in the two roles, and the difference is
+ * load-bearing, not cosmetic:
+ *  - As Zicl_ObjectVTable's `enumerate_struct`, `node` is the Zicl_Object*
+ *    itself (cast to const void*) -- call Zicl_ObjectBody/Zicl_ObjectBodyConst
+ *    on it to reach your own struct data, the same as every other
+ *    Zicl_ObjectVTable callback. It is deliberately *not* handed to you
+ *    already-unwrapped: the Object pointer is this node's identity for
+ *    dedup/cycle detection, and it's the same pointer every other path that
+ *    can reach this object (a dict/list slot holding it, a sibling field
+ *    following it via Zicl_StructWalkerFollowValue) arrives with. Handing out
+ *    a different address here (e.g. the body) would make two paths to the
+ *    same object look like two different nodes, breaking cycle detection for
+ *    good.
+ *  - As the `enumerateStruct` forwarded to Zicl_StructWalkerFollowStruct,
+ *    `node` is exactly the `ptr` that call was given -- no Object wraps a
+ *    nested plain struct field, so there's nothing to unwrap. */
+typedef int (*Zicl_EnumerateStructFn)(Zicl_StructWalker *ctx, const void *node);
+
+/* Layout-identical to the Zig side's `heap.Object.VTable` with the C union
+ * variant selected (`is_c_vtable = true`); the two must be kept in step.
+ *  - duplicate: called to copy the object (Zicl_Duplicate, or copy-on-write
+ *    duplication inside a dict/list that holds it). Required -- NULL means
+ *    the type can never be duplicated, and Zicl panics if it tries. There is
+ *    no default: every type provides its own, however trivial (a POD
+ *    struct's is a couple of lines -- Zicl_NewObject, memcpy the body,
+ *    return).
+ *  - update_string: called lazily the first time the object's string
+ *    representation is needed (Zicl_String / Zicl_GetString on a value that
+ *    hasn't been stringified yet). Returns ZICL_OK or ZICL_OOM (any other
+ *    result is treated as ZICL_OOM). Required for the same reason as
+ *    duplicate: Tcl's "everything is a string" model has no value that
+ *    cannot render as one, so NULL here also panics rather than making
+ *    Zicl_String return NULL.
+ *  - free_internal_rep: called once, when the last reference is dropped,
+ *    before the object's own storage is freed. NULL means there is nothing
+ *    to free beyond that -- the right choice for a POD struct with no
+ *    internal pointers.
+ *  - make_crossthread: called once when a value crosses from the thread that
+ *    created it to another (Zicl_MakeCrossthread). NULL means the type may
+ *    never cross threads at all -- Zicl panics if it tries.
+ *    Zicl_NoopMakeCrossthread is provided for a type with no cross-thread
+ *    hazards (nothing in its body another thread could race on).
+ *  - enumerate_struct: called when a Zicl_LeakCheckAll dump reaches one of
+ *    this type's objects, to describe its fields. NULL means the object
+ *    shows up in a dump as an opaque leaf (address only) -- unlike the
+ *    others, this one is optional with a real "do nothing extra" meaning,
+ *    since it only affects debug output, never correctness. */
+typedef struct Zicl_ObjectVTable {
+    bool is_c_vtable;
+    const char *name;
+    Zicl_Object *(*duplicate)(const Zicl_Object *src);
+    void (*free_internal_rep)(Zicl_Object *obj);
+    int (*update_string)(Zicl_Object *obj);
+    void (*make_crossthread)(Zicl_Object *obj);
+    Zicl_EnumerateStructFn enumerate_struct;
+} Zicl_ObjectVTable;
+
+/* For a type with no cross-thread hazards: nothing in its body that another
+ * thread reading it concurrently could race on. */
+void Zicl_NoopMakeCrossthread(Zicl_Object *obj);
+
+/* Allocates a new object under `vtable`, with `size` bytes of zeroed inline
+ * storage (size must be <= ZICL_OBJECT_BODY_MAX_SIZE -- a bigger struct
+ * stores a pointer here instead; see the section comment above). *out_body is
+ * set to that storage; write the struct there. Returns NULL on OOM.
+ *
+ * Two objects are the same type exactly when they share the same `vtable`
+ * pointer, compared by address, not contents -- Zicl_AsObject checks this.
+ * So: one `static const Zicl_ObjectVTable` per type, and share its address
+ * with any other compiled unit that needs to recognize the same type (e.g.
+ * via the dict Zicl_LoadLibrary / `load` returns). */
+Zicl_Object *Zicl_NewObject(const Zicl_ObjectVTable *vtable, size_t size, void **out_body);
+/* NULL if `value` isn't a pointer-tagged value built by Zicl_NewObject with
+ * this exact `vtable` (by address, not structural match). Otherwise, the
+ * object's inline body -- the same pointer Zicl_NewObject handed back as
+ * *out_body when the object was created. */
+void *Zicl_AsObject(Zicl_Value value, const Zicl_ObjectVTable *vtable);
+/* Raw access to an object's inline body, for use inside a vtable callback:
+ * those receive a bare Zicl_Object*, not a boxed Zicl_Value, so Zicl_AsObject
+ * doesn't apply there. Unlike Zicl_AsObject this does no type check -- a
+ * vtable callback already knows its own object's type, since Zicl only ever
+ * calls a type's callbacks on that type's own objects. */
+void *Zicl_ObjectBody(Zicl_Object *obj);
+const void *Zicl_ObjectBodyConst(const Zicl_Object *obj);
+/* For use inside a vtable's `update_string` callback: computes the string
+ * representation and copies it in. `str` need not be NUL-terminated (`len`
+ * is the byte length), or pass -1 for NUL-terminated. Returns ZICL_OK or
+ * ZICL_OOM; update_string should propagate this return value directly (see
+ * Zicl_ObjectVTable's update_string docs above for how a non-ZICL_OK result
+ * is treated). Without this, update_string -- a required callback, not an
+ * optional one -- would have no way to actually fulfill its contract. */
+int Zicl_SetObjectString(Zicl_Object *obj, const char *str, int len);
+
+/* ===== Struct enumeration (leak-check dump introspection) =====
+ * The C-callable counterpart to a Zig type's `enumerateStruct`: called from
+ * an `enumerate_struct` implementation (Zicl_ObjectVTable's, or one passed to
+ * Zicl_StructWalkerFollowStruct) to describe that struct's own fields for
+ * Zicl_LeakCheckAll's dump. All three return ZICL_OK or ZICL_OOM;
+ * enumerate_struct should propagate that return value directly.
+ *
+ * `fieldName` is never copied (across all three functions): it labels an
+ * edge in the dump, and every existing caller of this same underlying
+ * mechanism -- every Zig type's own enumerateStruct -- passes a string
+ * literal, so pass one here too, not something built in a stack buffer that
+ * won't outlive this call. */
+
+/* Show `fieldName` as `valueStr` in the dump. Unlike `fieldName`, `valueStr`
+ * *is* copied, so it's fine (expected, even) to format it into a stack
+ * buffer that goes out of scope before the dump actually prints -- as
+ * opposed to `Zicl_ObjectVTable.name` or a `Zicl_StructWalkerFollowStruct`
+ * `typeName`, neither of which are copied either. */
+int Zicl_StructWalkerAddField(Zicl_StructWalker *ctx, const char *fieldName, const char *valueStr);
+/* Recurse into `fieldName`, a field that is itself a Zicl_Value (e.g. a
+ * dict/list a custom type happens to hold onto). Cycle-safe and
+ * dedup-tracked the same way any other Value reference is. */
+int Zicl_StructWalkerFollowValue(Zicl_StructWalker *ctx, const char *fieldName, Zicl_Value value);
+/* Recurse into `fieldName`, a plain (non-Zicl_Value) struct field. `ptr` is
+ * the real field pointer -- its identity is what dedup/cycle detection keys
+ * on, so pass the actual field, not a copy, or a genuinely cyclic structure
+ * (one that points back to an ancestor) will recurse forever. `typeName`
+ * labels it in the dump. `enumerateStruct` is the forwarding function that
+ * describes *its* fields in turn -- NULL shows it as an opaque leaf (address
+ * only), which is the right choice for a field with no further structure
+ * worth expanding. */
+int Zicl_StructWalkerFollowStruct(Zicl_StructWalker *ctx, const char *fieldName,
+                                   const void *ptr, const char *typeName,
+                                   Zicl_EnumerateStructFn enumerateStruct);
+
 /* ===== Cross-thread sharing =====
  * Objects opt into cross-thread access by marking themselves (and their
  * children) cross-thread. Marking is one-way: a marked object can never

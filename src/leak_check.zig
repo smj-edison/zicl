@@ -21,7 +21,11 @@ const LogCategory = enum {
     other,
 };
 const LogEntry = struct {
-    /// We assume that the memory containing the entry is zero-initialized.
+    /// We assume that the memory containing the entry is zero-initialized,
+    /// hence `initialized` will read as false. We need this because `debug_log`
+    /// is being filled from multiple threads simultaneously, and a thread could
+    /// be partway through filling the log entry before crashing, and we don't
+    /// want to read a partially filled entry.
     initialized: std.atomic.Value(bool),
     value: Value,
     addrs: [32]usize,
