@@ -278,20 +278,23 @@ pub fn initGlobals(options: Options) !void {
 pub fn deinitGlobals() void {
     // Steal the map so we can deinit atomically.
     registry.mutex.lockUncancelable(heap.global_io);
-    const heads = registry.heads;
+    var heads = registry.heads;
     registry.heads = .empty;
     registry.mutex.unlock(heap.global_io);
     registry = .{};
 
-    var stolen_registry: Registry = .{
-        .mutex = .init,
-        .heads = heads,
-        .csprng = undefined,
-    };
-
-    var iter = stolen_registry.heads.valueIterator();
-    while (iter.next()) |head| head.*.close();
-    stolen_registry.heads.deinit(heap.global_gpa);
+    // Close and release whatever capabilities were left open. We do
+    // this manually, since we can't deregister anything, since we've
+    // swapped out the registry table.
+    var iter = heads.valueIterator();
+    while (iter.next()) |head_ptr| {
+        const head = head_ptr.*;
+        if (head.closed.swap(true, .acq_rel) == false) {
+            head.vtable.deinitBody(head);
+        }
+        head.release();
+    }
+    heads.deinit(heap.global_gpa);
 
     if (host_name_owned) |owned| heap.global_gpa.free(owned);
     host_name_owned = null;

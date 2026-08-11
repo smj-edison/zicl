@@ -105,10 +105,10 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 
 ### Core Components
 
-**Heap (src/heap.zig)**: The object and value system. A single global allocator (`heap.global_gpa`) backs every heap object. There is no per-thread heap and no buddy allocator; objects are individually allocated into fixed 88-byte slots. The heap module owns:
+**Heap (src/heap.zig)**: The object and value system. A single global allocator (`heap.global_gpa`) backs every heap object. There is no per-thread heap and no buddy allocator; objects are individually allocated into fixed 80-byte slots. The heap module owns:
 
 -   `Value` and `OptionalValue` -- the 16-byte tagged-union value representation (see below).
--   `Object` -- the 88-byte heap-allocated object header plus body, carrying a vtable, ref count, atomic string metadata, and hash metadata.
+-   `Object` -- the 80-byte heap-allocated object header plus body, carrying a vtable, ref count, atomic string metadata, and hash metadata.
 -   `SpecialString` -- the wrapper for large strings (> 1024 bytes) and strings that embed hash references, ref-counted independently of their owning object.
 -   `HashRegistry` (`heap.registered_hashes`) -- a global, `RwLock`-protected, content-addressable store mapping `u256` Blake3 hashes to a representative `*Object`. Lets any thread resolve a shared object by hash, and reclaims the representative once every instance of the hash is gone.
 -   `NativeFnRegistry` (`heap.nativefn_registry`) -- a global, mutex-protected map from command name to a lazy `LazyRegisterFn`, for lazily loading C commands.
@@ -159,7 +159,7 @@ Because integers are now full-width inline, `objects.Integer.new` never allocate
 
 `OptionalValue` is the same 16 bytes with the `none` tag reserved, used for optional values and inside `Shimmerable`. `Value.fromRep` asserts the tag is not `none`.
 
-`Object` is an 88-byte `extern struct`. The header is `string` (atomic), `metadata`, `vtable`, `ref_count`, `string_metadata` (atomic), and `hash_metadata` (atomic); the trailing `body_backing: [48]u8 align(8)` holds the type-specific body (`String`, `List`, `Dictionary`, etc.). `Object.from(T, ptr)` / `Object.asType(obj, T)` translate between a typed body pointer and its header (`asType` returns null on a vtable mismatch, and `asTypeConst` is the const variant). `Object.assertValidType(T)` enforces the size, alignment, and vtable requirements at comptime. A type's body is always allocated together with its header via `Object.newObject(T)` / `Object.newObjectUninitialized(T)`.
+`Object` is an 80-byte `extern struct`. The header is `string` (atomic), `vtable`, `ref_count`, `metadata`, `string_metadata` (atomic), and `hash_metadata` (atomic), in that order (chosen to minimize padding); the trailing `body_backing: [48]u8 align(8)` holds the type-specific body (`String`, `List`, `Dictionary`, etc.). `Object.from(T, ptr)` / `Object.asType(obj, T)` translate between a typed body pointer and its header (`asType` returns null on a vtable mismatch, and `asTypeConst` is the const variant). `Object.assertValidType(T)` enforces the size, alignment, and vtable requirements at comptime. A type's body is always allocated together with its header via `Object.newObject(T)` / `Object.newObjectUninitialized(T)`.
 
 Objects automatically "shimmer" between types. Shimmering replaces the vtable and body in place (when `canShimmer` holds, i.e. the object is not cross-thread) while preserving the string representation, or duplicates the object into a fresh slot tracked by the `Shimmerable`. The string representation is the source of truth: it is generated on demand by the type's `update_string` vtable entry and cached atomically on the object.
 

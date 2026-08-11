@@ -84,7 +84,7 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `SpecialString.getString(self)` -- Return the string bytes.
 - `SpecialString.incrRefCount(self)` / `SpecialString.decrRefCount(self)` -- Atomic ref counting (frees at zero).
 
-### Object (88-byte header plus inline body)
+### Object (80-byte header plus inline body)
 - `Object.body_max_size` (48) / `Object.body_align` (8) -- The size and alignment budget for a type's body.
 - `Object.assertValidType(T)` -- Comptime check that `T` fits the body budget and declares a `vtable`.
 - `Object.from(T, ptr)` -- Get the `*Object` header for a typed body pointer `*T`.

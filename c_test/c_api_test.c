@@ -440,8 +440,11 @@ int main(void) {
         CHECK(Zicl_DictLength(md) == 2);
 
         Zicl_Value k1 = Zicl_NewLong(1);
-        Zicl_OptionalValue got = Zicl_DictGet(interp, &dv, k1);
+        Zicl_Shimmerable dv_shim = Zicl_NewShimmerable(dv);
+        Zicl_OptionalValue got;
+        CHECK(Zicl_ShimDictGet(interp, &dv_shim, k1, &got) == ZICL_OK);
         CHECK(!Zicl_IsNone(got));
+        Zicl_ShimDiscardChanges(&dv_shim);
         Zicl_Release(k1);
         Zicl_Release(dv);
     }
@@ -465,8 +468,11 @@ int main(void) {
         /* Commit: release the old shared value, store the new dict. */
         ZICL_SWAP(&shared, Zicl_BoxDict(md));
         Zicl_Value k20 = Zicl_NewLong(20);
-        Zicl_OptionalValue got = Zicl_DictGet(interp, &shared, k20);
+        Zicl_Shimmerable shared_shim = Zicl_NewShimmerable(shared);
+        Zicl_OptionalValue got;
+        CHECK(Zicl_ShimDictGet(interp, &shared_shim, k20, &got) == ZICL_OK);
         CHECK(!Zicl_IsNone(got));  /* new key present in the copy */
+        Zicl_ShimDiscardChanges(&shared_shim);
         Zicl_Release(k20);
         Zicl_Release(shared);  /* the new copy */
         Zicl_Release(dv);       /* the original, now refcount 1 */
@@ -485,7 +491,11 @@ int main(void) {
         CHECK(removed == 1);
         CHECK(Zicl_DictLength(md) == 1);
         Zicl_Value k1 = Zicl_NewLong(1);
-        CHECK(Zicl_IsNone(Zicl_DictGet(interp, &dv, k1)));  /* gone */
+        Zicl_Shimmerable dv_shim = Zicl_NewShimmerable(dv);
+        Zicl_OptionalValue got;
+        CHECK(Zicl_ShimDictGet(interp, &dv_shim, k1, &got) == ZICL_OK);
+        CHECK(Zicl_IsNone(got));  /* gone */
+        Zicl_ShimDiscardChanges(&dv_shim);
         Zicl_Release(k1);
         Zicl_Release(dv);
     }

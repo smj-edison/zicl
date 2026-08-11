@@ -1,20 +1,27 @@
 #pragma once
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* ===== Values, types, and conventions =====
- * The foundational representations every other section builds on: the value
- * and optional-value types, the shimmerable working buffer, the status codes
- * and ownership convention, and the opaque interpreter and object handles. */
+/* ===== Values, types, and conventions ===== */
 
-/* The payload of a value. Small primitives (integers, floats, booleans, and
- * interned strings) live inline; everything else is a pointer to a ref-counted
- * heap object. Mirrors `heap.ValueRep` on the Zig side, so the two must be
- * kept in step. */
+/* A ref-counted heap object. Forward-declared here because it and
+ * Zicl_ObjectVTable are mutually recursive: the vtable's callbacks take
+ * Zicl_Object*, and Zicl_Object holds a pointer to its own vtable. A pointer
+ * to an incomplete type is fine in C, so this forward declaration is enough
+ * to define Zicl_ObjectVTable below; the full field list follows right
+ * after it, once Zicl_ObjectVTable is a complete type. */
+typedef struct Zicl_Object Zicl_Object;
 
+/* The payload of `Zicl_Value` and `Zicl_OptionalValue`. Small primitives
+ * (integers, floats, booleans, and interned strings) live inline, while
+ * everything else is a pointer to a ref-counted heap object. Mirrors
+ * `heap.ValueRep` on the Zig side, so the two must be kept in step. */
 typedef enum : uint8_t {
     ZICL_TAG_NONE = 0,
     ZICL_TAG_POINTER,
@@ -25,7 +32,7 @@ typedef enum : uint8_t {
 } Zicl_Tag;
 typedef struct Zicl_ValueRep {
     union {
-        void *pointer;
+        Zicl_Object *pointer;
         double float_value;
         int64_t integer;
         bool boolean;
@@ -36,16 +43,12 @@ typedef struct Zicl_ValueRep {
     Zicl_Tag tag;
 } Zicl_ValueRep;
 
-/* A value that is always present. Pass it by value. */
+/* A non-null Value. */
 typedef struct Zicl_Value {
     Zicl_ValueRep raw;
 } Zicl_Value;
 
-/* A value that may legitimately be absent, such as an out-of-range list index.
- * This is not how failure is reported: anything that can fail returns a status
- * code and writes its result through an out-parameter. The two are distinct
- * struct types, so an absent value cannot be passed onward by accident. Check
- * with Zicl_IsNone, then narrow with Zicl_Unwrap. */
+/* A nullable Value. */
 typedef struct Zicl_OptionalValue {
     Zicl_ValueRep raw;
 } Zicl_OptionalValue;
@@ -177,11 +180,6 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
         }                                                       \
     } while (0)
 
-/* A ref-counted heap object. Opaque because its layout carries atomic fields
- * and a type-erased body that C cannot usefully touch directly; reach its state
- * through the accessors below (`Zicl_AsPtr`, `Zicl_RefCount`, ...). */
-typedef struct Zicl_Object Zicl_Object;
-
 typedef struct Zicl_Interp Zicl_Interp;
 
 typedef int (*Zicl_CCommandFn)(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv);
@@ -237,6 +235,46 @@ void Zicl_LocalArenaRewind(Zicl_ArenaSnapshot snap);
  * the string rep on demand, which can allocate (and so return NULL on OOM). */
 
 int Zicl_NewString(Zicl_Value *out, const char *ptr, int len);
+/* Build a string value from a printf-style format, the C-side counterpart to
+ * the Zig side's `objects.String.newFormatted`. A header inline rather than an
+ * exported function because C variadic arguments can't cross the Zig/C ABI
+ * boundary as `...`; this formats into a stack buffer (falling back to a
+ * transient `malloc`'d one only if the result doesn't fit) and hands the
+ * bytes to Zicl_NewString, so the only allocation Zicl itself tracks is the
+ * copy Zicl_NewString makes. Returns ZICL_OK, ZICL_OOM (from Zicl_NewString or
+ * the malloc fallback), or ZICL_ERR if vsnprintf itself reports an encoding
+ * error. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 3)))
+#endif
+static inline int Zicl_NewStringFormatted(Zicl_Value *out, const char *fmt, ...) {
+    char stack_buf[256];
+    va_list args;
+    va_start(args, fmt);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = vsnprintf(stack_buf, sizeof(stack_buf), fmt, args);
+    va_end(args);
+    if (needed < 0) {
+        va_end(args_copy);
+        return ZICL_ERR;
+    }
+    if ((size_t)needed < sizeof(stack_buf)) {
+        va_end(args_copy);
+        return Zicl_NewString(out, stack_buf, needed);
+    }
+
+    char *heap_buf = (char *)malloc((size_t)needed + 1);
+    if (!heap_buf) {
+        va_end(args_copy);
+        return ZICL_OOM;
+    }
+    vsnprintf(heap_buf, (size_t)needed + 1, fmt, args_copy);
+    va_end(args_copy);
+    int rc = Zicl_NewString(out, heap_buf, needed);
+    free(heap_buf);
+    return rc;
+}
 /* Wrap a static, NUL-terminated string as an interned value with no copy and no
  * allocation (so it cannot fail and returns by value). The string must live for
  * as long as the value is read and must be NUL-terminated. This is a header
@@ -370,12 +408,37 @@ typedef int (*Zicl_EnumerateStructFn)(Zicl_StructWalker *ctx, const void *node);
 typedef struct Zicl_ObjectVTable {
     bool is_c_vtable;
     const char *name;
+    /* Note that we discard the union here, since the layout is identical without
+     * the union. This only works because both variants have the exact same number
+    * of function pointers. */
     Zicl_Object *(*duplicate)(const Zicl_Object *src);
     void (*free_internal_rep)(Zicl_Object *obj);
     int (*update_string)(Zicl_Object *obj);
     void (*make_crossthread)(Zicl_Object *obj);
     Zicl_EnumerateStructFn enumerate_struct;
 } Zicl_ObjectVTable;
+
+/* Layout-identical to the Zig side's `heap.Object`, field order included --
+ * the two must be kept in step. Every field here is a plain type, matching
+ * the Zig side: `heap.Object` has no atomic-qualified fields either, since
+ * Zig models atomicity as a property of the operation (@atomicLoad,
+ * @atomicRmw), not of the field's type. That said, `string`, `string_metadata`,
+ * and `hash_metadata` *are* read and written atomically by the interpreter,
+ * so touching them directly from C without an equivalent atomic access races
+ * with it; go through the accessors below (Zicl_RefCount, Zicl_ObjectBody,
+ * Zicl_SetObjectString, ...) instead of reading these fields directly.
+ * `metadata`, `string_metadata`, and `hash_metadata` also each pack multiple
+ * bits (Object.Metadata, Object.StringMetadata, Object.HashMetadata on the
+ * Zig side); their bit layouts aren't exposed here. */
+struct Zicl_Object {
+    void *string;
+    const Zicl_ObjectVTable *vtable;
+    uint32_t ref_count;
+    uint8_t metadata;
+    uint32_t string_metadata;
+    uint8_t hash_metadata;
+    _Alignas(8) uint8_t body_backing[ZICL_OBJECT_BODY_MAX_SIZE];
+};
 
 /* For a type with no cross-thread hazards: nothing in its body that another
  * thread reading it concurrently could race on. */
@@ -505,6 +568,12 @@ const char *Zicl_ShimGetString(Zicl_Shimmerable *shim, int *len);
 /* Release any shimmered duplicate and roll the shimmerable back to its original
  * value. The caller still owns `original`. */
 void Zicl_ShimDiscardChanges(Zicl_Shimmerable *shim);
+/* The shimmerable counterpart to Zicl_NewObject: converts `shim`'s current
+ * value in place to the type identified by `vtable` (boxing a primitive, or
+ * duplicating first if the object can't shimmer -- see Zicl_Shimmerable's
+ * docs above), then hands back its raw body storage to fill in, the same
+ * kind of pointer Zicl_NewObject hands back as *out_body. NULL on OOM. */
+void *Zicl_PrepareToShimmer(Zicl_Shimmerable *shim, const Zicl_ObjectVTable *vtable);
 
 /* ===== Lists =====
  * The typed mutable body `*List` is the opaque handle `Zicl_List`; the export
@@ -631,10 +700,6 @@ int Zicl_DictRemove(Zicl_Dict *dictPtr, Zicl_Value key, int *removed);
  * Writes a borrowed value to *out, or ZICL_NONE when the key is absent. Returns
  * ZICL_OOM/ZICL_ERR if shimmering the dict or resolving a link fails. */
 int Zicl_ShimDictGet(Zicl_Interp *interp, Zicl_Shimmerable *shim, Zicl_Value key, Zicl_OptionalValue *out);
-
-/* Absent when the key is not present (following `~parent` links). The result is
- * borrowed from the dict, so it is only valid while the dict holds it. */
-Zicl_OptionalValue Zicl_DictGet(Zicl_Interp *interp, Zicl_Value *dict, Zicl_Value key);
 
 /* Replace the value for `key` with `value` in place, without invalidating the
  * dict's string rep. For writing a shimmered form of an already-stored value
@@ -824,39 +889,29 @@ typedef __int128 Zicl_Id;
 #error "zicl requires 128-bit integer support (__int128)"
 #endif
 
-struct Zicl_Head;
+struct Zicl_CapabilityHead;
 
 typedef struct Zicl_HeadVTable {
     /* NUL-terminated, e.g. "file-handle". */
     const char *name;
     /* Deinits the body. Runs exactly once, from close. */
-    void (*deinit_body)(struct Zicl_Head *head);
+    void (*deinit_body)(struct Zicl_CapabilityHead *head);
     /* Frees the backing. Runs at ref count zero, which may be long after close. */
-    void (*destroy_backing)(struct Zicl_Head *head);
+    void (*destroy_backing)(struct Zicl_CapabilityHead *head);
 } Zicl_HeadVTable;
 
 /* The generic part of a capability. Embed this as a field of a backing struct
- * (at any offset; recover the backing with `Zicl_ContainerOf`). C code sets
+ * (at any offset; recover the backing with the `Zicl_ContainerOf` macro). C code sets
  * `vtable`; `Zicl_CapabilityNew` initializes the rest, so the remaining fields
  * are reserved for Zicl. The layout matches `Capability.Head` on the Zig side
  * for the target both are compiled for; the field order is fixed, so no size is
  * asserted here (it varies between 32- and 64-bit targets). */
-typedef struct Zicl_Head {
+typedef struct Zicl_CapabilityHead {
     const Zicl_HeadVTable *vtable;
     Zicl_Id id;
     bool closed;
     uint32_t ref_count;
 } Zicl_Head;
-
-/* Parsed form of a capability URL. `host` and `type_name` point into the input
- * string and are not NUL-terminated. */
-typedef struct Zicl_ParsedName {
-    const char *host;
-    int host_len;
-    const char *type_name;
-    int type_len;
-    Zicl_Id id;
-} Zicl_ParsedName;
 
 /* Register `head` and return the capability object that names it. `head` is a
  * `Zicl_Head` embedded in a backing struct the caller allocated (at any offset);
@@ -887,7 +942,3 @@ void Zicl_HeadRelease(Zicl_Head *head);
 void Zicl_HeadClose(Zicl_Head *head);
 bool Zicl_HeadIsClosed(Zicl_Head *head);
 void Zicl_HeadGetId(Zicl_Head *head, Zicl_Id *out);
-
-/* Parse a capability URL into its parts. `host` and `type_name` point into
- * `str` and are not NUL-terminated. */
-int Zicl_ParseCapabilityName(const char *str, int len, Zicl_ParsedName *out);

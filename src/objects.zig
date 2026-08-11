@@ -72,6 +72,15 @@ pub const Shimmerable = extern struct {
     }
 
     pub fn prepareToShimmer(self: *Shimmerable, T: type) !*T {
+        heap.Object.assertValidType(T);
+        const body = try self.prepareToShimmerVTable(&T.vtable);
+        return @ptrCast(@alignCast(body));
+    }
+
+    /// The vtable-typed counterpart to `prepareToShimmer`, for callers (namely
+    /// the C API) that only have a `*const Object.VTable`, not a Zig type.
+    /// Returns the object's raw body storage; the caller fills it in.
+    pub fn prepareToShimmerVTable(self: *Shimmerable, vtable: *const Object.VTable) !*anyopaque {
         try self.ensureShimmerable();
 
         // We know that this must be an object, since we boxed it if
@@ -81,9 +90,9 @@ pub const Shimmerable = extern struct {
         _ = try obj.getString();
         obj.invalidateInternalRep();
 
-        obj.vtable = &T.vtable;
+        obj.vtable = vtable;
 
-        return obj.asType(T).?;
+        return &obj.body_backing;
     }
 
     pub fn getMutable(shim: *Shimmerable, T: type, det: ?*ErrorDetails) !*T {

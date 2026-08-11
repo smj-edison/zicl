@@ -1096,9 +1096,7 @@ test "exec merges stderr into a redirected stdout" {
     const path = try std.fmt.allocPrint(ta, "{s}/both.txt", .{dir_path});
     defer ta.free(path);
 
-    // Both streams have to land on one descriptor. Opening the file once per
-    // stream would give each its own offset, and the second writer would start
-    // back at the beginning.
+    // Both streams have to land on one descriptor (see `stderr_to_stdout`).
     const script = try std.fmt.allocPrint(ta,
         \\exec {{{s} -c {{echo aaaaaaaa; echo bb >&2}}}} >& {s}
         \\exec {{{s} {s}}}

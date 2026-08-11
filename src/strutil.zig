@@ -49,6 +49,26 @@ pub const toTitle = if (use_utf8) toTitlecaseUtf8 else std.ascii.toUpper;
 pub const toUpper = if (use_utf8) toUppercaseUtf8 else std.ascii.toUpper;
 pub const toLower = if (use_utf8) toLowercaseUtf8 else std.ascii.toLower;
 
+/// Encode a single codepoint into `buf`, returning the number of bytes
+/// written. When UTF-8 support is disabled, `cp` is already a raw byte and is
+/// copied through unchanged (that branch never fails).
+///
+/// The UTF-8 branch can fail exactly as `std.unicode.utf8Encode` can: a
+/// surrogate half, or a codepoint above `0x10FFFF`. Unlike `removeEscaping`,
+/// whose codepoints come straight from user-typed hex digits, every caller of
+/// this function in this codebase got `cp` by decoding valid UTF-8 via
+/// `Utf8Iterator` (which already rejects both of those) or by mapping a valid
+/// codepoint to another valid one, so this never actually fires here; callers
+/// should `catch unreachable` unless they have some other source for `cp`.
+pub fn encodeCodepoint(cp: Codepoint, buf: *[4]u8) error{ Utf8CannotEncodeSurrogateHalf, CodepointTooLarge }!usize {
+    if (use_utf8) {
+        return try utf8Encode(cp, buf);
+    } else {
+        buf[0] = cp;
+        return 1;
+    }
+}
+
 /// Conditional uppercase
 fn condUpper(cp: Codepoint, enabled: bool) Codepoint {
     if (enabled) {
@@ -89,10 +109,245 @@ const AsciiIterator = struct {
         var it = self;
         return it.next();
     }
+
+    pub fn prev(self: *Self) ?u8 {
+        if (self.i == 0) return null;
+        self.i -= 1;
+        return self.bytes[self.i];
+    }
 };
 
+const DecodedCodepoint = struct { cp: u21, len: usize };
+
+/// Decodes one codepoint from `bytes` starting at `i`. A malformed sequence
+/// (a bad continuation byte, not enough bytes left, an overlong encoding, or
+/// a codepoint outside `0..0x10FFFF` or in the surrogate range) falls back to
+/// treating `bytes[i]` as its own one-byte codepoint, matching Tcl's and
+/// Jim's `*ToUniChar`/`utf8_tounicode`: neither substitutes a replacement
+/// character.
+///
+/// The one deliberate difference from both: they accept 4-byte sequences
+/// above `0x10FFFF` (harmless for them, since their own encoders never fail
+/// on an out-of-range codepoint) and Tcl doesn't reject 3-byte-encoded
+/// surrogates either. We reject both here, because `encodeCodepoint` assumes
+/// every codepoint it's given can be encoded, and Zig's encoder rejects both.
+fn decodeAt(bytes: []const u8, i: usize) DecodedCodepoint {
+    const remaining = bytes.len - i;
+    const b0 = bytes[i];
+
+    decode: {
+        if (b0 & 0x80 == 0) {
+            return .{ .cp = b0, .len = 1 };
+        } else if (b0 & 0xE0 == 0xC0) {
+            if (remaining < 2 or bytes[i + 1] & 0xC0 != 0x80) break :decode;
+            const cp: u21 = (@as(u21, b0 & 0x1F) << 6) | (bytes[i + 1] & 0x3F);
+            if (cp < 0x80) break :decode; // overlong
+            return .{ .cp = cp, .len = 2 };
+        } else if (b0 & 0xF0 == 0xE0) {
+            if (remaining < 3 or bytes[i + 1] & 0xC0 != 0x80 or bytes[i + 2] & 0xC0 != 0x80) break :decode;
+            const cp: u21 = (@as(u21, b0 & 0x0F) << 12) | (@as(u21, bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F);
+            if (cp < 0x800) break :decode; // overlong
+            if (cp >= 0xD800 and cp <= 0xDFFF) break :decode; // surrogate
+            return .{ .cp = cp, .len = 3 };
+        } else if (b0 & 0xF8 == 0xF0) {
+            if (remaining < 4 or bytes[i + 1] & 0xC0 != 0x80 or bytes[i + 2] & 0xC0 != 0x80 or bytes[i + 3] & 0xC0 != 0x80) break :decode;
+            const cp: u21 = (@as(u21, b0 & 0x07) << 18) | (@as(u21, bytes[i + 1] & 0x3F) << 12) | (@as(u21, bytes[i + 2] & 0x3F) << 6) | (bytes[i + 3] & 0x3F);
+            if (cp < 0x10000 or cp > 0x10FFFF) break :decode; // overlong or out of range
+            return .{ .cp = cp, .len = 4 };
+        }
+    }
+
+    return .{ .cp = b0, .len = 1 };
+}
+
+/// Forward and backward UTF-8 iterator. See `decodeAt` for how malformed
+/// input is handled; `prev` applies the same rules walking backwards.
+const Utf8Iterator = struct {
+    bytes: []const u8,
+    i: usize = 0,
+
+    const Self = @This();
+
+    pub fn init(bytes: []const u8) Self {
+        return .{ .bytes = bytes };
+    }
+
+    pub fn next(self: *Self) ?u21 {
+        if (self.i >= self.bytes.len) return null;
+        const decoded = decodeAt(self.bytes, self.i);
+        self.i += decoded.len;
+        return decoded.cp;
+    }
+
+    pub fn peek(self: Self) ?u21 {
+        var it = self;
+        return it.next();
+    }
+
+    /// Scans backwards by one codepoint, decrementing `i` to the start of
+    /// what it returns.
+    ///
+    /// The search for a lead byte is bounded to 3 trailing bytes back, like
+    /// `Tcl_UtfPrev`: no valid sequence has more than 3 continuation bytes,
+    /// so a longer run can never be part of one that reaches back to `i`'s
+    /// original position, and there is no point walking further. Whatever
+    /// lead byte candidate that search lands on is decoded and accepted only
+    /// if it produces a sequence whose length reaches exactly back to the
+    /// original `i`; otherwise (or if the search lands on a plain byte that
+    /// was never a lead byte at all) this steps back exactly one byte, same
+    /// as `decodeAt`'s own fallback.
+    pub fn prev(self: *Self) ?u21 {
+        if (self.i == 0) return null;
+
+        var lead = self.i - 1;
+        var trail_bytes_seen: usize = 0;
+        while (lead > 0 and self.bytes[lead] & 0xC0 == 0x80 and trail_bytes_seen < 3) {
+            lead -= 1;
+            trail_bytes_seen += 1;
+        }
+
+        if (self.bytes[lead] & 0x80 != 0) {
+            const decoded = decodeAt(self.bytes, lead);
+            if (lead + decoded.len == self.i) {
+                self.i = lead;
+                return decoded.cp;
+            }
+        }
+
+        self.i -= 1;
+        return self.bytes[self.i];
+    }
+};
+
+// These test `Utf8Iterator` directly rather than through the `Iterator`
+// alias, so the decode logic is exercised regardless of `-Duse-utf8`.
+
+test "Utf8Iterator ascii" {
+    var it = Utf8Iterator.init("abc");
+    try expectEqual('a', it.next());
+    try expectEqual(1, it.i);
+    try expectEqual('b', it.peek());
+    try expectEqual('b', it.next());
+    try expectEqual('c', it.next());
+    try expectEqual(null, it.peek());
+    try expectEqual(null, it.next());
+}
+
+test "Utf8Iterator valid multi-byte" {
+    var it = Utf8Iterator.init("é中😀"); // 2-byte, 3-byte, 4-byte
+    try expectEqual(0xE9, it.next());
+    try expectEqual(2, it.i);
+    try expectEqual(0x4E2D, it.next());
+    try expectEqual(5, it.i);
+    try expectEqual(0x1F600, it.next());
+    try expectEqual(9, it.i);
+    try expectEqual(null, it.next());
+}
+
+test "Utf8Iterator malformed input falls back to the raw byte, not U+FFFD" {
+    // A lone 3-byte lead with no continuation bytes at all.
+    {
+        var it = Utf8Iterator.init("\xe0");
+        try expectEqual(0xE0, it.next());
+        try expectEqual(1, it.i);
+        try expectEqual(null, it.next());
+    }
+    // A 3-byte lead truncated by the end of the string.
+    {
+        var it = Utf8Iterator.init("a\xe0\x80");
+        try expectEqual('a', it.next());
+        try expectEqual(0xE0, it.next());
+        try expectEqual(0x80, it.next());
+        try expectEqual(null, it.next());
+    }
+    // An orphan continuation byte with no lead byte before it.
+    {
+        var it = Utf8Iterator.init("a\x80b");
+        try expectEqual('a', it.next());
+        try expectEqual(0x80, it.next());
+        try expectEqual('b', it.next());
+    }
+    // Overlong encodings are rejected byte-by-byte, same as any other
+    // malformed sequence (this input is the classic overlong NUL: a 4-byte
+    // sequence that decodes to 0, which must be rejected since 0 < 0x10000).
+    {
+        var it = Utf8Iterator.init("\xf0\x80\x80\xaf");
+        try expectEqual(0xF0, it.next());
+        try expectEqual(0x80, it.next());
+        try expectEqual(0x80, it.next());
+        try expectEqual(0xAF, it.next());
+        try expectEqual(null, it.next());
+    }
+}
+
+test "Utf8Iterator rejects codepoints encodeCodepoint couldn't handle" {
+    // A 4-byte sequence decoding above 0x10FFFF (Jim and Tcl both accept
+    // this; we don't, since our encoder can't round-trip it).
+    {
+        var it = Utf8Iterator.init("\xf7\xbf\xbf\xbf"); // decodes to 0x1FFFFF
+        try expectEqual(0xF7, it.next());
+        try expectEqual(0xBF, it.next());
+    }
+    // A 3-byte sequence encoding a surrogate (0xED 0xA0 0x80 = U+D800).
+    {
+        var it = Utf8Iterator.init("\xed\xa0\x80");
+        try expectEqual(0xED, it.next());
+        try expectEqual(0xA0, it.next());
+        try expectEqual(0x80, it.next());
+    }
+}
+
+test "Utf8Iterator prev retraces next exactly, including through malformed input" {
+    const cases = [_][]const u8{
+        "hello",
+        "é中😀",
+        "a\xe0\x80b\x9f",
+        "\x80\x80\x80\x80\x80", // longer than the 3-trail-byte backward search bound
+        "\xf0\x9f\x98\x80", // valid 4-byte, but with a broken byte spliced in below
+    };
+
+    for (cases) |str| {
+        var forward = Utf8Iterator.init(str);
+        var positions: std.ArrayList(usize) = .empty;
+        defer positions.deinit(std.testing.allocator);
+        try positions.append(std.testing.allocator, 0);
+        while (forward.next()) |_| try positions.append(std.testing.allocator, forward.i);
+
+        var backward = Utf8Iterator.init(str);
+        backward.i = str.len;
+        var idx = positions.items.len - 1;
+        while (backward.prev()) |_| {
+            idx -= 1;
+            try expectEqual(positions.items[idx], backward.i);
+        }
+        try expectEqual(0, idx);
+    }
+
+    // A 4-byte lead followed by a byte that breaks the continuation run
+    // partway through: forward splits this into 4 separate one-byte steps,
+    // and prev() must retrace exactly that, not resynthesize the original
+    // 4-byte codepoint.
+    {
+        const str = "\xf0\x9f\x41\x80";
+        var forward = Utf8Iterator.init(str);
+        var positions: std.ArrayList(usize) = .empty;
+        defer positions.deinit(std.testing.allocator);
+        try positions.append(std.testing.allocator, 0);
+        while (forward.next()) |_| try positions.append(std.testing.allocator, forward.i);
+        try expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4 }, positions.items);
+
+        var backward = Utf8Iterator.init(str);
+        backward.i = str.len;
+        var idx = positions.items.len - 1;
+        while (backward.prev()) |_| {
+            idx -= 1;
+            try expectEqual(positions.items[idx], backward.i);
+        }
+    }
+}
+
 /// Iterate over codepoints
-pub const Iterator = if (use_utf8) uucode.utf8.Iterator else AsciiIterator;
+pub const Iterator = if (use_utf8) Utf8Iterator else AsciiIterator;
 
 /// lexographical comparision of codepoints
 pub fn compare(a: []const u8, b: []const u8, up_to_cp: ?usize, case_insensitive: bool) std.math.Order {
@@ -192,55 +447,21 @@ pub fn findCodepoint(str: []const u8, cp: u21) ?usize {
 
 /// Returns the new left-most index in bytes, after trimming. Returns 0
 /// if there was nothing to trim.
-pub fn trimLeft(str: []const u8, trim_chars: []u8) usize {
+pub fn trimLeft(str: []const u8, trim_chars: []const u8) usize {
     var iter = Iterator.init(str);
 
-    outer: while (iter.next()) |cp_to_check| {
-        // Check this codepoint against all the trim_chars codepoints
+    // Peek rather than consume: a non-trim codepoint must be left where it
+    // is, since `iter.i` after consuming it would already point past it.
+    while (iter.peek()) |cp_to_check| : (_ = iter.next()) {
         var trim_char_iter = Iterator.init(trim_chars);
-        while (trim_char_iter.next()) |check_against| {
-            if (cp_to_check == check_against) {
-                continue :outer;
-            }
-        } else break;
+        const is_trim_char = while (trim_char_iter.next()) |check_against| {
+            if (cp_to_check == check_against) break true;
+        } else false;
+
+        if (!is_trim_char) break;
     }
 
     return iter.i;
-}
-
-fn reverseNext(iter: *Iterator) ?Codepoint {
-    if (use_utf8) {
-        while (iter.i > 0) {
-            iter.i -= 1;
-
-            if (iter.bytes[iter.i] & 0x80 == 0) {
-                // Normal character
-                return iter.bytes[iter.i];
-            } else if (iter.bytes[iter.i] & 0xC0 == 0x80) {
-                // Partway through a code point, keep going backwards
-            } else if (iter.bytes[iter.i] & 0xE0 == 0xC0) {
-                // Two byte codepoint
-                if (iter.bytes.len - iter.i > 2) {
-                    return std.unicode.utf8Decode2(iter.bytes[iter.i..(iter.i + 2)]);
-                } else return 0xFFFD; // 0xFFFD = replacement character
-            } else if (iter.bytes[iter.i] & 0xF0 == 0xE0) {
-                // Three byte codepoint
-                if (iter.bytes.len - iter.i > 3) {
-                    return std.unicode.utf8Decode3(iter.bytes[iter.i..(iter.i + 3)]);
-                } else return 0xFFFD;
-            } else if (iter.bytes[iter.i] & 0xF8 == 0xF0) {
-                // Four byte codepoint
-                if (iter.bytes.len - iter.i > 4) {
-                    return std.unicode.utf8Decode4(iter.bytes[iter.i..(iter.i + 4)]);
-                } else return 0xFFFD;
-            } else return 0xFFFD; // 0xFFFD = replacement character
-        } else return null;
-    } else {
-        if (iter.i > 0) {
-            iter.i -= 1;
-            return iter.bytes[iter.i];
-        } else return null;
-    }
 }
 
 /// Returns the new length in bytes, after trimming. `trim_chars` can be
@@ -250,7 +471,7 @@ pub fn trimRight(str: []const u8, trim_chars: []const u8) usize {
     iter.i = str.len;
 
     var len = iter.i;
-    outer: while (reverseNext(iter)) |cp_to_check| : (len = iter.i) {
+    outer: while (iter.prev()) |cp_to_check| : (len = iter.i) {
         // Check this codepoint against all the trim_chars codepoints
         var trim_char_iter = Iterator.init(trim_chars);
         while (trim_char_iter.next()) |check_against| {
@@ -441,24 +662,23 @@ test "glob match" {
     try expect(!globMatch("any?hing", "ANYTHING", false));
 }
 
-pub fn findFirstOccurrence(searching_for: []const u8, searching_in: []const u8, cp_index: usize) ?usize {
-    if (searching_for.len > searching_in.len or cp_index > searching_in.len) {
+pub fn findFirstOccurrence(needle: []const u8, haystack: []const u8, cp_index: usize) ?usize {
+    if (needle.len > haystack.len or cp_index > haystack.len) {
         return null;
     }
 
-    var searching_in_iter = Iterator.init(searching_in);
-    searching_in_iter.i = cpIndex(searching_in, cp_index) orelse return null;
+    var haystack_iter = Iterator.init(haystack);
+    haystack_iter.i = cpIndex(haystack, cp_index) orelse return null;
 
-    while (true) : (_ = searching_in_iter.next()) {
-        _ = searching_in_iter.peek() orelse return null;
-        if (searching_in_iter.bytes.len - searching_in_iter.i < searching_for.len) {
+    while (true) : (_ = haystack_iter.next()) {
+        _ = haystack_iter.peek() orelse return null;
+        if (haystack_iter.bytes.len - haystack_iter.i < needle.len) {
             return null;
         }
 
-        const searching_in_slice =
-            searching_in[searching_in_iter.i .. searching_in_iter.i + searching_for.len];
-        if (std.mem.eql(u8, searching_for, searching_in_slice)) {
-            return searching_in_iter.i;
+        const haystack_slice = haystack[haystack_iter.i .. haystack_iter.i + needle.len];
+        if (std.mem.eql(u8, needle, haystack_slice)) {
+            return haystack_iter.i;
         }
     }
 
@@ -472,25 +692,45 @@ test "Find first occurrence" {
     try expectEqual(findFirstOccurrence("world", "hello world", 7), null);
 }
 
-pub fn findLastOccurrence(searching_for: []const u8, searching_in: []const u8) ?usize {
-    if (searching_for.len > searching_in.len) {
-        return null;
-    }
-
-    var idx = searching_in.len - searching_for.len;
-    while (true) {
-        if (std.mem.eql(u8, searching_for, searching_in[idx .. idx + searching_for.len])) {
-            return idx;
-        }
-
-        if (idx == 0) return null;
-        idx -= 1;
-    }
+/// Like `findLastOccurrenceBounded`, but with no start boundary: the whole
+/// haystack is searchable.
+pub fn findLastOccurrence(needle: []const u8, haystack: []const u8) ?usize {
+    return findLastOccurrenceBounded(needle, haystack, haystack.len);
 }
 
 test "Find last occurrence" {
     try expectEqual(findLastOccurrence("world", "hello world world"), 12);
     try expectEqual(findLastOccurrence("world", "hello"), null);
+}
+
+/// Like `findLastOccurrence`, but only considers matches whose first byte
+/// falls before `max_start_byte`. The match itself may extend past that
+/// boundary; only where it may start is bounded. This is what `[string last]`
+/// needs for its optional `lastIndex` argument: the search is constrained to
+/// start at or before a given position, not truncated there.
+pub fn findLastOccurrenceBounded(needle: []const u8, haystack: []const u8, max_start_byte: usize) ?usize {
+    if (needle.len == 0) return null;
+
+    var i = @min(max_start_byte, haystack.len);
+    while (i > 0) {
+        i -= 1;
+        if (i + needle.len <= haystack.len and
+            std.mem.eql(u8, needle, haystack[i..][0..needle.len]))
+        {
+            return i;
+        }
+    }
+    return null;
+}
+
+test "Find last occurrence bounded" {
+    // The match starting at 3 ("ba" at indices 3-4) is allowed because only
+    // its start (3) needs to be before the boundary (4); the match itself
+    // extends past it.
+    try expectEqual(findLastOccurrenceBounded("ba", "badbad", 4), 3);
+    try expectEqual(findLastOccurrenceBounded("ba", "badbad", 3), 0);
+    try expectEqual(findLastOccurrenceBounded("ba", "badbad", 0), null);
+    try expectEqual(findLastOccurrenceBounded("world", "hello world world", 18), 12);
 }
 
 pub fn hexDigitValue(c: u8) ?u4 {
