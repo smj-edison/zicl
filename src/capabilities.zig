@@ -48,6 +48,26 @@ pub const File = struct {
         writer.flush() catch return writer.err.?;
     }
 
+    /// Reads everything from the current position to EOF. Only the whole-file
+    /// slurp is implemented for now (matching [read]'s minimal boot.folk use);
+    /// a `numChars`/`-nonewline` form would need its own careful handling
+    /// since Tcl counts characters, not bytes, and a partial read must not
+    /// consume past the requested codepoint boundary.
+    pub fn readAll(file: *File) ![:0]u8 {
+        var buffer: [1024]u8 = undefined;
+        var reader = std.Io.File.Reader.initStreaming(file.file, heap.global_io, &buffer);
+
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(heap.global_gpa);
+        reader.interface.appendRemaining(heap.global_gpa, &result, .unlimited) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.StreamTooLong => unreachable, // `.unlimited` never trips this
+        };
+
+        return try result.toOwnedSliceSentinel(heap.global_gpa, 0);
+    }
+
     pub const Backing = struct {
         head: Capability.Head,
         body: File,

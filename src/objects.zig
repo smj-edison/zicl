@@ -718,6 +718,9 @@ pub const Index = struct {
             if (start < 0) start = 0;
             if (end < 0) end = 0;
             if (end > len) end = len;
+            // A start past the end (e.g. `lrange $l 10 20` on a 3-element
+            // list) would otherwise leave `start > end`, an invalid slice.
+            if (start > end) start = end;
 
             return .{
                 .start = @intCast(start),
@@ -764,11 +767,23 @@ pub const Index = struct {
                         .is_relative = true,
                     };
                 } else break :blk as_end;
-            } else {
-                break :blk .{
-                    .index = std.fmt.parseInt(i64, bytes, 0) catch return badIndexError(det, bytes),
-                    .is_relative = false,
-                };
+            } else if (std.fmt.parseInt(i64, bytes, 0)) |plain| {
+                break :blk .{ .index = plain, .is_relative = false };
+            } else |_| {
+                // Not a plain integer: fall back to a literal "N+M" / "N-M" form,
+                // e.g. `$i+1` after substitution becomes "3+1". The sign has to
+                // come after position 0 so a bare "-3" is still a plain integer.
+                const sign_pos = blk2: {
+                    var i: usize = 1;
+                    while (i < bytes.len) : (i += 1) {
+                        if (bytes[i] == '+' or bytes[i] == '-') break :blk2 i;
+                    }
+                    break :blk2 null;
+                } orelse return badIndexError(det, bytes);
+
+                const base = std.fmt.parseInt(i64, bytes[0..sign_pos], 10) catch return badIndexError(det, bytes);
+                const offset = std.fmt.parseInt(i64, bytes[sign_pos..], 10) catch return badIndexError(det, bytes);
+                break :blk .{ .index = base + offset, .is_relative = false };
             }
         };
 
@@ -1508,7 +1523,7 @@ pub const List = struct {
     /// `list` must be mutable.
     pub fn set(list: *List, index: usize, value: Value) !void {
         assert(list.asHead().canMutate());
-        list.items[index].swap(value);
+        list.items[index].swap(value.borrow());
         list.asHead().invalidateString();
     }
 
@@ -1524,6 +1539,91 @@ pub const List = struct {
         list.items[index].swap(value.borrow());
         // Don't invalidate the string: `value` is a shimmered form of the same
         // string rep, so the list's cached string is still valid.
+    }
+
+    /// Resolves the index at `context.get(0)`, propagating a real error for
+    /// malformed index syntax (e.g. "abc"). Bounds-checking against a
+    /// particular list's length is the caller's job: [lindex] and [lset]
+    /// disagree on what an in-range-syntax-but-out-of-bounds index means (one
+    /// reports empty, the other a real error), so that check can't live here
+    /// without conflating the two failure modes under one error, the way an
+    /// earlier version of this function did (and leaked the message it built
+    /// for the case [lindex] meant to silently swallow).
+    fn resolveIndex(det: ?*ErrorDetails, context: anytype) !Index {
+        var index_shim: Shimmerable = .{ .original = context.get(0) };
+        defer index_shim.discardChanges();
+        return try Index.get(det, &index_shim);
+    }
+
+    /// Reads the element at the index path given by `context`, mirroring
+    /// `Dictionary.getRecursively`: an out-of-range index at any level reports
+    /// `.none` rather than an error (matching [lindex]), and when a child had to
+    /// shimmer into a fresh `List` to be read, that result is written back into
+    /// this list's slot so a later access through the same object skips the
+    /// re-parse.
+    pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !OptionalValue {
+        if (context.len() == 0) return shim.current().asOptional();
+
+        const as_list = try List.shimmerFrom(det, shim);
+        const len = as_list.items.len;
+
+        const index = try resolveIndex(det, context);
+        const abs = index.asAbsoluteIndex(len);
+        if (abs < 0 or abs >= @as(i65, @intCast(len))) return .none;
+        const idx: usize = @intCast(abs);
+
+        var child_shim: Shimmerable = .{ .original = as_list.items[idx] };
+        defer child_shim.discardChanges();
+        const child_result = try getRecursively(det, &child_shim, context.sliceAfter(1));
+
+        if (child_shim.shimmered.asValue()) |new_child| {
+            try shim.ensureShimmerable();
+            const as_list_mut = shim.current().asType(List).?;
+            as_list_mut.shimmerWriteback(idx, new_child);
+        }
+
+        return child_result;
+    }
+
+    /// Sets the element at the index path given by `context` to `value`,
+    /// mirroring `Dictionary.putRecursively`'s copy-on-write walk: a child
+    /// that's already uniquely owned is mutated in place, otherwise it's
+    /// copied and the copy is written back into this list's slot.
+    pub fn setRecursively(list: *List, det: ?*ErrorDetails, context: anytype, value: Value) !void {
+        assert(list.asHead().canMutate());
+        assert(context.len() > 0);
+
+        const len = list.items.len;
+        const index = try resolveIndex(det, context);
+        const abs = index.asAbsoluteIndex(len);
+        if (abs < 0 or abs >= @as(i65, @intCast(len))) {
+            if (det) |details| details.* = .{
+                .message = try allocPrintZ("list index out of range", .{}),
+            };
+            return error.BadIndex;
+        }
+        const idx: usize = @intCast(abs);
+
+        if (context.len() == 1) {
+            try list.set(idx, value);
+            return;
+        }
+
+        var child_shim: Shimmerable = .{ .original = list.items[idx] };
+        _ = try List.shimmerFrom(det, &child_shim);
+
+        if (child_shim.shimmered.isNone() and child_shim.original.canMutate()) {
+            // Mutate in place, if possible.
+            const as_list = child_shim.original.asType(List).?;
+            try as_list.setRecursively(det, context.sliceAfter(1), value);
+        } else {
+            const child_mut = try child_shim.getMutable(List, det);
+            defer child_mut.asHead().release();
+            try child_mut.setRecursively(det, context.sliceAfter(1), value);
+            try list.set(idx, child_mut.asHead().asValue());
+        }
+
+        list.asHead().invalidateString();
     }
 
     /// `list` must be mutable.

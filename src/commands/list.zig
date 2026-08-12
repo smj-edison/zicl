@@ -1,12 +1,16 @@
 const std = @import("std");
 
 const control_flow = @import("control_flow.zig");
+const strutil = @import("../strutil.zig");
+const regex = @import("../regex.zig");
+const pcre2 = @import("pcre2");
 
 const common = @import("common.zig");
 const heap = common.heap;
 const objects = common.objects;
 const String = objects.String;
 const List = objects.List;
+const Value = common.Value;
 const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
@@ -142,6 +146,225 @@ pub fn concatCmd(interp: *Interp, args: []Shimmerable) !void {
     try interp.setResultStringOwning(try buf.toOwnedSliceSentinel(heap.global_gpa, 0));
 }
 
+/// [lindex]
+///
+/// Each argument after `list` is one index level to drill through (matching
+/// Jim's `Jim_ListIndices`, which does not treat a lone list-valued index
+/// argument as sugar for multiple indices the way vanilla Tcl documents it).
+/// The walk itself lives in `List.getRecursively`, mirroring
+/// `Dictionary.getRecursively`.
+pub fn lindexCmd(interp: *Interp, args: []Shimmerable) !void {
+    const result = try interp.getListValueRecursively(&args[1], objects.ShimmerableSliceContext{ .items = args[2..] });
+    if (result.asValue()) |val| {
+        interp.setResult(val);
+    } else {
+        interp.setEmptyResult();
+    }
+}
+
+/// [lrange]
+pub fn lrangeCmd(interp: *Interp, args: []Shimmerable) !void {
+    const as_list = try interp.getList(&args[1]);
+
+    var det: ErrorDetails = undefined;
+    const range = try interp.wrapError(&det, objects.Index.getRange(&det, as_list.items.len, &args[2], &args[3]));
+
+    const result = try List.new(as_list.items[range.start..range.end]);
+    interp.setResultOwning(result.asHead().asValue());
+}
+
+/// [lreplace]
+///
+/// `Index.Range` isn't reused here: it always clamps to a valid start/end
+/// pair for extraction (as [lrange] wants), but [lreplace] needs first and
+/// the delete boundary tracked separately, since an inverted range still has
+/// to insert at `first` rather than collapsing to an empty range.
+pub fn lreplaceCmd(interp: *Interp, args: []Shimmerable) !void {
+    const as_list = try interp.getList(&args[1]);
+    const len = as_list.items.len;
+    const len_i: i65 = @intCast(len);
+
+    const first_index = try interp.getIndex(&args[2]);
+    const last_index = try interp.getIndex(&args[3]);
+    const first_abs = first_index.asAbsoluteIndex(len);
+    const last_abs = last_index.asAbsoluteIndex(len);
+
+    // `first` clamps into [0, len]. When `last` falls before `first`, nothing
+    // is deleted and any new elements are inserted at `first` instead, which
+    // is why `delete_end` is clamped to be no earlier than `first` itself.
+    const first: usize = @intCast(std.math.clamp(first_abs, 0, len_i));
+    const first_i: i65 = @intCast(first);
+    const delete_end: usize = @intCast(std.math.clamp(@max(last_abs + 1, first_i), first_i, len_i));
+
+    const new_elements = args[4..];
+    const total = first + new_elements.len + (len - delete_end);
+    const result = try List.newWithCapacity(&.{}, total);
+    errdefer result.asHead().release();
+
+    for (as_list.items[0..first]) |item| result.appendAssumeCapacity(item);
+    for (new_elements) |elem| result.appendAssumeCapacity(elem.current());
+    for (as_list.items[delete_end..]) |item| result.appendAssumeCapacity(item);
+
+    interp.setResultOwning(result.asHead().asValue());
+}
+
+/// [lsearch]
+pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
+    const Mode = enum { exact, glob, regexp };
+    var mode: Mode = .glob; // Tcl's default.
+    var opt_nocase = false;
+
+    var i: usize = 1;
+    while (i + 2 < args.len) : (i += 1) {
+        if (try args[i].current().equalsString("-exact")) {
+            mode = .exact;
+        } else if (try args[i].current().equalsString("-glob")) {
+            mode = .glob;
+        } else if (try args[i].current().equalsString("-regexp")) {
+            mode = .regexp;
+        } else if (try args[i].current().equalsString("-nocase")) {
+            opt_nocase = true;
+        } else if (try args[i].current().equalsString("--")) {
+            i += 1;
+            break;
+        } else {
+            return error.WrongUsage;
+        }
+    }
+
+    if (args.len - i != 2) return error.WrongUsage;
+
+    const as_list = try interp.getList(&args[i]);
+    const pattern_shim = &args[i + 1];
+    const pattern_bytes = try pattern_shim.current().getString();
+
+    var det: ErrorDetails = undefined;
+    var compiled_regexp: ?*const regex.Regexp = null;
+    if (mode == .regexp) {
+        var compile_opts: u32 = pcre2.PCRE2_UTF | pcre2.PCRE2_UCP;
+        if (opt_nocase) compile_opts |= pcre2.PCRE2_CASELESS;
+        compiled_regexp = try interp.wrapError(&det, regex.Regexp.shimmerFrom(&det, pattern_shim, compile_opts));
+    }
+
+    for (as_list.items, 0..) |item, idx| {
+        var item_shim: Shimmerable = .{ .original = item };
+        defer item_shim.discardChanges();
+        const item_bytes = try item_shim.current().getString();
+
+        const matched = switch (mode) {
+            .exact => strutil.compare(item_bytes, pattern_bytes, null, opt_nocase) == .eq,
+            .glob => strutil.globMatch(pattern_bytes, item_bytes, opt_nocase),
+            .regexp => try interp.wrapError(&det, regex.doesStringMatch(&det, compiled_regexp.?.regexp, item_bytes)),
+        };
+
+        if (matched) {
+            try interp.setResultInteger(@intCast(idx));
+            return;
+        }
+    }
+
+    try interp.setResultInteger(-1);
+}
+
+/// [lset]
+/// [lset]
+///
+/// Mirrors `dict set`'s own command body: prefer mutating the variable's list
+/// in place, and only duplicate it when it's shared. The index-path walk
+/// itself is `List.setRecursively`, mirroring `Dictionary.putRecursively`.
+pub fn lsetCmd(interp: *Interp, args: []Shimmerable) !void {
+    const var_name = &args[1];
+    const new_value = args[args.len - 1].current();
+
+    if (args.len == 3) {
+        // No index: same as [set].
+        try interp.setVariable(var_name, new_value);
+        interp.setResult(new_value);
+        return;
+    }
+
+    const index_context: objects.ShimmerableSliceContext = .{ .items = args[2 .. args.len - 1] };
+    var det: ErrorDetails = undefined;
+    const current = try interp.getVariableOrError(var_name);
+
+    if (try interp.wrapError(&det, current.asMutableInPlace(List, &det))) |list_mut| {
+        try interp.setListValueRecursively(list_mut, index_context, new_value);
+        interp.setResult(list_mut.asHead().asValue());
+    } else {
+        const duped = try interp.wrapError(&det, current.duplicateAsType(List, &det));
+        defer duped.asHead().release();
+        try interp.setListValueRecursively(duped, index_context, new_value);
+        try interp.setVariable(var_name, duped.asHead().asValue());
+        interp.setResult(duped.asHead().asValue());
+    }
+}
+
+const LsortMode = enum { ascii, integer, real };
+
+/// Ordering used by [lsort]'s comparator, factored out of the sort context so
+/// it isn't duplicated between the ascending and descending cases.
+fn lsortOrder(mode: LsortMode, a: Value, b: Value) std.math.Order {
+    switch (mode) {
+        .ascii => {
+            const sa = a.getString() catch "";
+            const sb = b.getString() catch "";
+            return strutil.compare(sa, sb, null, false);
+        },
+        .integer, .real => {
+            var a_shim: Shimmerable = .{ .original = a };
+            defer a_shim.discardChanges();
+            var b_shim: Shimmerable = .{ .original = b };
+            defer b_shim.discardChanges();
+
+            const a_num = objects.Number.getAsIntOrFloat(null, &a_shim) catch return .eq;
+            const b_num = objects.Number.getAsIntOrFloat(null, &b_shim) catch return .eq;
+            return std.math.order(a_num.asFloat(), b_num.asFloat());
+        },
+    }
+}
+
+const LsortContext = struct {
+    mode: LsortMode,
+    decreasing: bool,
+
+    fn lessThan(self: @This(), a: Value, b: Value) bool {
+        const order = lsortOrder(self.mode, a, b);
+        return if (self.decreasing) order == .gt else order == .lt;
+    }
+};
+
+/// [lsort]
+pub fn lsortCmd(interp: *Interp, args: []Shimmerable) !void {
+    var mode: LsortMode = .ascii;
+    var decreasing = false;
+
+    var i: usize = 1;
+    while (i < args.len - 1) : (i += 1) {
+        if (try args[i].current().equalsString("-ascii")) {
+            mode = .ascii;
+        } else if (try args[i].current().equalsString("-integer") or
+            try args[i].current().equalsString("-real"))
+        {
+            mode = .integer;
+        } else if (try args[i].current().equalsString("-increasing")) {
+            decreasing = false;
+        } else if (try args[i].current().equalsString("-decreasing")) {
+            decreasing = true;
+        } else {
+            return error.WrongUsage;
+        }
+    }
+
+    const as_list = try interp.getList(&args[i]);
+    const items = try heap.local_arena.dupe(Value, as_list.items);
+
+    const ctx: LsortContext = .{ .mode = mode, .decreasing = decreasing };
+    std.mem.sort(Value, items, ctx, LsortContext.lessThan);
+
+    const result = try List.new(items);
+    interp.setResultOwning(result.asHead().asValue());
+}
+
 /// [join]
 pub fn joinCmd(interp: *Interp, args: []Shimmerable) !void {
     // join list ?joinString?
@@ -172,6 +395,12 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "lmap", lmapCmd, "varList list ?varList list ...? body", 3, null);
     try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null);
     try registerCommand(interp, "join", joinCmd, "list ?joinString?", 1, 2);
+    try registerCommand(interp, "lindex", lindexCmd, "list ?index ...?", 1, null);
+    try registerCommand(interp, "lrange", lrangeCmd, "list first last", 3, 3);
+    try registerCommand(interp, "lreplace", lreplaceCmd, "list first last ?element ...?", 3, null);
+    try registerCommand(interp, "lsearch", lsearchCmd, "?options? list pattern", 2, null);
+    try registerCommand(interp, "lset", lsetCmd, "varName ?index ...? newValue", 2, null);
+    try registerCommand(interp, "lsort", lsortCmd, "?options? list", 1, null);
 }
 
 const testing = std.testing;
@@ -425,4 +654,135 @@ fn testLmapMapsABodyOverAList(ta: std.mem.Allocator) !void {
 
 test "lmap maps a body over a list" {
     try memutil.checkAllocationFailures(.exhaustive, testLmapMapsABodyOverAList, .{});
+}
+
+fn testLindexBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // No index returns the list itself.
+    try interp.testExpectScriptResult("a b c", "lindex {a b c}");
+
+    // A single index.
+    try interp.testExpectScriptResult("b", "lindex {a b c} 1");
+    try interp.testExpectScriptResult("c", "lindex {a b c} end");
+    try interp.testExpectScriptResult("b", "lindex {a b c} end-1");
+
+    // Out of range comes back empty, not an error.
+    try interp.testExpectScriptResult("", "lindex {a b c} 10");
+    try interp.testExpectScriptResult("", "lindex {a b c} -1");
+
+    // Each argument drills one level deeper (no single-list-of-indices sugar):
+    // braces are just Tcl quoting, so `{0}` is the same argument as `0`, not
+    // a nested one-element list to flatten.
+    try interp.testExpectScriptResult("d", "lindex {{a b} {c d}} 1 1");
+    try interp.testExpectScriptResult("a", "lindex {a b c} {0}");
+
+    // Malformed index syntax is a real error, unlike a well-formed index
+    // that's merely out of range (matching Jim's `Jim_ListIndices`, which
+    // only treats a genuinely out-of-range numeric index as "return empty").
+    try interp.testExpectScriptError(error.EvalError,
+        \\bad index "abc": must be intexpr or end?[+-]intexpr?
+    , "lindex {a b c} abc");
+}
+
+test "lindex basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLindexBasic, .{});
+}
+
+fn testLrangeBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("b c", "lrange {a b c d} 1 2");
+    try interp.testExpectScriptResult("c d", "lrange {a b c d} end-1 end");
+    try interp.testExpectScriptResult("a b c d", "lrange {a b c d} 0 end");
+
+    // Start past the list length used to panic (invalid slice); now clamps empty.
+    try interp.testExpectScriptResult("", "lrange {a b c} 10 20");
+
+    // Inverted range returns nothing.
+    try interp.testExpectScriptResult("", "lrange {a b c d} 3 1");
+}
+
+test "lrange basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLrangeBasic, .{});
+}
+
+fn testLreplaceBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Replace a middle range.
+    try interp.testExpectScriptResult("a X Y d", "lreplace {a b c d} 1 2 X Y");
+
+    // Deleting with no replacement elements.
+    try interp.testExpectScriptResult("a d", "lreplace {a b c d} 1 2");
+
+    // last < first inserts without deleting anything.
+    try interp.testExpectScriptResult("a X b c", "lreplace {a b c} 1 0 X");
+
+    // Appending past the end.
+    try interp.testExpectScriptResult("a b c X", "lreplace {a b c} 10 20 X");
+}
+
+test "lreplace basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLreplaceBasic, .{});
+}
+
+fn testLsearchBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Default mode is glob.
+    try interp.testExpectScriptResult("1", "lsearch {foo ba* baz} ba*");
+    try interp.testExpectScriptResult("2", "lsearch {foo bar baz} b*z");
+    try interp.testExpectScriptResult("-1", "lsearch {foo bar baz} nope");
+
+    try interp.testExpectScriptResult("1", "lsearch -exact {foo bar baz} bar");
+    try interp.testExpectScriptResult("2", "lsearch -regexp {foo bar baz} {z$}");
+}
+
+test "lsearch basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLsearchBasic, .{});
+}
+
+fn testLsetBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("a X c",
+        \\ set l {a b c}
+        \\ lset l 1 X
+    );
+    try interp.testExpectScriptResult("a X c", "return $l");
+
+    // Nested index path.
+    try interp.testExpectScriptResult("{a b} {c X}",
+        \\ set l {{a b} {c d}}
+        \\ lset l 1 1 X
+    );
+
+    // No index at all just sets the variable, like [set].
+    try interp.testExpectScriptResult("Y",
+        \\ set l {a b c}
+        \\ lset l Y
+    );
+}
+
+test "lset basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLsetBasic, .{});
+}
+
+fn testLsortBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("a b c", "lsort {c a b}");
+    try interp.testExpectScriptResult("c b a", "lsort -decreasing {c a b}");
+    try interp.testExpectScriptResult("2 10 30", "lsort -integer {10 2 30}");
+}
+
+test "lsort basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testLsortBasic, .{});
 }

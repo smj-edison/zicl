@@ -356,8 +356,19 @@ pub fn compare(a: []const u8, b: []const u8, up_to_cp: ?usize, case_insensitive:
 
     var i: usize = 0;
     while (up_to_cp == null or i < up_to_cp.?) : (i += 1) {
-        const a_cp = condUpper(a_iter.next() orelse return .lt, case_insensitive);
-        const b_cp = condUpper(b_iter.next() orelse return .gt, case_insensitive);
+        const maybe_a = a_iter.next();
+        const maybe_b = b_iter.next();
+
+        // Both strings run out at the same codepoint: equal, not `.lt`. Checking
+        // `a` first (as the old code did via `orelse return .lt`) would report
+        // two identical strings as `.lt` the moment `a` is exhausted, without
+        // ever checking whether `b` ran out too.
+        if (maybe_a == null and maybe_b == null) return .eq;
+        if (maybe_a == null) return .lt;
+        if (maybe_b == null) return .gt;
+
+        const a_cp = condUpper(maybe_a.?, case_insensitive);
+        const b_cp = condUpper(maybe_b.?, case_insensitive);
 
         const order = std.math.order(a_cp, b_cp);
         if (order != .eq) return order;

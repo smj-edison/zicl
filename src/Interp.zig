@@ -344,7 +344,7 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
     }
 }
 
-fn callNative(interp: *Interp, command: *evaltypes.NativeCommand, args: []Shimmerable) !void {
+fn callNative(interp: *Interp, command: *const evaltypes.NativeCommand, args: []Shimmerable) !void {
     const arg_count = args.len - 1;
     wrong_arg_count: {
         // Check arg count.
@@ -790,11 +790,11 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
     return closure_and_key;
 }
 
-const CommandOrClosure = union(enum) {
+const CommandVariant = union(enum) {
     closure: ClosureAndCacheKey,
-    command: *evaltypes.NativeCommand,
+    command: *const evaltypes.NativeCommand,
 
-    pub fn deinit(self: *CommandOrClosure) void {
+    pub fn deinit(self: *CommandVariant) void {
         switch (self.*) {
             .closure => |*closure| closure.closure.asHead().release(),
             else => {},
@@ -803,7 +803,7 @@ const CommandOrClosure = union(enum) {
 };
 
 /// If variant is `closure`, then the closure is returned borrowed.
-fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_method: bool) !CommandOrClosure {
+fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
     var det: ErrorDetails = undefined;
 
     const var_val_raw: ?Value = try interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame, name));
@@ -848,7 +848,7 @@ fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_
 }
 
 /// If variant is `closure`, then the closure is returned borrowed.
-pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandOrClosure {
+pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
     return interp.getCommandInner(call_frame_idx, name, can_be_method) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => return error.CommandNotFound,
@@ -886,7 +886,7 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
 }
 
 const CommandError = heap.Error || error{InfiniteRecursion};
-fn invokeCommand(interp: *Interp, command_or_closure: *CommandOrClosure, args: []Shimmerable) CommandError!void {
+fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []Shimmerable) CommandError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.InfiniteRecursion;
@@ -907,7 +907,7 @@ fn invokeCommand(interp: *Interp, command_or_closure: *CommandOrClosure, args: [
         interp.setEmptyResult();
 
         const result = blk: {
-            switch (command_or_closure.*) {
+            switch (command_variant.*) {
                 .command => |command| {
                     break :blk interp.callNative(command, current_args);
                 },
@@ -1068,7 +1068,7 @@ fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
 }
 
 /// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
-fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { command: ?CommandOrClosure, self: OptionalValue } {
+fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { command: ?CommandVariant, self: OptionalValue } {
     var command = interp.getCommand(interp.callFrameIdx(), &args[0], true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EvalError => return error.EvalError,
@@ -1151,7 +1151,7 @@ fn invokeCommandMaybeMethod(
     var args = args_raw[1..];
 
     const cmd_and_self = try interp.getCommandAndSelfParam(args);
-    var command: CommandOrClosure = cmd_and_self.command orelse {
+    var command: CommandVariant = cmd_and_self.command orelse {
         // [unknown] was invoked and terminated normally, so there's nothing else to do.
         return;
     };
@@ -1746,6 +1746,16 @@ pub fn removeDictValue(interp: *Interp, dict: *Dictionary, key: Value) !bool {
 pub fn removeDictValueRecursively(interp: *Interp, dict: *Dictionary, context: anytype) heap.Error!bool {
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, dict.removeRecursively(&det, context));
+}
+
+pub fn getListValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!OptionalValue {
+    var det: ErrorDetails = undefined;
+    return try interp.wrapError(&det, objects.List.getRecursively(&det, shim, context));
+}
+
+pub fn setListValueRecursively(interp: *Interp, list: *List, context: anytype, value: Value) heap.Error!void {
+    var det: ErrorDetails = undefined;
+    try interp.wrapError(&det, list.setRecursively(&det, context, value));
 }
 
 test "recursive dict keys" {

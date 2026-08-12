@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const ioutil = @import("../ioutil.zig");
 const Capability = @import("../Capability.zig");
 const capabilities = @import("../capabilities.zig");
+const strutil = @import("../strutil.zig");
 
 const common = @import("common.zig");
 const exec = @import("exec.zig");
@@ -68,6 +69,25 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
 fn writeError(interp: *Interp, err: anyerror) Interp.Error {
     try interp.setResultFormatted("failed to write: {}", .{err});
     return error.EvalError;
+}
+
+fn readError(interp: *Interp, err: anyerror) Interp.Error {
+    try interp.setResultFormatted("failed to read: {}", .{err});
+    return error.EvalError;
+}
+
+/// [read]
+///
+/// `read fileId`, reading everything from the current position to EOF. The
+/// `numChars`/`-nonewline` forms aren't implemented yet (see `File.readAll`).
+pub fn readCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    var det: ErrorDetails = undefined;
+    const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
+    const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
+    const body: *capabilities.File = &backing.body;
+
+    const bytes = body.readAll() catch |err| return readError(interp, err);
+    try interp.setResultStringOwning(bytes);
 }
 
 /// [pid]
@@ -401,11 +421,119 @@ pub fn fopenCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setResultOwning(cap.asHead().asValue());
 }
 
+fn hasGlobMeta(segment: []const u8) bool {
+    for (segment) |c| {
+        if (c == '*' or c == '?' or c == '[') return true;
+    }
+    return false;
+}
+
+fn joinPath(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, dir, ".")) return try allocator.dupe(u8, name);
+    if (std.mem.eql(u8, dir, "/")) return try std.fmt.allocPrint(allocator, "/{s}", .{name});
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+}
+
+/// Matches `pattern` against the filesystem, appending every hit to
+/// `results`. The pattern is split on '/' and matched one path segment at a
+/// time, so a wildcard never crosses a directory boundary, matching both
+/// shell globs and Tcl's own [glob].
+fn globPattern(pattern: []const u8, results: *std.ArrayList([]const u8)) !void {
+    const is_absolute = pattern.len > 0 and pattern[0] == '/';
+
+    var segments: std.ArrayList([]const u8) = .empty;
+    defer segments.deinit(heap.local_arena);
+    var seg_iter = std.mem.splitScalar(u8, pattern, '/');
+    while (seg_iter.next()) |seg| {
+        if (seg.len == 0) continue; // Collapses "//" and a leading/trailing '/'.
+        try segments.append(heap.local_arena, seg);
+    }
+    if (segments.items.len == 0) return;
+
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer candidates.deinit(heap.local_arena);
+    try candidates.append(heap.local_arena, if (is_absolute) "/" else ".");
+
+    for (segments.items, 0..) |segment, seg_i| {
+        const is_last = seg_i == segments.items.len - 1;
+        var next_candidates: std.ArrayList([]const u8) = .empty;
+
+        for (candidates.items) |dir_path| {
+            if (hasGlobMeta(segment)) {
+                var dir = std.Io.Dir.cwd().openDir(heap.global_io, dir_path, .{ .iterate = true }) catch continue;
+                defer dir.close(heap.global_io);
+
+                var it = dir.iterate();
+                while (it.next(heap.global_io) catch null) |entry| {
+                    // A dotfile only matches a pattern that itself starts with
+                    // '.', the same as shell globs and Tcl's [glob].
+                    if (entry.name.len > 0 and entry.name[0] == '.' and
+                        !(segment.len > 0 and segment[0] == '.')) continue;
+                    if (!strutil.globMatch(segment, entry.name, false)) continue;
+
+                    try next_candidates.append(heap.local_arena, try joinPath(heap.local_arena, dir_path, entry.name));
+                }
+            } else {
+                const full = try joinPath(heap.local_arena, dir_path, segment);
+                const stat = std.Io.Dir.cwd().statFile(heap.global_io, full, .{}) catch continue;
+                if (!is_last and stat.kind != .directory) continue;
+                try next_candidates.append(heap.local_arena, full);
+            }
+        }
+
+        candidates.deinit(heap.local_arena);
+        candidates = next_candidates;
+    }
+
+    for (candidates.items) |path| try results.append(heap.local_arena, path);
+}
+
+/// [glob]
+///
+/// `glob ?-nocomplain? ?--? pattern ?pattern ...?`. Only `-nocomplain` is
+/// implemented; `-directory`/`-types`/`-join`/etc. aren't, since nothing in
+/// this codebase's boot path needs them.
+pub fn globCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    var nocomplain = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (try args[i].current().equalsString("-nocomplain")) {
+            nocomplain = true;
+        } else if (try args[i].current().equalsString("--")) {
+            i += 1;
+            break;
+        } else break;
+    }
+    if (i >= args.len) return error.WrongUsage;
+
+    var results: std.ArrayList([]const u8) = .empty;
+    defer results.deinit(heap.local_arena);
+
+    for (args[i..]) |*pattern_arg| {
+        const pattern = try pattern_arg.current().getString();
+        try globPattern(pattern, &results);
+    }
+
+    if (results.items.len == 0 and !nocomplain) {
+        try interp.setResultString("no files matched glob pattern");
+        return error.EvalError;
+    }
+
+    const list = try objects.List.newWithCapacity(&.{}, results.items.len);
+    errdefer list.asHead().release();
+    for (results.items) |path| {
+        list.appendAssumeCapacityOwning(try objects.String.newValue(path));
+    }
+    interp.setResultOwning(list.asHead().asValue());
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
     try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2);
+    try registerCommand(interp, "read", readCmd, "fileId", 1, 1);
+    try registerCommand(interp, "glob", globCmd, "?-nocomplain? ?--? pattern ?pattern ...?", 1, null);
 }
 
 const testing = std.testing;
@@ -607,6 +735,63 @@ test "file capability round trip" {
     try memutil.checkAllocationFailures(.exhaustive, testFileCapability, .{});
 }
 
+fn testReadSlurpsTheRemainderOfAFile(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(heap.global_io, "foo.txt", .{});
+    try file.writeStreamingAll(heap.global_io, "first line\nsecond line");
+    file.close(heap.global_io);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
+
+    const script = try std.fmt.allocPrint(ta,
+        \\set fd [fopen {s} r]
+        \\set contents [read $fd]
+        \\close $fd
+        \\set contents
+    , .{absolute_path});
+    defer ta.free(script);
+
+    try interp.testExpectScriptResult("first line\nsecond line", script);
+}
+
+test "read slurps the remainder of a file" {
+    try memutil.checkAllocationFailures(.exhaustive, testReadSlurpsTheRemainderOfAFile, .{});
+}
+
+fn testReadResumesFromWhereAPriorReadLeftOff(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(heap.global_io, "foo.txt", .{});
+    try file.writeStreamingAll(heap.global_io, "hello world");
+    file.close(heap.global_io);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
+
+    // A second [read] on the same handle picks up at EOF, since it's reading
+    // through the same open file descriptor rather than reopening the path.
+    const script = try std.fmt.allocPrint(ta,
+        \\set fd [fopen {s} r]
+        \\set first [read $fd]
+        \\set second [read $fd]
+        \\close $fd
+        \\list $first $second
+    , .{absolute_path});
+    defer ta.free(script);
+
+    try interp.testExpectScriptResult("{hello world} {}", script);
+}
+
+test "read resumes from where a prior read left off" {
+    try memutil.checkAllocationFailures(.exhaustive, testReadResumesFromWhereAPriorReadLeftOff, .{});
+}
+
 fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
@@ -641,4 +826,80 @@ fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
 
 test "writing to a closed capability reports it as stale" {
     try memutil.checkAllocationFailures(.exhaustive, testWritingToAClosedCapabilityReportsItAsStale, .{});
+}
+
+fn testGlobMatchesFilesInADirectory(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a.folk", "b.folk", "c.txt" }) |name| {
+        const f = try tmp.dir.createFile(heap.global_io, name, .{});
+        f.close(heap.global_io);
+    }
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = path_buffer[0..(try tmp.dir.realPath(heap.global_io, &path_buffer))];
+
+    const script = try std.fmt.allocPrint(ta, "lsort [glob {s}/*.folk]", .{dir_path});
+    defer ta.free(script);
+
+    const expected = try std.fmt.allocPrint(ta, "{s}/a.folk {s}/b.folk", .{ dir_path, dir_path });
+    defer ta.free(expected);
+    try interp.testExpectScriptResult(expected, script);
+}
+
+test "glob matches files in a directory" {
+    try memutil.checkAllocationFailures(.exhaustive, testGlobMatchesFilesInADirectory, .{});
+}
+
+fn testGlobMatchesADirectoryWildcardSegment(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(heap.global_io, "sub", .default_dir);
+    var sub = try tmp.dir.openDir(heap.global_io, "sub", .{});
+    defer sub.close(heap.global_io);
+    const f = try sub.createFile(heap.global_io, "prog.folk", .{});
+    f.close(heap.global_io);
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = path_buffer[0..(try tmp.dir.realPath(heap.global_io, &path_buffer))];
+
+    // Mirrors boot.folk's `glob -nocomplain builtin-programs/*/*.folk`: a
+    // wildcard directory segment followed by a wildcard filename segment.
+    const script = try std.fmt.allocPrint(ta, "glob -nocomplain {s}/*/*.folk", .{dir_path});
+    defer ta.free(script);
+
+    const expected = try std.fmt.allocPrint(ta, "{s}/sub/prog.folk", .{dir_path});
+    defer ta.free(expected);
+    try interp.testExpectScriptResult(expected, script);
+}
+
+test "glob matches a directory wildcard segment" {
+    try memutil.checkAllocationFailures(.exhaustive, testGlobMatchesADirectoryWildcardSegment, .{});
+}
+
+fn testGlobNocomplainReturnsEmptyRatherThanErroring(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("", "glob -nocomplain /nonexistent-dir-xyz/*.folk");
+}
+
+test "glob -nocomplain returns empty rather than erroring" {
+    try memutil.checkAllocationFailures(.exhaustive, testGlobNocomplainReturnsEmptyRatherThanErroring, .{});
+}
+
+fn testGlobWithoutNocomplainErrorsOnNoMatches(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptError(error.EvalError, "no files matched glob pattern", "glob /nonexistent-dir-xyz/*.folk");
+}
+
+test "glob without -nocomplain errors on no matches" {
+    try memutil.checkAllocationFailures(.exhaustive, testGlobWithoutNocomplainErrorsOnNoMatches, .{});
 }
