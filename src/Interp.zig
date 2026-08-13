@@ -29,6 +29,8 @@ const Closure = evaltypes.Closure;
 const Script = evaltypes.Script;
 const Expression = evaltypes.Expression;
 const Substitution = evaltypes.Substitution;
+const Letrec = evaltypes.Letrec;
+const CachedNativeCommand = evaltypes.CachedNativeCommand;
 
 // We re-export these so callers only need to import Interp and not evaltypes.
 pub const ReturnCode = heap.ReturnCode;
@@ -124,6 +126,7 @@ pub fn narrowError(err: anyerror) heap.EvalError {
         error.EvalError => error.EvalError,
         error.Exit => error.Exit,
         error.OutOfMemory => error.OutOfMemory,
+        error.PropagateResult => error.PropagateResult,
         else => error.EvalError,
     };
 }
@@ -222,7 +225,7 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
 }
 
 /// If called with a method, this will _modify_ `args[1]`, not just shimmer it.
-pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, args: []Shimmerable) !void {
+pub fn callClosure(interp: *Interp, closure: *Closure.Content, letrec_scope: ?*Dictionary, cache_key: u256, args: []Shimmerable) heap.EvalError!void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     const is_method = closure.is_method;
@@ -235,16 +238,16 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
         // Wrong argument count, error accordingly.
         const command_usage = try closure.getUsage(heap.local_arena, try args[0].current().getString());
         try interp.setResultFormatted("wrong # args: should be \"{s}\"", .{command_usage});
-        return error.WrongUsage;
+        return error.EvalError;
     }
 
     // Check for infinite recursion.
     if (interp.callFrameIdx() >= interp.max_call_depth) {
         try interp.setResultString("Too many nested calls. Infinite recursion?");
-        return error.InfiniteRecursion;
+        return error.EvalError;
     }
 
-    const call_frame_idx = try interp.pushCallFrame(args, closure);
+    const call_frame_idx = try interp.pushCallFrame(args, closure, letrec_scope);
     defer {
         var frame_mut = interp.call_frames.pop().?;
         frame_mut.deinit();
@@ -257,8 +260,8 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, cache_key: u256, 
     // Where we are in the signature.
     var signature_idx: u32 = 0;
 
-    const arg_names = (try closure.arg_names.get()).items;
-    const optional_values = if (closure.optional_values) |*vals| (try vals.get()).items else &.{};
+    const arg_names = closure.arg_names.items;
+    const optional_values = if (closure.optional_values) |val| val.items else &.{};
 
     while (signature_idx < arg_names.len) : (signature_idx += 1) {
         var var_name: Shimmerable = .{ .original = arg_names[signature_idx] };
@@ -353,26 +356,27 @@ fn callNative(interp: *Interp, command: *const evaltypes.NativeCommand, args: []
             if (arg_count > max_arity) break :wrong_arg_count;
         }
 
-        switch (command.call_info) {
+        const result = switch (command.call_info) {
+            .zig => |to_call| to_call(interp, args),
+            .c => |to_call| ReturnCode.toError(to_call(interp, @intCast(args.len), args.ptr)),
+        };
+
+        result catch |err| switch (err) {
             // A command can also reject its arguments from inside its body, for
             // reasons the arity bounds cannot express. Routing that back through
             // the same path below gives it the real usage string, which only this
             // function can build since only it knows which command ran.
-            .zig => |to_call| to_call(interp, args) catch |err| switch (err) {
-                error.WrongUsage => break :wrong_arg_count,
-                else => return err,
-            },
-            .c => |to_call| {
-                try ReturnCode.toError(to_call(interp, @intCast(args.len), args.ptr));
-            },
-        }
+            error.WrongUsage => break :wrong_arg_count,
+            error.Tailcall => return error.Tailcall,
+            else => return narrowError(err),
+        };
 
         return;
     }
 
     const command_usage = try command.getUsageInfo(heap.local_arena, try args[0].current().getString());
     try interp.setResultFormatted("wrong # args: should be \"{s}\"", .{command_usage});
-    return error.WrongUsage;
+    return error.EvalError;
 }
 
 fn freeLastResult(interp: *Interp) void {
@@ -505,14 +509,14 @@ const CallFrame = struct {
     variables: *vartypes.VarTable,
     /// Arguments of this procedure call. Lifetime managed by creator.
     args: []Shimmerable,
-    /// Signature of the closure that is being called. Note this is an abridged
-    /// signature, since we only use a few of the fields of the closure during
-    /// evaluation.
+    /// Signature of the closure that is being called. Note this is more than
+    /// a normal closure signature, since this also includes `letrec_scope`.
     signature: struct {
         cache_id: u64,
         /// Used during stack trace reporting, so we can say what closure was executed.
         name: OptionalValue,
-        scope_hash_ref: ?objects.AlwaysCanBeType(objects.HashReference),
+        letrec_scope: ?*objects.Dictionary,
+        scope: ?*objects.Dictionary,
     },
     /// Call epoch. Used to invalidate previous variable lookups.
     call_epoch: u64,
@@ -523,7 +527,8 @@ const CallFrame = struct {
         // Args are managed externally, so we don't free them.
         frame.variables.destroy();
         frame.signature.name.release();
-        if (frame.signature.scope_hash_ref) |*scope_hash_ref| scope_hash_ref.deinit();
+        if (frame.signature.scope) |scope| scope.asHead().release();
+        if (frame.signature.letrec_scope) |letrec_scope| letrec_scope.asHead().release();
     }
 };
 
@@ -540,30 +545,45 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
     const frame = &interp.call_frames.items[call_frame_idx];
     const table = frame.variables;
 
-    // The lexical scope link lives on the frame's signature rather than in the
-    // table, so it has to be re-materialized here. It goes in first so that a
-    // captured scope's iteration order, and therefore its content hash, doesn't
-    // depend on when the link was established relative to the frame's variables.
-    const parent_link: ?Value = if (frame.signature.scope_hash_ref) |ref| ref.inner.asValue() else null;
-    const parent_slots: usize = if (parent_link != null) 2 else 0;
+    // We create a snapshot of the current variables, since they're stored in a non-dict type.
+    const new_scope = try Dictionary.newWithCapacity(&.{}, table.count() * 2 + 2);
+    errdefer new_scope.asHead().release();
 
-    // Note, the captured scope is a copy: the frame keeps mutating its variables
-    // after this returns, while a captured scope must not change.
-    const new_dict = try Dictionary.newWithCapacity(&.{}, table.count() * 2 + parent_slots);
-    errdefer new_dict.asHead().release();
+    if (frame.signature.scope) |ref| {
+        // `~parent` links are always `HashReference`s (see `Dictionary.getFollowingLinks`),
+        // so the direct `*Dictionary` we hold here has to be wrapped, not stored as-is.
+        const hash_ref = try objects.HashReference.new(ref.asHead());
+        defer hash_ref.asHead().release();
+        try new_scope.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
+    }
 
-    if (parent_link) |link| try new_dict.put(objects.interned_tilde_parent, link);
+    if (frame.signature.letrec_scope) |letrec_scope| {
+        // If we're in a letrec, we actually need to capture the parent scope differently.
+        // We need to wrap everything in "letrec select" so we don't cause recursive capture.
+        var iter = letrec_scope.table.iterator();
+        while (iter.next()) |pair| {
+            if (try pair.key_ptr.equals(objects.interned_tilde_parent)) continue;
+            const letrec_entry = Letrec.new(null, letrec_scope, pair.key_ptr.*) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadVariableName => undefined,
+            };
+            defer letrec_entry.asHead().release();
+            try new_scope.put(pair.key_ptr.*, letrec_entry.asHead().asValue());
+        }
+
+        // Now we can fill the new scope with the local frame variables.
+    }
 
     // Upvars can't be captured as links, since the frame they point into may be
     // gone by the time the closure runs, so they resolve to their values here.
     for (table.map.keys(), table.map.values()) |name, slot| {
         switch (slot) {
-            .normal => |value| try new_dict.put(name, value),
+            .normal => |value| try new_scope.put(name, value),
             .upvar => |link| {
                 var name_shim: Shimmerable = .{ .original = link.linked_name };
                 defer name_shim.discardChanges();
                 if ((try interp.getVariableInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
-                    try new_dict.put(name, linked_value);
+                    try new_scope.put(name, linked_value);
                 } else {
                     try interp.setResultFormatted(
                         "failed to capture the variable \"{s}\", as it was an upvar that pointed at nothing",
@@ -575,7 +595,7 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
         }
     }
 
-    return new_dict;
+    return new_scope;
 }
 
 /// Returns a dict capturing the current call frame's variables.
@@ -620,14 +640,28 @@ pub fn evalFrame(interp: *Interp) *EvalFrame {
 
 /// `signature` does not need to outlive this function call, as this borrows everything
 /// needed from `signature` when creating the call frame.
-fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure.Content) !u32 {
+fn pushCallFrame(
+    interp: *Interp,
+    args: []Shimmerable,
+    signature: *const Closure.Content,
+    letrec_scope: ?*objects.Dictionary,
+) !u32 {
     // The lexical scope link is not stored in the table; it lives on the frame's
     // signature below, and `captureScope` re-materializes it when it needs one.
     const variables = try vartypes.VarTable.create();
     errdefer variables.destroy();
 
-    // Reserved up front, since a failing append would strand the references in its argument.
+    // Reserved up front, to avoid unnecessary `defer`s.
     try interp.call_frames.ensureUnusedCapacity(heap.global_gpa, 1);
+
+    if (signature.scope) |val| {
+        assert(val.asHead().metadata.cross_thread);
+        val.asHead().incrRefCount();
+    }
+    if (letrec_scope) |val| {
+        assert(val.asHead().metadata.cross_thread);
+        val.asHead().incrRefCount();
+    }
 
     const new_call_frame_idx = interp.call_frames.items.len;
     interp.call_frames.appendAssumeCapacity(.{
@@ -636,7 +670,8 @@ fn pushCallFrame(interp: *Interp, args: []Shimmerable, signature: *const Closure
         .signature = .{
             .cache_id = signature.cache_id,
             .name = signature.name.borrow(),
-            .scope_hash_ref = if (signature.scope_hash_ref) |val| val.duplicate() else null,
+            .scope = signature.scope,
+            .letrec_scope = letrec_scope,
         },
         // TODO PERF recycle variable hash table if possible.
         .variables = variables,
@@ -793,55 +828,96 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
 const CommandVariant = union(enum) {
     closure: ClosureAndCacheKey,
     command: *const evaltypes.NativeCommand,
+    letrec: struct {
+        closure: ClosureAndCacheKey,
+        scope: *Dictionary,
+    },
 
     pub fn deinit(self: *CommandVariant) void {
         switch (self.*) {
             .closure => |*closure| closure.closure.asHead().release(),
+            .letrec => |*letrec| {
+                letrec.closure.closure.asHead().release();
+                letrec.scope.asHead().release();
+            },
             else => {},
         }
     }
 };
 
-/// If variant is `closure`, then the closure is returned borrowed.
-fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
+/// Borrows the closure in the case of letrec and closure. Use `CommandVariant.deinit()` for
+/// proper cleanup.
+pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: bool) !CommandVariant {
     var det: ErrorDetails = undefined;
 
-    const var_val_raw: ?Value = try interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame, name));
-    const var_val = var_val_raw orelse {
-        try interp.setResultFormatted("invalid command name \"{s}\"", .{try name.current().getString()});
-        return error.CommandNotFound;
-    };
-
-    if (var_val.asType(Closure)) |closure| {
+    if (shim.current().asType(CachedNativeCommand)) |cached_fn| {
+        if (cached_fn.command_epoch == interp.global_procedure_epoch) {
+            return .{ .command = cached_fn.command };
+        }
+    } else if (shim.current().asType(Closure)) |closure| {
         closure.asHead().incrRefCount();
         return .{ .closure = .{
             .closure = closure,
             .cache_key = @as(u256, closure.content.cache_id),
         } };
+    } else if (shim.current().asType(Letrec)) |letrec| {
+        const closure_value = (try letrec.scope.getNoFollow(letrec.selected)).asValue() orelse {
+            try interp.setResultFormatted("\"{s}\" does not exist in letrec scope", .{try letrec.selected.getString()});
+            return error.CommandNotFound;
+        };
+        const closure = try interp.getClosure(closure_value, can_be_method);
+
+        closure.closure.asHead().incrRefCount();
+        letrec.scope.asHead().incrRefCount();
+        return .{ .letrec = .{
+            .scope = letrec.scope,
+            .closure = closure,
+        } };
     }
 
-    // TODO PERF probably should cache nativefn lookup.
-    const bytes = try var_val.getString();
+    const bytes = try shim.current().getString();
     if (bytes.len > 9 and std.mem.eql(u8, bytes[0..9], "nativefn ")) {
         // TODO `bytes[9..]` doesn't account for a nativefn name in braces or with escapes.
         const cmd_name = bytes[9..];
         if (interp.global_commands.getPtr(cmd_name)) |command| {
+            (try shim.prepareToShimmer(CachedNativeCommand)).* = .{
+                .command = command,
+                .command_epoch = interp.global_procedure_epoch,
+            };
             return .{ .command = command };
         }
 
         // Command not registered locally, so check the shared lazy-init registry.
         if (heap.lazy_fn_registry.get(cmd_name)) |init_fn| {
-            init_fn(@ptrCast(interp));
+            init_fn(interp);
             // Retry after initialization.
             if (interp.global_commands.getPtr(cmd_name)) |command| {
+                (try shim.prepareToShimmer(CachedNativeCommand)).* = .{
+                    .command = command,
+                    .command_epoch = interp.global_procedure_epoch,
+                };
                 return .{ .command = command };
             }
         }
 
         try interp.setResultFormatted("invalid native command name \"{s}\"", .{cmd_name});
         return error.CommandNotFound;
+    } else if (bytes.len > Letrec.prefix.len and std.mem.eql(u8, bytes[0..Letrec.prefix.len], Letrec.prefix)) {
+        const letrec: *const Letrec = try interp.wrapError(&det, Letrec.shimmerFrom(&det, shim));
+        const closure_value = (try letrec.scope.getNoFollow(letrec.selected)).asValue() orelse {
+            try interp.setResultFormatted("\"{s}\" does not exist in letrec scope", .{try letrec.selected.getString()});
+            return error.CommandNotFound;
+        };
+        const closure = try interp.getClosure(closure_value, can_be_method);
+
+        closure.closure.asHead().incrRefCount();
+        letrec.scope.asHead().incrRefCount();
+        return .{ .letrec = .{
+            .scope = letrec.scope,
+            .closure = closure,
+        } };
     } else {
-        const closure = try interp.getClosure(var_val, can_be_method);
+        const closure = try interp.getClosure(shim.current(), can_be_method);
         closure.closure.asHead().incrRefCount();
         return .{ .closure = closure };
     }
@@ -849,11 +925,33 @@ fn getCommandInner(interp: *Interp, call_frame: u32, name: *Shimmerable, can_be_
 
 /// If variant is `closure`, then the closure is returned borrowed.
 pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
-    return interp.getCommandInner(call_frame_idx, name, can_be_method) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.CommandNotFound => return error.CommandNotFound,
-        else => return error.EvalError,
+    var det: ErrorDetails = undefined;
+
+    const var_val_raw: ?Value = try interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame_idx, name));
+    const var_val = var_val_raw orelse {
+        try interp.setResultFormatted("invalid command name \"{s}\"", .{try name.current().getString()});
+        return error.CommandNotFound;
     };
+
+    var var_val_shim: Shimmerable = .{ .original = var_val };
+    defer var_val_shim.discardChanges();
+    const command = try interp.getCommandFromValue(&var_val_shim, can_be_method);
+
+    if (var_val_shim.shimmered.asValue()) |new_var_val| {
+        try interp.setVariableInFrame(call_frame_idx, name, new_var_val);
+    }
+
+    // A closure resolved from inside a letrec's call frame keeps that letrec's
+    // scope threaded through, so this is the logic that plumbs the letrec scope
+    // through all inner closure calls.
+    if (command == .closure) {
+        if (interp.call_frames.items[call_frame_idx].signature.letrec_scope) |letrec_scope| {
+            letrec_scope.asHead().incrRefCount();
+            return .{ .letrec = .{ .closure = command.closure, .scope = letrec_scope } };
+        }
+    }
+
+    return command;
 }
 
 fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
@@ -885,11 +983,10 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     try interp.invokeCommand(&unknown_cmd, new_args);
 }
 
-const CommandError = heap.Error || error{InfiniteRecursion};
-fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []Shimmerable) CommandError!void {
+pub fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []Shimmerable) heap.EvalError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
-        return error.InfiniteRecursion;
+        return error.EvalError;
     }
 
     interp.eval_depth += 1;
@@ -912,7 +1009,10 @@ fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []Shim
                     break :blk interp.callNative(command, current_args);
                 },
                 .closure => |*closure| {
-                    break :blk interp.callClosure(closure.closure.content, closure.cache_key, current_args);
+                    break :blk interp.callClosure(closure.closure.content, null, closure.cache_key, current_args);
+                },
+                .letrec => |letrec| {
+                    break :blk interp.callClosure(letrec.closure.closure.content, letrec.scope, letrec.closure.cache_key, current_args);
                 },
             }
         };
@@ -939,7 +1039,10 @@ fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []Shim
                 try interp.setErrorStack();
                 return error.EvalError;
             },
-            else => return err,
+            error.PropagateResult => return error.PropagateResult,
+            error.Break => return error.Break,
+            error.Continue => return error.Continue,
+            error.Exit => return error.Exit,
         };
 
         if (tailcall_found == false) {
@@ -1084,6 +1187,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
 
     const is_method = switch (command) {
         .closure => |closure| closure.closure.content.is_method,
+        .letrec => |letrec| letrec.closure.closure.content.is_method,
         .command => false,
     };
     if (is_method) {
@@ -1144,10 +1248,10 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
 /// larger than `args`, and `args` should be `args_raw[1..]`. If called with a
 /// method, `args_raw[1]` will become `args_raw[0]`, opening up a space for the
 /// `self` parameter.
-fn invokeCommandMaybeMethod(
+pub fn invokeCommandMaybeMethod(
     interp: *Interp,
     args_raw: []Shimmerable,
-) CommandError!void {
+) heap.EvalError!void {
     var args = args_raw[1..];
 
     const cmd_and_self = try interp.getCommandAndSelfParam(args);
@@ -1169,7 +1273,7 @@ fn invokeCommandMaybeMethod(
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
     try interp.invokeCommand(&command, args);
 
-    if (maybe_self.asValue()) |_| {
+    if (maybe_self.isSome()) {
         // Be sure to write back `self`.
 
         const call_frame = interp.callFrameIdx();
@@ -1189,7 +1293,7 @@ fn invokeCommandMaybeMethod(
         const as_dict_sugar = blk: {
             switch (ensure_result) {
                 .not_found => {
-                    const args_list = try command.closure.closure.content.arg_names.get();
+                    const args_list = command.closure.closure.content.arg_names;
                     const self_name = try args_list.items[0].getString();
                     try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
                     return error.EvalError;
@@ -1473,21 +1577,25 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     new_interp.parsed_substs = try ParsedSubstitutions.initWithCapacity(heap.global_gpa, cfg.cache_capacity);
     errdefer new_interp.parsed_substs.deinit(heap.global_gpa);
 
-    var arg_names: objects.AlwaysCanBeType(List) = .initOwning(try objects.List.new(&.{}));
-    defer arg_names.deinit();
-    // Push root call frame.
-    _ = try new_interp.pushCallFrame(&.{}, &.{
-        .arg_names = arg_names,
-        .optional_values = null,
-        .required_arity = 0,
-        .optional_arity = 0,
-        .body = heap.interned_empty_string,
-        .name = .none,
-        .scope_hash_ref = null,
-        .has_args_parameter = false,
-        .is_method = false,
-        .cache_id = Closure.closure_cache_id.fetchAdd(1, .monotonic),
-    });
+    {
+        var arg_names = try objects.List.new(&.{});
+        arg_names.asHead().makeCrossthread();
+        defer arg_names.asHead().release();
+
+        // Push root call frame.
+        _ = try new_interp.pushCallFrame(&.{}, &.{
+            .arg_names = arg_names,
+            .optional_values = null,
+            .required_arity = 0,
+            .optional_arity = 0,
+            .body = heap.interned_empty_string,
+            .name = .none,
+            .scope = null,
+            .has_args_parameter = false,
+            .is_method = false,
+            .cache_id = Closure.closure_cache_id.fetchAdd(1, .monotonic),
+        }, null);
+    }
     errdefer new_interp.call_frames.deinit(heap.global_gpa);
     errdefer new_interp.call_frames.items[0].deinit(); // Deinit root call frame on error.
 
@@ -1748,14 +1856,14 @@ pub fn removeDictValueRecursively(interp: *Interp, dict: *Dictionary, context: a
     return try interp.wrapError(&det, dict.removeRecursively(&det, context));
 }
 
-pub fn getListValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!OptionalValue {
+pub fn getListValueRecursively(interp: *Interp, shim: *Shimmerable, keys: []Shimmerable) heap.Error!OptionalValue {
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, objects.List.getRecursively(&det, shim, context));
+    return try interp.wrapError(&det, objects.List.getRecursively(&det, shim, keys));
 }
 
-pub fn setListValueRecursively(interp: *Interp, list: *List, context: anytype, value: Value) heap.Error!void {
+pub fn setListValueRecursively(interp: *Interp, list: *List, indexes: []Shimmerable, value: Value) heap.Error!void {
     var det: ErrorDetails = undefined;
-    try interp.wrapError(&det, list.setRecursively(&det, context, value));
+    try interp.wrapError(&det, list.setRecursively(&det, indexes, value));
 }
 
 test "recursive dict keys" {

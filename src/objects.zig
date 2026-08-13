@@ -129,71 +129,6 @@ pub const Shimmerable = extern struct {
     }
 };
 
-/// `T` must never mutate after this point, but it can shimmer.
-pub fn AlwaysCanBeType(T: type) type {
-    return struct {
-        const Self = @This();
-
-        inner: *Object,
-
-        pub fn init(value: *T) Self {
-            return .{ .inner = Object.from(T, value).borrow() };
-        }
-
-        pub fn initOwning(value: *T) Self {
-            return .{ .inner = Object.from(T, value) };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.inner.release();
-            self.* = undefined;
-        }
-
-        pub fn duplicate(self: *const Self) Self {
-            self.inner.incrRefCount();
-            return self.*;
-        }
-
-        pub fn get(self: *Self) error{OutOfMemory}!*const T {
-            var shim: Shimmerable = .{ .original = self.inner.asValue() };
-            const result: *const T = T.shimmerFrom(null, &shim) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => unreachable,
-            };
-            if (shim.shimmered.asValue()) |val| {
-                // Got a new value, probably since `inner` became crossthread.
-                if (val.asPtr()) |obj| Object.swap(&self.inner, obj);
-                // If `shim.shimmered` is a primitive, we can safely drop it.
-            }
-            return result;
-        }
-
-        pub fn getMutable(self: *Self) error{OutOfMemory}!*T {
-            if (self.inner.canMutate()) {
-                // Since we own it, we know it should never have changed types.
-                return self.inner.asType(T);
-            } else {
-                const duped = try self.inner.duplicate();
-                errdefer duped.release();
-                var shim: Shimmerable = .{ .original = duped.asValue() };
-                defer shim.discardChanges();
-
-                // Duplicated objects may not always have the same type, so we
-                // need to shimmer it to the type the caller is expecting.
-                _ = T.shimmerFrom(null, &shim) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => unreachable,
-                };
-
-                if (shim.shimmered.asValue()) |val| if (val.asPtr()) |obj| Object.swap(&self.inner, obj);
-
-                assert(self.inner.canMutate());
-                return self.inner.asType(T);
-            }
-        }
-    };
-}
-
 /// Helpers to work with struct iteration, used for walking the heap if a leak occured.
 pub const IterHelper = struct {
     ctx: StructIterator,
@@ -652,6 +587,13 @@ pub const HashReference = struct {
         return Object.from(HashReference, self);
     }
 
+    pub fn render(hash: u256) [hashutil.hash_and_prepend_len]u8 {
+        var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
+        _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(hash)));
+        @memcpy(encoded[0..hashutil.hash_prepend.len], hashutil.hash_prepend);
+        return encoded;
+    }
+
     fn duplicate(src: *const Object) !*Object {
         const new_obj = try Object.newObject(HashReference);
         errdefer new_obj.head.freeBacking();
@@ -671,10 +613,7 @@ pub const HashReference = struct {
     fn updateString(obj: *Object) !void {
         const as_hash_ref = obj.asType(HashReference).?;
         const target_hash = try as_hash_ref.ref.getHashRegistering();
-        var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
-        _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(target_hash)));
-        @memcpy(encoded[0..hashutil.hash_prepend.len], hashutil.hash_prepend);
-        try obj.setStringDuplicatingIgnoreRace(&encoded);
+        try obj.setStringDuplicatingIgnoreRace(&render(target_hash));
     }
 
     fn makeCrossthread(obj: *Object) void {
@@ -716,11 +655,12 @@ pub const Index = struct {
             var end = end_index.asAbsoluteIndex(len) + 1;
 
             if (start < 0) start = 0;
+            if (start > len) start = len;
             if (end < 0) end = 0;
             if (end > len) end = len;
-            // A start past the end (e.g. `lrange $l 10 20` on a 3-element
-            // list) would otherwise leave `start > end`, an invalid slice.
-            if (start > end) start = end;
+            // An inverted range (end before start) collapses to empty at `start`,
+            // rather than producing an invalid slice.
+            if (start > end) end = start;
 
             return .{
                 .start = @intCast(start),
@@ -767,23 +707,11 @@ pub const Index = struct {
                         .is_relative = true,
                     };
                 } else break :blk as_end;
-            } else if (std.fmt.parseInt(i64, bytes, 0)) |plain| {
-                break :blk .{ .index = plain, .is_relative = false };
-            } else |_| {
-                // Not a plain integer: fall back to a literal "N+M" / "N-M" form,
-                // e.g. `$i+1` after substitution becomes "3+1". The sign has to
-                // come after position 0 so a bare "-3" is still a plain integer.
-                const sign_pos = blk2: {
-                    var i: usize = 1;
-                    while (i < bytes.len) : (i += 1) {
-                        if (bytes[i] == '+' or bytes[i] == '-') break :blk2 i;
-                    }
-                    break :blk2 null;
-                } orelse return badIndexError(det, bytes);
-
-                const base = std.fmt.parseInt(i64, bytes[0..sign_pos], 10) catch return badIndexError(det, bytes);
-                const offset = std.fmt.parseInt(i64, bytes[sign_pos..], 10) catch return badIndexError(det, bytes);
-                break :blk .{ .index = base + offset, .is_relative = false };
+            } else {
+                break :blk .{
+                    .index = std.fmt.parseInt(i64, bytes, 0) catch return badIndexError(det, bytes),
+                    .is_relative = false,
+                };
             }
         };
 
@@ -1521,109 +1449,76 @@ pub const List = struct {
     }
 
     /// `list` must be mutable.
-    pub fn set(list: *List, index: usize, value: Value) !void {
+    pub fn set(list: *List, index: usize, value: Value) void {
         assert(list.asHead().canMutate());
         list.items[index].swap(value.borrow());
         list.asHead().invalidateString();
     }
 
+    pub fn resolveIndex(list: *const List, index: Index) ?usize {
+        const abs = index.asAbsoluteIndex(list.items.len);
+        if (abs < 0 or abs >= list.items.len) return null;
+        return @intCast(abs);
+    }
+
     /// Replace the item at `index` with `value` in place, without invalidating
-    /// the string rep. The dict analogue is `Dictionary.shimmerWriteback`; like
-    /// it, this is for writing a shimmered form of an already-stored item back
-    /// into its slot, where the shimmer preserved the string rep so the list's
-    /// cached string is still valid. `index` must be in range and `list` must
-    /// not be cross-thread. Infallible: unlike the dict version there is no hash
-    /// to compute, since the slot is addressed directly.
+    /// the string rep.
     pub fn shimmerWriteback(list: *List, index: usize, value: Value) void {
         assert(!list.asHead().metadata.cross_thread);
         list.items[index].swap(value.borrow());
-        // Don't invalidate the string: `value` is a shimmered form of the same
-        // string rep, so the list's cached string is still valid.
+        // Don't invalidate the string, since string parsing isn't injective.
     }
 
-    /// Resolves the index at `context.get(0)`, propagating a real error for
-    /// malformed index syntax (e.g. "abc"). Bounds-checking against a
-    /// particular list's length is the caller's job: [lindex] and [lset]
-    /// disagree on what an in-range-syntax-but-out-of-bounds index means (one
-    /// reports empty, the other a real error), so that check can't live here
-    /// without conflating the two failure modes under one error, the way an
-    /// earlier version of this function did (and leaked the message it built
-    /// for the case [lindex] meant to silently swallow).
-    fn resolveIndex(det: ?*ErrorDetails, context: anytype) !Index {
-        var index_shim: Shimmerable = .{ .original = context.get(0) };
-        defer index_shim.discardChanges();
-        return try Index.get(det, &index_shim);
-    }
+    pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, indexes: []Shimmerable) !OptionalValue {
+        if (indexes.len == 0) return shim.current().asOptional();
 
-    /// Reads the element at the index path given by `context`, mirroring
-    /// `Dictionary.getRecursively`: an out-of-range index at any level reports
-    /// `.none` rather than an error (matching [lindex]), and when a child had to
-    /// shimmer into a fresh `List` to be read, that result is written back into
-    /// this list's slot so a later access through the same object skips the
-    /// re-parse.
-    pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !OptionalValue {
-        if (context.len() == 0) return shim.current().asOptional();
+        var as_list = try shimmerFrom(det, shim);
 
-        const as_list = try List.shimmerFrom(det, shim);
-        const len = as_list.items.len;
+        const index = as_list.resolveIndex((try Index.shimmerFrom(det, &indexes[0])).*) orelse return .none;
 
-        const index = try resolveIndex(det, context);
-        const abs = index.asAbsoluteIndex(len);
-        if (abs < 0 or abs >= @as(i65, @intCast(len))) return .none;
-        const idx: usize = @intCast(abs);
-
-        var child_shim: Shimmerable = .{ .original = as_list.items[idx] };
+        var child_shim: Shimmerable = .{ .original = as_list.items[index] };
         defer child_shim.discardChanges();
-        const child_result = try getRecursively(det, &child_shim, context.sliceAfter(1));
+        const child_result = try getRecursively(det, &child_shim, indexes[1..]);
 
         if (child_shim.shimmered.asValue()) |new_child| {
             try shim.ensureShimmerable();
             const as_list_mut = shim.current().asType(List).?;
-            as_list_mut.shimmerWriteback(idx, new_child);
+            as_list_mut.shimmerWriteback(index, new_child);
         }
 
         return child_result;
     }
 
-    /// Sets the element at the index path given by `context` to `value`,
-    /// mirroring `Dictionary.putRecursively`'s copy-on-write walk: a child
-    /// that's already uniquely owned is mutated in place, otherwise it's
-    /// copied and the copy is written back into this list's slot.
-    pub fn setRecursively(list: *List, det: ?*ErrorDetails, context: anytype, value: Value) !void {
+    pub fn setRecursively(list: *List, det: ?*ErrorDetails, indexes: []Shimmerable, value: Value) !void {
         assert(list.asHead().canMutate());
-        assert(context.len() > 0);
+        assert(indexes.len > 0);
 
-        const len = list.items.len;
-        const index = try resolveIndex(det, context);
-        const abs = index.asAbsoluteIndex(len);
-        if (abs < 0 or abs >= @as(i65, @intCast(len))) {
+        const index = list.resolveIndex((try Index.shimmerFrom(det, &indexes[0])).*) orelse {
             if (det) |details| details.* = .{
                 .message = try allocPrintZ("list index out of range", .{}),
             };
             return error.BadIndex;
-        }
-        const idx: usize = @intCast(abs);
+        };
 
-        if (context.len() == 1) {
-            try list.set(idx, value);
+        if (indexes.len == 1) {
+            list.set(index, value);
             return;
         }
 
-        var child_shim: Shimmerable = .{ .original = list.items[idx] };
-        _ = try List.shimmerFrom(det, &child_shim);
+        var child_shim: Shimmerable = .{ .original = list.items[index] };
+        defer child_shim.discardChanges();
 
         if (child_shim.shimmered.isNone() and child_shim.original.canMutate()) {
-            // Mutate in place, if possible.
+            // Mutate in place.
             const as_list = child_shim.original.asType(List).?;
-            try as_list.setRecursively(det, context.sliceAfter(1), value);
+            try as_list.setRecursively(det, indexes[1..], value);
+            list.asHead().invalidateString();
         } else {
             const child_mut = try child_shim.getMutable(List, det);
             defer child_mut.asHead().release();
-            try child_mut.setRecursively(det, context.sliceAfter(1), value);
-            try list.set(idx, child_mut.asHead().asValue());
+            try child_mut.setRecursively(det, indexes[1..], value);
+            list.set(index, child_mut.asHead().asValue());
         }
-
-        list.asHead().invalidateString();
     }
 
     /// `list` must be mutable.
@@ -2338,19 +2233,19 @@ pub const Dictionary = struct {
         };
 
         var child_dict_shim: Shimmerable = .{ .original = child_dict };
+        defer child_dict_shim.discardChanges();
         _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
         if (child_dict_shim.shimmered.isNone() and child_dict_shim.original.canMutate()) {
-            // Mutate in place, if possible.
+            // Mutate in place.
             const as_dict = child_dict_shim.original.asType(Dictionary).?;
             try as_dict.putRecursively(det, context.sliceAfter(1), value);
+            dict.asHead().invalidateString();
         } else {
             const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
             defer child_dict_mut.asHead().release();
             try child_dict_mut.putRecursively(det, context.sliceAfter(1), value);
             try dict.put(context.get(0), child_dict_mut.asHead().asValue());
         }
-
-        dict.asHead().invalidateString();
     }
 
     pub fn removeRecursively(dict: *Dictionary, det: ?*ErrorDetails, context: anytype) !bool {
@@ -2360,6 +2255,7 @@ pub const Dictionary = struct {
 
         if ((try dict.getNoFollow(context.get(0))).asValue()) |child_dict| {
             var child_dict_shim: Shimmerable = .{ .original = child_dict };
+            defer child_dict_shim.discardChanges();
             _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
 
             const did_remove = blk: {
@@ -2426,7 +2322,9 @@ pub const Dictionary = struct {
                 error.HashLookupFailed, error.NotHashReference => return error.LinkLookupFailed,
             };
             if (parent_link_shim.shimmered.asValue()) |new_parent_link| {
-                try @constCast(as_dict).shimmerWriteback(interned_tilde_parent, new_parent_link);
+                try shim.ensureShimmerable();
+                const as_shimmerable = shim.current().asType(Dictionary).?;
+                try as_shimmerable.shimmerWriteback(interned_tilde_parent, new_parent_link);
             }
 
             var parent_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
@@ -2437,7 +2335,9 @@ pub const Dictionary = struct {
             if (parent_shim.shimmered.asValue()) |new_parent| {
                 const new_hash_ref = try HashReference.newFromValue(new_parent);
                 errdefer new_hash_ref.asHead().release();
-                try @constCast(as_dict).shimmerWriteback(interned_tilde_parent, new_hash_ref.asHead().asValue());
+                try shim.ensureShimmerable();
+                const as_shimmerable = shim.current().asType(Dictionary).?;
+                try as_shimmerable.shimmerWriteback(interned_tilde_parent, new_hash_ref.asHead().asValue());
             }
         }
 

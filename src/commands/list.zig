@@ -154,12 +154,8 @@ pub fn concatCmd(interp: *Interp, args: []Shimmerable) !void {
 /// The walk itself lives in `List.getRecursively`, mirroring
 /// `Dictionary.getRecursively`.
 pub fn lindexCmd(interp: *Interp, args: []Shimmerable) !void {
-    const result = try interp.getListValueRecursively(&args[1], objects.ShimmerableSliceContext{ .items = args[2..] });
-    if (result.asValue()) |val| {
-        interp.setResult(val);
-    } else {
-        interp.setEmptyResult();
-    }
+    const result = try interp.getListValueRecursively(&args[1], args[2..]);
+    interp.setResult(result.orEmpty());
 }
 
 /// [lrange]
@@ -283,17 +279,16 @@ pub fn lsetCmd(interp: *Interp, args: []Shimmerable) !void {
         return;
     }
 
-    const index_context: objects.ShimmerableSliceContext = .{ .items = args[2 .. args.len - 1] };
     var det: ErrorDetails = undefined;
     const current = try interp.getVariableOrError(var_name);
 
     if (try interp.wrapError(&det, current.asMutableInPlace(List, &det))) |list_mut| {
-        try interp.setListValueRecursively(list_mut, index_context, new_value);
+        try interp.setListValueRecursively(list_mut, args[2..(args.len - 1)], new_value);
         interp.setResult(list_mut.asHead().asValue());
     } else {
         const duped = try interp.wrapError(&det, current.duplicateAsType(List, &det));
         defer duped.asHead().release();
-        try interp.setListValueRecursively(duped, index_context, new_value);
+        try interp.setListValueRecursively(duped, args[2..(args.len - 1)], new_value);
         try interp.setVariable(var_name, duped.asHead().asValue());
         interp.setResult(duped.asHead().asValue());
     }

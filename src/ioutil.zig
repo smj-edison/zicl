@@ -5,7 +5,7 @@ const Io = std.Io;
 const heap = @import("heap.zig");
 
 pub threadlocal var local_stdout_fd: i32 = std.posix.STDOUT_FILENO;
-pub threadlocal var local_stderr_fd: i32 = std.posix.STDOUT_FILENO;
+pub threadlocal var local_stderr_fd: i32 = std.posix.STDERR_FILENO;
 
 // TODO threadlocal version of stdout and stderr
 

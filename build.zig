@@ -85,7 +85,6 @@ pub fn build(b: *std.Build) void {
         .root_module = root,
         .use_llvm = use_llvm,
     });
-
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);

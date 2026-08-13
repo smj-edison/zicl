@@ -156,39 +156,6 @@ fn ensureList(det: ?*objects.ErrorDetails, shim: *objects.Shimmerable) !*const o
 }
 ```
 
-### `AlwaysCanBeType` (read-only typed views).
-
-`objects.AlwaysCanBeType(T)` wraps a `*Object` as a read-only view of type `T`. It can
-shimmer (so `.get()` converts the object to `T` if needed) but it never mutates the
-object it shares, which makes it the right tool when a parameter or cached field should
-observe a value as `T` without giving anyone a mutable `*T`. It borrows the object on
-`init` (or takes your reference with `initOwning`) and releases it on `deinit`.
-
-`AlwaysCanBeType` is especially useful when an object is shared, because the object's
-vtable is ephemeral and another holder can shimmer it away from `T` (say, from `List`
-to `Dictionary`). Its `get()` recovers `T` even then: when the object can still
-shimmer, it shimmers it back in place; when it cannot shimmer -- most importantly when
-it has been made cross-thread -- `get()` duplicates it first (the duplicate is
-non-cross-thread) and shimmers the duplicate back to `T` from its string rep. So even a
-cross-thread object whose type drifted _before_ it was frozen can still be viewed as
-`T`: the frozen original keeps its current type for everyone sharing it, and your view
-holds its own re-shimmered copy.
-
-```zig
-var view = objects.AlwaysCanBeType(objects.List).init(list_ptr); // `list_ptr` is `*List`.
-defer view.deinit();
-
-const list = try view.get(); // Shimmers to `List` if needed; returns `*const List`.
-const n = list.items.len;
-```
-
-Its `getMutable()` returns a writable `*T`, duplicating the held object first whenever
-that object cannot be mutated in place, so the shared original is never written to.
-
-Prefer `AlwaysCanBeType` over a raw `*Object` plus ad-hoc `asType` calls when the "this
-is a `T`, but read-only" intent matters. It is the typed-view counterpart to
-`Shimmerable`'s mutable `getMutable`.
-
 ### Implementing a shimmer function for a new type.
 
 Inside a shimmer function, call `shim.prepareToShimmer(T)` before writing the new body.

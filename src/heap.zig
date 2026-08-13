@@ -18,6 +18,7 @@ const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
 const Capability = @import("Capability.zig");
+const Interp = @import("Interp.zig");
 
 pub var initialized: bool = false;
 /// Use to lock `custom_types` or `script_metadata` when adding or removing
@@ -203,9 +204,8 @@ pub export fn dumpLastTouchedTrace(fd: i32) void {
     leak_check.dumpLastTouchedTrace(fd);
 }
 
-/// Signature for a lazy native command initializer. The interpreter pointer
-/// is opaque here to avoid a circular dependency on Interp.zig.
-pub const LazyRegisterFn = *const fn (interp: *anyopaque) callconv(.c) void;
+/// Signature for a lazy native command initializer.
+pub const LazyRegisterFn = *const fn (interp: *Interp) callconv(.c) void;
 
 const LazyFnEntry = struct {
     init_fn: LazyRegisterFn,
@@ -1486,13 +1486,6 @@ pub const Object = extern struct {
         }
     }
 
-    /// Force whatever `getHashNoRegister` would otherwise allocate lazily. Guarded
-    /// on `hashIsCached` so an ordinary object is not made to hash its bytes here
-    /// for a result nothing keeps.
-    fn cacheHash(obj: *Object) error{OutOfMemory}!void {
-        if (!obj.hashIsCached()) _ = try obj.getHashNoRegister();
-    }
-
     pub fn duplicateHeadOnto(src: *const Object, dest: *Object) error{OutOfMemory}!void {
         dest.vtable = src.vtable;
         dest.metadata = .{
@@ -1635,7 +1628,9 @@ pub const hashutil = struct {
     pub fn cacheQuickHash(value: Value) error{OutOfMemory}!void {
         const obj = value.asPtr() orelse return;
         const bytes = try obj.getString();
-        if (bytes.len >= quick_hash_cutoff) try obj.cacheHash();
+        if (bytes.len >= quick_hash_cutoff) {
+            if (!obj.hashIsCached()) _ = try obj.getHashNoRegister();
+        }
     }
 };
 

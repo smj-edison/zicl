@@ -135,8 +135,8 @@ const binary_oper_table = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, 
 
     .angle_bracket_left = .{ .prec = 80, .tag = Node.Tag.less_than, .assoc = .none },
     .angle_bracket_right = .{ .prec = 80, .tag = Node.Tag.greater_than, .assoc = .none },
-    .angle_bracket_left_equal = .{ .prec = 80, .tag = Node.Tag.less_than, .assoc = .none },
-    .angle_bracket_right_equal = .{ .prec = 80, .tag = Node.Tag.less_than, .assoc = .none },
+    .angle_bracket_left_equal = .{ .prec = 80, .tag = Node.Tag.less_or_equal, .assoc = .none },
+    .angle_bracket_right_equal = .{ .prec = 80, .tag = Node.Tag.greater_or_equal, .assoc = .none },
 
     // Precedence must be higher than ==, !=, eq, ne but lower than <, >, <=, >=
     .keyword_lt = .{ .prec = 75, .tag = Node.Tag.string_less_than, .assoc = .none },

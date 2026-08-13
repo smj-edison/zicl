@@ -143,6 +143,7 @@ pub const CachedLocalVar = struct {
     }
 
     fn makeCrossthread(obj: *Object) void {
+        assert(obj.maybeGetString() != null);
         obj.vtable = &objects.None.vtable;
     }
 
@@ -172,6 +173,7 @@ pub const CachedLexicalVar = struct {
     }
 
     fn makeCrossthread(obj: *Object) void {
+        assert(obj.maybeGetString() != null);
         obj.vtable = &objects.None.vtable;
     }
 
@@ -316,6 +318,13 @@ pub const VariableValue = union(enum) {
     lexical_variable: Value,
 };
 
+pub fn badVariableNameError(det: ?*ErrorDetails, name: []const u8) error{ OutOfMemory, BadVariableName } {
+    if (det) |details| details.* = .{
+        .message = try objects.allocPrintZ("bad variable name: \"{s}\"", .{name}),
+    };
+    return error.BadVariableName;
+}
+
 /// Resolves to the variable's value, if any. Does not account for dict sugar.
 fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, var_name: Value) error{
     OutOfMemory,
@@ -328,15 +337,11 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
     // variable. Note that the reservation holds even though the variables table
     // has no `~parent` key of its own, because `Interp.captureScope` writes one
     // into the dictionary it produces.
-    if (try var_name.equalsString("~parent")) {
-        if (det) |details| details.* = .{
-            .message = try std.fmt.allocPrintSentinel(heap.global_gpa, "bad variable name: \"{s}\"", .{try var_name.getString()}, 0),
-        };
-        return error.BadVariableName;
-    }
+    if (try var_name.equals(objects.interned_tilde_parent)) return badVariableNameError(det, "~parent");
 
     const var_table = interp.call_frames.items[var_call_frame].variables;
-    const maybe_scope_hash_ref = &interp.call_frames.items[var_call_frame].signature.scope_hash_ref;
+    const maybe_letrec_scope = &interp.call_frames.items[var_call_frame].signature.letrec_scope;
+    const maybe_scope = &interp.call_frames.items[var_call_frame].signature.scope;
 
     if (try var_table.getIndex(var_name)) |index| {
         return .{
@@ -348,17 +353,31 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
     }
 
     // Wasn't in the variables, maybe it's in a parent scope instead?
-    if (maybe_scope_hash_ref.*) |*scope_hash_ref| {
-        const hash_ref = try scope_hash_ref.get();
-        var dict_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
+    if (maybe_letrec_scope.*) |*letrec_scope| {
+        var dict_shim: Shimmerable = .{ .original = letrec_scope.*.asHead().asValue() };
+        defer dict_shim.discardChanges();
+        const in_linked_scope = try Dictionary.getFollowingLinks(det, &dict_shim, var_name);
+
+        if (dict_shim.takeShimmered().asValue()) |new_dict| {
+            const old_inner = letrec_scope.*;
+            letrec_scope.* = new_dict.asType(Dictionary).?; // Shimmer writeback.
+            old_inner.asHead().release();
+        }
+
+        if (in_linked_scope.asValue()) |val| {
+            return .{ .lexical_variable = val };
+        }
+    }
+
+    if (maybe_scope.*) |*scope| {
+        var dict_shim: Shimmerable = .{ .original = scope.*.asHead().asValue() };
         defer dict_shim.discardChanges();
         const in_linked_scope = try objects.Dictionary.getFollowingLinks(det, &dict_shim, var_name);
 
-        if (dict_shim.shimmered.asValue()) |new_dict_raw| {
-            const new_hash_ref = try objects.HashReference.new(new_dict_raw.asPtr().?);
-            const old_inner = scope_hash_ref.*.inner;
-            scope_hash_ref.*.inner = new_hash_ref.asHead();
-            old_inner.release();
+        if (dict_shim.takeShimmered().asValue()) |new_dict| {
+            const old_inner = scope.*;
+            scope.* = new_dict.asType(Dictionary).?; // Shimmer writeback.
+            old_inner.asHead().release();
         }
 
         if (in_linked_scope.asValue()) |val| {
@@ -448,7 +467,8 @@ pub fn ensureValidVariableType(
 
     // We don't know whether this is a normal variable or dict sugar yet.
     const var_name = try name.current().getString();
-    if (try DictSugar.isValidDictSugar(var_name)) return .dict_sugar;
+    const is_valid_dict_sugar = DictSugar.isValidDictSugar(var_name) catch return badVariableNameError(det, "~parent");
+    if (is_valid_dict_sugar) return .dict_sugar;
 
     // Make sure the variable exists.
     return try reshimmerToVariable(interp, det, var_call_frame, name);

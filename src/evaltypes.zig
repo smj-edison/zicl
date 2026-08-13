@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 const strutil = @import("strutil.zig");
 const ioutil = @import("ioutil.zig");
@@ -1082,17 +1083,17 @@ pub const Closure = struct {
 
     pub const Content = struct {
         /// Argument list of the procedure.
-        arg_names: objects.AlwaysCanBeType(objects.List),
+        arg_names: *objects.List,
         /// Default values of optional arguments.
-        optional_values: ?objects.AlwaysCanBeType(objects.List),
+        optional_values: ?*objects.List,
         required_arity: usize,
         optional_arity: usize,
         /// Value for the script's body.
         body: Value,
         /// We do our best to track the closure's name.
         name: OptionalValue,
-        /// Hash reference pointing to the scope.
-        scope_hash_ref: ?objects.AlwaysCanBeType(objects.HashReference),
+        /// Dictionary containing the scope.
+        scope: ?*objects.Dictionary,
         /// Whether `args` is provided as an argument name. `args`, if present, is always
         /// the last argument name.
         has_args_parameter: bool,
@@ -1102,18 +1103,25 @@ pub const Closure = struct {
         cache_id: u64,
 
         pub fn duplicate(content: *const Content) Content {
-            const borrowed_args = content.arg_names.duplicate();
-            const borrowed_optional_values = if (content.optional_values) |val| val.duplicate() else null;
-            const borrowed_hash_ref = if (content.scope_hash_ref) |val| val.duplicate() else null;
+            assert(content.arg_names.asHead().metadata.cross_thread);
+            content.arg_names.asHead().incrRefCount();
+            if (content.optional_values) |val| {
+                assert(val.asHead().metadata.cross_thread);
+                val.asHead().incrRefCount();
+            }
+            if (content.scope) |val| {
+                assert(val.asHead().metadata.cross_thread);
+                val.asHead().incrRefCount();
+            }
 
             return .{
-                .arg_names = borrowed_args,
-                .optional_values = borrowed_optional_values,
+                .arg_names = content.arg_names,
+                .optional_values = content.optional_values,
                 .required_arity = content.required_arity,
                 .optional_arity = content.optional_arity,
                 .body = content.body.borrow(),
                 .name = content.name.borrow(),
-                .scope_hash_ref = borrowed_hash_ref,
+                .scope = content.scope,
                 .has_args_parameter = content.has_args_parameter,
                 .is_method = content.is_method,
                 .cache_id = content.cache_id,
@@ -1121,12 +1129,12 @@ pub const Closure = struct {
         }
 
         pub fn deinit(content: *Content) void {
-            content.arg_names.inner.release();
-            if (content.optional_values) |vals| vals.inner.release();
+            content.arg_names.asHead().release();
+            if (content.optional_values) |vals| vals.asHead().release();
 
             content.body.release();
             content.name.release();
-            if (content.scope_hash_ref) |ref| ref.inner.release();
+            if (content.scope) |ref| ref.asHead().release();
 
             content.* = undefined;
         }
@@ -1134,11 +1142,11 @@ pub const Closure = struct {
         pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
             const closure: *const Content = @ptrCast(@alignCast(info.node));
             const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
-            try helper.follow(Object, "args", closure.arg_names.inner);
-            try helper.followOptional(Object, "optional_values", if (closure.optional_values) |val| val.inner else null);
+            try helper.follow(Object, "args", closure.arg_names.asHead());
+            try helper.followOptional(Object, "optional_values", if (closure.optional_values) |val| val.asHead() else null);
             try helper.followValue("body", closure.body);
             try helper.followOptionalValue("name", closure.name);
-            try helper.followOptional(Object, "scope_hash_ref", if (closure.scope_hash_ref) |val| val.inner else null);
+            try helper.followOptional(Object, "scope", if (closure.scope) |val| val.asHead() else null);
             try helper.addField(bool, "has_args_parameter", "{}", .{closure.has_args_parameter});
             try helper.addField(bool, "is_method", "{}", .{closure.is_method});
             try helper.addField(u64, "cache_id", "{}", .{closure.cache_id});
@@ -1150,7 +1158,7 @@ pub const Closure = struct {
 
             aw.writer.writeAll(command_name) catch return error.OutOfMemory;
 
-            const closure_args = (try closure.arg_names.get()).items;
+            const closure_args = closure.arg_names.items;
             const signature_len = closure_args.len;
             const optional_start = if (closure.has_args_parameter) closure.required_arity - 1 else closure.required_arity;
 
@@ -1247,17 +1255,20 @@ pub const Closure = struct {
             },
         };
 
-        // Scope must always be a hash reference.
-        var scope_hash_ref: ?*objects.HashReference = null;
-        if (maybe_scope.asValue()) |scope| {
-            var scope_shim: Shimmerable = .{ .original = scope };
-            defer scope_shim.discardChanges();
+        // Scope must always be a dictionary.
+        var scope: ?*objects.Dictionary = null;
+        if (maybe_scope.asValue()) |scope_hash_ref| {
+            var scope_hash_ref_shim: Shimmerable = .{ .original = scope_hash_ref };
+            defer scope_hash_ref_shim.discardChanges();
             // We know we're the only ones who own it, so const cast won't violate any assumptions.
-            const hash_ref = @constCast(try objects.HashReference.shimmerFrom(det, &scope_shim));
-            hash_ref.asHead().incrRefCount();
-            scope_hash_ref = hash_ref;
+            const hash_ref = try objects.HashReference.shimmerFrom(det, &scope_hash_ref_shim);
+
+            var scope_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
+            defer scope_shim.discardChanges();
+            _ = try objects.Dictionary.shimmerFrom(null, &scope_shim);
+            scope = scope_shim.current().borrow().asType(objects.Dictionary).?;
         }
-        errdefer if (scope_hash_ref) |ref| ref.asHead().release();
+        errdefer if (scope) |val| val.asHead().release();
 
         var parsed_args = try parseArgList(det, args_as_list);
         defer parsed_args.deinit();
@@ -1272,14 +1283,19 @@ pub const Closure = struct {
         errdefer heap.global_gpa.destroy(closure_content);
         const closure_obj = try Object.newObject(Closure);
 
+        // By making these values crossthread, we can ensure they never shimmer away from their current type.
+        arg_names_list.asHead().makeCrossthread();
+        if (optional_values_list) |val| val.asHead().makeCrossthread();
+        if (scope) |val| val.asHead().makeCrossthread();
+
         closure_content.* = .{
-            .arg_names = .initOwning(arg_names_list),
-            .optional_values = if (optional_values_list) |val| .initOwning(val) else null,
+            .arg_names = arg_names_list,
+            .optional_values = optional_values_list,
             .required_arity = parsed_args.required_arity,
             .optional_arity = parsed_args.optional_values.len,
             .body = body,
             .name = maybe_name.borrow(),
-            .scope_hash_ref = if (scope_hash_ref) |val| .initOwning(val) else null,
+            .scope = scope,
             .has_args_parameter = parsed_args.has_args_parameter,
             .is_method = is_method,
             .cache_id = closure_cache_id.fetchAdd(1, .monotonic),
@@ -1422,8 +1438,8 @@ pub const Closure = struct {
         const required = closure.required_arity;
         const optional = closure.optional_arity;
 
-        const arg_names = try closure.arg_names.get();
-        const optional_values = if (closure.optional_values) |*val| try val.get() else null;
+        const arg_names = closure.arg_names;
+        const optional_values = closure.optional_values;
 
         // Step 1: Rebuild the arguments list from required and optional args.
 
@@ -1464,9 +1480,12 @@ pub const Closure = struct {
         result.appendAssumeCapacity("impl");
         result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, &args_and_body));
 
-        if (closure.scope_hash_ref) |hash_ref| {
+        var scope_hash_ref: ?[heap.hashutil.hash_and_prepend_len]u8 = null;
+        if (closure.scope) |scope| {
             result.appendAssumeCapacity("scope");
-            result.appendAssumeCapacity(try hash_ref.inner.getString());
+            // Use `getHashRegistering`, as the hash has escaped.
+            scope_hash_ref = objects.HashReference.render(try scope.asHead().getHashRegistering());
+            result.appendAssumeCapacity(&scope_hash_ref.?);
         }
 
         try obj.setStringDuplicating(try strutil.quoteStrings(heap.local_arena, result.items));
@@ -1480,11 +1499,168 @@ pub const Closure = struct {
 
     fn makeCrossthread(obj: *Object) void {
         const content = obj.asType(Closure).?.content;
-        content.arg_names.inner.makeCrossthread();
-        if (content.optional_values) |optional| optional.inner.makeCrossthread();
+        assert(content.arg_names.asHead().metadata.cross_thread);
+        if (content.optional_values) |optional| assert(optional.asHead().metadata.cross_thread);
         content.body.makeCrossthread();
         content.name.makeCrossthread();
-        if (content.scope_hash_ref) |scope| scope.inner.makeCrossthread();
+        if (content.scope) |scope| assert(scope.asHead().metadata.cross_thread);
+    }
+
+    pub const vtable: Object.VTable = .zig(@typeName(@This()), .{
+        .duplicate = duplicate,
+        .free_internal_rep = freeInternalRep,
+        .update_string = updateString,
+        .make_crossthread = makeCrossthread,
+        .enumerate_struct = enumerateStruct,
+    });
+};
+
+pub const CachedNativeCommand = struct {
+    command: *const NativeCommand,
+    command_epoch: u64,
+
+    fn makeCrossthread(obj: *Object) void {
+        assert(obj.maybeGetString() != null);
+        obj.vtable = &objects.None.vtable;
+    }
+
+    pub const vtable: Object.VTable = .zig(@typeName(CachedNativeCommand), .{
+        .duplicate = Object.duplicateStringOnly,
+        .update_string = null,
+        .free_internal_rep = null,
+        .make_crossthread = makeCrossthread,
+        // TODO same issue as `CachedLocalVar.vtable`.
+        .enumerate_struct = null,
+    });
+};
+
+pub const Letrec = struct {
+    pub const interned_select = heap.InternedString.newValue("select");
+
+    /// The scope containing all the functions that can call each other. Identical
+    /// to any other bog-standard scope.
+    scope: *objects.Dictionary,
+    /// Which function is selected. For example, if I did
+    /// ```tcl
+    /// fn group::foo {} { bar }
+    /// fn group::bar {} { foo }
+    /// set foo [letrec select $group foo]
+    /// ```
+    /// then `foo` would be the value of `selected`. This means
+    /// that [foo] is the entry point to recursion in this case.
+    selected: Value,
+
+    pub const prefix = "letrec ";
+
+    pub fn asHead(self: *Letrec) *Object {
+        return Object.from(Letrec, self);
+    }
+
+    pub fn new(det: ?*ErrorDetails, scope: *objects.Dictionary, selected: Value) !*Letrec {
+        if (try selected.equals(objects.interned_tilde_parent)) return vartypes.badVariableNameError(det, "~parent");
+
+        const new_obj = try Object.newObject(Letrec);
+        errdefer new_obj.head.release();
+
+        assert(scope.asHead().metadata.cross_thread);
+        scope.asHead().incrRefCount();
+
+        new_obj.body.* = .{
+            .scope = scope,
+            .selected = selected.borrow(),
+        };
+        return new_obj.body;
+    }
+
+    fn badLetrec(det: ?*ErrorDetails, bytes: []const u8) error{ OutOfMemory, BadLetrec } {
+        if (det) |details| details.* = .{
+            .message = try allocPrintZ("not a valid letrec: \"{s}\"", .{bytes}),
+        };
+        return error.BadLetrec;
+    }
+
+    pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !*const Letrec {
+        if (shim.current().asType(Letrec)) |letrec| return letrec;
+
+        const bytes = try shim.current().getString();
+        if (bytes.len <= prefix.len or !std.mem.eql(u8, bytes[0..prefix.len], prefix)) return badLetrec(det, bytes);
+
+        var letrec_value: Shimmerable = .{ .original = try objects.String.newValue(bytes[prefix.len..]) };
+        defer letrec_value.deinit();
+
+        const as_dict = objects.Dictionary.shimmerFrom(null, &letrec_value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return badLetrec(det, bytes),
+        };
+
+        const scope = (try as_dict.getNoFollow(Closure.interned_scope)).asValue() orelse return badLetrec(det, bytes);
+        const selected = (try as_dict.getNoFollow(interned_select)).asValue() orelse return badLetrec(det, bytes);
+        if (try selected.equals(objects.interned_tilde_parent)) return vartypes.badVariableNameError(det, "~parent");
+
+        var scope_hash_ref_shim: Shimmerable = .{ .original = scope };
+        defer scope_hash_ref_shim.discardChanges();
+        // We know we're the only ones who own it, so const cast won't violate any assumptions.
+        const hash_ref = try objects.HashReference.shimmerFrom(det, &scope_hash_ref_shim);
+
+        var scope_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
+        defer scope_shim.discardChanges();
+        _ = try objects.Dictionary.shimmerFrom(det, &scope_shim);
+        const dict = scope_shim.current().asType(objects.Dictionary).?;
+
+        const as_letrec = try shim.prepareToShimmer(Letrec);
+        dict.asHead().makeCrossthread();
+        dict.asHead().incrRefCount();
+        as_letrec.* = .{
+            .scope = dict,
+            .selected = selected.borrow(),
+        };
+
+        return as_letrec;
+    }
+
+    fn duplicate(src: *const Object) !*Object {
+        const new_obj = try Object.newObjectUninitialized(Letrec);
+        errdefer new_obj.head.freeBacking();
+        try src.duplicateHeadOnto(new_obj.head);
+
+        const as_letrec = src.asTypeConst(Letrec).?;
+        as_letrec.scope.asHead().incrRefCount();
+        new_obj.body.* = .{
+            .scope = as_letrec.scope,
+            .selected = as_letrec.selected.borrow(),
+        };
+        return new_obj.head;
+    }
+
+    fn freeInternalRep(obj: *Object) void {
+        const as_letrec = obj.asType(Letrec).?;
+        as_letrec.scope.asHead().release();
+        as_letrec.selected.release();
+    }
+
+    fn updateString(obj: *Object) !void {
+        const as_letrec = obj.asType(Letrec).?;
+        const parts: [5][]const u8 = .{
+            "letrec",
+            "select",
+            try as_letrec.selected.getString(),
+            "scope",
+            try as_letrec.scope.asHead().getString(),
+        };
+        try obj.setStringDuplicating(try strutil.quoteStrings(heap.local_arena, &parts));
+    }
+
+    fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
+        const letrec = obj.asTypeConst(Letrec).?;
+        const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
+        try helper.follow(Object, "scope", letrec.scope.asHead());
+        try helper.followValue("selected", letrec.selected);
+    }
+
+    fn makeCrossthread(obj: *Object) void {
+        const letrec = obj.asType(Letrec).?;
+        assert(letrec.scope.asHead().metadata.cross_thread);
+        letrec.selected.makeCrossthread();
     }
 
     pub const vtable: Object.VTable = .zig(@typeName(@This()), .{
@@ -1508,7 +1684,7 @@ pub const NativeCommand = struct {
 
     /// Returns a string containing all the usage information. Allocates the string
     /// onto `gpa`. Produces something like `cmd ...`, or `cmd arg1 arg2 ?arg3?`
-    pub fn getUsageInfo(command: *NativeCommand, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
+    pub fn getUsageInfo(command: *const NativeCommand, gpa: std.mem.Allocator, command_name: []const u8) ![]const u8 {
         var aw = std.Io.Writer.Allocating.init(gpa);
         defer aw.deinit();
 

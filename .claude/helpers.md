@@ -155,15 +155,6 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Shimmerable.prepareToShimmer(self, T)` -- `ensureShimmerable`, cache the string rep, free the old body, install `T`'s vtable, and return the `*T` body to fill in. Call this from inside a `shimmerFrom`.
 - `Shimmerable.getMutable(self, T, det)` -- Shimmer to `T`, then return an owned `*T` to mutate. Essentially always duplicates, and the result is detached from the shim: release it yourself and write it back explicitly. Prefer `Value.asMutableInPlace` unless a shim is already in hand.
 
-### AlwaysCanBeType (read-only typed view)
-- `objects.AlwaysCanBeType(T)` -- Comptime: returns a wrapper around `*Object` that can shimmer but never mutates the shared object.
-  - `.init(value)` -- Wrap a `*T`, borrowing it.
-  - `.initOwning(value)` -- Wrap a `*T`, taking the caller's reference.
-  - `.deinit(self)` -- Release the held object.
-  - `.duplicate(self)` -- Copy the wrapper (bumps ref count).
-  - `.get(self)` -- Shimmer to `T` if needed and return `*const T`; may OOM. Re-points `inner` at a duplicate when the original could not shimmer.
-  - `.getMutable(self)` -- Return a `*T` safe to write to, duplicating first when the held object cannot mutate.
-
 ### IterHelper (leak-graph field walking)
 - `IterHelper.follow(helper, T, field_name, ptr)` -- Follow a child struct (rejects object bodies; follow their `*Object` instead).
 - `IterHelper.followOptional(helper, T, field_name, ptr)` -- Follow a nullable child struct.

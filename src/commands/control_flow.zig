@@ -64,6 +64,21 @@ pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setEmptyResult();
 }
 
+pub fn whileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    while (try interp.getBoolFromExpression(args[1].current())) {
+        // Evaluate body.
+        switch (try propagateLoopControl(interp, interp.evalValue(args[2].current()))) {
+            .@"break" => {
+                break;
+            },
+            .@"continue" => {},
+            .none => {},
+        }
+    }
+
+    interp.setEmptyResult();
+}
+
 /// Shared implementation of [foreach] and [lmap].
 /// Shared by [foreach] here and [lmap] in `list.zig`.
 pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { foreach, map }) Interp.Error!void {
@@ -531,6 +546,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "if", ifCmd, "condition trueBody ?elseif ...? ?else falseBody?", 2, null);
     try registerCommand(interp, "return", returnCmd, "?-option value ...? ?result?", 0, null);
     try registerCommand(interp, "switch", switchCmd, "?options? string pattern body ... ?default body? or pattern body ?pattern body ...?", 2, null);
+    try registerCommand(interp, "while", whileCmd, "condition body", 2, 2);
 }
 
 fn testReturnEscapesANestedBodyToLeaveTheClosure(ta: std.mem.Allocator) !void {

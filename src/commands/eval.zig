@@ -4,7 +4,6 @@ const testing = std.testing;
 const Tokenizer = @import("../Tokenizer.zig");
 const evaltypes = @import("../evaltypes.zig");
 const common = @import("common.zig");
-const AlwaysCanBeType = common.AlwaysCanBeType;
 const assert = common.assert;
 const heap = common.heap;
 const Object = heap.Object;
@@ -106,35 +105,79 @@ pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 /// [apply]
 pub fn applyCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    const closure_and_key = try interp.getClosure(args[1].current(), false);
-
-    closure_and_key.closure.asHead().incrRefCount(); // Pin the closure so it doesn't get freed while we evaluate it.
-    defer closure_and_key.closure.asHead().release();
+    var command = interp.getCommandFromValue(&args[1], false) catch |err| switch (err) {
+        error.CommandNotFound => return error.EvalError, // Message already set.
+        else => return Interp.narrowError(err),
+    };
+    defer command.deinit();
 
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
-    try Interp.narrowToEvalError(interp.callClosure(closure_and_key.closure.content, closure_and_key.cache_key, args[1..]));
+    try interp.invokeCommand(&command, args[1..]);
 }
 
 pub fn applymethodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    const closure_and_key = try interp.getClosure(args[1].current(), true);
+    var command = interp.getCommandFromValue(&args[1], true) catch |err| switch (err) {
+        error.CommandNotFound => return error.EvalError, // Message already set.
+        else => return Interp.narrowError(err),
+    };
+    defer command.deinit();
 
-    if (!closure_and_key.closure.content.is_method) {
+    const valid = switch (command) {
+        .closure => |closure| closure.closure.content.is_method,
+        .letrec => |letrec| letrec.closure.closure.content.is_method,
+        .command => false,
+    };
+    if (!valid) {
         try interp.setResultString("[applymethod] called with a function");
         return error.EvalError;
     }
 
-    closure_and_key.closure.asHead().incrRefCount(); // Pin the closure so it doesn't get freed while we evaluate it.
-    defer closure_and_key.closure.asHead().release();
-
-    try Interp.narrowToEvalError(interp.callClosure(closure_and_key.closure.content, closure_and_key.cache_key, args[1..]));
+    defer args[2].discardChanges(); // Make sure the mutated self value never escapes.
+    try interp.invokeCommand(&command, args[1..]);
 
     const new_self = args[2].shimmered.asValue().?;
-    args[2].shimmered = .none; // It's bad practice to leave a `Shimmerable` as mutated.
-    defer new_self.release();
     const method_result = interp.result;
 
     interp.setResultOwning((try objects.List.new(&.{ new_self, method_result })).asHead().asValue());
+}
+
+pub fn letrecCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    const Subcommands = enum { select, new };
+    const Parser = objects.SubcommandParser(Subcommands, &.{
+        .{ .variant = .select, .usage = "scope function", .min_args = 2, .max_args = 2 },
+        .{ .variant = .new, .usage = "scope", .min_args = 1, .max_args = 1 },
+    });
+
+    var det: ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    _ = try interp.getDict(&args[2]);
+    const scope_mut = args[2].current().asType(objects.Dictionary).?;
+    scope_mut.asHead().makeCrossthread();
+
+    switch (subcommand) {
+        .select => {
+            const letrec = try interp.wrapError(&det, evaltypes.Letrec.new(&det, scope_mut, args[3].current()));
+            interp.setResultOwning(letrec.asHead().asValue());
+        },
+        .new => {
+            // A dumb wrapper: it wraps every key in `scope`, whether it holds a
+            // function or plain data, since it has no way to tell the two apart.
+            const result = try objects.Dictionary.newWithCapacity(&.{}, scope_mut.items.len);
+            errdefer result.asHead().release();
+
+            var iter = scope_mut.table.iterator();
+            while (iter.next()) |pair| {
+                if (try pair.key_ptr.equals(objects.interned_tilde_parent)) continue;
+                const letrec_entry = try interp.wrapError(&det, evaltypes.Letrec.new(&det, scope_mut, pair.key_ptr.*));
+                defer letrec_entry.asHead().release();
+                try result.put(pair.key_ptr.*, letrec_entry.asHead().asValue());
+            }
+
+            interp.setResultOwning(result.asHead().asValue());
+        },
+    }
 }
 
 pub fn tailcallCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -186,10 +229,8 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
 
         // Capture the current scope.
         const scope: *objects.Dictionary = try Interp.narrowToEvalError(interp.captureCurrentScope());
-        defer scope.asHead().release();
+        errdefer scope.asHead().release();
         // As well as reference it.
-        const scope_hash_ref = try objects.HashReference.new(scope.asHead());
-        errdefer scope_hash_ref.asHead().release();
 
         const closure_obj = try Object.newObject(evaltypes.Closure);
         errdefer closure_obj.head.freeBacking();
@@ -201,14 +242,19 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
             if (parsed_args.optional_values.len > 0) try objects.List.new(parsed_args.optional_values) else null;
         errdefer comptime unreachable; // We now take ownership of everything.
 
+        // This makes sure the values never shimmer away from their current representations.
+        arg_names.asHead().makeCrossthread();
+        scope.asHead().makeCrossthread();
+        if (optional_values) |val| val.asHead().makeCrossthread();
+
         closure_content.* = .{
-            .arg_names = .initOwning(arg_names),
+            .arg_names = arg_names,
             .body = body.current().borrow(),
             .name = if (fn_name) |val| val.current().borrow().asOptional() else .none,
-            .scope_hash_ref = .initOwning(scope_hash_ref),
+            .scope = scope,
             .required_arity = parsed_args.required_arity,
             .optional_arity = parsed_args.optional_values.len,
-            .optional_values = if (optional_values) |values| AlwaysCanBeType(List).initOwning(values) else null,
+            .optional_values = optional_values,
             .has_args_parameter = parsed_args.has_args_parameter,
             .is_method = mode == .method,
             .cache_id = evaltypes.Closure.closure_cache_id.fetchAdd(1, .monotonic),
@@ -245,6 +291,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null);
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1);
     try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3);
+    try registerCommand(interp, "letrec", letrecCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1);
     try registerCommand(interp, "subst", substCmd, "?options? string", 1, 4);
@@ -315,7 +362,7 @@ test "fn nested closure scope" {
     try memutil.checkAllocationFailures(.exhaustive, testFnNestedClosureScope, .{});
 }
 
-fn testFnNestsLexicalScopesThreeLevelsDeep(ta: std.mem.Allocator) !void {
+fn testFnDeeplyNestedClosure(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
@@ -337,11 +384,11 @@ fn testFnNestsLexicalScopesThreeLevelsDeep(ta: std.mem.Allocator) !void {
     );
 }
 
-test "fn nests lexical scopes three levels deep" {
-    try memutil.checkAllocationFailures(.exhaustive, testFnNestsLexicalScopesThreeLevelsDeep, .{});
+test "fn deeply nested closure" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnDeeplyNestedClosure, .{});
 }
 
-fn testFnShadowsALexicalWithALocalOfTheSameName(ta: std.mem.Allocator) !void {
+fn testFnShadowsCorrectly(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
@@ -360,11 +407,132 @@ fn testFnShadowsALexicalWithALocalOfTheSameName(ta: std.mem.Allocator) !void {
     );
 }
 
-test "fn shadows a lexical with a local of the same name" {
-    try memutil.checkAllocationFailures(.exhaustive, testFnShadowsALexicalWithALocalOfTheSameName, .{});
+test "fn shadows correctly" {
+    try memutil.checkAllocationFailures(.exhaustive, testFnShadowsCorrectly, .{});
 }
 
-fn testEvaluationRecyclesArenaScratchInsteadOfAccumulatingIt(ta: std.mem.Allocator) !void {
+fn testLetrec(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Self recursion.
+    try interp.testExpectScriptResult("55",
+        \\ fn scope::fibonacci {n} {
+        \\     if {$n <= 1} { return $n }
+        \\     return [+ [fibonacci [- $n 1]] [fibonacci [- $n 2]]]
+        \\ }
+        \\ set fibonacci [letrec select $scope fibonacci]
+        \\ fibonacci 10
+    );
+}
+
+test "letrec" {
+    try memutil.checkAllocationFailures(.exhaustive, testLetrec, .{});
+}
+
+fn testLetrecMutualRecursion(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Mutual recursion: two closures in the same letrec scope calling each other.
+    try interp.testExpectScriptResult("true",
+        \\ fn scope::is_even {n} {
+        \\     if {$n == 0} { return true }
+        \\     return [is_odd [- $n 1]]
+        \\ }
+        \\ fn scope::is_odd {n} {
+        \\     if {$n == 0} { return false }
+        \\     return [is_even [- $n 1]]
+        \\ }
+        \\ set is_even [letrec select $scope is_even]
+        \\ is_even 10
+    );
+}
+
+test "letrec mutual recursion" {
+    try memutil.checkAllocationFailures(.exhaustive, testLetrecMutualRecursion, .{});
+}
+
+fn testLetrecMethod(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // A letrec-selected value resolves through `getCommandFromValue`'s `.letrec`
+    // branch, not its `.closure` branch. `[applymethod]` validates methods
+    // through both branches separately, so this exercises the `.letrec` one:
+    // does `self` write back correctly when the method was reached via letrec?
+    try interp.testExpectScriptResult("count 8",
+        \\ method scope::bump {self n} {
+        \\     dict set self count [+ [dict get $self count] $n]
+        \\     return done
+        \\ }
+        \\ set bump [letrec select $scope bump]
+        \\ lindex [applymethod $bump {count 5} 3] 0
+    );
+}
+
+test "letrec method" {
+    try memutil.checkAllocationFailures(.exhaustive, testLetrecMethod, .{});
+}
+
+fn testLetrecNew(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // `[letrec new $scope]` builds the whole self-dispatch table in one call,
+    // instead of a `letrec select` per peer.
+    try interp.testExpectScriptResult("ping pong ping",
+        \\ method scope::ping {self n} {
+        \\     set self::path [concat $self::path ping]
+        \\     if {$n <= 0} { return $self::path }
+        \\     return [self::pong [- $n 1]]
+        \\ }
+        \\ method scope::pong {self n} {
+        \\     set self::path [concat $self::path pong]
+        \\     if {$n <= 0} { return $self::path }
+        \\     return [self::ping [- $n 1]]
+        \\ }
+        \\ set self [dict merge {path {}} [letrec new $scope]]
+        \\ self::ping 2
+    );
+}
+
+test "letrec new" {
+    try memutil.checkAllocationFailures(.exhaustive, testLetrecNew, .{});
+}
+
+fn testLetrecSelfDictSugar(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Mutual recursion between two methods, reaching each other through
+    // `self::peerName` (dict sugar). Bare-name method dispatch already
+    // extracts `self` from the dict at that path and writes the mutated
+    // result back afterward, so no `[applymethod]` call is needed anywhere,
+    // including at the top level: `self` carries its own dispatch table.
+    try interp.testExpectScriptResult("ping pong ping",
+        \\ method scope::ping {self n} {
+        \\     set self::path [concat $self::path ping]
+        \\     if {$n <= 0} { return $self::path }
+        \\     return [self::pong [- $n 1]]
+        \\ }
+        \\ method scope::pong {self n} {
+        \\     set self::path [concat $self::path pong]
+        \\     if {$n <= 0} { return $self::path }
+        \\     return [self::ping [- $n 1]]
+        \\ }
+        \\ set ping [letrec select $scope ping]
+        \\ set pong [letrec select $scope pong]
+        \\ set self [dict create path {} ping $ping pong $pong]
+        \\ self::ping 2
+    );
+}
+
+test "letrec self dict sugar" {
+    try memutil.checkAllocationFailures(.exhaustive, testLetrecSelfDictSugar, .{});
+}
+
+fn testHeapArenaRecycles(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
@@ -391,8 +559,8 @@ fn testEvaluationRecyclesArenaScratchInsteadOfAccumulatingIt(ta: std.mem.Allocat
     try std.testing.expectEqual(warmed, heap.local_arena_instance.queryCapacity());
 }
 
-test "evaluation recycles arena scratch instead of accumulating it" {
-    try memutil.checkAllocationFailures(.exhaustive, testEvaluationRecyclesArenaScratchInsteadOfAccumulatingIt, .{});
+test "heap arena recycles" {
+    try memutil.checkAllocationFailures(.exhaustive, testHeapArenaRecycles, .{});
 }
 
 fn testArenaScratchDoesNotScaleWithTheWorkAScriptDoes(ta: std.mem.Allocator) !void {
