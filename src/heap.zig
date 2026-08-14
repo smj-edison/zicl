@@ -1211,10 +1211,23 @@ pub const Object = extern struct {
                     };
                 }
 
-                switch (obj.getStringDetails()) {
+                var details = obj.getStringDetails();
+                switch (details) {
                     .special => |special| return special.getString(),
                     .normal => |normal| return normal,
-                    .none => unreachable,
+                    .none => {
+                        // May not have released the details of the string yet,
+                        // so spin until we get all the details.
+                        while (std.meta.activeTag(details) == .none) {
+                            details = obj.getStringDetails();
+                        }
+
+                        switch (details) {
+                            .special => |special| return special.getString(),
+                            .normal => |normal| return normal,
+                            .none => unreachable,
+                        }
+                    },
                 }
             },
         }
@@ -1364,30 +1377,43 @@ pub const Object = extern struct {
     }
 
     pub fn release(obj: *Object) void {
-        const new_ref_count = decrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        if (!obj.metadata.cross_thread) {
+            // We don't deal with hash unregistering here, since an object
+            // is always marked as crossthread when it's registered.
+            obj.ref_count -= 1;
+            obj.asValue().trace("Decremented ref count (now {})", .{obj.ref_count});
+            if (obj.ref_count == 0) obj.deinit();
+            return;
+        }
+
+        // We need to load `metadata` before decrementing, because decrementing means
+        // we've released our ownership of the object, and so another thread could
+        // swoop in and free the object before we read the metadata (ask me how I know).
+        const metadata = obj.hash_metadata.load(.monotonic);
+        const new_ref_count = decrRefCountOf(u32, &obj.ref_count, true);
         obj.asValue().trace("Decremented ref count (now {})", .{new_ref_count});
 
-        // You may be wondering, why the heck `<= 1`, and not `== 0`? Because hash representatives
-        // are owned by the hash registry, so there's a circular reference. But, hash representatives
-        // can be safely freed if nobody else references them, so this is the needed logic to deal
-        // with the circular reference created by the hash registry.
-        if (new_ref_count <= 1) {
-            const metadata = obj.hash_metadata.load(.monotonic);
+        if (new_ref_count == 1) {
             if (metadata.is_representative) {
                 // It's impossible for this to not have a registered hash,
                 // since we just checked that `is_representative` is true,
-                // which means that the hash was registered.
+                // which means that the hash was registered and owned
+                // by the registry.
                 const hash = obj.getHashNoRegister() catch unreachable;
                 registered_hashes.unregister(hash, obj);
             }
-
-            if (new_ref_count == 0) {
-                if (metadata.hash_registered) {
-                    const hash = obj.getHashNoRegister() catch unreachable;
-                    registered_hashes.unregister(hash, obj);
-                }
-                obj.deinit();
+        } else if (new_ref_count == 0) {
+            if (metadata.hash_registered) {
+                // Now you might say, "hey, didn't you previously have to
+                // load `metadata` beforehand to prevent the object from
+                // being freed from underneath you?" And yes, I did say that.
+                // However, if we were the ones _who brought it to zero_,
+                // we are the true last owners. When we brought it to one,
+                // there was still someone else who could bring it to zero.
+                const hash = obj.getHashNoRegister() catch unreachable;
+                registered_hashes.unregister(hash, obj);
             }
+            obj.deinit();
         }
     }
 
