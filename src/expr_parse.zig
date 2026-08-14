@@ -205,12 +205,6 @@ pub const Parser = struct {
 
     const Mode = struct {
         ternary: enum { not, true_branch, false_branch } = .not,
-        parens: enum {
-            none,
-            non_function,
-            function_more_args,
-            function_no_more_args,
-        } = .none,
     };
     fn parsePrefixExpr(p: *Parser, mode: Mode) error{ OutOfMemory, ParseError }!?Node.Index {
         const token = p.tokenTag(p.token_i);
@@ -234,7 +228,10 @@ pub const Parser = struct {
             },
             .l_paren => {
                 p.token_i += 1;
-                return try p.parseExprPrecedence(0, .{ .parens = .non_function, .ternary = mode.ternary });
+                const inner = try p.parseExprPrecedence(0, .{ .ternary = mode.ternary }) orelse return p.fail(.missing_operand);
+                if (p.tokenTag(p.token_i) != .r_paren) return p.fail(.missing_r_paren);
+                p.token_i += 1;
+                return inner;
             },
             .r_paren => {
                 // We shouldn't normally hit a right paren as the first token, so something
@@ -314,9 +311,10 @@ pub const Parser = struct {
                     },
                     1 => {
                         const func_argument = try p.parseExprPrecedence(0, .{
-                            .parens = .function_no_more_args,
                             .ternary = mode.ternary,
                         }) orelse return p.fail(.too_few_arguments);
+                        if (p.tokenTag(p.token_i) != .r_paren) return p.fail(.too_many_arguments);
+                        p.token_i += 1;
                         return try p.addNode(.{
                             .tag = tag,
                             .data = .{ .unary = func_argument },
@@ -324,13 +322,19 @@ pub const Parser = struct {
                     },
                     2 => {
                         const first_argument = try p.parseExprPrecedence(0, .{
-                            .parens = .function_more_args,
                             .ternary = mode.ternary,
                         }) orelse return p.fail(.too_few_arguments);
+                        if (p.tokenTag(p.token_i) != .comma) return p.fail(.too_few_arguments);
+                        p.token_i += 1;
                         const second_argument = try p.parseExprPrecedence(0, .{
-                            .parens = .function_no_more_args,
                             .ternary = mode.ternary,
                         }) orelse return p.fail(.too_few_arguments);
+                        if (p.tokenTag(p.token_i) != .r_paren) {
+                            // Point at the extra argument itself, not the
+                            // comma before it.
+                            return p.failAt(.too_many_arguments, p.token_i + 1);
+                        }
+                        p.token_i += 1;
                         return try p.addNode(.{
                             .tag = tag,
                             .data = .{ .binary = .{ first_argument, second_argument } },
@@ -443,29 +447,8 @@ pub const Parser = struct {
                 => {
                     return p.fail(.missing_operator);
                 },
-                .r_paren => {
-                    if (mode.parens == .function_more_args) {
-                        return p.fail(.too_few_arguments);
-                    } else if (mode.parens == .function_no_more_args) {
-                        p.token_i += 1;
-                        return node;
-                    } else if (mode.parens == .non_function) {
-                        p.token_i += 1;
-                        return node;
-                    } else {
-                        return p.fail(.too_many_r_parens);
-                    }
-                },
-                .comma => {
-                    if (mode.parens == .function_more_args) {
-                        p.token_i += 1;
-                        return node;
-                    } else if (mode.parens == .function_no_more_args) {
-                        return p.failAt(.too_many_arguments, p.token_i + 1);
-                    } else {
-                        return p.fail(.comma_outside_function);
-                    }
-                },
+                // Caller decides how to handle .r_paren and .comma.
+                .r_paren, .comma => return node,
                 .colon => {
                     if (mode.ternary == .true_branch) {
                         return node;
@@ -479,14 +462,12 @@ pub const Parser = struct {
                     p.token_i += 1;
                     const value_if_true = try p.parseExprPrecedence(0, .{
                         .ternary = .true_branch,
-                        .parens = mode.parens,
                     }) orelse return p.fail(.missing_operand);
                     if (p.tokenTag(p.nextToken()) != .colon) {
                         return p.fail(.missing_colon);
                     }
                     const value_if_false = try p.parseExprPrecedence(0, .{
                         .ternary = .false_branch,
-                        .parens = mode.parens,
                     }) orelse return p.fail(.missing_operand);
 
                     return try p.addNode(.{
@@ -541,6 +522,13 @@ pub const Parser = struct {
 
     pub fn parseExpr(p: *Parser) error{ OutOfMemory, ParseError }!Parsed {
         const root_node = try p.parseExprPrecedence(0, .{}) orelse return p.fail(.empty_expression);
+        if (p.tokenTag(p.token_i) != .end_of_file) {
+            return switch (p.tokenTag(p.token_i)) {
+                .r_paren => p.fail(.too_many_r_parens),
+                .comma => p.fail(.comma_outside_function),
+                else => p.fail(.missing_operator),
+            };
+        }
 
         return .{
             .nodes = try p.nodes.toOwnedSlice(p.gpa),
@@ -580,6 +568,7 @@ pub const Parser = struct {
             too_few_arguments,
             too_many_arguments,
             too_many_r_parens,
+            missing_r_paren,
             chained_comparison_operators,
             comma_outside_function,
             missing_operator,
@@ -652,6 +641,7 @@ pub const Parser = struct {
             .too_few_arguments => try w.writeAll("not enough arguments for function"),
             .too_many_arguments => try w.writeAll("too many arguments for function"),
             .too_many_r_parens => try w.writeAll("unexpected closing parenthesis"),
+            .missing_r_paren => try w.writeAll("missing close-parenthesis"),
             .chained_comparison_operators => try w.writeAll("unexpected chained comparison operator"),
             .comma_outside_function => try w.writeAll("unexpected \",\""),
         }
@@ -840,6 +830,16 @@ test "expr parsing" {
         "(.atan2 (.ternary_conditional 1 10 5) (.to_int (.ternary_conditional 0 5 2)))",
     );
 
+    // A `(...)` group must stop at its own `)`, not keep absorbing whatever
+    // operator follows.
+    try testExprParse(ta, "(2*2)/(3*4) < 100", "(((2 .mul 2) .div (3 .mul 4)) .less_than 100)");
+    try testExprParse(ta, "sin(2+3) + 1", "((.sin (2 .add 3)) .add 1)");
+    try testExprParse(
+        ta,
+        "atan2(1+2, 3+4) + 5",
+        "((.atan2 (1 .add 2) (3 .add 4)) .add 5)",
+    );
+
     // Test error messages.
     try testExprParseError(ta, "", .empty_expression, "error: empty expression\n  |\n1 | \n  | ^");
     try testExprParseError(ta, "   ", .empty_expression, null);
@@ -885,8 +885,8 @@ test "expr parsing" {
         \\1 | 5 < 10 > 15
         \\  |        ^
     );
-    try testExprParseError(ta, "atan2((1, 5)", .comma_outside_function,
-        \\error: unexpected ","
+    try testExprParseError(ta, "atan2((1, 5)", .missing_r_paren,
+        \\error: missing close-parenthesis
         \\  |
         \\1 | atan2((1, 5)
         \\  |         ^
