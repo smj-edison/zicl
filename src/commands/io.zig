@@ -54,16 +54,15 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
 
         body.writeAll(to_print) catch |err| return writeError(interp, err);
         if (print_newline) body.writeAll("\n") catch |err| return writeError(interp, err);
-        return;
+    } else {
+        const stdout = ioutil.getStdout();
+        var buf: [64]u8 = undefined;
+        var writer = stdout.writer(heap.global_io, &buf);
+
+        writer.interface.writeAll(to_print) catch return writeError(interp, writer.err.?);
+        if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, writer.err.?);
+        writer.flush() catch return writeError(interp, writer.err.?);
     }
-
-    const stdout = ioutil.getStdout();
-    var buf: [64]u8 = undefined;
-    var writer = stdout.writer(heap.global_io, &buf);
-
-    writer.interface.writeAll(to_print) catch return writeError(interp, writer.err.?);
-    if (print_newline) writer.interface.writeAll("\n") catch return writeError(interp, writer.err.?);
-    writer.flush() catch return writeError(interp, writer.err.?);
 }
 
 fn writeError(interp: *Interp, err: anyerror) Interp.Error {
@@ -192,9 +191,14 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .mkdir => {
             const path = try args[2].getString();
-            std.Io.Dir.cwd().createDir(heap.global_io, path, .default_dir) catch |err| {
-                try interp.setResultFormatted("could not create directory: {s}", .{@errorName(err)});
-                return error.EvalError;
+            // Tcl's `file mkdir` is idempotent, so it's not an error if the
+            // directory already exists.
+            std.Io.Dir.cwd().createDir(heap.global_io, path, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => {
+                    try interp.setResultFormatted("could not create directory: {s}", .{@errorName(err)});
+                    return error.EvalError;
+                },
             };
             interp.setEmptyResult();
         },
