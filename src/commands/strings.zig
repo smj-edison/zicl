@@ -1,4 +1,5 @@
 const std = @import("std");
+const fmt = std.fmt;
 
 const strutil = @import("../strutil.zig");
 
@@ -608,8 +609,348 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
     }
 }
 
+const FormatSpec = struct {
+    left_align: bool = false,
+    force_sign: bool = false,
+    space_sign: bool = false,
+    zero_pad: bool = false,
+    alt_form: bool = false,
+    width: ?usize = null,
+    precision: ?usize = null,
+};
+
+/// Pads `text` out to `spec.width`, on the left with spaces (right-justified,
+/// the default) or on the right with spaces (`-` flag). Zero-padding for
+/// numeric conversions is handled by `formatNumeric` instead, since the
+/// padding zeros have to land *after* any sign, not before it.
+fn padAndAppend(gpa: std.mem.Allocator, text: []const u8, spec: FormatSpec, out: *std.ArrayList(u8)) !void {
+    const pad = if (spec.width) |w| w -| text.len else 0;
+    if (pad > 0 and !spec.left_align) try out.appendNTimes(gpa, ' ', pad);
+    try out.appendSlice(gpa, text);
+    if (pad > 0 and spec.left_align) try out.appendNTimes(gpa, ' ', pad);
+}
+
+/// Formats an already-rendered (unsigned, unpadded) digit string `digits`
+/// for a numeric conversion: applies the sign, the `#`-flag prefix, and
+/// width padding (zero-padding lands between the sign/prefix and the
+/// digits, so `-007` not `00-7`, matching C's printf).
+fn formatNumeric(
+    gpa: std.mem.Allocator,
+    digits: []const u8,
+    negative: bool,
+    prefix: []const u8,
+    spec: FormatSpec,
+    out: *std.ArrayList(u8),
+) !void {
+    const sign: []const u8 = if (negative) "-" else if (spec.force_sign) "+" else if (spec.space_sign) " " else "";
+    const body_len = sign.len + prefix.len + digits.len;
+    const pad = if (spec.width) |w| w -| body_len else 0;
+
+    if (pad > 0 and !spec.left_align and !spec.zero_pad) try out.appendNTimes(gpa, ' ', pad);
+    try out.appendSlice(gpa, sign);
+    try out.appendSlice(gpa, prefix);
+    if (pad > 0 and !spec.left_align and spec.zero_pad) try out.appendNTimes(gpa, '0', pad);
+    try out.appendSlice(gpa, digits);
+    if (pad > 0 and spec.left_align) try out.appendNTimes(gpa, ' ', pad);
+}
+
+fn formatInteger(gpa: std.mem.Allocator, value: i64, base: u8, uppercase: bool, spec: FormatSpec, out: *std.ArrayList(u8)) !void {
+    const negative = value < 0 and base == 10;
+    // Formatted as unsigned throughout: %x/%o always treat the bit pattern
+    // as unsigned (matching C), and for %d we just strip the sign here and
+    // reapply it in `formatNumeric`.
+    const magnitude: u64 = if (base == 10) @abs(value) else @as(u64, @bitCast(value));
+
+    var buf: [64]u8 = undefined;
+    const digits_len = std.fmt.printInt(&buf, magnitude, base, if (uppercase) .upper else .lower, .{});
+    const digits = buf[0..digits_len];
+
+    var prefix: []const u8 = "";
+    if (spec.alt_form and magnitude != 0) {
+        if (base == 16) {
+            prefix = if (uppercase) "0X" else "0x";
+        } else if (base == 8) {
+            prefix = "0";
+        }
+    }
+
+    try formatNumeric(gpa, digits, negative, prefix, spec, out);
+}
+
+/// Fetches the next format argument, erroring if none are left. Each
+/// conversion specifier consumes exactly one argument.
+fn nextFormatArg(interp: *Interp, args: []Shimmerable, arg_i: *usize) !*Shimmerable {
+    if (arg_i.* >= args.len) {
+        try interp.setResultFormatted("not enough arguments for all format specifiers", .{});
+        return error.EvalError;
+    }
+    const arg = &args[arg_i.*];
+    arg_i.* += 1;
+    return arg;
+}
+
+/// Number of decimal digits in `v` (1 for 0). Used to compute the
+/// scientific exponent of a `FloatDecimal` for `%g`.
+fn decimalLengthU64(v: u64) u32 {
+    if (v == 0) return 1;
+    var len: u32 = 0;
+    var n = v;
+    while (n > 0) : (n /= 10) len += 1;
+    return len;
+}
+
+/// Removes trailing zeros after the decimal point for `%g`'s trailing-zero
+/// suppression, but always keeps at least one digit after the dot so the
+/// result always has a fractional part (e.g. `1.0`, not `1`).
+/// If the rendered string has no decimal point at all (as happens when the
+/// computed precision is 0), a `.0` is inserted before the exponent. In
+/// scientific notation, the mantissa and exponent are adjacent in the
+/// buffer, so the exponent is shifted to make room or close the gap.
+fn stripTrailingZeros(buf: []u8, rendered: []u8) []u8 {
+    var e_pos: usize = rendered.len;
+    for (rendered, 0..) |ch, idx| {
+        if (ch == 'e' or ch == 'E') {
+            e_pos = idx;
+            break;
+        }
+    }
+
+    // Find the dot within the mantissa.
+    var dot_pos: usize = e_pos;
+    for (rendered[0..e_pos], 0..) |ch, idx| {
+        if (ch == '.') {
+            dot_pos = idx;
+            break;
+        }
+    }
+
+    if (dot_pos >= e_pos) {
+        // No decimal point. Insert ".0" before the exponent so the result
+        // always has a fractional part.
+        const exp_len = rendered.len - e_pos;
+        // Shift the exponent right by 2 to make room for ".0".
+        for (rendered[e_pos..], 0..) |ch, j| {
+            buf[e_pos + 2 + j] = ch;
+        }
+        buf[dot_pos] = '.';
+        buf[dot_pos + 1] = '0';
+        return buf[0 .. e_pos + 2 + exp_len];
+    }
+
+    // Strip trailing zeros down to the first non-zero digit after the dot,
+    // but never remove the dot itself or its sole remaining digit.
+    var mantissa_end = e_pos;
+    while (mantissa_end > dot_pos + 2 and rendered[mantissa_end - 1] == '0') mantissa_end -= 1;
+
+    if (e_pos < rendered.len) {
+        const exp_len = rendered.len - e_pos;
+        // Shift the exponent left to close the gap. Safe because
+        // mantissa_end <= e_pos, so writes never overtake reads.
+        for (rendered[e_pos..], 0..) |ch, j| {
+            rendered[mantissa_end + j] = ch;
+        }
+        return rendered[0 .. mantissa_end + exp_len];
+    }
+    return rendered[0..mantissa_end];
+}
+
+/// Renders `value` (an `f64`) for `%f`, `%e`, or `%g` (and uppercase
+/// variants), returning the unsigned rendered string. The caller adds the
+/// sign via `formatNumeric`. Uses `std.fmt.float` (Ryu) for the digit
+/// rendering, with post-processing for `%g`'s trailing-zero suppression.
+fn formatFloat(buf: []u8, value: f64, conversion: u8, spec: FormatSpec) fmt.float.Error![]u8 {
+    const abs_val = @abs(value);
+
+    switch (conversion) {
+        'f', 'F' => {
+            const p = spec.precision orelse 6;
+            const rendered: []u8 = @constCast(try fmt.float.render(buf, abs_val, .{
+                .mode = .decimal,
+                .precision = p,
+            }));
+            if (conversion == 'F') {
+                for (rendered) |*ch| ch.* = std.ascii.toUpper(ch.*);
+            }
+            return rendered;
+        },
+        'e', 'E' => {
+            const p = spec.precision orelse 6;
+            const rendered: []u8 = @constCast(try fmt.float.render(buf, abs_val, .{
+                .mode = .scientific,
+                .precision = p,
+            }));
+            if (conversion == 'E') {
+                for (rendered) |*ch| ch.* = std.ascii.toUpper(ch.*);
+            }
+            return rendered;
+        },
+        'g', 'G' => {
+            const p = if (spec.precision) |pr| (if (pr == 0) @as(usize, 1) else pr) else 6;
+
+            // For %g, decide between decimal and scientific by computing
+            // the exponent that %e would produce. C: use %f if
+            // P > exp >= -4, else %e.
+            const bits: u64 = @bitCast(abs_val);
+            const d = fmt.float.binaryToDecimal(u64, bits, 52, 11, false, fmt.float.Backend64_TablesFull);
+
+            // inf/nan: binaryToDecimal sets exponent to special_exponent.
+            if (d.exponent == 0x7fffffff) {
+                const rendered: []u8 = @constCast(try fmt.float.render(buf, abs_val, .{
+                    .mode = .decimal,
+                    .precision = p,
+                }));
+                if (conversion == 'G') {
+                    for (rendered) |*ch| ch.* = std.ascii.toUpper(ch.*);
+                }
+                return rendered;
+            }
+
+            const olength = decimalLengthU64(d.mantissa);
+            const sci_exp = d.exponent + @as(i32, @intCast(olength)) - 1;
+
+            if (sci_exp >= -4 and sci_exp < @as(i32, @intCast(p))) {
+                // Decimal (%f) with precision P - 1 - sci_exp.
+                const dec_prec: usize = @intCast(@as(i64, @intCast(p)) - 1 - @as(i64, @intCast(sci_exp)));
+                var rendered: []u8 = @constCast(try fmt.float.formatDecimal(u64, buf, d, dec_prec));
+                if (!spec.alt_form) {
+                    rendered = stripTrailingZeros(buf, rendered);
+                }
+                if (conversion == 'G') {
+                    for (rendered) |*ch| ch.* = std.ascii.toUpper(ch.*);
+                }
+                return rendered;
+            } else {
+                // Scientific (%e) with precision P - 1.
+                var rendered: []u8 = @constCast(try fmt.float.formatScientific(u64, buf, d, p - 1));
+                if (!spec.alt_form) {
+                    rendered = stripTrailingZeros(buf, rendered);
+                }
+                if (conversion == 'G') {
+                    for (rendered) |*ch| ch.* = std.ascii.toUpper(ch.*);
+                }
+                return rendered;
+            }
+        },
+        else => unreachable,
+    }
+}
+
+/// [format]
+pub fn formatCmd(interp: *Interp, args: []Shimmerable) !void {
+    const fmt_bytes = try args[1].current().getString();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(heap.global_gpa);
+
+    var arg_i: usize = 2;
+    var i: usize = 0;
+    while (i < fmt_bytes.len) {
+        if (fmt_bytes[i] != '%') {
+            try out.append(heap.global_gpa, fmt_bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i < fmt_bytes.len and fmt_bytes[i] == '%') {
+            // Escaped percent.
+            try out.append(heap.global_gpa, '%');
+            i += 1;
+            continue;
+        }
+
+        var spec: FormatSpec = .{};
+        while (i < fmt_bytes.len) : (i += 1) {
+            switch (fmt_bytes[i]) {
+                '-' => spec.left_align = true,
+                '+' => spec.force_sign = true,
+                ' ' => spec.space_sign = true,
+                '0' => spec.zero_pad = true,
+                '#' => spec.alt_form = true,
+                else => break,
+            }
+        }
+        if (i < fmt_bytes.len and fmt_bytes[i] >= '0' and fmt_bytes[i] <= '9') {
+            var w: usize = 0;
+            while (i < fmt_bytes.len and fmt_bytes[i] >= '0' and fmt_bytes[i] <= '9') : (i += 1) {
+                w = w * 10 + (fmt_bytes[i] - '0');
+            }
+            spec.width = w;
+        }
+        if (i < fmt_bytes.len and fmt_bytes[i] == '.') {
+            i += 1;
+            var p: usize = 0;
+            while (i < fmt_bytes.len and fmt_bytes[i] >= '0' and fmt_bytes[i] <= '9') : (i += 1) {
+                p = p * 10 + (fmt_bytes[i] - '0');
+            }
+            spec.precision = p;
+        }
+        if (i >= fmt_bytes.len) {
+            try interp.setResultFormatted("format string ended in middle of field specifier", .{});
+            return error.EvalError;
+        }
+        const conversion = fmt_bytes[i];
+        i += 1;
+
+        switch (conversion) {
+            'd', 'i', 'u' => {
+                const value = try interp.getInteger(try nextFormatArg(interp, args, &arg_i));
+                try formatInteger(heap.global_gpa, value, 10, false, spec, &out);
+            },
+            'x', 'X' => {
+                const value = try interp.getInteger(try nextFormatArg(interp, args, &arg_i));
+                try formatInteger(heap.global_gpa, value, 16, conversion == 'X', spec, &out);
+            },
+            'o' => {
+                const value = try interp.getInteger(try nextFormatArg(interp, args, &arg_i));
+                try formatInteger(heap.global_gpa, value, 8, false, spec, &out);
+            },
+            'c' => {
+                const value = try interp.getInteger(try nextFormatArg(interp, args, &arg_i));
+                if (value < 0 or value > 0x10FFFF) {
+                    try interp.setResultFormatted("expected a Unicode codepoint but got \"{d}\"", .{value});
+                    return error.EvalError;
+                }
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(@intCast(value), &buf) catch {
+                    try interp.setResultFormatted("expected a Unicode codepoint but got \"{d}\"", .{value});
+                    return error.EvalError;
+                };
+                try padAndAppend(heap.global_gpa, buf[0..len], spec, &out);
+            },
+            's' => {
+                const value = try (try nextFormatArg(interp, args, &arg_i)).current().getString();
+                const truncated = if (spec.precision) |p| value[0..@min(p, value.len)] else value;
+                try padAndAppend(heap.global_gpa, truncated, spec, &out);
+            },
+            'f', 'F', 'e', 'E', 'g', 'G' => {
+                const value = try interp.getFloat(try nextFormatArg(interp, args, &arg_i));
+                var buf: [1024]u8 = undefined;
+                const rendered = formatFloat(&buf, value, conversion, spec) catch |err| switch (err) {
+                    error.BufferTooSmall => {
+                        try interp.setResultFormatted("precision too large for format specifier", .{});
+                        return error.EvalError;
+                    },
+                };
+                try formatNumeric(heap.global_gpa, rendered, std.math.signbit(value), "", spec, &out);
+            },
+            else => {
+                try interp.setResultFormatted("bad field specifier \"{c}\"", .{conversion});
+                return error.EvalError;
+            },
+        }
+    }
+
+    if (arg_i < args.len) {
+        try interp.setResultFormatted("too many arguments for format specifiers", .{});
+        return error.EvalError;
+    }
+
+    try interp.setResultString(out.items);
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "append", appendCmd, "varName ?value ...?", 1, null);
+    try registerCommand(interp, "format", formatCmd, "formatString ?arg ...?", 1, null);
     try registerCommand(interp, "string", stringCmd, "subcommand ?arg ...?", 1, null);
 }
 
@@ -964,4 +1305,148 @@ fn testStringIndexMalformed(ta: std.mem.Allocator) !void {
 
 test "string index malformed utf8" {
     try memutil.checkAllocationFailures(.exhaustive, testStringIndexMalformed, .{});
+}
+
+fn testFormatBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("hello world", "format {%s %s} hello world");
+    try interp.testExpectScriptResult("42", "format %d 42");
+    try interp.testExpectScriptResult("-42", "format %d -42");
+    try interp.testExpectScriptResult("100%", "format {%d%%} 100");
+    try interp.testExpectScriptResult("1.2346", "format %6.4f 1.23456");
+    // %e uses Ryu's exponent format (e0, e10, e-5).
+    try interp.testExpectScriptResult("1.500000e0", "format %e 1.5");
+    try interp.testExpectScriptResult("1.000000e10", "format %e 1e10");
+    try interp.testExpectScriptResult("1.500000E0", "format %E 1.5");
+}
+
+test "format basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatBasic, .{});
+}
+
+fn testFormatWidthAndFlags(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("   42", "format %5d 42");
+    try interp.testExpectScriptResult("42   ", "format %-5d 42");
+    try interp.testExpectScriptResult("00042", "format %05d 42");
+    try interp.testExpectScriptResult("+42", "format %+d 42");
+    try interp.testExpectScriptResult(" 42", "format {% d} 42");
+    // Zero-padding lands after the sign, not before it.
+    try interp.testExpectScriptResult("-0042", "format %05d -42");
+}
+
+test "format width and flags" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatWidthAndFlags, .{});
+}
+
+fn testFormatRadixAndChar(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("ff", "format %x 255");
+    try interp.testExpectScriptResult("FF", "format %X 255");
+    try interp.testExpectScriptResult("0xff", "format %#x 255");
+    try interp.testExpectScriptResult("10", "format %o 8");
+    try interp.testExpectScriptResult("A", "format %c 65");
+}
+
+test "format radix and char" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatRadixAndChar, .{});
+}
+
+fn testFormatStringPrecision(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("he", "format %.2s hello");
+    try interp.testExpectScriptResult("        hi", "format %10s hi");
+    try interp.testExpectScriptResult("hi        ", "format %-10s hi");
+}
+
+test "format string precision" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatStringPrecision, .{});
+}
+
+fn testFormatNotEnoughArguments(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptError(error.EvalError,
+        \\not enough arguments for all format specifiers
+    , "format %d");
+}
+
+test "format not enough arguments" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatNotEnoughArguments, .{});
+}
+
+fn testFormatG(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // %g strips trailing zeros but always keeps a fractional part, and
+    // picks between decimal and scientific by exponent.
+    try interp.testExpectScriptResult("1.0", "format %g 1.0");
+    try interp.testExpectScriptResult("1.5", "format %g 1.5");
+    try interp.testExpectScriptResult("100.0", "format %g 100.0");
+    try interp.testExpectScriptResult("100000.0", "format %g 100000.0");
+    // Exponent >= 6 (default precision): switches to scientific.
+    try interp.testExpectScriptResult("1.0e6", "format %g 1000000.0");
+    try interp.testExpectScriptResult("1.0e8", "format %g 100000000.0");
+    // Exponent < -4: switches to scientific.
+    try interp.testExpectScriptResult("1.0e-5", "format %g 0.00001");
+    // Exponent exactly -4: stays decimal.
+    try interp.testExpectScriptResult("0.0001", "format %g 0.0001");
+    try interp.testExpectScriptResult("0.0", "format %g 0.0");
+    // %G is uppercase.
+    try interp.testExpectScriptResult("1.0E8", "format %G 100000000.0");
+    // %#g keeps trailing zeros.
+    try interp.testExpectScriptResult("1.00000", "format %#g 1.0");
+}
+
+test "format g conversion" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatG, .{});
+}
+
+fn testFormatSpecial(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // inf and nan render as their names, sign applied by formatNumeric.
+    try interp.testExpectScriptResult("inf", "format %f inf");
+    try interp.testExpectScriptResult("nan", "format %f nan");
+    try interp.testExpectScriptResult("-inf", "format %f -inf");
+    try interp.testExpectScriptResult("inf", "format %g inf");
+    try interp.testExpectScriptResult("1.234560e2", "format %e 123.456");
+    try interp.testExpectScriptResult("0.000000e0", "format %e 0.0");
+}
+
+test "format special values" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatSpecial, .{});
+}
+
+fn testFormatErrors(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Negative codepoint: clean error, not a crash.
+    try interp.testExpectScriptError(error.EvalError,
+        \\expected a Unicode codepoint but got "-1"
+    , "format %c -1");
+    // Too many arguments.
+    try interp.testExpectScriptError(error.EvalError,
+        \\too many arguments for format specifiers
+    , "format %d 1 2 3");
+    // Absurd precision on a float: clean error, not a crash.
+    try interp.testExpectScriptError(error.EvalError,
+        \\precision too large for format specifier
+    , "format %.2000f 1.0");
+}
+
+test "format error cases" {
+    try memutil.checkAllocationFailures(.exhaustive, testFormatErrors, .{});
 }
