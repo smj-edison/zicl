@@ -73,18 +73,14 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     interp.setResultOwning(list.asHead().asValue());
                 }
             } else {
-                const file_name = try String.newValue(try args[3].current().getString());
-                errdefer file_name.release();
                 const line_no = try interp.getInteger(&args[4]);
-                const line_no_narrowed = std.math.cast(u32, line_no) orelse {
-                    return interp.wrapError(&det, objects.Integer.overflowError(i64, &det, line_no));
-                };
-                const as_source = try script.prepareToShimmer(objects.Source);
-                as_source.* = .{
-                    .file_name = file_name.asOptional(),
-                    .line_no = line_no_narrowed,
-                    .hash = .init(null),
-                };
+                const line_no_narrowed = std.math.cast(u32, line_no) orelse return interp.integerOverflowError(i64, line_no);
+                const source = try objects.Source.new(
+                    try args[2].current().getString(),
+                    args[3].current().asOptional(),
+                    line_no_narrowed,
+                );
+                interp.setResultOwning(source.asHead().asValue());
             }
         },
         .frame => {
@@ -131,9 +127,11 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             errdefer result_dict.asHead().release();
             try result_dict.put(heap.InternedString.newValue("type"), heap.InternedString.newValue("source"));
             if (eval_frame.currently_evaluating.asType(objects.Source)) |source| {
-                const line_no = objects.Integer.new(source.line_no);
-                try result_dict.put(heap.InternedString.newValue("line"), line_no);
+                try result_dict.put(heap.InternedString.newValue("line"), objects.Integer.new(source.line_no));
                 try result_dict.put(heap.InternedString.newValue("file"), source.file_name.orEmpty());
+            } else {
+                try result_dict.put(heap.InternedString.newValue("line"), Value.newInt(-1));
+                try result_dict.put(heap.InternedString.newValue("file"), heap.interned_empty_string);
             }
 
             const rel_level = objects.Integer.new(current - target);
