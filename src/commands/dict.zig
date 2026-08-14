@@ -37,6 +37,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         replace,
         update,
         link,
+        assign,
     };
     const Parser = objects.SubcommandParser(Subcommands, &.{
         .{ .variant = .create, .usage = "?key value ...?", .stride = 2 },
@@ -59,6 +60,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .replace, .usage = "dictionary ?key value ...?", .min_args = 1 },
         .{ .variant = .update, .usage = "varName ?arg ...? script", .min_args = 2 },
         .{ .variant = .link, .usage = "linkTo dict", .min_args = 2, .max_args = 2 },
+        .{ .variant = .assign, .usage = "dictionary varName ?varName ...?", .min_args = 2 },
     });
 
     var det: ErrorDetails = undefined;
@@ -192,6 +194,17 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             interp.setResultOwning(dict_mut.asHead().asValue());
         },
+        .assign => {
+            const dict = &args[2];
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                const key = args[i].current();
+                const found = try interp.wrapError(&det, Dictionary.getFollowingLinks(&det, dict, key));
+                const value = found.asValue() orelse return interp.wrapError(&det, Dictionary.keyNotFoundError(&det, key));
+                try interp.setVariable(&args[i], value);
+            }
+            interp.setResult(dict.current());
+        },
         else => std.debug.panic("unimplemented: {}", .{subcommand}),
     }
 }
@@ -232,6 +245,27 @@ fn testDictCommands(ta: std.mem.Allocator) !void {
 
 test "dict commands" {
     try memutil.checkAllocationFailures(.exhaustive, testDictCommands, .{});
+}
+
+fn testDictAssign(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("1 2 3",
+        \\ set d {a 1 b 2 c 3}
+        \\ dict assign $d a b c
+        \\ list $a $b $c
+    );
+
+    try interp.testExpectScriptError(error.EvalError,
+        \\could not find value for key "missing"
+    ,
+        \\ dict assign {a 1} missing
+    );
+}
+
+test "dict assign" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictAssign, .{});
 }
 
 fn testDictParentLinks(ta: std.mem.Allocator) !void {

@@ -95,7 +95,7 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
 }
 
 /* Recover the containing struct from one of its members. A C program embeds a
- * Zicl type (such as a `Zicl_Head`) as a field in its own struct and uses this
+ * Zicl type (such as a `Zicl_CapabilityHead`) as a field in its own struct and uses this
  * to get back to the outer struct from the pointer Zicl hands it. Lets C code
  * manage its own objects the way the Zig side uses `@fieldParentPtr`. Mirrors
  * the Linux kernel's `container_of`. */
@@ -711,6 +711,13 @@ int Zicl_ShimDictGet(Zicl_Interp *interp, Zicl_Shimmerable *shim, Zicl_Value key
  * `value`. */
 int Zicl_DictShimmerWriteback(Zicl_Dict *dict, Zicl_Value key, Zicl_Value value);
 
+/* Like [dict link], but builds a fresh dict rather than mutating `dict` in
+ * place: the caller keeps both `dict` and `parent` untouched. The result has
+ * `~parent` as its first entry, a hash reference to `parent`, followed by
+ * `dict`'s existing items. `parent` is borrowed, and boxed first if it is a
+ * primitive. Returns NULL on OOM; the caller owns the returned handle. */
+Zicl_Dict *Zicl_DictLink(const Zicl_Dict *dict, Zicl_Value parent);
+
 /* ===== Source =====
  * A `Source` carries file/line metadata alongside a value's bytes, so
  * evaluation errors can point at the originating location. A value shimmers to
@@ -798,6 +805,46 @@ int Zicl_EvalValue(Zicl_Interp *interp, Zicl_Value script);
  * Returns ZICL_OOM if boxing the string allocates and fails. */
 int Zicl_Eval(Zicl_Interp *interp, const char *script);
 int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
+
+/* ===== Closures =====
+ * A resolved closure plus the cache key its body evaluates under, opaque to
+ * the C side. Get one with Zicl_GetClosure, invoke it (possibly more than
+ * once) with Zicl_CallClosure, and release it with Zicl_ReleaseClosure. */
+typedef struct Zicl_Closure Zicl_Closure;
+
+/* Resolve closure_value into a handle: parses it as a closure literal first
+ * if it is not one already. The handle borrows the underlying closure object,
+ * so closure_value need not survive the call. closure_value must not be a
+ * [method] closure: like ordinary command dispatch, that returns ZICL_ERR
+ * with "method cannot be invoked as function". Returns ZICL_OOM on allocation
+ * failure. The caller owns *out and must release it with Zicl_ReleaseClosure. */
+int Zicl_GetClosure(Zicl_Interp *interp, Zicl_Value closure_value, Zicl_Closure **out);
+/* Release a handle obtained from Zicl_GetClosure. */
+void Zicl_ReleaseClosure(Zicl_Closure *closure);
+/* Call closure the same way the interpreter calls a closure it resolved from
+ * a command name: argv[0] fills the command-name slot, argv[1..argc] are its
+ * arguments. Letrec-bound closures are not reachable through this entry point
+ * yet, so its scope is always NULL. The result is left on the interpreter;
+ * read it with Zicl_GetResult. */
+int Zicl_CallClosure(Zicl_Interp *interp, Zicl_Closure *closure, int argc, Zicl_Shimmerable *argv);
+/* The closure's body, as a value borrowed from closure (valid only while
+ * closure is alive; borrow it yourself to keep it longer). Pass it to
+ * Zicl_AsSource / Zicl_SourceGetFilename / Zicl_SourceGetLine to read its
+ * file/line info, if any was attached. */
+Zicl_Value Zicl_ClosureGetBody(const Zicl_Closure *closure);
+/* The closure's captured lexical scope, borrowed from closure (valid only
+ * while closure is alive), or NULL if it has none. Look up a name in it
+ * with Zicl_ShimDictGet, which follows ~parent links, so this reaches
+ * variables from enclosing scopes too, not just this closure's own. */
+Zicl_Dict *Zicl_ClosureGetScope(const Zicl_Closure *closure);
+/* The current error's call stack, as a flat list of {name file line args}
+ * groups repeated once per frame (innermost first), or an empty list if
+ * there is none. Unlike Zicl_MakeErrorMessage, this doesn't consume or
+ * reformat the interpreter's result -- it's a separate, structured read of
+ * the same trace Zicl_MakeErrorMessage would render into prose. Borrowed
+ * from the interpreter. */
+Zicl_Value Zicl_GetErrorStack(Zicl_Interp *interp);
+
 /* Dynamically load a compiled Zicl extension: dlopen `path`, then call its
  * `Zicl_<pkgname>Init(interp)`, where `<pkgname>` is `path`'s basename up to
  * (not including) its first `.` (so `foo.so` calls `Zicl_fooInit`). The
@@ -838,6 +885,11 @@ int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
  * init symbol is missing, or the init function itself fails. */
 int Zicl_LoadLibrary(Zicl_Interp *interp, const char *path);
 Zicl_Value Zicl_GetScriptBeingEvaluated(Zicl_Interp *interp);
+/* The name of the closure currently executing in the current call frame,
+ * borrowed from the frame (valid only while it remains on the stack).
+ * ZICL_NONE for the top-level frame, or a closure invoked without a name
+ * (e.g. [apply] on a literal). */
+Zicl_OptionalValue Zicl_GetClosureNameBeingEvaluated(Zicl_Interp *interp);
 /* Index of the current (innermost) eval frame. Walk downwards from this to
  * inspect the stack; pair with Zicl_EvalFrameScript. */
 uint32_t Zicl_CurrentEvalFrameIdx(Zicl_Interp *interp);
@@ -856,7 +908,8 @@ int Zicl_SetErrorString(Zicl_Interp *interp, const char *str, int len);
 int Zicl_SetResultBool(Zicl_Interp *interp, int value);
 int Zicl_SetResultLong(Zicl_Interp *interp, long value);
 int Zicl_SetEmptyResult(Zicl_Interp *interp);
-int Zicl_SetVariable(Zicl_Interp *interp, Zicl_Value *name, Zicl_Value value);
+int Zicl_SetVariable(Zicl_Interp *interp, Zicl_Shimmerable *name, Zicl_Value value);
+int Zicl_SetVariableString(Zicl_Interp *interp, const char *name, Zicl_Value value);
 int Zicl_MakeErrorMessage(Zicl_Interp *interp);
 
 /* Ask the interpreter to stop evaluating. The next command boundary in a
@@ -872,8 +925,8 @@ void Zicl_ClearStop(Zicl_Interp *interp);
 /* ===== Capabilities =====
  * A capability is an unforgeable name (a `zicl://<host>/<type>/<id>` URL) for a
  * resource a script can hold and pass around. C code can define its own
- * capability types: allocate a backing struct that embeds a `Zicl_Head` as a
- * field, point the head's `vtable` at a static `Zicl_HeadVTable`, and register
+ * capability types: allocate a backing struct that embeds a `Zicl_CapabilityHead` as a
+ * field, point the head's `vtable` at a static `Zicl_CapabilityHeadVTable`, and register
  * it with `Zicl_CapabilityNew`. The same vtable pointer is what
  * `Zicl_GetBacking` compares against, so each capability type has exactly one
  * vtable instance. These layouts mirror `Capability.Head` and
@@ -891,14 +944,14 @@ typedef __int128 Zicl_Id;
 
 struct Zicl_CapabilityHead;
 
-typedef struct Zicl_HeadVTable {
+typedef struct Zicl_CapabilityHeadVTable {
     /* NUL-terminated, e.g. "file-handle". */
     const char *name;
     /* Deinits the body. Runs exactly once, from close. */
     void (*deinit_body)(struct Zicl_CapabilityHead *head);
     /* Frees the backing. Runs at ref count zero, which may be long after close. */
     void (*destroy_backing)(struct Zicl_CapabilityHead *head);
-} Zicl_HeadVTable;
+} Zicl_CapabilityHeadVTable;
 
 /* The generic part of a capability. Embed this as a field of a backing struct
  * (at any offset; recover the backing with the `Zicl_ContainerOf` macro). C code sets
@@ -907,17 +960,17 @@ typedef struct Zicl_HeadVTable {
  * for the target both are compiled for; the field order is fixed, so no size is
  * asserted here (it varies between 32- and 64-bit targets). */
 typedef struct Zicl_CapabilityHead {
-    const Zicl_HeadVTable *vtable;
+    const Zicl_CapabilityHeadVTable *vtable;
     Zicl_Id id;
     bool closed;
     uint32_t ref_count;
-} Zicl_Head;
+} Zicl_CapabilityHead;
 
 /* Register `head` and return the capability object that names it. `head` is a
- * `Zicl_Head` embedded in a backing struct the caller allocated (at any offset);
+ * `Zicl_CapabilityHead` embedded in a backing struct the caller allocated (at any offset);
  * Zicl initializes `id`, `closed`, and `ref_count`. The caller owns the returned
  * value, and recovers its backing from the head with `Zicl_ContainerOf`. */
-int Zicl_CapabilityNew(Zicl_Value *out, Zicl_Head *head);
+int Zicl_CapabilityNew(Zicl_Value *out, Zicl_CapabilityHead *head);
 /* Close a capability (idempotent). No-op if `value` is not a capability. */
 void Zicl_CapabilityClose(Zicl_Value value);
 /* Resolve a capability URL string in place, replacing `*value` with the
@@ -934,11 +987,13 @@ bool Zicl_CapabilityIsClosed(Zicl_Value value);
  * that it has not been closed, and writes its head to `*out`. The head is
  * borrowed from the capability: valid while the capability stays alive and
  * open. Recover the backing with `Zicl_ContainerOf(*out, MyBacking, head)`. */
-int Zicl_GetBacking(Zicl_Value value, const Zicl_HeadVTable *expected, Zicl_Head **out);
+int Zicl_GetBacking(Zicl_Value value, const Zicl_CapabilityHeadVTable *expected, Zicl_CapabilityHead **out);
+
+int Zicl_NewFileFromDescriptor(int descriptor, Zicl_Value *out);
 
 /* Head operations, mirroring Capability.Head. */
-Zicl_Head *Zicl_HeadBorrow(Zicl_Head *head);
-void Zicl_HeadRelease(Zicl_Head *head);
-void Zicl_HeadClose(Zicl_Head *head);
-bool Zicl_HeadIsClosed(Zicl_Head *head);
-void Zicl_HeadGetId(Zicl_Head *head, Zicl_Id *out);
+Zicl_CapabilityHead *Zicl_CapabilityHeadBorrow(Zicl_CapabilityHead *head);
+void Zicl_CapabilityHeadRelease(Zicl_CapabilityHead *head);
+void Zicl_CapabilityHeadClose(Zicl_CapabilityHead *head);
+bool Zicl_CapabilityHeadIsClosed(Zicl_CapabilityHead *head);
+void Zicl_CapabilityHeadGetId(Zicl_CapabilityHead *head, Zicl_Id *out);

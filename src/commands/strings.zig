@@ -143,7 +143,7 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
     switch (subcommand) {
         .bytelength => {
             const bytes = try sub_args[0].current().getString();
-            try interp.setResultInteger(@intCast(bytes.len));
+            interp.setResultInteger(@intCast(bytes.len));
         },
         .byterange => {
             const bytes = try sub_args[0].current().getString();
@@ -188,14 +188,14 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
                 if (subcommand == .equal) {
                     interp.setResultBoolean(order == .eq);
                 } else switch (order) {
-                    .lt => try interp.setResultInteger(-1),
-                    .eq => try interp.setResultInteger(0),
-                    .gt => try interp.setResultInteger(1),
+                    .lt => interp.setResultInteger(-1),
+                    .eq => interp.setResultInteger(0),
+                    .gt => interp.setResultInteger(1),
                 }
             }
         },
         .length => {
-            try interp.setResultInteger(@intCast(try String.getCodepointLength(&sub_args[0])));
+            interp.setResultInteger(@intCast(try String.getCodepointLength(&sub_args[0])));
         },
         .range => {
             const str = &sub_args[0];
@@ -316,7 +316,7 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
             const haystack = try sub_args[1].current().getString();
 
             if (needle.len == 0) {
-                try interp.setResultInteger(-1);
+                interp.setResultInteger(-1);
                 return;
             }
 
@@ -343,7 +343,7 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
                     break :blk strutil.findLastOccurrenceBounded(needle, haystack, max_start_byte);
                 }
             } orelse {
-                try interp.setResultInteger(-1);
+                interp.setResultInteger(-1);
                 return;
             };
 
@@ -351,7 +351,7 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
                 byte_offset
             else
                 strutil.codepointLength(haystack[0..byte_offset]);
-            try interp.setResultInteger(@intCast(cp_offset));
+            interp.setResultInteger(@intCast(cp_offset));
         },
         .is => {
             const Class = enum {

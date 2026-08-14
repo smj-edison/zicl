@@ -25,7 +25,7 @@ pub fn lmapCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 /// [llength]
 pub fn llengthCmd(interp: *Interp, args: []Shimmerable) !void {
     const as_list = try interp.getList(&args[1]);
-    try interp.setResultInteger(@intCast(as_list.items.len));
+    interp.setResultInteger(@intCast(as_list.items.len));
 }
 
 pub fn lappendCmd(interp: *Interp, args: []Shimmerable) !void {
@@ -254,12 +254,12 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
         };
 
         if (matched) {
-            try interp.setResultInteger(@intCast(idx));
+            interp.setResultInteger(@intCast(idx));
             return;
         }
     }
 
-    try interp.setResultInteger(-1);
+    interp.setResultInteger(-1);
 }
 
 /// [lset]

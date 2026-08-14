@@ -4,7 +4,6 @@ const testing = std.testing;
 const Tokenizer = @import("../Tokenizer.zig");
 const evaltypes = @import("../evaltypes.zig");
 const common = @import("common.zig");
-const assert = common.assert;
 const heap = common.heap;
 const Object = heap.Object;
 const ErrorDetails = common.ErrorDetails;
@@ -90,7 +89,7 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     defer script.release();
 
     const cache_key = @as(u256, interp.call_frames.items[target_frame].signature.cache_id) ^ try script.getHashNoRegister();
-    return interp.evalObjectInner(target_frame, script, cache_key);
+    return interp.evalValueInner(target_frame, script, cache_key);
 }
 
 pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -184,27 +183,39 @@ pub fn tailcallCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (interp.callFrameIdx() == 0) {
         try interp.setResultString("tailcall can only be called from a proc or lambda");
         return error.EvalError;
-    } else if (args.len >= 2) {
-        // Make sure that if the command doesn't exist, we throw the error here, so
-        // it doesn't mysteriously show up at a untracable spot up the call stack.
-        _ = interp.getCommand(interp.callFrameIdx() - 1, &args[1], false) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.EvalError,
-        };
-
-        const tailcall_args = try heap.global_gpa.dupe(Shimmerable, args[1..]);
-        errdefer heap.global_gpa.free(tailcall_args);
-
-        // `args[1..]` includes the name of the command to run.
-        assert(interp.callFrame().tailcall == null);
-        interp.callFrame().tailcall = .{
-            .args = tailcall_args,
-        };
-        return error.Tailcall;
-    } else {
+    } else if (args.len < 2) {
         try interp.setResultString("no function provided");
         return error.EvalError;
     }
+
+    // Method calling requires writing back `self`, but by returning error.Tailcall,
+    // the call frame would be destroyed, deleting `self`. Hence, no [tailcall]
+    // within a method.
+    if (interp.callFrame().signature.is_method) {
+        try interp.setResultString("tailcall cannot be used from within a method");
+        return error.EvalError;
+    }
+
+    // We need to resolve the command now, since we get it from the current scope.
+    {
+        // Run this in a block, so when we later return error.Tailcall, we don't
+        // trigger the `errdefer command.deinit();`.
+        var command = interp.getCommand(interp.callFrameIdx(), &args[1], false) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.EvalError,
+        };
+        errdefer command.deinit();
+
+        const tailcall_args = try heap.global_gpa.alloc(Shimmerable, args.len - 1);
+        for (args[1..], 0..) |*arg, i| {
+            tailcall_args[i] = .{ .original = arg.current().borrow() };
+        }
+
+        if (interp.pending_tailcall) |*prev| prev.deinit();
+        interp.pending_tailcall = .{ .args = tailcall_args, .command = command };
+    }
+
+    return error.Tailcall;
 }
 
 /// `closureHelper` is a helper function that implements [fn] and [method] logic. This function
@@ -285,12 +296,23 @@ pub fn sourceCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     try interp.evalFile(try args[1].current().getString());
 }
 
+/// [import] -- reads `fileName` and runs it as a module: it gets a call
+/// frame of its own (no access to the caller's locals), and the result is a
+/// dict of whatever it bound at its own top level (its `set`/`fn`
+/// definitions), not its return value. Pair with [dict assign] to pull
+/// specific names into the current scope.
+pub fn importCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    const module = try interp.evalFileAsModule(try args[1].current().getString());
+    interp.setResultOwning(module.asHead().asValue());
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null);
     try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null);
     try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null);
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1);
     try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3);
+    try registerCommand(interp, "import", importCmd, "fileName", 1, 1);
     try registerCommand(interp, "letrec", letrecCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1);
@@ -505,11 +527,6 @@ fn testLetrecSelfDictSugar(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    // Mutual recursion between two methods, reaching each other through
-    // `self::peerName` (dict sugar). Bare-name method dispatch already
-    // extracts `self` from the dict at that path and writes the mutated
-    // result back afterward, so no `[applymethod]` call is needed anywhere,
-    // including at the top level: `self` carries its own dispatch table.
     try interp.testExpectScriptResult("ping pong ping",
         \\ method scope::ping {self n} {
         \\     set self::path [concat $self::path ping]
@@ -532,7 +549,187 @@ test "letrec self dict sugar" {
     try memutil.checkAllocationFailures(.exhaustive, testLetrecSelfDictSugar, .{});
 }
 
-fn testHeapArenaRecycles(ta: std.mem.Allocator) !void {
+fn testTailcallBasicFactorial(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("3628800",
+        \\ fn scope::fac {x {val 1}} {
+        \\   if {$x <= 2} {
+        \\     expr {$x * $val}
+        \\   } else {
+        \\     tailcall fac [expr {$x - 1}] [expr {$x * $val}]
+        \\   }
+        \\ }
+        \\ set fac [letrec select $scope fac]
+        \\ fac 10
+    );
+}
+
+test "tailcall basic factorial" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallBasicFactorial, .{});
+}
+
+fn testTailcallInTry(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("13",
+        \\ set x 0
+        \\ fn scope::a {} { upvar x x; incr x }
+        \\ fn scope::b {} { upvar x x; incr x 4; try { tailcall a } finally { incr x 8 } }
+        \\ set b [letrec select $scope b]
+        \\ b
+        \\ set x
+    );
+}
+
+test "tailcall in try" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallInTry, .{});
+}
+
+fn testTailcallDoesReturn(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("5",
+        \\ set x 0
+        \\ fn scope::a {} { upvar x x; incr x }
+        \\ fn scope::b {} { upvar x x; incr x 4; tailcall a; incr x 8 }
+        \\ set b [letrec select $scope b]
+        \\ b
+        \\ set x
+    );
+}
+
+test "tailcall does return" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallDoesReturn, .{});
+}
+
+fn testTailcallUplevelInteraction(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("c c",
+        \\ fn c {} { return c }
+        \\ fn b {} {
+        \\   lappend result [uplevel 1 a c]
+        \\   lappend result [uplevel 1 a c]
+        \\ }
+        \\ fn a {cmd} { tailcall $cmd }
+        \\ a b
+    );
+}
+
+test "tailcall uplevel interaction" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallUplevelInteraction, .{});
+}
+
+fn testTailcallPassesThroughReturn(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("ok",
+        \\ fn a {script} {
+        \\   tailcall foreach i {1 2 3} $script
+        \\ }
+        \\ fn b {} {
+        \\   a {return ok}
+        \\   return bad
+        \\ }
+        \\ b
+    );
+}
+
+test "tailcall passes through return" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallPassesThroughReturn, .{});
+}
+
+test "tailcall large number of invocations" {
+    const ta = std.testing.allocator;
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("1",
+        \\ fn scope::a {n} {
+        \\   if {$n == 0} { return 1 }
+        \\   incr n -1
+        \\   tailcall a $n
+        \\ }
+        \\ set a [letrec select $scope a]
+        \\ a 3000
+    );
+}
+
+fn testTailcallThroughUplevel(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("2",
+        \\ fn d {} { return [info level] }
+        \\ fn c {} { tailcall d }
+        \\ fn b {} { uplevel 1 c }
+        \\ fn a {} { tailcall b }
+        \\ a
+    );
+}
+
+test "tailcall through uplevel" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallThroughUplevel, .{});
+}
+
+fn testTailcallChained(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("1",
+        \\ fn c {} { return [info level] }
+        \\ fn b {} { tailcall tailcall c }
+        \\ fn a {} { b }
+        \\ a
+    );
+}
+
+test "tailcall chained" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallChained, .{});
+}
+
+fn testTailcallUplevel(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("2",
+        \\ fn c {} { return [info level] }
+        \\ fn b {} { uplevel 1 tailcall c }
+        \\ fn a {} { b }
+        \\ a
+    );
+}
+
+test "tailcall uplevel" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallUplevel, .{});
+}
+
+fn testTailcallErrorStackTracksReplacementArgs(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("true false",
+        \\ fn b {z} { error boom }
+        \\ fn a {x} { tailcall b REPLACEMENT_ARG }
+        \\ catch { a ORIGINAL_ARG } msg opts
+        \\ set stack [dict get $opts -errorstack]
+        \\ list [string match {*REPLACEMENT_ARG*} $stack] [string match {*ORIGINAL_ARG*} $stack]
+    );
+}
+
+test "tailcall error stack tracks replacement args" {
+    try memutil.checkAllocationFailures(.exhaustive, testTailcallErrorStackTracksReplacementArgs, .{});
+}
+
+test "heap arena recycles" {
+    const ta = std.testing.allocator;
+
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
@@ -559,11 +756,8 @@ fn testHeapArenaRecycles(ta: std.mem.Allocator) !void {
     try std.testing.expectEqual(warmed, heap.local_arena_instance.queryCapacity());
 }
 
-test "heap arena recycles" {
-    try memutil.checkAllocationFailures(.exhaustive, testHeapArenaRecycles, .{});
-}
-
-fn testArenaScratchDoesNotScaleWithTheWorkAScriptDoes(ta: std.mem.Allocator) !void {
+test "arena scratch does not scale with the work a script does" {
+    const ta = std.testing.allocator;
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
@@ -584,10 +778,6 @@ fn testArenaScratchDoesNotScaleWithTheWorkAScriptDoes(ta: std.mem.Allocator) !vo
     }
     _ = try interp.testRunScript(flat.items);
     try std.testing.expectEqual(small_loop, heap.local_arena_instance.queryCapacity());
-}
-
-test "arena scratch does not scale with the work a script does" {
-    try memutil.checkAllocationFailures(.exhaustive, testArenaScratchDoesNotScaleWithTheWorkAScriptDoes, .{});
 }
 
 fn testSubstReportsAParseErrorWithoutFaulting(ta: std.mem.Allocator) !void {

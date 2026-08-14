@@ -98,7 +98,7 @@ pub fn readCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 /// nothing, its number having stopped meaning anything.
 pub fn pidCmd(interp: *Interp, args: []Shimmerable) !void {
     if (args.len == 1) {
-        try interp.setResultInteger(@intCast(std.os.linux.getpid()));
+        interp.setResultInteger(@intCast(std.os.linux.getpid()));
         return;
     }
 
@@ -204,7 +204,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
                 return error.EvalError;
             };
-            try interp.setResultInteger(@intCast(stat.size));
+            interp.setResultInteger(@intCast(stat.size));
         },
         .readable => {
             const path = try args[2].getString();

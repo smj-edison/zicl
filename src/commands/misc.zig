@@ -39,6 +39,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         exists,
         source,
         frame,
+        level,
         hostname,
         type,
     };
@@ -46,6 +47,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .exists, .usage = "varName", .min_args = 1, .max_args = 1 },
         .{ .variant = .source, .usage = "script ?fileName lineNo?", .min_args = 1, .max_args = 3 },
         .{ .variant = .frame, .usage = "?level?", .min_args = 0, .max_args = 1 },
+        .{ .variant = .level, .usage = "?levelNum?", .min_args = 0, .max_args = 1 },
         .{ .variant = .hostname, .usage = "", .min_args = 0, .max_args = 0 },
         .{ .variant = .type, .usage = "object", .min_args = 1, .max_args = 1 },
     });
@@ -90,7 +92,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const current = @as(i64, interp.callFrameIdx());
 
             if (args.len == 2) {
-                try interp.setResultInteger(current + 1);
+                interp.setResultInteger(current + 1);
                 return;
             }
 
@@ -138,6 +140,24 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             try result_dict.put(heap.InternedString.newValue("level"), rel_level);
 
             interp.setResultOwning(result_dict.asHead().asValue());
+        },
+        .level => {
+            const current = @as(i64, interp.callFrameIdx());
+
+            if (args.len == 2) {
+                interp.setResultInteger(current);
+                return;
+            }
+
+            const level = try interp.getInteger(&args[2]);
+            const target = if (level == 0) current else if (level > 0) level else current + level;
+            if (target < 1 or target > current) {
+                return interp.setError(heap.InternedString.newValue("bad level"));
+            }
+
+            const frame_args = interp.call_frames.items[@intCast(target)].args;
+            const list = try objects.List.newFromShimmerables(frame_args);
+            interp.setResultOwning(list.asHead().asValue());
         },
         .hostname => {
             var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
@@ -189,4 +209,49 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "launder", launderCmd, "string", 1, 1);
     try registerCommand(interp, "ref", refCmd, "string", 1, 1);
+}
+
+const testing = std.testing;
+const memutil = common.memutil;
+
+fn testInfoLevel(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("0", "info level");
+    try interp.testExpectScriptError(error.EvalError, "bad level", "info level 0");
+    try interp.testExpectScriptError(error.EvalError, "bad level", "info level -1");
+    try interp.testExpectScriptError(error.EvalError, "bad level", "info level 1");
+
+    try interp.testExpectScriptResult("f a b",
+        \\ fn f {a b} { return [info level 1] }
+        \\ f a b
+    );
+    try interp.testExpectScriptResult("f a b",
+        \\ fn f {a b} { return [info level 0] }
+        \\ f a b
+    );
+
+    // `g`'s frame (level 2) can see its own invocation (0 or 2), and its
+    // caller `f`'s invocation via either an absolute (1) or relative (-1) level.
+    try interp.testExpectScriptResult("g c/f a b/f a b",
+        \\ fn g {x} { return "[info level 2]/[info level -1]/[info level 1]" }
+        \\ fn f {a b} { g c }
+        \\ f a b
+    );
+
+    try interp.testExpectScriptError(error.EvalError, "bad level",
+        \\ fn g {x} { info level 3 }
+        \\ fn f {a b} { g c }
+        \\ f a b
+    );
+    try interp.testExpectScriptError(error.EvalError, "bad level",
+        \\ fn g {x} { info level -3 }
+        \\ fn f {a b} { g c }
+        \\ f a b
+    );
+}
+
+test "info level" {
+    try memutil.checkAllocationFailures(.exhaustive, testInfoLevel, .{});
 }

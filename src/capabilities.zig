@@ -14,7 +14,7 @@ pub const File = struct {
     pub const Mode = enum { r, @"r+", w, @"w+" };
 
     file: std.Io.File,
-    mode: Mode,
+    close_when_done: bool,
 
     pub fn open(path: []const u8, mode: Mode) !*Capability {
         const cwd = std.Io.Dir.cwd();
@@ -34,7 +34,21 @@ pub const File = struct {
         errdefer heap.global_gpa.destroy(cap_backing);
         cap_backing.* = .{
             .head = .{ .vtable = &Backing.vtable, .id = undefined },
-            .body = .{ .file = file, .mode = mode },
+            .body = .{ .file = file, .close_when_done = true },
+        };
+
+        return try Capability.new(&cap_backing.head);
+    }
+
+    pub fn openDescriptor(handle: std.Io.File.Handle) !*Capability {
+        // TODO should this always be `nonblocking = false`?
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+
+        const cap_backing = try heap.global_gpa.create(Backing);
+        errdefer heap.global_gpa.destroy(cap_backing);
+        cap_backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .body = .{ .file = file, .close_when_done = false },
         };
 
         return try Capability.new(&cap_backing.head);
@@ -74,7 +88,7 @@ pub const File = struct {
 
         fn deinitBody(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
-            backing.body.file.close(heap.global_io);
+            if (backing.body.close_when_done) backing.body.file.close(heap.global_io);
         }
 
         fn destroyBacking(head: *Capability.Head) callconv(.c) void {

@@ -85,6 +85,9 @@ pending_error_code: OptionalValue,
 /// lose track of the original error. So instead when this happens we store the
 /// original error in a `-pending` key, inside of the new error.
 pending_error_during: OptionalValue,
+/// Set by `[tailcall]` just before it returns `error.Tailcall`, and consumed by
+/// the `invokeCommand` that owns the frame being replaced.
+pending_tailcall: ?Tailcall,
 /// Set to true if you'd like the interpreter to stop evaluating. Checked
 /// after each command evaluated.
 stop_executing: std.atomic.Value(bool),
@@ -143,7 +146,18 @@ pub fn narrowToEvalError(result: anytype) blk: {
 
 const Tailcall = struct {
     args: []Shimmerable,
+    command: CommandVariant,
+
+    pub fn deinit(self: *Tailcall) void {
+        for (self.args) |*arg| arg.deinit();
+        heap.global_gpa.free(self.args);
+        self.command.deinit();
+    }
 };
+
+/// Used when things have handled error.WrongUsage but still need to propagate
+/// error.Tailcall.
+const InternalEvalError = heap.EvalError || error{Tailcall};
 
 fn wrapErrorDetailsReturnType(ResultType: type) type {
     if (comptime std.meta.activeTag(@typeInfo(ResultType)) == .error_set) {
@@ -225,7 +239,13 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
 }
 
 /// If called with a method, this will _modify_ `args[1]`, not just shimmer it.
-pub fn callClosure(interp: *Interp, closure: *Closure.Content, letrec_scope: ?*Dictionary, cache_key: u256, args: []Shimmerable) heap.EvalError!void {
+pub fn callClosure(
+    interp: *Interp,
+    closure: *Closure.Content,
+    letrec_scope: ?*Dictionary,
+    cache_key: u256,
+    args: []Shimmerable,
+) InternalEvalError!void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
     const is_method = closure.is_method;
@@ -313,7 +333,7 @@ pub fn callClosure(interp: *Interp, closure: *Closure.Content, letrec_scope: ?*D
     // ```
     //
     // Here the `if` body is its own evaluation, so `f` would answer 99.
-    interp.evalObjectInner(call_frame_idx, closure.body, cache_key) catch |err| switch (err) {
+    interp.evalValueInner(call_frame_idx, closure.body, cache_key) catch |err| switch (err) {
         error.PropagateResult => {
             interp.return_propagate.left_to_go -= 1;
             if (interp.return_propagate.left_to_go > 0) return error.PropagateResult;
@@ -394,7 +414,7 @@ pub fn setResultOwning(interp: *Interp, value: Value) void {
     interp.result = value;
 }
 
-pub fn setResultInteger(interp: *Interp, value: i64) !void {
+pub fn setResultInteger(interp: *Interp, value: i64) void {
     interp.setResultOwning(objects.Integer.new(value));
 }
 
@@ -517,11 +537,12 @@ const CallFrame = struct {
         name: OptionalValue,
         letrec_scope: ?*objects.Dictionary,
         scope: ?*objects.Dictionary,
+        /// Whether the closure running in this frame was invoked as a method.
+        /// Used in [tailcall] to make sure [tailcall] isn't invoked within a method.
+        is_method: bool,
     },
     /// Call epoch. Used to invalidate previous variable lookups.
     call_epoch: u64,
-    /// Set this during evaluation to trigger a tailcall.
-    tailcall: ?Tailcall,
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
@@ -672,10 +693,10 @@ fn pushCallFrame(
             .name = signature.name.borrow(),
             .scope = signature.scope,
             .letrec_scope = letrec_scope,
+            .is_method = signature.is_method,
         },
         // TODO PERF recycle variable hash table if possible.
         .variables = variables,
-        .tailcall = null,
     });
 
     return @intCast(new_call_frame_idx);
@@ -712,7 +733,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !
         },
         .command_subst => {
             const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
-            try interp.evalObjectInner(interp.callFrameIdx(), value, nested_cache_key);
+            try interp.evalValueInner(interp.callFrameIdx(), value, nested_cache_key);
             return interp.result.borrow();
         },
         else => {
@@ -798,6 +819,8 @@ pub const ClosureAndCacheKey = struct {
     closure: *Closure,
     cache_key: u256,
 };
+/// Returns the closure borrowed. The caller owns the reference and must
+/// release it (directly, or via `CommandVariant.deinit()`).
 pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAndCacheKey {
     const closure_and_key: ClosureAndCacheKey = blk: {
         if (value.asType(Closure)) |closure| {
@@ -822,10 +845,11 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
         return error.EvalError;
     }
 
+    closure_and_key.closure.asHead().incrRefCount();
     return closure_and_key;
 }
 
-const CommandVariant = union(enum) {
+pub const CommandVariant = union(enum) {
     closure: ClosureAndCacheKey,
     command: *const evaltypes.NativeCommand,
     letrec: struct {
@@ -867,7 +891,6 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
         };
         const closure = try interp.getClosure(closure_value, can_be_method);
 
-        closure.closure.asHead().incrRefCount();
         letrec.scope.asHead().incrRefCount();
         return .{ .letrec = .{
             .scope = letrec.scope,
@@ -910,7 +933,6 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
         };
         const closure = try interp.getClosure(closure_value, can_be_method);
 
-        closure.closure.asHead().incrRefCount();
         letrec.scope.asHead().incrRefCount();
         return .{ .letrec = .{
             .scope = letrec.scope,
@@ -918,7 +940,6 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
         } };
     } else {
         const closure = try interp.getClosure(shim.current(), can_be_method);
-        closure.closure.asHead().incrRefCount();
         return .{ .closure = closure };
     }
 }
@@ -983,7 +1004,7 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     try interp.invokeCommand(&unknown_cmd, new_args);
 }
 
-pub fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []Shimmerable) heap.EvalError!void {
+pub fn invokeCommand(interp: *Interp, command_variant: *const CommandVariant, args: []Shimmerable) InternalEvalError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.EvalError;
@@ -994,17 +1015,20 @@ pub fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []
 
     // Loop the calling section, as there may be a tailcall.
     var current_args = args;
-    var tailcall_info: ?Tailcall = null;
-    defer if (tailcall_info) |info| heap.global_gpa.free(info.args);
+    var owned_tailcall: ?Tailcall = null;
+    defer if (owned_tailcall) |*tailcall| tailcall.deinit();
     while (true) {
-        interp.evalFrame().args = args;
+        // Set so that error handling sees the current args.
+        interp.evalFrame().args = current_args;
         // TODO implement tracing.
 
         // Be sure to clear the previous result.
         interp.setEmptyResult();
 
+        const to_call: *const CommandVariant = if (owned_tailcall) |*tailcall| &tailcall.command else command_variant;
+
         const result = blk: {
-            switch (command_variant.*) {
+            switch (to_call.*) {
                 .command => |command| {
                     break :blk interp.callNative(command, current_args);
                 },
@@ -1017,23 +1041,28 @@ pub fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []
             }
         };
 
-        var tailcall_found = false;
-
         result catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Tailcall => {
-                tailcall_found = true;
-                const tailcall = interp.callFrame().tailcall.?;
-
-                // Be sure to free the previous tailcall.
-                if (tailcall_info) |prev_tailcall| {
-                    for (prev_tailcall.args) |*arg| arg.deinit();
-                    heap.global_gpa.free(prev_tailcall.args);
+                if (std.meta.activeTag(to_call.*) == .command) {
+                    // If we're running within a native command (say [eval]),
+                    // and we receive a tailcall, we need to keep passing it
+                    // up, so the owner of the call frame can swap it out.
+                    return error.Tailcall;
                 }
 
-                tailcall_info = tailcall;
+                const tailcall = interp.pending_tailcall orelse {
+                    // If `pending_tailcall` wasn't set, it means that something
+                    // besides [tailcall] returned error.Tailcall.
+                    try interp.setResultString("cannot use -code tailcall");
+                    return error.EvalError;
+                };
+                interp.pending_tailcall = null;
+
+                if (owned_tailcall) |*prev| prev.deinit();
+                owned_tailcall = tailcall;
                 current_args = tailcall.args;
-                interp.callFrame().tailcall = null;
+                continue;
             },
             error.EvalError => {
                 try interp.setErrorStack();
@@ -1045,10 +1074,7 @@ pub fn invokeCommand(interp: *Interp, command_variant: *CommandVariant, args: []
             error.Exit => return error.Exit,
         };
 
-        if (tailcall_found == false) {
-            tailcall_info = null; // Avoid double free.
-            break;
-        }
+        break;
     }
 }
 
@@ -1251,7 +1277,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
 pub fn invokeCommandMaybeMethod(
     interp: *Interp,
     args_raw: []Shimmerable,
-) heap.EvalError!void {
+) InternalEvalError!void {
     var args = args_raw[1..];
 
     const cmd_and_self = try interp.getCommandAndSelfParam(args);
@@ -1430,7 +1456,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     try interp.invokeCommandMaybeMethod(args_raw);
 }
 
-pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) heap.EvalError!void {
+pub fn evalValueInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) InternalEvalError!void {
     // A loop evaluates its body through here once per iteration, which is what
     // keeps an iterating script from accumulating. Nesting is safe, since an
     // inner evaluation snapshots at a higher watermark than an outer one.
@@ -1466,6 +1492,9 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
                 // just carries the result outward. `callClosure` is what consumes
                 // a level; see the comment there.
                 error.PropagateResult => return error.PropagateResult,
+                // A tailcall replaces the frame of whichever _closure_ is running,
+                // which means it propagates up eval frames to the next call frame.
+                error.Tailcall => return error.Tailcall,
                 else => |narrowed_err| {
                     if (narrowed_err == error.OutOfMemory) {
                         // In the case of OOM, the inside function almost certainly failed
@@ -1506,18 +1535,21 @@ pub fn evalObjectInner(interp: *Interp, call_frame: u32, script: Value, cache_ke
 pub fn evalTopLevel(interp: *Interp, script: Value) heap.EvalError!void {
     interp.evalValue(script) catch |err| switch (err) {
         error.PropagateResult => interp.return_propagate = .{},
-        else => return err,
+        error.Tailcall => {
+            return interp.setErrorString("can't invoke tailcall when called from C");
+        },
+        else => |narrowed_err| return narrowed_err,
     };
 }
 
-pub fn evalValue(interp: *Interp, script: Value) heap.EvalError!void {
+pub fn evalValue(interp: *Interp, script: Value) InternalEvalError!void {
     // Reset the stack trace at each new top-level invocation.
     interp.stack_trace.swapWithNone();
     const cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try script.getHashNoRegister();
-    return evalObjectInner(interp, interp.callFrameIdx(), script, cache_key);
+    return evalValueInner(interp, interp.callFrameIdx(), script, cache_key);
 }
 
-pub fn evalFile(interp: *Interp, filename: []const u8) heap.EvalError!void {
+pub fn evalFile(interp: *Interp, filename: []const u8) InternalEvalError!void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         heap.global_io,
         filename,
@@ -1540,6 +1572,70 @@ pub fn evalFile(interp: *Interp, filename: []const u8) heap.EvalError!void {
     try interp.evalValue(source.asHead().asValue());
 }
 
+/// Reads `filename` and evaluates it in a call frame of its own, then hands
+/// back whatever ended up bound in that frame.
+pub fn evalFileAsModule(interp: *Interp, filename: []const u8) InternalEvalError!*Dictionary {
+    const parent_scope = try narrowToEvalError(interp.captureCurrentScope());
+    parent_scope.asHead().makeCrossthread();
+    defer parent_scope.asHead().release();
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        heap.global_io,
+        filename,
+        heap.global_gpa,
+        .unlimited,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try interp.setResultFormatted("couldn't read file \"{s}\": {}", .{ filename, err });
+            return error.EvalError;
+        },
+    };
+    defer heap.global_gpa.free(bytes);
+
+    const filename_value = try objects.String.newValue(filename);
+    defer filename_value.release();
+    const source = try objects.Source.new(bytes, filename_value.asOptional(), 1);
+    defer source.asHead().release();
+    const script = source.asHead().asValue();
+
+    var arg_names = try objects.List.new(&.{});
+    arg_names.asHead().makeCrossthread();
+    defer arg_names.asHead().release();
+
+    const call_frame_idx = try interp.pushCallFrame(&.{}, &.{
+        .arg_names = arg_names,
+        .optional_values = null,
+        .required_arity = 0,
+        .optional_arity = 0,
+        .body = script,
+        .name = .none,
+        .scope = parent_scope,
+        .has_args_parameter = false,
+        .is_method = false,
+        // Not used in practice.
+        .cache_id = Closure.closure_cache_id.fetchAdd(1, .monotonic),
+    }, null);
+    defer {
+        var frame_mut = interp.call_frames.pop().?;
+        frame_mut.deinit();
+    }
+
+    const cache_key = try script.getHashNoRegister();
+    interp.evalValueInner(call_frame_idx, script, cache_key) catch |err| switch (err) {
+        error.PropagateResult => {
+            interp.return_propagate.left_to_go = 0;
+            return interp.setErrorString("cannot return from import");
+        },
+        error.Tailcall => {
+            return interp.setErrorString("cannot call [tailcall] from import");
+        },
+        else => return err,
+    };
+
+    return try narrowToEvalError(interp.captureScope(call_frame_idx));
+}
+
 pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     const unknown_str = try objects.String.newValue("unknown");
     errdefer unknown_str.release();
@@ -1559,6 +1655,7 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
         .stack_trace = .none,
         .pending_error_code = .none,
         .pending_error_during = .none,
+        .pending_tailcall = null,
         .stop_executing = .init(false),
         // TODO: init per interpreter
         .prng = .init(0),
@@ -1615,6 +1712,7 @@ pub fn deinit(interp: *Interp) void {
     interp.stack_trace.swapWithNone();
     interp.pending_error_code.swapWithNone();
     interp.pending_error_during.swapWithNone();
+    if (interp.pending_tailcall) |*tailcall| tailcall.deinit();
     interp.unknown_str.release();
     interp.global_commands.deinit(heap.global_gpa);
 

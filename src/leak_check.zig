@@ -10,15 +10,21 @@ const heap = @import("heap.zig");
 const Object = heap.Object;
 const Value = heap.Value;
 
-threadlocal var debugging_buffer: if (options.trace_mem) [16 * 1024 * 1024]u8 else void = undefined;
+/// Heap-allocated to avoid blowing up the stack.
+threadlocal var debugging_buffer: if (options.trace_mem) []u8 else void = undefined;
 threadlocal var debugging_gpa: if (options.trace_mem) memutil.RingBufferAllocator else void = undefined;
 /// Use this for debugging objects (traces, etc) that can afford to leak.
 threadlocal var debug_gpa: std.mem.Allocator = undefined;
+threadlocal var thread_initialized: bool = false;
 
-const LogCategory = enum {
+const LogInfo = union(enum) {
     alloc,
+    incr_ref_count: struct { new_ref_count: u32 },
+    decr_ref_count: struct { new_ref_count: u32 },
+    invalidate_rep,
+    invalidate_string: struct { was: []u8 },
+    set_string: struct { set_to: []u8 },
     free,
-    other,
 };
 const LogEntry = struct {
     /// We assume that the memory containing the entry is zero-initialized,
@@ -27,38 +33,65 @@ const LogEntry = struct {
     /// be partway through filling the log entry before crashing, and we don't
     /// want to read a partially filled entry.
     initialized: std.atomic.Value(bool),
-    value: Value,
-    addrs: [32]usize,
+    ptr: *Object,
+    sequence_number: u64,
+    info: LogInfo,
+    addrs: [if (options.capture_stack_trace) 32 else 0]usize,
     stack_trace: std.debug.StackTrace,
-    category: LogCategory,
-    message: []u8,
 };
 var debug_log: if (options.trace_mem) [1024 * 1024]LogEntry else void = undefined;
 var next_debug_location: std.atomic.Value(usize) = .init(0);
 var alloc_count: std.atomic.Value(isize) = .init(0);
-
-pub fn init() void {
-    if (options.trace_mem) {
-        debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer[0..]);
-        debug_gpa = debugging_gpa.allocator();
-    }
-}
 
 pub fn deinit() void {
     if (options.trace_mem) {
         for (debug_log[0..next_debug_location.load(.monotonic)]) |*entry| {
             entry.initialized = .init(false);
         }
-        alloc_count.store(0, .monotonic);
         next_debug_location.store(0, .monotonic);
     }
 }
 
-pub inline fn globalTrace(category: LogCategory, value: Value, comptime fmt: []const u8, args: anytype) void {
+pub fn initThread() !void {
+    if (thread_initialized) return;
+
     if (options.trace_mem) {
-        if (category == .alloc) {
+        debugging_buffer = try std.heap.page_allocator.alloc(u8, 16 * 1024 * 1024);
+        debugging_gpa = memutil.RingBufferAllocator.init(debugging_buffer);
+        debug_gpa = debugging_gpa.allocator();
+    }
+
+    thread_initialized = true;
+}
+
+pub fn deinitThread() void {
+    if (!thread_initialized) return;
+    thread_initialized = false;
+
+    if (options.trace_mem) {
+        std.heap.page_allocator.free(debugging_buffer);
+    }
+}
+
+/// Copy `bytes` into this thread's ring buffer so a log entry can hold onto
+/// string content that outlives the object it came from (the object may be
+/// freed, or the string replaced, before the log is ever read). The ring
+/// buffer wraps rather than growing, so an old copy can be overwritten by a
+/// later trace on the same thread -- acceptable for debugging output, never
+/// used for anything load-bearing. Only call under `options.trace_mem`.
+pub inline fn dupeForTrace(bytes: []const u8) []u8 {
+    if (options.trace_mem) {
+        return debug_gpa.dupe(u8, bytes) catch &.{};
+    } else {
+        return &.{};
+    }
+}
+
+pub inline fn globalTrace(ptr: *Object, info: LogInfo) void {
+    if (options.trace_mem) {
+        if (std.meta.activeTag(info) == .alloc) {
             _ = alloc_count.fetchAdd(1, .monotonic);
-        } else if (category == .free) {
+        } else if (std.meta.activeTag(info) == .free) {
             _ = alloc_count.fetchSub(1, .monotonic);
         }
 
@@ -67,11 +100,27 @@ pub inline fn globalTrace(category: LogCategory, value: Value, comptime fmt: []c
             std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &debug_log[slot].addrs)
         else
             .{ .return_addresses = &.{}, .skipped = .unknown };
-        debug_log[slot].category = category;
+        debug_log[slot].ptr = ptr;
+        debug_log[slot].sequence_number = ptr.sequence_number;
+        debug_log[slot].info = info;
         debug_log[slot].stack_trace = stack_trace;
-        debug_log[slot].value = value;
-        debug_log[slot].message = std.fmt.allocPrint(debug_gpa, fmt, args) catch unreachable;
         debug_log[slot].initialized.store(true, .release);
+    }
+}
+
+/// Render one log entry as a single line: what happened, plus enough of the
+/// payload (new refcount, string content) to read the history without
+/// re-deriving it from surrounding entries.
+fn formatLogInfo(writer: *std.Io.Writer, entry: *const LogEntry) !void {
+    try writer.print("seq={d} ", .{entry.sequence_number});
+    switch (entry.info) {
+        .alloc => try writer.writeAll("alloc"),
+        .free => try writer.writeAll("free"),
+        .incr_ref_count => |v| try writer.print("incrRefCount (now {d})", .{v.new_ref_count}),
+        .decr_ref_count => |v| try writer.print("decrRefCount (now {d})", .{v.new_ref_count}),
+        .invalidate_rep => try writer.writeAll("invalidateInternalRep"),
+        .invalidate_string => |v| try writer.print("invalidateString (was \"{s}\")", .{v.was}),
+        .set_string => |v| try writer.print("setString (\"{s}\")", .{v.set_to}),
     }
 }
 
@@ -180,7 +229,9 @@ pub const LeakResult = struct {
             const obj = entry.key_ptr.*;
 
             for (entry.value_ptr.entries.items) |log_entry| {
-                try writer.print("\n\nTrace for addr=0x{x}: {s}\n", .{ @intFromPtr(obj), log_entry.message });
+                try writer.print("\n\nTrace for addr=0x{x}: ", .{@intFromPtr(obj)});
+                try formatLogInfo(writer, log_entry);
+                try writer.writeByte('\n');
                 try std.debug.writeStackTrace(&log_entry.stack_trace, terminal);
             }
             try writer.writeAll("\n");
@@ -206,11 +257,6 @@ pub const LeakResult = struct {
 };
 pub fn captureLeaks() !LeakResult {
     if (options.trace_mem) {
-        // Don't do expensive leak checks unless the allocation count is off.
-        if (alloc_count.load(.monotonic) == 0) {
-            return .{ .arena = null, .object_logs = .empty, .nodes = .empty, .edges = .empty };
-        }
-
         // It's unsafe to use `global_gpa`, since that's the allocator we're
         // checking leaks against right now. Hence, we use `external_arena` for
         // all our tracing needs.
@@ -225,8 +271,7 @@ pub fn captureLeaks() !LeakResult {
             // Make sure this entry was fully initialized, else we'll ignore it.
             if (log_entry.initialized.load(.acquire) == false) continue;
 
-            const ptr = log_entry.value.asPtr() orelse continue; // Only track values with pointers.
-            const entry = object_logs.getOrPut(external_arena, ptr) catch @panic("OOM");
+            const entry = object_logs.getOrPut(external_arena, log_entry.ptr) catch @panic("OOM");
             if (!entry.found_existing) entry.value_ptr.* = .{ .entries = .empty, .leaked = false };
 
             entry.value_ptr.entries.append(external_arena, log_entry) catch @panic("OOM");
@@ -235,9 +280,9 @@ pub fn captureLeaks() !LeakResult {
             // The address may have been reused by another structure, but we
             // know if it was allocated and not freed as an object, it's an
             // object.
-            if (log_entry.category == .alloc) {
+            if (std.meta.activeTag(log_entry.info) == .alloc) {
                 entry.value_ptr.leaked = true;
-            } else if (log_entry.category == .free) {
+            } else if (std.meta.activeTag(log_entry.info) == .free) {
                 entry.value_ptr.leaked = false;
             }
         }
@@ -266,6 +311,164 @@ pub fn captureLeaks() !LeakResult {
     } else {
         return .{ .arena = null, .object_logs = .empty, .nodes = .empty, .edges = .empty };
     }
+}
+
+pub const CrossthreadViolation = struct {
+    /// The crossthread object that holds a reference to `child`.
+    parent: *const Object,
+    /// The non-crossthread object `parent` shouldn't be able to reach.
+    child: *const Object,
+    field_name: []const u8,
+};
+
+/// Walks the live object graph (same roots as `captureLeaks`) looking for an
+/// edge from a crossthread object into a non-crossthread one -- the
+/// invariant `Object.makeCrossthread` is supposed to establish for the whole
+/// subgraph it marks. A hit here means some object reached a crossthread
+/// parent without going through `makeCrossthread` (a raw field assignment
+/// that bypassed it, a mutation that happened before marking finished on
+/// another thread, etc).
+const CrossthreadChecker = struct {
+    violations: std.ArrayList(CrossthreadViolation) = .empty,
+    /// Same role as `GraphWalker.nodes`: bounds the walk to one expansion per
+    /// node regardless of how many parents reach it, so a shared child in a
+    /// large live graph doesn't get re-walked once per parent.
+    visited: std.AutoHashMapUnmanaged(*const anyopaque, void) = .empty,
+
+    const vtable: memutil.StructIterator.VTable = .{ .visit_node = visitNode };
+
+    fn promote(self: *CrossthreadChecker, arena: std.mem.Allocator) memutil.StructIterator {
+        return .{ .ptr = self, .vtable = &vtable, .arena = arena };
+    }
+
+    fn asObject(info: *const memutil.StructIterator.NodeInfo) ?*const Object {
+        if (info.is_synthetic) return null;
+        if (!std.mem.eql(u8, info.type_name, @typeName(Object))) return null;
+        return @ptrCast(@alignCast(info.node));
+    }
+
+    fn visitNode(
+        ctx: memutil.StructIterator,
+        info: *const memutil.StructIterator.NodeInfo,
+        edge_coming_from: ?[]const u8,
+    ) memutil.StructIterator.Error!void {
+        const self: *CrossthreadChecker = @ptrCast(@alignCast(ctx.ptr));
+
+        if (info.parent_info) |parent_info| {
+            if (asObject(parent_info)) |parent_obj| {
+                if (asObject(info)) |child_obj| {
+                    if (parent_obj.metadata.cross_thread and !child_obj.metadata.cross_thread) {
+                        try self.violations.append(ctx.arena, .{
+                            .parent = parent_obj,
+                            .child = child_obj,
+                            .field_name = edge_coming_from orelse "?",
+                        });
+                    }
+                }
+            }
+        }
+
+        // Same expand-once dispatch as GraphWalker.visitNode -- edges into an
+        // already-visited node are still recorded above (that's the whole
+        // check), only re-expanding its children is skipped.
+        if (self.visited.contains(info.node)) return;
+        try self.visited.put(ctx.arena, info.node, {});
+
+        if (info.enumerate_struct_c) |c_fn| {
+            var walker: memutil.StructIterator.CEnumerateContext = .{ .ctx = ctx, .info = info };
+            if (c_fn(&walker, info.node) != 0) return error.OutOfMemory;
+        } else if (info.enumerate_struct) |follow_fn| {
+            try follow_fn(ctx, info);
+        }
+    }
+};
+
+pub const CrossthreadCheckResult = struct {
+    arena: ?std.heap.ArenaAllocator,
+    violations: std.ArrayList(CrossthreadViolation),
+
+    pub fn deinit(result: *CrossthreadCheckResult) void {
+        if (result.arena) |arena| arena.deinit();
+    }
+
+    pub fn dump(result: *const CrossthreadCheckResult, writer: *std.Io.Writer) !void {
+        if (result.violations.items.len == 0) {
+            try writer.writeAll("No crossthread violations found.\n");
+            return;
+        }
+        for (result.violations.items) |v| {
+            try writer.print(
+                "VIOLATION: {s} 0x{x} (crossthread) -- field \"{s}\" --> {s} 0x{x} (NOT crossthread)\n",
+                .{ v.parent.vtable.name, @intFromPtr(v.parent), v.field_name, v.child.vtable.name, @intFromPtr(v.child) },
+            );
+        }
+    }
+};
+
+/// Root the walk from every object the log currently shows as
+/// allocated-but-not-yet-freed -- i.e. every live object at the moment this
+/// is called, not just ones reachable from a particular container -- and
+/// check each edge for the crossthread invariant. Call this any time
+/// (mid-run at a breakpoint, or from `dumpCrossthreadCheck` via gdb); it only
+/// reads the log that's always being written, so unlike the old
+/// message/stack-trace tracing it adds nothing to the hot allocation path.
+pub fn checkCrossthreadInvariant() !CrossthreadCheckResult {
+    if (options.trace_mem) {
+        var external_arena_allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer external_arena_allocator.deinit();
+        const external_arena = external_arena_allocator.allocator();
+
+        // Net alloc-minus-free per pointer, not a replay of `.alloc`/`.free`
+        // in array-index order: slots are handed out in thread-local batches
+        // (see `local_next_debug_location`), so index order no longer tracks
+        // real chronological order across threads -- a thread can log a
+        // `.free` at a low index long after another thread's `.alloc` landed
+        // at a high one. A net count is order-independent and still correct
+        // under address reuse (alloc, free, alloc-again nets to +1 = live).
+        var net_count: std.AutoHashMapUnmanaged(*const Object, i32) = .empty;
+        for (debug_log[0..next_debug_location.load(.monotonic)]) |*log_entry| {
+            if (log_entry.initialized.load(.acquire) == false) continue;
+            const entry = net_count.getOrPut(external_arena, log_entry.ptr) catch @panic("OOM");
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += switch (std.meta.activeTag(log_entry.info)) {
+                .alloc => @as(i32, 1),
+                .free => @as(i32, -1),
+                else => @as(i32, 0),
+            };
+        }
+
+        var checker: CrossthreadChecker = .{};
+        const struct_iter = checker.promote(external_arena);
+        var live_iter = net_count.iterator();
+        while (live_iter.next()) |entry| {
+            if (entry.value_ptr.* <= 0) continue;
+            struct_iter.followUnparentedNode(Object, entry.key_ptr.*) catch @panic("OOM");
+        }
+
+        return .{ .arena = external_arena_allocator, .violations = checker.violations };
+    } else {
+        return .{ .arena = null, .violations = .empty };
+    }
+}
+
+pub fn dumpCrossthreadCheck() !void {
+    var result = try checkCrossthreadInvariant();
+    defer result.deinit();
+
+    const stderr = ioutil.getStderr();
+    var buffer: [256]u8 = undefined;
+    var writer = stderr.writer(heap.global_io, &buffer);
+    try result.dump(&writer.interface);
+    try writer.flush();
+}
+
+/// Callable straight from gdb (`call zicl_dumpCrossthreadCheck()`) once
+/// stopped -- runs `checkCrossthreadInvariant` and prints any violations to
+/// stderr. Safe to call repeatedly; unlike `Zicl_LeakCheckAll` it never
+/// frees anything, so it doesn't leave the interpreter unusable afterward.
+export fn zicl_dumpCrossthreadCheck() void {
+    if (!options.trace_mem) return;
+    dumpCrossthreadCheck() catch {};
 }
 
 /// Capture any leaked objects and dump the leak graph to stderr as dot.
@@ -341,28 +544,42 @@ pub fn dumpLastTouchedTrace(fd: i32) void {
 
     // Recent context: the last ~15 entries, regardless of object, so the
     // immediate lead-up to the crash is visible even if the last-touched object
-    // isn't the one that faulted.
+    // isn't the one that faulted. Also tracks which object the very last
+    // initialized entry touched, so the full per-object trace below is for
+    // the actual last-touched object rather than whatever happens to be at
+    // the highest slot (a thread can still be mid-write to a higher slot).
     writer.print("== Recent operations summary (last 15) ==\n", .{}) catch {};
     const start = entries -| 15;
+    var last_touched: ?*const Object = null;
     var j: usize = start;
     while (j < entries) : (j += 1) {
         const entry = &debug_log[j];
         if (!entry.initialized.load(.acquire)) continue;
-        const obj = entry.value.asPtr() orelse continue;
-        writer.print("  [{:>2}] addr=0x{x} {s}\n", .{ j - start, @intFromPtr(obj), entry.message }) catch {};
+        writer.print("  [{:>2}] addr=0x{x} ", .{ j - start, @intFromPtr(entry.ptr) }) catch {};
+        formatLogInfo(writer, entry) catch {};
+        writer.writeByte('\n') catch {};
+        last_touched = entry.ptr;
     }
 
-    j = start;
+    const target = last_touched orelse return;
+    writer.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(target)}) catch {};
+    j = 0;
     while (j < entries) : (j += 1) {
         const entry = &debug_log[j];
         if (!entry.initialized.load(.acquire)) continue;
-        const obj = entry.value.asPtr() orelse continue;
-        writer.print("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)}) catch {};
-        writer.print("  [{:>2}] addr=0x{x} {s}\n", .{ j - start, @intFromPtr(obj), entry.message }) catch {};
+        if (entry.ptr != target) continue;
+        writer.print("  [{d}] addr=0x{x} ", .{ j, @intFromPtr(entry.ptr) }) catch {};
+        formatLogInfo(writer, entry) catch {};
+        writer.writeByte('\n') catch {};
         std.debug.writeStackTrace(&entry.stack_trace, terminal) catch {};
     }
 }
 
+/// Callable straight from gdb (`call dumpTraceForObject(addr, verbose)`).
+/// Prints every logged event for the object at `addr`, in log order; with
+/// `verbose` also prints each event's stack trace. We never dereference
+/// `addr` -- it's compared as a raw pointer value against `entry.ptr`, so
+/// this is safe to call even on a dangling/freed address.
 export fn dumpTraceForObject(addr: usize, verbose: bool) void {
     if (!options.trace_mem) return;
 
@@ -372,33 +589,27 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
         return;
     }
 
+    const stderr = ioutil.getStderr();
+    var buffer: [256]u8 = undefined;
+    var file_writer = stderr.writer(heap.global_io, &buffer);
+    const writer: *std.Io.Writer = &file_writer.interface;
+    const terminal: std.Io.Terminal = .{ .writer = writer, .mode = .no_color };
+    defer writer.flush() catch {};
+
     var counter: usize = 0;
-    for (debug_log[0..entries]) |*entry| {
+    for (debug_log[0..entries], 0..) |*entry, j| {
         if (!entry.initialized.load(.acquire)) continue;
-        const obj = entry.value.asPtr() orelse continue;
-        if (@intFromPtr(obj) == addr) {
-            ioutil.debug("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
-            counter += 1;
-        }
+        if (@intFromPtr(entry.ptr) != addr) continue;
+
+        writer.print("  [{:>2}] idx={d} ", .{ counter, j }) catch {};
+        formatLogInfo(writer, entry) catch {};
+        writer.writeByte('\n') catch {};
+        if (verbose) std.debug.writeStackTrace(&entry.stack_trace, terminal) catch {};
+        counter += 1;
     }
 
-    if (verbose) {
-        counter = 0;
-        for (debug_log[0..entries]) |*entry| {
-            if (!entry.initialized.load(.acquire)) continue;
-            const obj = entry.value.asPtr() orelse continue;
-            if (@intFromPtr(obj) == addr) {
-                ioutil.debug("\n== Full trace for last-touched object addr=0x{x} ==\n", .{@intFromPtr(obj)});
-                ioutil.debug("  [{:>2}] addr=0x{x} {s}\n", .{ counter, @intFromPtr(obj), entry.message });
-
-                const stderr = ioutil.getStderr();
-                var buffer: [256]u8 = undefined;
-                var writer = stderr.writer(heap.global_io, &buffer);
-                const terminal: std.Io.Terminal = .{ .writer = &writer.interface, .mode = .no_color };
-                std.debug.writeStackTrace(&entry.stack_trace, terminal) catch {};
-                counter += 1;
-            }
-        }
+    if (counter == 0) {
+        writer.print("(no entries for addr=0x{x})\n", .{addr}) catch {};
     }
 }
 

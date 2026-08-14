@@ -35,6 +35,23 @@ static long item_as_long(Zicl_Interp *interp, Zicl_Value *list, int index) {
     return n;
 }
 
+/* Reports the name of the closure currently executing (or "(none)" at the
+ * top level / inside an anonymous closure) as the result. */
+static int whoami_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
+    (void)argc;
+    (void)argv;
+    Zicl_OptionalValue name = Zicl_GetClosureNameBeingEvaluated(interp);
+    if (Zicl_IsNone(name)) {
+        Zicl_Value none_marker;
+        if (Zicl_NewString(&none_marker, "(none)", -1) != ZICL_OK) return ZICL_OOM;
+        Zicl_SetResult(interp, none_marker);
+        Zicl_Release(none_marker);
+    } else {
+        Zicl_SetResult(interp, Zicl_Unwrap(name));
+    }
+    return ZICL_OK;
+}
+
 /* A command that asks the interpreter to stop. The check in evalObjectInner
  * fires at the next command boundary, so the script never reaches the command
  * after this one. */
@@ -521,6 +538,41 @@ int main(void) {
         Zicl_Release(dv);
     }
 
+    /* Dict link: build a fresh dict with a ~parent hash reference, leaving
+     * both inputs untouched, and confirm a key that only the parent has
+     * resolves through the link. */
+    {
+        Zicl_Value parent_kv[2] = { Zicl_NewLong(100), Zicl_NewLong(1000) };
+        Zicl_Dict *parent = Zicl_NewDict(parent_kv, 2);
+        Zicl_Value pv = Zicl_BoxDict(parent);
+
+        Zicl_Value child_kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
+        Zicl_Dict *child = Zicl_NewDict(child_kv, 2);
+
+        Zicl_Dict *linked = Zicl_DictLink(child, pv);
+        CHECK(linked != NULL);
+        CHECK(Zicl_DictLength(linked) == 2);  /* ~parent plus child's one pair */
+        CHECK(Zicl_DictLength(child) == 1);   /* child untouched */
+
+        int klen = -1;
+        const char *k0 = Zicl_GetString(Zicl_DictItems(linked)[0], &klen);
+        CHECK(klen == 7 && memcmp(k0, "~parent", 7) == 0);
+
+        Zicl_Value lv = Zicl_BoxDict(linked);
+        int llen = -1;
+        const char *ls = Zicl_GetString(lv, &llen);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "dict get {%.*s} 100", llen, ls);
+        CHECK(Zicl_Eval(interp, buf) == ZICL_OK);
+        int rlen = -1;
+        const char *got = Zicl_GetString(Zicl_GetResult(interp), &rlen);
+        CHECK(rlen == 4 && memcmp(got, "1000", 4) == 0);
+
+        Zicl_Release(lv);
+        Zicl_Release(pv);
+        Zicl_ReleaseDict(child);
+    }
+
     /* Source copy-on-write: in-place branch (uniquely owned, annotate line). */
     {
         Zicl_Value s;
@@ -608,6 +660,97 @@ int main(void) {
         CHECK(Zicl_Eval(interp, "return 5") == ZICL_PROPAGATE);
         got = Zicl_GetString(Zicl_GetResult(interp), &len);
         CHECK(got != NULL && len == 1 && got[0] == '5');
+    }
+
+    /* Closures: GetClosure resolves a value into a reusable handle, GetBody
+     * reads its (unattached, here) source location, CallClosure invokes it
+     * -- possibly more than once -- and ReleaseClosure frees the handle.
+     * [fn] leaves a closure value as the eval result; resolve it instead of
+     * going through [apply]. argv[0] is the name slot callClosure expects
+     * (unused for a plain, non-method closure). */
+    {
+        CHECK(Zicl_Eval(interp, "fn {a b} { + $a $b }") == ZICL_OK);
+        Zicl_Value closure_value = Zicl_GetResult(interp);
+
+        Zicl_Closure *closure = NULL;
+        CHECK(Zicl_GetClosure(interp, closure_value, &closure) == ZICL_OK);
+        CHECK(closure != NULL);
+
+        /* The tokenizer wraps every literal word as a Source carrying a
+         * relative line number, even without a file (evalString, not
+         * evalFile, produced this script), so the filename is unset. */
+        int blen = -1;
+        const char *body = Zicl_GetString(Zicl_ClosureGetBody(closure), &blen);
+        CHECK(body != NULL && blen > 0);
+        CHECK(Zicl_AsSource(Zicl_ClosureGetBody(closure)) != NULL);
+        CHECK(Zicl_SourceGetFilename(Zicl_ClosureGetBody(closure)) == NULL);
+        CHECK(Zicl_SourceGetLine(Zicl_ClosureGetBody(closure)) >= 0);
+
+        Zicl_Shimmerable argv[3] = {
+            Zicl_NewShimmerable(closure_value),  /* name slot, unused */
+            Zicl_NewShimmerable(Zicl_NewLong(10)),
+            Zicl_NewShimmerable(Zicl_NewLong(20)),
+        };
+        CHECK(Zicl_CallClosure(interp, closure, 3, argv) == ZICL_OK);
+        int len = -1;
+        const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len == 2 && memcmp(got, "30", 2) == 0);
+
+        /* The same handle can be called again. */
+        Zicl_Shimmerable argv2[3] = {
+            Zicl_NewShimmerable(closure_value),
+            Zicl_NewShimmerable(Zicl_NewLong(1)),
+            Zicl_NewShimmerable(Zicl_NewLong(2)),
+        };
+        CHECK(Zicl_CallClosure(interp, closure, 3, argv2) == ZICL_OK);
+        got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len == 1 && got[0] == '3');
+
+        Zicl_ReleaseClosure(closure);
+
+        /* A [method] closure is rejected by Zicl_GetClosure with ZICL_ERR,
+         * matching plain command dispatch when a method is invoked as a
+         * function. */
+        CHECK(Zicl_Eval(interp, "method {self} {} { }") == ZICL_OK);
+        Zicl_Closure *method = NULL;
+        CHECK(Zicl_GetClosure(interp, Zicl_GetResult(interp), &method) == ZICL_ERR);
+        CHECK(method == NULL);
+    }
+
+    /* GetClosureNameBeingEvaluated: ZICL_NONE at the top level, the closure's
+     * name once one is running. */
+    {
+        CHECK(Zicl_CreateCommand(interp, "whoami", whoami_cmd, "current closure name", 0, 0) == ZICL_OK);
+
+        CHECK(Zicl_Eval(interp, "whoami") == ZICL_OK);
+        int len = -1;
+        const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && strcmp(got, "(none)") == 0);
+
+        CHECK(Zicl_Eval(interp, "fn myproc {} { whoami }; myproc") == ZICL_OK);
+        got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && strcmp(got, "myproc") == 0);
+    }
+
+    /* Zicl_CallClosure runs a [tailcall] the closure body issues, rather than
+     * handing back ZICL_TAILCALL with the target left unrun: it dispatches
+     * through the same invokeCommand loop that consumes a tailcall for an
+     * ordinary command call, instead of calling callClosure on its own. */
+    {
+        CHECK(Zicl_Eval(interp, "fn tc_b {} { return tailcalled }") == ZICL_OK);
+        CHECK(Zicl_Eval(interp, "fn tc_a {} { tailcall tc_b }") == ZICL_OK);
+        Zicl_Value closure_value = Zicl_GetResult(interp);
+
+        Zicl_Closure *closure = NULL;
+        CHECK(Zicl_GetClosure(interp, closure_value, &closure) == ZICL_OK);
+
+        Zicl_Shimmerable argv[1] = { Zicl_NewShimmerable(closure_value) };
+        CHECK(Zicl_CallClosure(interp, closure, 1, argv) == ZICL_OK);
+        int len = -1;
+        const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
+        CHECK(got != NULL && len == 10 && memcmp(got, "tailcalled", 10) == 0);
+
+        Zicl_ReleaseClosure(closure);
     }
 
     /* Local arena snapshot/rewind: rendering an inline integer's string rep

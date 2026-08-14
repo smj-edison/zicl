@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     ) orelse &[0][]const u8{};
     const token_debugging = b.option(bool, "token-debugging", "Whether to print tokens when they're parsed") orelse false;
     const threading = b.option(bool, "threading", "Whether threading is enabled") orelse true;
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build with ThreadSanitizer") orelse false;
     const full_oom_testing = b.option(bool, "full-oom-testing", "Enable all incremental OOM tests (slow)") orelse false;
 
     const target = b.standardTargetOptions(.{
@@ -72,6 +73,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
     });
 
     root.addImport("uucode", uucode.module("uucode"));
@@ -97,6 +99,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .pic = true,
+        .sanitize_thread = sanitize_thread,
     });
     lz_mod.addImport("uucode", uucode.module("uucode"));
     lz_mod.addImport("options", options_mod);

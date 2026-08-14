@@ -78,6 +78,10 @@ fn catchTryHelper(
     // Out of memory belongs to the allocator's caller, not the script: catching it
     // would report code 7 as an ordinary result and hide that anything failed.
     to_propagate.insert(.oom);
+    // By default we allow [tailcall] calls to pass through [catch], else
+    // the tailcall would silently never run. It is allowed on an opt-in
+    // basis though.
+    to_propagate.insert(.tailcall);
 
     // The caller may have specified a different set of codes to propagate/catch. The
     // format is -no"code", or -"code". For example, -nobreak would propagate break.
@@ -346,7 +350,7 @@ fn catchTryHelper(
 
     switch (mode) {
         .@"catch" => {
-            try interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromErrorUnion(script_result)));
+            interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromErrorUnion(script_result)));
             return;
         },
         .@"try" => {

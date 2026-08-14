@@ -128,7 +128,10 @@ pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
     lazy_fn_registry = .{};
     registered_hashes = .{};
 
-    leak_check.init();
+    // We need to make sure the leak checker is initialized, because
+    // we create objects in this function.
+    try leak_check.initThread();
+
     try regex.initGlobals();
     errdefer regex.deinitGlobals();
     try Capability.initGlobals(config.capability);
@@ -176,19 +179,21 @@ pub fn deinitGlobals() void {
     initialized = false;
 }
 
-pub fn initThread() void {
+pub fn initThread() !void {
     local_arena_instance = memutil.RewindableArena.init(global_gpa);
     local_arena = local_arena_instance.allocator();
+    try leak_check.initThread();
 }
 
 pub fn deinitThread() void {
+    leak_check.deinitThread();
     local_arena_instance.deinit();
     local_arena = undefined;
 }
 
 pub fn testStart(gpa: Allocator, io: std.Io) !void {
     try initGlobals(gpa, io, .{});
-    initThread();
+    try initThread();
 }
 
 pub fn testFinish() void {
@@ -705,10 +710,6 @@ pub const Value = extern struct {
         }
     }
 
-    pub inline fn trace(value: Value, comptime fmt: []const u8, args: anytype) void {
-        leak_check.globalTrace(.other, value, fmt, args);
-    }
-
     pub fn duplicateAsBoxed(value: Value) !*Object {
         if (value.asPtr()) |obj| {
             return try obj.duplicate();
@@ -733,7 +734,10 @@ pub const Value = extern struct {
     }
 
     pub fn makeCrossthread(value: Value) void {
-        if (value.asPtr()) |obj| obj.makeCrossthread();
+        if (value.asPtr()) |obj| {
+            if (obj.metadata.cross_thread) return;
+            obj.makeCrossthread();
+        }
     }
 
     pub fn newInt(value: i64) Value {
@@ -916,6 +920,8 @@ pub const Object = extern struct {
     pub const body_max_size = 48;
     pub const body_align = 8;
 
+    pub var next_sequence_number: std.atomic.Value(u64) = .init(0);
+
     pub const VTable = extern struct {
         is_c_vtable: bool = false,
         name: [*:0]const u8,
@@ -976,6 +982,8 @@ pub const Object = extern struct {
     hash_metadata: std.atomic.Value(HashMetadata),
 
     body_backing: [body_max_size]u8 align(body_align),
+
+    sequence_number: if (options.trace_mem) u64 else u0,
 
     pub fn assertValidType(T: type) void {
         comptime {
@@ -1051,9 +1059,10 @@ pub const Object = extern struct {
             .string = undefined,
             .string_metadata = undefined,
             .body_backing = undefined,
+            .sequence_number = if (options.trace_mem) next_sequence_number.fetchAdd(1, .monotonic) else 0,
         };
 
-        leak_check.globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{@typeName(T)});
+        leak_check.globalTrace(obj, .alloc);
 
         return .{ .head = obj, .body = obj.asType(T).? };
     }
@@ -1133,7 +1142,7 @@ pub const Object = extern struct {
     }
 
     pub fn freeBacking(obj: *Object) void {
-        leak_check.globalTrace(.free, obj.asValue(), "Freed", .{});
+        leak_check.globalTrace(obj, .free);
         global_gpa.destroy(obj);
     }
 
@@ -1303,6 +1312,7 @@ pub const Object = extern struct {
                 // that should hopefully blow things up if it is touched in this case.
                 .len = std.math.maxInt(u16),
             }, .release);
+            leak_check.globalTrace(obj, .{ .set_string = .{ .set_to = leak_check.dupeForTrace(bytes) } });
         } else {
             // Attempt to set the string.
             if (obj.string.cmpxchgStrong(null, bytes.ptr, .monotonic, .monotonic) != null) {
@@ -1315,9 +1325,8 @@ pub const Object = extern struct {
                 .is_special = false,
                 .len = @intCast(bytes.len),
             }, .release);
+            leak_check.globalTrace(obj, .{ .set_string = .{ .set_to = leak_check.dupeForTrace(bytes) } });
         }
-
-        obj.asValue().trace("Set string to \"{s}\"", .{bytes});
     }
 
     /// Takes ownership of `bytes`.
@@ -1354,8 +1363,6 @@ pub const Object = extern struct {
                 .len = @intCast(bytes.len),
             });
         }
-
-        obj.asValue().trace("Set string to \"{s}\"", .{bytes});
     }
 
     pub fn getRefCount(obj: *const Object) u32 {
@@ -1367,8 +1374,8 @@ pub const Object = extern struct {
     }
 
     pub fn incrRefCount(obj: *Object) void {
-        const new_count = incrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
-        obj.asValue().trace("Incremented ref count (now {})", .{new_count});
+        const new_ref_count = incrRefCountOf(u32, &obj.ref_count, obj.metadata.cross_thread);
+        leak_check.globalTrace(obj, .{ .incr_ref_count = .{ .new_ref_count = new_ref_count } });
     }
 
     pub fn borrow(obj: *Object) *Object {
@@ -1381,7 +1388,7 @@ pub const Object = extern struct {
             // We don't deal with hash unregistering here, since an object
             // is always marked as crossthread when it's registered.
             obj.ref_count -= 1;
-            obj.asValue().trace("Decremented ref count (now {})", .{obj.ref_count});
+            leak_check.globalTrace(obj, .{ .decr_ref_count = .{ .new_ref_count = obj.ref_count } });
             if (obj.ref_count == 0) obj.deinit();
             return;
         }
@@ -1391,7 +1398,7 @@ pub const Object = extern struct {
         // swoop in and free the object before we read the metadata (ask me how I know).
         const metadata = obj.hash_metadata.load(.monotonic);
         const new_ref_count = decrRefCountOf(u32, &obj.ref_count, true);
-        obj.asValue().trace("Decremented ref count (now {})", .{new_ref_count});
+        leak_check.globalTrace(obj, .{ .decr_ref_count = .{ .new_ref_count = new_ref_count } });
 
         if (new_ref_count == 1) {
             if (metadata.is_representative) {
@@ -1435,16 +1442,19 @@ pub const Object = extern struct {
 
     pub fn invalidateString(obj: *Object) void {
         assert(obj.canShimmer());
-        switch (obj.getStringDetails()) {
-            .special => |special| obj.asValue().trace("Invalidate string (was \"{s}\")", .{special.getString()}),
-            .normal => |bytes| obj.asValue().trace("Invalidate string (was \"{s}\")", .{bytes}),
-            .none => {},
+        if (options.trace_mem) {
+            const was: []u8 = switch (obj.getStringDetails()) {
+                .none => &.{},
+                .normal => |normal| leak_check.dupeForTrace(normal),
+                .special => |special| leak_check.dupeForTrace(special.getString()),
+            };
+            leak_check.globalTrace(obj, .{ .invalidate_string = .{ .was = was } });
         }
         obj.freeStringInner();
     }
 
     pub fn invalidateInternalRep(obj: *Object) void {
-        obj.asValue().trace("Invalidate body", .{});
+        leak_check.globalTrace(obj, .invalidate_rep);
         if (obj.vtable.is_c_vtable) {
             if (obj.vtable.as.c.free_internal_rep) |free_fn| free_fn(obj);
         } else {

@@ -109,7 +109,7 @@ fn takeOperand(
 /// Resolves the operand of an `@` redirection to an open file. Takes a file
 /// capability or one of the three standard stream names, checking `direction`,
 /// what the child will do with it, against how a capability was opened.
-fn resolveHandle(interp: *Interp, name: []const u8, direction: enum { read, write }) Interp.Error!File {
+fn resolveHandle(interp: *Interp, name: []const u8) Interp.Error!File {
     // Read straight out of the redirect cell. `ioutil`'s lock only orders
     // writers that go through it, and the child writes on a dup of its own, so
     // taking the lock here would order nothing.
@@ -133,18 +133,6 @@ fn resolveHandle(interp: *Interp, name: []const u8, direction: enum { read, writ
     var det: ErrorDetails = undefined;
     const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &shim));
     const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
-
-    // Caught here because the child would instead fail on its first read or
-    // write, naming neither the handle nor the redirection.
-    const usable = switch (backing.body.mode) {
-        .r => direction == .read,
-        .w => direction == .write,
-        .@"r+", .@"w+" => true,
-    };
-    if (!usable) return interp.setErrorFormatted(
-        "capability \"{s}\" was opened with mode {t}, so a child cannot {t} it",
-        .{ name, backing.body.mode, direction },
-    );
 
     return backing.body.file;
 }
@@ -291,7 +279,7 @@ fn parseRedirection(
         pipeline.stdin = switch (kind) {
             .path => .{ .path = target },
             .text => .{ .text = target },
-            .file => .{ .file = try resolveHandle(interp, target, .read) },
+            .file => .{ .file = try resolveHandle(interp, target) },
         };
         return;
     }
@@ -313,7 +301,7 @@ fn parseRedirection(
         }
         const target = try takeOperand(interp, rest, index, operand, word);
         stage.stderr = if (handle)
-            .{ .file = try resolveHandle(interp, target, .write) }
+            .{ .file = try resolveHandle(interp, target) }
         else
             .{ .path = .{ .bytes = target, .append = append } };
         return;
@@ -341,7 +329,7 @@ fn parseRedirection(
         }
         const target = try takeOperand(interp, rest, index, operand, word);
         pipeline.stdout = if (handle)
-            .{ .file = try resolveHandle(interp, target, .write) }
+            .{ .file = try resolveHandle(interp, target) }
         else
             .{ .path = .{ .bytes = target, .append = append } };
         pipeline.stdout_stage = stage_index;

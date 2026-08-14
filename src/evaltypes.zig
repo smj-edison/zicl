@@ -831,7 +831,7 @@ pub const Expression = struct {
             .value => return node.data.value.borrow(),
             .command_subst => {
                 const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node.data.value.getHashNoRegister();
-                try interp.evalObjectInner(interp.callFrameIdx(), node.data.value, nested_cache_key);
+                try interp.evalValueInner(interp.callFrameIdx(), node.data.value, nested_cache_key);
                 return interp.result.borrow();
             },
             .variable_subst => {

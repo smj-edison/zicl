@@ -1332,7 +1332,7 @@ pub const Boolean = struct {
     }
 };
 
-fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
+pub fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
     var fallback = std.heap.stackFallback(64, gpa);
     // `stackFallback.get()` asserts it's called once, so reuse the stored allocator for both alloc and free.
     const fb = fallback.get();
@@ -1636,7 +1636,6 @@ pub const List = struct {
     }
 
     fn makeCrossthread(obj: *Object) void {
-        if (obj.metadata.cross_thread) return;
         const as_list = obj.asType(List).?;
         for (as_list.items) |item| item.makeCrossthread();
     }
@@ -1853,6 +1852,13 @@ pub const Dictionary = struct {
             .table = table,
         };
         return as_dict;
+    }
+
+    pub fn keyNotFoundError(det: ?*ErrorDetails, key: Value) error{ OutOfMemory, KeyNotFound } {
+        if (det) |details| details.* = .{
+            .message = try allocPrintZ("could not find value for key \"{s}\"", .{try key.getString()}),
+        };
+        return error.KeyNotFound;
     }
 
     pub fn getNoFollow(self: *const Dictionary, key: Value) !OptionalValue {

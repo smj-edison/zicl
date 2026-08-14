@@ -1,6 +1,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const options = @import("options");
+
+const memutil = @import("memutil.zig");
+const ioutil = @import("ioutil.zig");
+const leak_check = @import("leak_check.zig");
+
 const heap = @import("heap.zig");
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
@@ -15,10 +21,9 @@ const evaltypes = @import("evaltypes.zig");
 const ReturnCode = heap.ReturnCode;
 const commands = @import("commands/common.zig");
 const load = @import("commands/load.zig");
-const leak_check = @import("leak_check.zig");
-const ioutil = @import("ioutil.zig");
+
 const Capability = @import("Capability.zig");
-const memutil = @import("memutil.zig");
+const capabilities = @import("capabilities.zig");
 
 // ===== Internal: logging and panic =====
 // These are not part of the C API surface; they wire Zig's log and panic
@@ -103,7 +108,7 @@ export fn Zicl_InitGlobals(host_name: ?[*:0]const u8) callconv(.c) ReturnCode {
 }
 
 export fn Zicl_InitThread() callconv(.c) ReturnCode {
-    heap.initThread();
+    heap.initThread() catch return .oom;
     return .ok;
 }
 
@@ -255,8 +260,9 @@ export fn Zicl_NewObject(
         .string = .init(null),
         .string_metadata = .init(.{}),
         .body_backing = @splat(0),
+        .sequence_number = if (options.trace_mem) heap.Object.next_sequence_number.fetchAdd(1, .monotonic) else 0,
     };
-    leak_check.globalTrace(.alloc, obj.asValue(), "Created object of type {s}", .{vtable.name});
+    leak_check.globalTrace(obj, .alloc);
 
     out_body.* = &obj.body_backing;
     return obj;
@@ -509,7 +515,7 @@ export fn Zicl_ListAppend(list: *List, item: Value) callconv(.c) ReturnCode {
 export fn Zicl_ListSet(list: *List, index: c_int, item: Value) callconv(.c) ReturnCode {
     const idx: usize = @intCast(index);
     if (idx >= list.items.len) return .@"error";
-    list.set(idx, item) catch |err| return ReturnCode.fromError(narrowError(err));
+    list.set(idx, item);
     return .ok;
 }
 
@@ -640,6 +646,23 @@ export fn Zicl_DictShimmerWriteback(dict: *Dictionary, key: Value, value: Value)
     return .ok;
 }
 
+/// Like [dict link], but builds a fresh dict rather than mutating `dict` in
+/// place: the caller keeps both `dict` and `parent` untouched. `parent` is
+/// borrowed, and boxed first if it is a primitive. Returns NULL on OOM.
+export fn Zicl_DictLink(dict: *const Dictionary, parent: Value) callconv(.c) ?*Dictionary {
+    const hash_ref = objects.HashReference.newFromValue(parent) catch return null;
+    defer hash_ref.asHead().release();
+
+    const items = heap.global_gpa.alloc(Value, dict.items.len + 2) catch return null;
+    defer heap.global_gpa.free(items);
+
+    items[0] = objects.interned_tilde_parent;
+    items[1] = hash_ref.asHead().asValue();
+    @memcpy(items[2..], dict.items);
+
+    return Dictionary.new(items) catch null;
+}
+
 // ===== Source =====
 // See the header docs for the contract.
 
@@ -740,12 +763,98 @@ export fn Zicl_EvalFile(interp: *Interp, filename: [*:0]const u8) callconv(.c) R
     return ReturnCode.fromErrorUnion(interp.evalFile(std.mem.span(filename)));
 }
 
+// ===== Closures =====
+// See the header docs for the contract.
+
+/// A resolved closure plus the cache key its body evaluates under. Reuses
+/// `Interp.ClosureAndCacheKey` directly rather than duplicating its fields;
+/// the C side only ever sees it as an opaque `Zicl_Closure *`.
+const ClosureHandle = Interp.ClosureAndCacheKey;
+
+/// Resolve `closure_value` into a handle: parses it as a closure literal
+/// first if it is not one already. The handle borrows the underlying closure
+/// object, so `closure_value` need not survive the call. `closure_value` must
+/// not be a [method] closure: like ordinary command dispatch, that returns
+/// ZICL_ERR with "method cannot be invoked as function". Returns ZICL_OOM on
+/// allocation failure. The caller owns `*out` and must release it with
+/// Zicl_ReleaseClosure.
+export fn Zicl_GetClosure(interp: *Interp, closure_value: Value, out: *?*ClosureHandle) callconv(.c) ReturnCode {
+    out.* = null;
+    // `getClosure` returns the closure already borrowed for us.
+    const closure_and_key = interp.getClosure(closure_value, false) catch |err| return ReturnCode.fromError(err);
+
+    const handle = heap.global_gpa.create(ClosureHandle) catch {
+        closure_and_key.closure.asHead().release();
+        return .oom;
+    };
+    handle.* = closure_and_key;
+
+    out.* = handle;
+    return .ok;
+}
+
+/// Release a handle obtained from Zicl_GetClosure.
+export fn Zicl_ReleaseClosure(closure: *ClosureHandle) callconv(.c) void {
+    closure.closure.asHead().release();
+    heap.global_gpa.destroy(closure);
+}
+
+/// Call `closure` the same way the interpreter calls a closure it resolved
+/// from a command name: `argv[0]` fills the command-name slot, `argv[1..argc]`
+/// are its arguments. Letrec-bound closures are not reachable through this
+/// entry point yet, so its scope is always null. The result is left on the
+/// interpreter; read it with Zicl_GetResult.
+export fn Zicl_CallClosure(
+    interp: *Interp,
+    closure: *ClosureHandle,
+    argc: c_int,
+    argv: [*]Shimmerable,
+) callconv(.c) ReturnCode {
+    const args = argv[0..@intCast(argc)];
+    // Use the higher level `invokeCommand` so tailcalls are handled.
+    const command_variant: Interp.CommandVariant = .{ .closure = closure.* };
+    return ReturnCode.fromErrorUnion(interp.invokeCommand(&command_variant, args));
+}
+
+/// The closure's body, as a value borrowed from `closure` (valid only while
+/// `closure` is alive; borrow it yourself to keep it longer). Pass it to
+/// Zicl_AsSource / Zicl_SourceGetFilename / Zicl_SourceGetLine to read its
+/// file/line info, if any was attached.
+export fn Zicl_ClosureGetBody(closure: *const ClosureHandle) callconv(.c) Value {
+    return closure.closure.content.body;
+}
+
+/// The closure's captured lexical scope, borrowed from `closure` (valid only
+/// while `closure` is alive), or null if it has none. Look up a name in it
+/// with Zicl_ShimDictGet, which follows ~parent links, so this reaches
+/// variables from enclosing scopes too, not just this closure's own.
+export fn Zicl_ClosureGetScope(closure: *const ClosureHandle) callconv(.c) ?*Dictionary {
+    return closure.closure.content.scope;
+}
+
+/// The current error's call stack, as a flat list of {name file line args}
+/// groups repeated once per frame (innermost first), or an empty list if
+/// there is none. Unlike Zicl_MakeErrorMessage, this doesn't consume or
+/// reformat the interpreter's result -- it's a separate, structured read of
+/// the same trace Zicl_MakeErrorMessage would render into prose.
+export fn Zicl_GetErrorStack(interp: *Interp) callconv(.c) Value {
+    return interp.stack_trace.orEmpty();
+}
+
 export fn Zicl_LoadLibrary(interp: *Interp, path: [*:0]const u8) callconv(.c) ReturnCode {
     return ReturnCode.fromErrorUnion(load.loadLibrary(interp, std.mem.span(path)));
 }
 
 export fn Zicl_GetScriptBeingEvaluated(interp: *Interp) callconv(.c) Value {
     return interp.evalFrame().currently_evaluating;
+}
+
+/// The name of the closure currently executing in the current call frame,
+/// borrowed from the frame (valid only while it remains on the stack).
+/// ZICL_NONE for the top-level frame, or a closure invoked without a name
+/// (e.g. [apply] on a literal).
+export fn Zicl_GetClosureNameBeingEvaluated(interp: *Interp) callconv(.c) OptionalValue {
+    return interp.callFrame().signature.name;
 }
 
 export fn Zicl_CurrentEvalFrameIdx(interp: *Interp) callconv(.c) u32 {
@@ -790,7 +899,7 @@ export fn Zicl_SetResultBool(interp: *Interp, value: c_int) callconv(.c) ReturnC
 }
 
 export fn Zicl_SetResultLong(interp: *Interp, value: c_long) callconv(.c) ReturnCode {
-    interp.setResultInteger(value) catch |err| return ReturnCode.fromError(err);
+    interp.setResultInteger(value);
     return .ok;
 }
 
@@ -799,11 +908,15 @@ export fn Zicl_SetEmptyResult(interp: *Interp) callconv(.c) ReturnCode {
     return .ok;
 }
 
-export fn Zicl_SetVariable(interp: *Interp, name: *Value, value: Value) callconv(.c) ReturnCode {
-    var name_shim: Shimmerable = .{ .original = name.* };
-    errdefer name_shim.discardChanges();
+export fn Zicl_SetVariable(interp: *Interp, name: *Shimmerable, value: Value) callconv(.c) ReturnCode {
+    interp.setVariable(name, value) catch |err| return ReturnCode.fromError(err);
+    return .ok;
+}
+
+export fn Zicl_SetVariableString(interp: *Interp, name: [*:0]const u8, value: Value) callconv(.c) ReturnCode {
+    var name_shim: Shimmerable = .{ .original = objects.String.newValue(std.mem.span(name)) catch return .oom };
+    defer name_shim.deinit();
     interp.setVariable(&name_shim, value) catch |err| return ReturnCode.fromError(err);
-    name.* = name_shim.consume();
     return .ok;
 }
 
@@ -899,6 +1012,12 @@ export fn Zicl_GetBacking(
         return .@"error";
     }
     out.* = cap.head;
+    return .ok;
+}
+
+export fn Zicl_NewFileFromDescriptor(descriptor: i32, out: *Value) callconv(.c) ReturnCode {
+    const capability = capabilities.File.openDescriptor(descriptor) catch return .oom;
+    out.* = capability.asHead().asValue();
     return .ok;
 }
 

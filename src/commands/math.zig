@@ -43,7 +43,7 @@ fn addMulHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
             }
         }
 
-        try interp.setResultInteger(result);
+        interp.setResultInteger(result);
         return;
     }
 
@@ -79,7 +79,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
                             // -128 to 128).
                             return interp.integerOverflowError(i65, -@as(i65, int));
                         };
-                        try interp.setResultInteger(result);
+                        interp.setResultInteger(result);
                     },
                     .float => |float| {
                         interp.setResultOwning(Value.newFloat(-float));
@@ -138,7 +138,7 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
             }
         }
 
-        try interp.setResultInteger(result);
+        interp.setResultInteger(result);
         return;
     }
 

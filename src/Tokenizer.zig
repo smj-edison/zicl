@@ -741,8 +741,12 @@ pub fn nextSeparatorToken(self: *Tokenizer) Token {
             '\t', 12, '\r', ' ' => {},
             '\\' => {
                 if (self.peek(1) == '\n') {
-                    // skip the \n
+                    // Escaped newline, so advance past the newline.
                     self.advance(1);
+                } else {
+                    // Just a normal escaped character, so it's the end of
+                    // the road (the separator) for us.
+                    break;
                 }
             },
             '\n' => break,
@@ -843,8 +847,8 @@ fn nextListQuoteToken(self: *Tokenizer) Token {
                 }
             },
             '"' => {
-                self.advance(1);
                 token.loc.end = self.index;
+                self.advance(1);
                 return token;
             },
             else => {},

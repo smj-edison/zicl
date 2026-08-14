@@ -213,7 +213,7 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         }
     } else {
         if (opt_all) {
-            try interp.setResultInteger(@intCast(match_count));
+            interp.setResultInteger(@intCast(match_count));
         } else {
             interp.setResultBoolean(match_count > 0);
         }
@@ -416,7 +416,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     if (remaining.len == 4) {
         try interp.setVariable(&remaining[3], substituted_str.asHead().asValue());
-        try interp.setResultInteger(@intCast(match_count));
+        interp.setResultInteger(@intCast(match_count));
     } else {
         interp.setResult(substituted_str.asHead().asValue());
     }
