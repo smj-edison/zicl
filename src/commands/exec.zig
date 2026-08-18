@@ -1,18 +1,26 @@
 //! [exec] and [wait].
 //!
-//! Following TIP 424, a stage is told from its redirections by position rather
-//! than by what its words look like. Every stage is exactly one list, which is
-//! its argv, and the words after it up to the next `|` are its redirections.
+//! Two grammars share one vocabulary of redirections and pipe words, chosen by
+//! whether the first word is a literal `|`. Without it, exec parses the classic
+//! way Tcl always has: each word is either a command argument, a redirection, or
+//! a `|`/`|&` stage separator, told apart only by what the word's own text looks
+//! like, so nothing before or after a redirection word marks where a stage begins
+//! or ends, and a literal `<`, `>`, or `|` argument can never be passed through.
+//! Following TIP 424, a leading `|` opts into a second grammar instead, where a
+//! stage is told from its redirections by position rather than by what its words
+//! look like: every stage is exactly one list, which is its argv, and the words
+//! after it up to the next `|` are its redirections.
 //!
 //! ```
-//! exec {echo >}                          ;# ">" is an argument, not an operator
-//! exec {cc -c foo.c} 2> errors.txt
-//! exec {cat} < in.txt | {sort -u} > out.txt
-//! exec $argv                             ;# argv is already a list
+//! exec cc -c foo.c 2> errors.txt
+//! exec cat < in.txt | sort -u > out.txt
+//! exec | {echo >}                        ;# only the | grammar can pass ">" through
+//! exec | {cat} < in.txt | {sort -u} > out.txt
+//! exec | $argv                           ;# argv is already a list
 //! ```
 //!
 //! Output follows Jim: stderr is folded into the result and only an abnormal
-//! exit raises, so `[exec {cc ...}]` hands back compiler warnings rather than
+//! exit raises, so `[exec cc ...]` hands back compiler warnings rather than
 //! throwing on them. `-split` reports the parts separately instead, and does not
 //! raise, so a failure can be inspected rather than caught.
 
@@ -88,6 +96,69 @@ const Pipeline = struct {
     split: bool = false,
 };
 
+/// What one redirection token means: which stream it names, and how its
+/// operand is meant to be read.
+const RedirFlags = packed struct(u8) {
+    in: bool = false,
+    out: bool = false,
+    err: bool = false,
+    /// Open the target for appending rather than truncating (`>>`, `2>>`).
+    append: bool = false,
+    /// The operand names an already-open file/capability rather than a path
+    /// (`<@`, `2>@`, `>@`).
+    handle: bool = false,
+    /// The operand is the literal text to feed the child, not a path (`<<`).
+    text: bool = false,
+    /// This stage's stderr shares whatever descriptor its stdout got (`>&`,
+    /// `>>&`, `>&@`).
+    dup_err: bool = false,
+    _padding: u1 = 0,
+};
+
+/// The redirection vocabulary, keyed by exact token text. Longer tokens are
+/// tried first in `classifyRedirection`, which is what keeps a token nobody
+/// defined (`>>@`, `>@&`) from being misread as a shorter, more general one
+/// (`>>`) with the rest of the word folded into its operand rather than
+/// rejected outright. Mirrors Jim's `redir_types` table in jim-exec.c.
+const redirection_tokens = std.StaticStringMap(RedirFlags).initComptime([_]struct { []const u8, RedirFlags }{
+    .{ "<<", .{ .in = true, .text = true } },
+    .{ "<@", .{ .in = true, .handle = true } },
+    .{ "<", .{ .in = true } },
+
+    .{ "2>>", .{ .err = true, .append = true } },
+    .{ "2>@", .{ .err = true, .handle = true } },
+    .{ "2>", .{ .err = true } },
+
+    .{ ">>&", .{ .out = true, .append = true, .dup_err = true } },
+    .{ ">>", .{ .out = true, .append = true } },
+    .{ ">&@", .{ .out = true, .handle = true, .dup_err = true } },
+    .{ ">@", .{ .out = true, .handle = true } },
+    .{ ">&", .{ .out = true, .dup_err = true } },
+    .{ ">", .{ .out = true } },
+});
+
+const max_redirection_token_len = 3;
+
+/// The result of classifying a word as a redirection: which stream/mode it
+/// names, and whatever text in the word follows the token itself (the
+/// attached operand, or "" when none is attached).
+const ClassifiedRedirection = struct { flags: RedirFlags, attached: []const u8 };
+
+/// Finds the longest token in `redirection_tokens` that `word` starts with, or
+/// null when `word` does not begin with any known token. Checking lengths
+/// longest-first is what makes this a longest-prefix match rather than
+/// whichever token happens to be checked first: `2>>` is found before the `2>`
+/// it also starts with.
+fn classifyRedirection(word: []const u8) ?ClassifiedRedirection {
+    var len = @min(word.len, max_redirection_token_len);
+    while (len > 0) : (len -= 1) {
+        if (redirection_tokens.get(word[0..len])) |flags| {
+            return .{ .flags = flags, .attached = word[len..] };
+        }
+    }
+    return null;
+}
+
 /// Returns the operand of a redirection. `attached` is whatever followed the
 /// operator in the same word; when it is empty the operand is the next word
 /// instead and `index` advances past it, which is `> file` against `>file`.
@@ -145,9 +216,10 @@ fn parse(interp: *Interp, args: []Shimmerable) Interp.Error!Pipeline {
 
     var rest = args[1..];
 
-    // A stage list renders as its own text, so one whose command begins with '-'
-    // is indistinguishable from an option and is refused as one; `--` is how it
-    // gets through. Guessing would run a mistyped option as a command.
+    // A word renders as its own text, so one that begins with '-' is
+    // indistinguishable from an option and is refused as one; `--` is how it
+    // gets through. Guessing would run a mistyped option as a command, which
+    // under the `|` grammar could be a whole stage list rendering that way.
     while (rest.len > 0) {
         const word = try rest[0].getString();
         if (word.len == 0 or word[0] != '-') break;
@@ -165,6 +237,107 @@ fn parse(interp: *Interp, args: []Shimmerable) Interp.Error!Pipeline {
         rest = rest[0 .. rest.len - 1];
     }
 
+    if (rest.len == 0) {
+        return interp.setErrorFormatted("didn't specify command to execute", .{});
+    }
+
+    // TIP 424's grammar is opted into by a literal `|` as the very first word;
+    // everything else falls back to the grammar exec has always had.
+    if (std.mem.eql(u8, try rest[0].getString(), "|")) {
+        try parseNewStyle(interp, &pipeline, rest[1..]);
+    } else {
+        try parseOldStyle(interp, &pipeline, rest);
+    }
+
+    // Only the last stage's stdout leaves the pipeline, so honouring a `>`
+    // written next to an earlier one would redirect a different stage than the
+    // script pointed at.
+    if (pipeline.stdout_stage) |stage_index| {
+        if (stage_index != pipeline.stages.len - 1) {
+            return interp.setErrorFormatted("can only redirect output out of the last stage of a pipeline", .{});
+        }
+    }
+
+    // A background child handed a pipe nobody drains fills it and wedges, so
+    // what the script did not redirect goes to the parent's own streams.
+    if (pipeline.background) {
+        if (pipeline.split) {
+            return interp.setErrorFormatted("-split cannot be used with a background pipeline", .{});
+        }
+        if (pipeline.stdout == .capture) pipeline.stdout = .inherit;
+        for (pipeline.stages) |*stage| {
+            if (stage.stderr == .capture) stage.stderr = .inherit;
+        }
+    }
+
+    return pipeline;
+}
+
+/// Parses the classic word-at-a-time grammar: each word is either a command
+/// argument, a redirection, or a `|`/`|&` stage separator, told apart only by
+/// what the word's own text looks like. Nothing marks where a stage's argv ends
+/// and its redirections begin, so a redirection can be written anywhere among a
+/// stage's words, before or after the command name; only their relative order is
+/// kept when building the argv.
+fn parseOldStyle(interp: *Interp, pipeline: *Pipeline, rest: []Shimmerable) Interp.Error!void {
+    var stages: std.ArrayList(Stage) = .empty;
+    var argv: std.ArrayList([]const u8) = .empty;
+    var stage: Stage = .{ .argv = &.{} };
+
+    var index: usize = 0;
+    while (index < rest.len) : (index += 1) {
+        const word = try rest[index].getString();
+
+        if (std.mem.eql(u8, word, "|") or std.mem.eql(u8, word, "|&")) {
+            if (index == rest.len - 1) {
+                return interp.setErrorFormatted("illegal use of | or |& in command", .{});
+            }
+            if (argv.items.len == 0) {
+                return interp.setErrorFormatted("didn't specify command to execute", .{});
+            }
+            if (std.mem.eql(u8, word, "|&")) {
+                if (stage.stderr != .capture) {
+                    return interp.setErrorFormatted("can't redirect a stage's stderr and also send it down the pipe with |&", .{});
+                }
+                stage.stderr_to_pipe = true;
+            }
+            stage.argv = try argv.toOwnedSlice(heap.local_arena);
+            try stages.append(heap.local_arena, stage);
+            if (stages.items.len >= max_pipeline_stages) {
+                return interp.setErrorFormatted("too many stages in pipeline", .{});
+            }
+            stage = .{ .argv = &.{} };
+            continue;
+        }
+
+        if (looksLikeRedirection(word)) {
+            try parseRedirection(interp, pipeline, &stage, rest, &index, word, stages.items.len);
+            continue;
+        }
+
+        try argv.append(heap.local_arena, word);
+    }
+
+    if (argv.items.len == 0) {
+        return interp.setErrorFormatted("didn't specify command to execute", .{});
+    }
+    stage.argv = try argv.toOwnedSlice(heap.local_arena);
+    try stages.append(heap.local_arena, stage);
+
+    pipeline.stages = try stages.toOwnedSlice(heap.local_arena);
+}
+
+/// Whether `word`'s own text marks it as a redirection rather than a plain
+/// argument; the same classification `parseRedirection` dispatches on.
+fn looksLikeRedirection(word: []const u8) bool {
+    return classifyRedirection(word) != null;
+}
+
+/// Parses TIP 424's grammar, selected by a leading `|` that `rest` has already
+/// had stripped: every stage is exactly one list, which is its argv, and the
+/// words after it up to the next `|` are its redirections, so nothing inside the
+/// list is ever mistaken for an operator.
+fn parseNewStyle(interp: *Interp, pipeline: *Pipeline, rest: []Shimmerable) Interp.Error!void {
     if (rest.len == 0) {
         return interp.setErrorFormatted("didn't specify command to execute", .{});
     }
@@ -200,7 +373,7 @@ fn parse(interp: *Interp, args: []Shimmerable) Interp.Error!Pipeline {
                 index += 1;
                 break;
             }
-            try parseRedirection(interp, &pipeline, &stage, rest, &index, word, stage_index);
+            try parseRedirection(interp, pipeline, &stage, rest, &index, word, stage_index);
         }
 
         try stages.append(heap.local_arena, stage);
@@ -211,33 +384,11 @@ fn parse(interp: *Interp, args: []Shimmerable) Interp.Error!Pipeline {
     }
 
     pipeline.stages = try stages.toOwnedSlice(heap.local_arena);
-
-    // Only the last stage's stdout leaves the pipeline, so honouring a `>`
-    // written next to an earlier one would redirect a different stage than the
-    // script pointed at.
-    if (pipeline.stdout_stage) |stage_index| {
-        if (stage_index != pipeline.stages.len - 1) {
-            return interp.setErrorFormatted("can only redirect output out of the last stage of a pipeline", .{});
-        }
-    }
-
-    // A background child handed a pipe nobody drains fills it and wedges, so
-    // what the script did not redirect goes to the parent's own streams.
-    if (pipeline.background) {
-        if (pipeline.split) {
-            return interp.setErrorFormatted("-split cannot be used with a background pipeline", .{});
-        }
-        if (pipeline.stdout == .capture) pipeline.stdout = .inherit;
-        for (pipeline.stages) |*stage| {
-            if (stage.stderr == .capture) stage.stderr = .inherit;
-        }
-    }
-
-    return pipeline;
 }
 
-/// Splits a stage's word into its argv. Read as a Tcl list, which is what makes
-/// `exec {echo >}` mean what it says: nothing inside a list is an operator.
+/// Splits a new-style stage's word into its argv. Read as a Tcl list, which is
+/// what makes `exec | {echo >}` mean what it says: nothing inside a list is an
+/// operator.
 fn wordsOf(interp: *Interp, shim: *Shimmerable) Interp.Error![]const []const u8 {
     const list = try interp.getList(shim);
 
@@ -259,90 +410,63 @@ fn parseRedirection(
     word: []const u8,
     stage_index: usize,
 ) Interp.Error!void {
-    if (word.len > 0 and word[0] == '<') {
+    const classified = classifyRedirection(word) orelse
+        return interp.setErrorFormatted("\"{s}\" is not a redirection: a stage's arguments belong in its list", .{word});
+    const flags = classified.flags;
+
+    if (flags.in) {
         if (stage_index != 0) {
             return interp.setErrorFormatted("can only redirect input into the first stage of a pipeline", .{});
         }
         if (pipeline.stdin != .inherit) {
             return interp.setErrorFormatted("can't redirect input twice", .{});
         }
-        var operand = word[1..];
-        var kind: enum { path, text, file } = .path;
-        if (operand.len > 0 and operand[0] == '<') {
-            kind = .text;
-            operand = operand[1..];
-        } else if (operand.len > 0 and operand[0] == '@') {
-            kind = .file;
-            operand = operand[1..];
-        }
-        const target = try takeOperand(interp, rest, index, operand, word);
-        pipeline.stdin = switch (kind) {
-            .path => .{ .path = target },
-            .text => .{ .text = target },
-            .file => .{ .file = try resolveHandle(interp, target) },
-        };
+        const target = try takeOperand(interp, rest, index, classified.attached, word);
+        pipeline.stdin = if (flags.handle)
+            .{ .file = try resolveHandle(interp, target) }
+        else if (flags.text)
+            .{ .text = target }
+        else
+            .{ .path = target };
         return;
     }
 
-    if (word.len > 1 and word[0] == '2' and word[1] == '>') {
+    if (flags.err) {
         if (stage.stderr != .capture) {
             return interp.setErrorFormatted("can't redirect a stage's stderr twice", .{});
         }
-        var operand = word[2..];
-        var append = false;
-        var handle = false;
-        if (operand.len > 0 and operand[0] == '>') {
-            append = true;
-            operand = operand[1..];
-        }
-        if (operand.len > 0 and operand[0] == '@') {
-            handle = true;
-            operand = operand[1..];
-        }
-        const target = try takeOperand(interp, rest, index, operand, word);
-        stage.stderr = if (handle)
-            .{ .file = try resolveHandle(interp, target) }
-        else
-            .{ .path = .{ .bytes = target, .append = append } };
-        return;
-    }
-
-    if (word.len > 0 and word[0] == '>') {
-        if (pipeline.stdout_stage != null) {
-            return interp.setErrorFormatted("can't redirect output twice", .{});
-        }
-        var operand = word[1..];
-        var append = false;
-        var also_stderr = false;
-        var handle = false;
-        if (operand.len > 0 and operand[0] == '>') {
-            append = true;
-            operand = operand[1..];
-        }
-        if (operand.len > 0 and operand[0] == '&') {
-            also_stderr = true;
-            operand = operand[1..];
-        }
-        if (operand.len > 0 and operand[0] == '@') {
-            handle = true;
-            operand = operand[1..];
-        }
-        const target = try takeOperand(interp, rest, index, operand, word);
-        pipeline.stdout = if (handle)
-            .{ .file = try resolveHandle(interp, target) }
-        else
-            .{ .path = .{ .bytes = target, .append = append } };
-        pipeline.stdout_stage = stage_index;
-        if (also_stderr) {
-            if (stage.stderr != .capture) {
-                return interp.setErrorFormatted("can't redirect a stage's stderr twice", .{});
-            }
+        const target = try takeOperand(interp, rest, index, classified.attached, word);
+        // `2>@1` is special: it does not name a handle at all, but means
+        // "wherever this stage's own stdout ends up", which might be a pipe
+        // into the next stage rather than any fixed file, so it shares `>&`'s
+        // mechanism instead of resolving "1" as a capability.
+        if (flags.handle and std.mem.eql(u8, target, "1")) {
             stage.stderr_to_stdout = true;
+            return;
         }
+        stage.stderr = if (flags.handle)
+            .{ .file = try resolveHandle(interp, target) }
+        else
+            .{ .path = .{ .bytes = target, .append = flags.append } };
         return;
     }
 
-    return interp.setErrorFormatted("\"{s}\" is not a redirection: a stage's arguments belong in its list", .{word});
+    std.debug.assert(flags.out);
+    if (pipeline.stdout_stage != null) {
+        return interp.setErrorFormatted("can't redirect output twice", .{});
+    }
+    const target = try takeOperand(interp, rest, index, classified.attached, word);
+    pipeline.stdout = if (flags.handle)
+        .{ .file = try resolveHandle(interp, target) }
+    else
+        .{ .path = .{ .bytes = target, .append = flags.append } };
+    pipeline.stdout_stage = stage_index;
+    if (flags.dup_err) {
+        if (stage.stderr != .capture) {
+            return interp.setErrorFormatted("can't redirect a stage's stderr twice", .{});
+        }
+        stage.stderr_to_stdout = true;
+    }
 }
 
 // -- Running a pipeline. --
@@ -858,7 +982,7 @@ const interned_childsusp = heap.InternedString.newValue("CHILDSUSP");
 const interned_childunknown = heap.InternedString.newValue("CHILDUNKNOWN");
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "exec", execCmd, "?-split? ?--? command ?arg ...?", 1, null);
+    try registerCommand(interp, "exec", execCmd, "?-split? ?--? ?|? command ?arg ...?", 1, null);
     try registerCommand(interp, "wait", waitCmd, "process", 1, 1);
 }
 
@@ -879,29 +1003,41 @@ test "exec captures stdout" {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    try interp.testExpectScriptResult("hello", "exec {" ++ echo_path ++ " hello}");
+    try interp.testExpectScriptResult("hello", "exec " ++ echo_path ++ " hello");
     // One trailing newline goes, and only one.
-    try interp.testExpectScriptResult("a\nb", "exec {" ++ echo_path ++ " a\\nb}");
+    try interp.testExpectScriptResult("a\nb", "exec " ++ echo_path ++ " a\\nb");
 }
 
-test "exec takes its command as a list" {
+test "exec (| grammar) takes each stage as a list" {
     const ta = testing.allocator;
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
     // Nothing inside a list is an operator, so a redirection character can be an
-    // ordinary argument.
-    try interp.testExpectScriptResult(">", "exec {" ++ echo_path ++ " >}");
-    try interp.testExpectScriptResult("| &", "exec {" ++ echo_path ++ " {|} &}");
+    // ordinary argument. This is the one thing the classic grammar cannot do.
+    try interp.testExpectScriptResult(">", "exec | {" ++ echo_path ++ " >}");
+    try interp.testExpectScriptResult("| &", "exec | {" ++ echo_path ++ " {|} &}");
 
     // A list built by the script runs without {*}, since the list is the argv.
-    try interp.testExpectScriptResult("a b", "set cmd [list " ++ echo_path ++ " a b]\nexec $cmd");
+    try interp.testExpectScriptResult("a b", "set cmd [list " ++ echo_path ++ " a b]\nexec | $cmd");
+
+    // The leading `|` only opts into the grammar; a `|` between stages still
+    // separates them the same way it does in the classic grammar.
+    try interp.testExpectScriptResult(
+        "a\nb\nc",
+        "exec | {" ++ sh_path ++ " -c {echo c; echo a; echo b; echo a}} | {" ++ sort_path ++ " -u}",
+    );
 
     // A word that is neither a list nor a redirection is named rather than run.
     try interp.testExpectScriptError(
         error.EvalError,
         "\"hello\" is not a redirection: a stage's arguments belong in its list",
-        "exec {" ++ echo_path ++ "} hello",
+        "exec | {" ++ echo_path ++ "} hello",
+    );
+    try interp.testExpectScriptError(
+        error.EvalError,
+        "didn't specify command to execute",
+        "exec | {}",
     );
 }
 
@@ -913,7 +1049,7 @@ test "exec resolves a bare command name" {
     // The one test without an absolute path. A bare name is resolved against
     // PATH from the `Io`'s environment block, which is empty unless the embedder
     // fills it in, and one that forgets sees every such [exec] fail.
-    try interp.testExpectScriptResult("resolved", "exec {echo resolved}");
+    try interp.testExpectScriptResult("resolved", "exec echo resolved");
 }
 
 test "exec passes the env dict to the child" {
@@ -924,15 +1060,15 @@ test "exec passes the env dict to the child" {
     // `env` is the dict of environment variables the child sees, the way Tcl's
     // `::env` works. Setting it replaces the child's whole environment, so a
     // script that wants to change what a child sees changes `env`.
-    try interp.testExpectScriptResult("ZICL_TEST=only", "set env {ZICL_TEST only}\nexec {" ++ env_path ++ "}");
+    try interp.testExpectScriptResult("ZICL_TEST=only", "set env {ZICL_TEST only}\nexec " ++ env_path);
 
     // It is read afresh each call, so a later [exec] sees a later value.
-    try interp.testExpectScriptResult("ZICL_TEST=again", "set env {ZICL_TEST again}\nexec {" ++ env_path ++ "}");
+    try interp.testExpectScriptResult("ZICL_TEST=again", "set env {ZICL_TEST again}\nexec " ++ env_path);
 
     // A child that reads a variable out of its environment gets the dict's value.
     try interp.testExpectScriptResult(
         "only",
-        "set env {ZICL_TEST only}\nexec {" ++ sh_path ++ " -c {echo -n $ZICL_TEST}}",
+        "set env {ZICL_TEST only}\nexec " ++ sh_path ++ " -c {echo -n $ZICL_TEST}",
     );
 }
 
@@ -941,13 +1077,13 @@ test "exec reports abnormal exit" {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    try interp.testExpectScriptResult("0", "catch { exec {" ++ true_path ++ "} }");
-    try interp.testExpectScriptResult("1", "catch { exec {" ++ false_path ++ "} }");
+    try interp.testExpectScriptResult("0", "catch { exec " ++ true_path ++ " }");
+    try interp.testExpectScriptResult("1", "catch { exec " ++ false_path ++ " }");
     // A child that says nothing gets the generic explanation.
     try interp.testExpectScriptError(
         error.EvalError,
         "child process exited abnormally",
-        "exec {" ++ false_path ++ "}",
+        "exec " ++ false_path,
     );
 }
 
@@ -960,13 +1096,13 @@ test "exec folds stderr into the result" {
     // `[exec $cc ...]` depends on this.
     try interp.testExpectScriptResult(
         "out\nerr",
-        "exec {" ++ sh_path ++ " -c {echo out; echo err >&2}}",
+        "exec " ++ sh_path ++ " -c {echo out; echo err >&2}",
     );
 
     // Sending stderr elsewhere takes it back out of the result.
     try interp.testExpectScriptResult(
         "out",
-        "exec {" ++ sh_path ++ " -c {echo out; echo err >&2}} 2> /dev/null",
+        "exec " ++ sh_path ++ " -c {echo out; echo err >&2} 2> /dev/null",
     );
 }
 
@@ -977,14 +1113,14 @@ test "exec splits the streams on request" {
 
     try interp.testExpectScriptResult(
         "out err 0",
-        "set r [exec -split {" ++ sh_path ++ " -c {echo out; echo err >&2}}]\n" ++
+        "set r [exec -split " ++ sh_path ++ " -c {echo out; echo err >&2}]\n" ++
             "list [dict get $r out] [dict get $r err] [dict get $r code]",
     );
 
     // A failure is reported rather than raised, which is the point of asking.
     try interp.testExpectScriptResult(
         "bad 3",
-        "set r [exec -split {" ++ sh_path ++ " -c {echo bad >&2; exit 3}}]\n" ++
+        "set r [exec -split " ++ sh_path ++ " -c {echo bad >&2; exit 3}]\n" ++
             "list [dict get $r err] [dict get $r code]",
     );
 }
@@ -999,7 +1135,7 @@ test "exec prefers the child's own diagnostic" {
     try interp.testExpectScriptError(
         error.EvalError,
         "no good",
-        "exec {" ++ sh_path ++ " -c {echo no good >&2; exit 3}}",
+        "exec " ++ sh_path ++ " -c {echo no good >&2; exit 3}",
     );
 }
 
@@ -1010,28 +1146,28 @@ test "exec runs a pipeline" {
 
     try interp.testExpectScriptResult(
         "a\nb\nc",
-        "exec {" ++ sh_path ++ " -c {echo c; echo a; echo b; echo a}} | {" ++ sort_path ++ " -u}",
+        "exec " ++ sh_path ++ " -c {echo c; echo a; echo b; echo a} | " ++ sort_path ++ " -u",
     );
 
     // Every stage's stderr is collected, in stage order.
     try interp.testExpectScriptResult(
         "from-second\nfrom-first",
-        "exec {" ++ sh_path ++ " -c {echo from-first >&2}} | {" ++ sh_path ++ " -c {echo from-second}}",
+        "exec " ++ sh_path ++ " -c {echo from-first >&2} | " ++ sh_path ++ " -c {echo from-second}",
     );
 
     // Redirecting one stage's stderr leaves the other's alone, which a single
     // shared stderr could not express.
     try interp.testExpectScriptResult(
         "kept",
-        "exec {" ++ sh_path ++ " -c {echo dropped >&2}} 2> /dev/null | " ++
-            "{" ++ sh_path ++ " -c {echo kept >&2}}",
+        "exec " ++ sh_path ++ " -c {echo dropped >&2} 2> /dev/null | " ++
+            sh_path ++ " -c {echo kept >&2}",
     );
 
     // A stage failing anywhere fails the pipeline, even when the last one
     // succeeded.
     try interp.testExpectScriptResult(
         "1",
-        "catch { exec {" ++ false_path ++ "} | {" ++ true_path ++ "} }",
+        "catch { exec " ++ false_path ++ " | " ++ true_path ++ " }",
     );
 }
 
@@ -1044,7 +1180,7 @@ test "exec merges a stage's stderr into the pipe" {
     // rather than it being collected.
     try interp.testExpectScriptResult(
         "TO-PIPE",
-        "exec {" ++ sh_path ++ " -c {echo to-pipe >&2}} |& {" ++ sh_path ++ " -c {tr a-z A-Z}}",
+        "exec " ++ sh_path ++ " -c {echo to-pipe >&2} |& " ++ sh_path ++ " -c {tr a-z A-Z}",
     );
 }
 
@@ -1061,9 +1197,9 @@ test "exec redirects to a file" {
     defer ta.free(path);
 
     const script = try std.fmt.allocPrint(ta,
-        \\exec {{{s} written}} > {s}
-        \\exec {{{s} more}} >> {s}
-        \\exec {{{s} {s}}}
+        \\exec {s} written > {s}
+        \\exec {s} more >> {s}
+        \\exec {s} {s}
     , .{ echo_path, path, echo_path, path, cat_path, path });
     defer ta.free(script);
 
@@ -1086,12 +1222,26 @@ test "exec merges stderr into a redirected stdout" {
 
     // Both streams have to land on one descriptor (see `stderr_to_stdout`).
     const script = try std.fmt.allocPrint(ta,
-        \\exec {{{s} -c {{echo aaaaaaaa; echo bb >&2}}}} >& {s}
-        \\exec {{{s} {s}}}
+        \\exec {s} -c {{echo aaaaaaaa; echo bb >&2}} >& {s}
+        \\exec {s} {s}
     , .{ sh_path, path, cat_path, path });
     defer ta.free(script);
 
     try interp.testExpectScriptResult("aaaaaaaa\nbb", script);
+}
+
+test "exec merges stderr via 2>@1" {
+    const ta = testing.allocator;
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // `2>@1` names no handle at all: it means "wherever this stage's own
+    // stdout goes", which for a pipeline's non-last stage is the pipe into the
+    // next stage rather than any fixed file.
+    try interp.testExpectScriptResult(
+        "OUT\nERR",
+        "exec " ++ sh_path ++ " -c {echo out; echo err >&2} 2>@1 | " ++ sh_path ++ " -c {tr a-z A-Z}",
+    );
 }
 
 test "exec redirects from a file and a document" {
@@ -1107,8 +1257,8 @@ test "exec redirects from a file and a document" {
     defer ta.free(path);
 
     const script = try std.fmt.allocPrint(ta,
-        \\exec {{{s} fed}} > {s}
-        \\list [exec {{{s}}} < {s}] [exec {{{s}}} <{s}]
+        \\exec {s} fed > {s}
+        \\list [exec {s} < {s}] [exec {s} <{s}]
     , .{ echo_path, path, cat_path, path, cat_path, path });
     defer ta.free(script);
 
@@ -1116,10 +1266,10 @@ test "exec redirects from a file and a document" {
     try interp.testExpectScriptResult("fed fed", script);
 
     // A `<<` document is fed verbatim, with no newline added.
-    try interp.testExpectScriptResult("inline", "exec {" ++ cat_path ++ "} << inline");
+    try interp.testExpectScriptResult("inline", "exec " ++ cat_path ++ " << inline");
     try interp.testExpectScriptResult(
         "3",
-        "exec {" ++ sh_path ++ " -c {wc -c}} << abc",
+        "exec " ++ sh_path ++ " -c {wc -c} << abc",
     );
 }
 
@@ -1129,7 +1279,7 @@ test "exec runs in the background" {
     defer common.testFinish(&interp);
 
     // The capability stands in for the output, which nobody is there to read.
-    const cap = try interp.testRunScript("set p [exec {" ++ true_path ++ "} &]");
+    const cap = try interp.testRunScript("set p [exec " ++ true_path ++ " &]");
     try testing.expect(std.mem.indexOf(u8, try cap.getString(), "/process/") != null);
 
     // Asking twice reports the same thing rather than failing on a child that
@@ -1145,7 +1295,7 @@ test "pid reports a running pipeline" {
     defer common.testFinish(&interp);
 
     // A pipeline that outlives the [pid] call, so there is something to report.
-    _ = try interp.testRunScript("set p [exec {" ++ sh_path ++ " -c {sleep 30}} | {" ++ cat_path ++ "} &]");
+    _ = try interp.testRunScript("set p [exec " ++ sh_path ++ " -c {sleep 30} | " ++ cat_path ++ " &]");
 
     const pids = try interp.testRunScript("pid $p");
     var iter = std.mem.splitScalar(u8, try pids.getString(), ' ');
@@ -1162,7 +1312,7 @@ test "pid reports a running pipeline" {
     // capability stops resolving and would report staleness instead.
     try interp.testExpectScriptResult(
         "",
-        "set done [exec {" ++ true_path ++ "} &]\nwait $done\npid $done",
+        "set done [exec " ++ true_path ++ " &]\nwait $done\npid $done",
     );
     try interp.testExpectScriptResult("", "close $done");
 }
@@ -1174,7 +1324,7 @@ test "closing a background pipeline reaps it" {
 
     // Closing has to end a child that is still running. Without the kill this
     // would block for the sleep.
-    const cap = (try interp.testRunScript("set p [exec {" ++ sh_path ++ " -c {sleep 30}} &]")).borrow();
+    const cap = (try interp.testRunScript("set p [exec " ++ sh_path ++ " -c {sleep 30} &]")).borrow();
     defer cap.release();
     try interp.testExpectScriptResult("", "close $p");
 
@@ -1207,7 +1357,7 @@ test "background output follows the redirect cell" {
         // flushed by the time the file is read.
         try interp.testExpectScriptResult(
             "CHILDSTATUS 0",
-            "set p [exec {" ++ echo_path ++ " backgrounded} &]\nwait $p",
+            "set p [exec " ++ echo_path ++ " backgrounded &]\nwait $p",
         );
         try interp.testExpectScriptResult("", "close $p");
     }
@@ -1225,53 +1375,60 @@ test "exec reports malformed invocations" {
     try interp.testExpectScriptError(
         error.EvalError,
         "can't specify \">\" as last word in command",
-        "exec {" ++ echo_path ++ " hi} >",
+        "exec " ++ echo_path ++ " hi >",
     );
+    // Nothing but switches leaves no command behind, whichever grammar follows.
     try interp.testExpectScriptError(
         error.EvalError,
         "didn't specify command to execute",
-        "exec {}",
+        "exec -split",
+    );
+    // A stage built entirely of redirections has no argv of its own.
+    try interp.testExpectScriptError(
+        error.EvalError,
+        "didn't specify command to execute",
+        "exec < /dev/null",
     );
     try interp.testExpectScriptError(
         error.EvalError,
         "illegal use of | or |& in command",
-        "exec {" ++ cat_path ++ "} |",
+        "exec " ++ cat_path ++ " |",
     );
     try interp.testExpectScriptError(
         error.EvalError,
         "can only redirect input into the first stage of a pipeline",
-        "exec {" ++ echo_path ++ " hi} | {" ++ cat_path ++ "} < /dev/null",
+        "exec " ++ echo_path ++ " hi | " ++ cat_path ++ " < /dev/null",
     );
     // Only the last stage's stdout leaves the pipeline, so a `>` written next to
     // an earlier stage is refused rather than quietly redirecting a later one.
     try interp.testExpectScriptError(
         error.EvalError,
         "can only redirect output out of the last stage of a pipeline",
-        "exec {" ++ echo_path ++ " hi} > /dev/null | {" ++ cat_path ++ "}",
+        "exec " ++ echo_path ++ " hi > /dev/null | " ++ cat_path,
     );
     try interp.testExpectScriptError(
         error.EvalError,
         "can't redirect output twice",
-        "exec {" ++ echo_path ++ " hi} > /dev/null > /dev/null",
+        "exec " ++ echo_path ++ " hi > /dev/null > /dev/null",
     );
     try interp.testExpectScriptError(
         error.EvalError,
         "can't redirect a stage's stderr twice",
-        "exec {" ++ echo_path ++ " hi} 2> /dev/null 2> /dev/null",
+        "exec " ++ echo_path ++ " hi 2> /dev/null 2> /dev/null",
     );
     // An unknown option is refused rather than run, since the alternative is
     // spawning something the script did not name.
     try interp.testExpectScriptError(
         error.EvalError,
         "bad option \"-nope\": must be -split or --",
-        "exec -nope {" ++ echo_path ++ " hi}",
+        "exec -nope " ++ echo_path ++ " hi",
     );
-    // A stage whose own command begins with '-' is indistinguishable from an
-    // option, so it is refused as one until `--` says otherwise.
+    // A word that begins with '-' is indistinguishable from an option, so it is
+    // refused as one until `--` says otherwise, whichever grammar it belongs to.
     try interp.testExpectScriptError(
         error.EvalError,
         "bad option \"-n hi\": must be -split or --",
         "exec {-n hi}",
     );
-    try interp.testExpectScriptResult("-nope", "exec -- {" ++ echo_path ++ " -nope}");
+    try interp.testExpectScriptResult("-nope", "exec -- " ++ echo_path ++ " -nope");
 }
