@@ -148,16 +148,20 @@ fn subDivHelper(interp: *Interp, args: []Shimmerable, comptime operator: enum { 
         var det: ErrorDetails = undefined;
         const operand: f64 = (try interp.wrapError(&det, Number.getAsIntOrFloat(&det, &args[i]))).asFloat();
 
-        result = switch (operator) {
-            .sub => result - operand,
-            .div => blk: {
-                if (operand == 0.0) {
-                    interp.setResultOwning(Number.division_by_zero_message);
-                    return error.EvalError;
-                }
-                break :blk result / operand;
-            },
-        };
+        if (i == 1) {
+            result = operand;
+        } else {
+            result = switch (operator) {
+                .sub => result - operand,
+                .div => blk: {
+                    if (operand == 0.0) {
+                        interp.setResultOwning(Number.division_by_zero_message);
+                        return error.EvalError;
+                    }
+                    break :blk result / operand;
+                },
+            };
+        }
     }
 
     interp.setResultFloat(result);
@@ -211,6 +215,13 @@ fn testArithmeticDivision(ta: std.mem.Allocator) !void {
     try interp.testExpectScriptResult("2", "/ 12 5");
     try interp.testExpectScriptResult("0", "/ 2 2 2");
     try interp.testExpectScriptError(error.EvalError, "division by zero", "/ 5 0");
+
+    // Make sure the first argument (0 in this case) isn't checked for
+    // "division" by zero. Only the second and following arguments should
+    // be checked.
+    try interp.testExpectScriptResult("0.0", "/ 0 255.0");
+    try interp.testExpectScriptResult("10.0", "/ 100.0 5 2");
+    try interp.testExpectScriptError(error.EvalError, "division by zero", "/ 5.0 0");
 }
 
 test "arithmetic division" {
