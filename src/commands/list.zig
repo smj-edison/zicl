@@ -204,6 +204,61 @@ pub fn lreplaceCmd(interp: *Interp, args: []Shimmerable) !void {
     interp.setResultOwning(result.asHead().asValue());
 }
 
+/// [linsert]
+pub fn linsertCmd(interp: *Interp, args: []Shimmerable) !void {
+    const as_list = try interp.getList(&args[1]);
+    const len = as_list.items.len;
+
+    const idx = try interp.getIndex(&args[2]);
+    const idx_abs = idx.asAbsoluteIndex(len);
+
+    // Tcl's semantics: idx >= len means append at end; idx < 0 means insert at
+    // len + idx + 1 (clamped to 0). As with [lreplace], relative indices like
+    // `end` are already resolved by asAbsoluteIndex, so only literal negatives
+    // need the transform.
+    const insert_at: usize = if (idx_abs >= len)
+        len
+    else if (idx_abs < 0)
+        @intCast(std.math.clamp(len + idx_abs + 1, 0, len))
+    else
+        @intCast(idx_abs);
+
+    const new_elements = args[3..];
+    const total = len + new_elements.len;
+    const result = try List.newWithCapacity(&.{}, total);
+    errdefer result.asHead().release();
+
+    for (as_list.items[0..insert_at]) |item| result.appendAssumeCapacity(item);
+    for (new_elements) |elem| result.appendAssumeCapacity(elem.current());
+    if (insert_at < len) for (as_list.items[insert_at..]) |item| result.appendAssumeCapacity(item);
+
+    interp.setResultOwning(result.asHead().asValue());
+}
+
+/// [lrepeat]
+pub fn lrepeatCmd(interp: *Interp, args: []Shimmerable) !void {
+    const count_raw = try interp.getInteger(&args[1]);
+    const count = std.math.cast(usize, count_raw) catch return interp.integerOverflowError(i64, count_raw);
+
+    if (count == 0 or args.len == 2) {
+        interp.setEmptyResult();
+        return;
+    }
+
+    const elements = args[2..];
+
+    const total_raw = std.math.mulWide(usize, count, elements.len);
+    const total = std.math.cast(usize, total_raw) orelse return interp.integerOverflowError(u128, total_raw);
+    const result = try List.newWithCapacity(&.{}, total);
+    errdefer result.asHead().release();
+
+    for (0..count) |_| {
+        for (elements) |elem| result.appendAssumeCapacity(elem.current());
+    }
+
+    interp.setResultOwning(result.asHead().asValue());
+}
+
 /// [lsearch]
 pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
     const Mode = enum { exact, glob, regexp };
