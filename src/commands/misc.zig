@@ -42,6 +42,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         level,
         hostname,
         type,
+        stacktrace,
     };
     const Parser = objects.SubcommandParser(Subcommands, &.{
         .{ .variant = .exists, .usage = "varName", .min_args = 1, .max_args = 1 },
@@ -50,6 +51,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .level, .usage = "?levelNum?", .min_args = 0, .max_args = 1 },
         .{ .variant = .hostname, .usage = "", .min_args = 0, .max_args = 0 },
         .{ .variant = .type, .usage = "object", .min_args = 1, .max_args = 1 },
+        .{ .variant = .stacktrace, .usage = "", .min_args = 0, .max_args = 0 },
     });
 
     var det: ErrorDetails = undefined;
@@ -85,28 +87,21 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .frame => {
             const bad_level_err = heap.InternedString.newValue("bad level");
-            const current = @as(i64, interp.callFrameIdx());
+            const current_frame = interp.callFrameIdx();
+            const current_level: i64 = interp.call_frames.items[current_frame].level;
 
             if (args.len == 2) {
-                interp.setResultInteger(current + 1);
+                interp.setResultInteger(current_level + 1);
                 return;
             }
 
             const level = try interp.getInteger(&args[2]);
-            const target: u32 = blk: {
-                if (level < 0) {
-                    // Less than 0, so this is a relative frame index. Note this means that
-                    // `current + level` is always less than `current`, so we don't need to
-                    // check if it's higher than the current frame.
-                    const abs_frame = current + level;
-                    break :blk std.math.cast(u32, abs_frame) orelse return interp.setError(bad_level_err);
-                } else {
-                    if (level >= current + 1) return interp.setError(bad_level_err);
-                    // Since `current` is a u32, it's impossible for `level` to be bigger than a u32,
-                    // hence we can safely cast it.
-                    break :blk @intCast(level);
-                }
-            };
+            // Less than 0 means `level` is a relative level.
+            const target_level = if (level < 0) current_level + level else level;
+            if (target_level < 0 or target_level > current_level) return interp.setError(bad_level_err);
+
+            const levels_up: u32 = @intCast(current_level - target_level);
+            const target_frame = interp.getRelativeCallFrame(current_frame, levels_up).?;
 
             // Find the topmost eval frame for the target call frame. We start at
             // `eval_frames.items.len` since by design, the current eval frame is
@@ -116,7 +111,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             while (i > 0) {
                 i -= 1;
                 const eval_frame = &interp.eval_frames.items[i];
-                if (eval_frame.call_frame == target) {
+                if (eval_frame.call_frame == target_frame) {
                     target_eval_frame = eval_frame;
                     break;
                 }
@@ -134,26 +129,30 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 try result_dict.put(heap.InternedString.newValue("file"), heap.interned_empty_string);
             }
 
-            const rel_level = objects.Integer.new(current - target);
+            const rel_level = objects.Integer.new(levels_up);
             try result_dict.put(heap.InternedString.newValue("level"), rel_level);
 
             interp.setResultOwning(result_dict.asHead().asValue());
         },
         .level => {
-            const current = @as(i64, interp.callFrameIdx());
+            const current_frame = interp.callFrameIdx();
+            const current_level = @as(i64, interp.call_frames.items[current_frame].level);
 
             if (args.len == 2) {
-                interp.setResultInteger(current);
+                interp.setResultInteger(current_level);
                 return;
             }
 
             const level = try interp.getInteger(&args[2]);
-            const target = if (level == 0) current else if (level > 0) level else current + level;
-            if (target < 1 or target > current) {
+            const target_level = if (level == 0) current_level else if (level > 0) level else current_level + level;
+            if (target_level < 1 or target_level > current_level) {
                 return interp.setError(heap.InternedString.newValue("bad level"));
             }
 
-            const frame_args = interp.call_frames.items[@intCast(target)].args;
+            const levels_up: u32 = @intCast(current_level - target_level);
+            const target_frame = interp.getRelativeCallFrame(current_frame, levels_up).?;
+
+            const frame_args = interp.call_frames.items[target_frame].args;
             const list = try objects.List.newFromShimmerables(frame_args);
             interp.setResultOwning(list.asHead().asValue());
         },
@@ -171,6 +170,10 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             } else {
                 try interp.setResultString(@tagName(args[1].current().raw.tag));
             }
+        },
+        .stacktrace => {
+            const trace = try interp.buildErrorStack();
+            interp.setResultOwning(trace);
         },
     }
 }

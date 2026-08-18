@@ -76,11 +76,10 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len - script_start < 1) return error.WrongUsage;
 
     const current_frame = interp.callFrameIdx();
-    if (current_frame < levels_up) {
+    const target_frame = interp.getRelativeCallFrame(current_frame, levels_up) orelse {
         try interp.setResultString("bad level");
         return error.EvalError;
-    }
-    const target_frame = current_frame - levels_up;
+    };
 
     const script = if (args.len - script_start == 1)
         args[script_start].current().borrow()
@@ -606,6 +605,22 @@ test "tailcall does return" {
     try memutil.checkAllocationFailures(.exhaustive, testTailcallDoesReturn, .{});
 }
 
+fn testUplevelThroughAnIntermediateCall(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("hello",
+        \\ fn inner {} { uplevel { set valueInOuterScope } }
+        \\ fn outer {} { uplevel { inner } }
+        \\ set valueInOuterScope "hello"
+        \\ outer
+    );
+}
+
+test "uplevel through an intermediate call" {
+    try memutil.checkAllocationFailures(.exhaustive, testUplevelThroughAnIntermediateCall, .{});
+}
+
 fn testTailcallUplevelInteraction(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
@@ -665,7 +680,7 @@ fn testTailcallThroughUplevel(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    try interp.testExpectScriptResult("2",
+    try interp.testExpectScriptResult("1",
         \\ fn d {} { return [info level] }
         \\ fn c {} { tailcall d }
         \\ fn b {} { uplevel 1 c }

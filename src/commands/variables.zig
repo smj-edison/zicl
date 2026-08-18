@@ -116,11 +116,10 @@ pub fn upvarCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len - upvar_names_start < 2) return error.WrongUsage;
 
     const current_frame = interp.callFrameIdx();
-    if (levels_up > current_frame) {
+    const target_frame = interp.getRelativeCallFrame(current_frame, levels_up) orelse {
         try interp.setResultString("bad level");
         return error.EvalError;
-    }
-    const target_frame = current_frame - levels_up;
+    };
 
     var j = upvar_names_start;
     while (j + 1 < args.len) : (j += 2) {

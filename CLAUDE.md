@@ -194,6 +194,30 @@ Scripts go through several stages:
 3.  **Caching** (`memutil.LruCache`): Parsed scripts, expressions, closures, and substitutions are cached by `u256` content hash.
 4.  **Evaluation** (`Interp.evalObject`): Walks the token list, substitutes variables/commands, invokes commands.
 
+### Closures, Modules, and Scope Capture
+
+**Scope capture.** `[fn]`/`[method]` (`closureHelper` in `src/commands/eval.zig`) capture the currently executing call frame as `Closure.Content.scope`, via `Interp.captureCurrentScope`/`captureScope`. The capture is a snapshot dict: every local variable is copied in by value (upvars are resolved eagerly, since the linked frame may not outlive the closure), and if the current frame itself has a lexical parent (`.signature.scope`), that parent is chained in as a `~parent` `HashReference` entry, so a name miss in the snapshot walks up the chain via `Dictionary.getFollowingLinks`. A closure is therefore frozen at *definition* time: `fn foo {} {...}` captures whatever frame is current when `[fn]` runs, not the frame active when `foo` is later called.
+
+**`[import]` and modules.** `[import fileName]` (`Interp.evalFileAsModule`) reads a file and evaluates it in a brand-new call frame (`pushCallFrame`), unlike `[source]` (`Interp.evalFile`), which reuses the caller's frame outright and so shares its variables completely. The module frame's `.signature.scope` is set to the importer's `captureCurrentScope()`, so a name miss in the module body still walks up to the importer's bindings as of the moment `[import]` ran, the same `~parent` chain closures use. Writes never propagate back, though: `vartypes.setVariable` always shadows a lexically-inherited name into the local `VarTable` rather than mutating the captured parent. `[return]` and `[tailcall]` are both rejected at a module's top level. Instead of the body's result, `evalFileAsModule` returns `captureScope` of the module's own frame: a `Dictionary` of every name the module bound at its own top level (`set`, a named `fn`/`method`, ...).
+
+There is no implicit "import everything." Pull specific names out of the result with `[dict assign $module name ...]` (binds same-named locals, erroring if a key is missing) or `[dict get $module name]`.
+
+```tcl
+# mathlib.tcl
+fn scope::square {x} { * $x $x }
+```
+```tcl
+set mathlib [import mathlib.tcl]
+dict assign $mathlib square
+square 5   ;# 25
+```
+
+**`letrec` (self-reference within a shared dict).** Module- and object-style functions are usually bound with dict sugar, `fn scope::fibonacci {n} {...}`, which stores the closure at key `fibonacci` of the `scope` dict via `setVariable`'s dict-sugar path. If `fibonacci`'s body calls `fibonacci` again, resolving that name through the closure's captured `.scope` snapshot would only ever see whatever was bound *before* its sibling definitions finished, and any later mutation to the shared dict (a `self` object whose method updates its own fields) would never be visible to peer calls. `[letrec select scope function]` builds a `Letrec` value carrying a live pointer to `scope` plus the key to re-look-up on every call, instead of a value frozen at wrap time. `[letrec new scope]` does this for every key in `scope` at once, producing a dict of `Letrec`-wrapped values; it cannot tell functions from data, so it wraps everything indiscriminately.
+
+Resolving a `Letrec` as a command (`Interp.getCommandFromValue`) re-reads `scope[selected]` fresh on every call. Once a call is dispatched through a `Letrec`, `Interp.getCommand` threads that same live `scope` onto the callee's frame (`signature.letrec_scope`), so any further bare-name call inside the body that resolves to a plain closure is automatically re-wrapped against the same `Letrec` scope. This is what keeps mutual recursion between sibling functions (`is_even` calling `is_odd`) live without an explicit `letrec select` at every call site.
+
+**`self::name` dispatch.** This is not special syntax; it is `vartypes.DictSugar` (the same grammar as plain dict-sugar variables) reused for command dispatch. Calling `self::ping` resolves `self["ping"]` as a variable, then, because closures resolved this way are commonly methods, `Interp.getCommandAndSelfParam` derives a `self` argument by walking every dict-sugar path component but the last (`self::ping` supplies `$self` itself; `outer::inner::frobnicate` supplies `[dict get $outer inner]`), passes it as the closure's first argument, and writes any mutation back afterward the same way `[applymethod]` does.
+
 ### Testing Patterns
 
 Tests use `testing.checkAllAllocationFailures()` to ensure proper error handling under OOM conditions:
@@ -265,6 +289,13 @@ if (try dict_raw.asMutableInPlace(objects.Dictionary, &det)) |dict| {
     try dict.put(key, value);
     try storeBack(duped.asValue()); // The copy is ours; put it where it belongs.
 }
+```
+
+**Integer casting**
+Avoid using `@intCast` when possible. Prefer `std.math.cast`, using `Integer.overflowError` or `Interp.integerOverflowError`. This also means use `std.math` methods when possible, such as
+```zig
+const multiplied = std.math.mulWide(a, b);
+const result = std.math.cast(usize, multiplied) catch return interp.integerOverflowError(u128, multiplied);
 ```
 
 See `.claude/cookbook.md` for extended recipes and `.claude/helpers.md` for the full function index.

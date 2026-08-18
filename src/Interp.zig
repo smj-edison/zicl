@@ -47,9 +47,8 @@ result: Value,
 /// eval frames (one for puts, and while puts is running, another
 /// for +).
 eval_frames: std.ArrayList(EvalFrame),
-/// All call frames. Note, index is _not_ stack depth. Why? Because
-/// when you run `uplevel`, it creates a new call frame, it doesn't
-/// jump back.
+/// All call frames, ordered by allocation. Note that a frame's index is
+/// _not_ its call depth; see `CallFrame`'s doc comment for why.
 call_frames: std.ArrayList(CallFrame),
 /// Used to invalidate cached variable lookups.
 current_call_epoch: u64,
@@ -522,7 +521,25 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
     return (try String.newOwning(owned_slice)).asHead().asValue();
 }
 
-/// Call frame.
+/// A call frame contains a function call's local variable scope, as well
+/// as information about that function that the interpreter needs to run it.
+///
+/// It's important to note that we track `parent` independently of the call frame's
+/// index in `call_frames`. This is because if a function is called inside of
+/// [uplevel], the call stack "forks", like so:
+/// ```tcl
+/// fn inner {} { uplevel { set valueInOuterScope } }
+/// fn outer {} { uplevel { inner } }
+/// set valueInOuterScope "hello"
+/// outer
+/// ```
+///
+/// The frame levels are: interpeter (#0) -> outer (#1) -> uplevel (#0) -> inner (#1).
+///
+/// Note that there's a call frame for both "outer" and "inner", meaning that both
+/// are in `call_frames` at the same time. That means "outer" is in `call_frames[0]`,
+/// and "inner" is in `call_frames[1]`. That's why we can't just take its index in
+/// `call_frames` as its call depth.
 const CallFrame = struct {
     /// The frame's variables. Held by pointer, not inline, so that the
     /// `*VarTable` a `CachedLocalVar` caches survives `call_frames` reallocating.
@@ -543,6 +560,10 @@ const CallFrame = struct {
     },
     /// Call epoch. Used to invalidate previous variable lookups.
     call_epoch: u64,
+    /// The frame that this function was called from.
+    parent: ?u32,
+    /// `parent`'s `level` plus one, or 0 for the root frame.
+    level: u32,
 
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
@@ -559,6 +580,13 @@ pub fn callFrameIdx(interp: *Interp) u32 {
 
 pub fn callFrame(interp: *Interp) *CallFrame {
     return &interp.call_frames.items[interp.callFrameIdx()];
+}
+
+pub fn getRelativeCallFrame(interp: *Interp, from: u32, levels_up: u32) ?u32 {
+    // See `CallFrame` on why we can't just return `from - levels_up`.
+    var target: u32 = from;
+    for (0..levels_up) |_| target = interp.call_frames.items[target].parent orelse return null;
+    return target;
 }
 
 /// Returns a dict containing this call frame's variables.
@@ -684,7 +712,15 @@ fn pushCallFrame(
         val.asHead().incrRefCount();
     }
 
-    const new_call_frame_idx = interp.call_frames.items.len;
+    const new_call_frame_idx: u32 = @intCast(interp.call_frames.items.len);
+
+    const parent: ?u32, const level: u32 = if (new_call_frame_idx == 0)
+        .{ null, 0 }
+    else blk: {
+        const parent_of_new_frame = interp.callFrameIdx();
+        break :blk .{ parent_of_new_frame, interp.call_frames.items[parent_of_new_frame].level + 1 };
+    };
+
     interp.call_frames.appendAssumeCapacity(.{
         .args = args,
         .call_epoch = interp.nextCallEpoch(),
@@ -697,9 +733,11 @@ fn pushCallFrame(
         },
         // TODO PERF recycle variable hash table if possible.
         .variables = variables,
+        .parent = parent,
+        .level = level,
     });
 
-    return @intCast(new_call_frame_idx);
+    return new_call_frame_idx;
 }
 
 fn pushEvalFrame(interp: *Interp, call_frame: u32, script: Value) !u32 {
@@ -1155,7 +1193,7 @@ pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
 
 /// Builds the stack trace as a flat list of {name file line args} repeated once per call
 /// frame. The top (innermost) frame is emitted first.
-fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
+pub fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
     var trace = try objects.List.newWithCapacity(&.{}, interp.eval_frames.items.len * 4);
     errdefer trace.asHead().release();
 
