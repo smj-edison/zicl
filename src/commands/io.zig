@@ -27,7 +27,7 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
     // Compared through the value rather than its bytes, so a short string can be
     // matched without its rendering being materialized.
     const print_newline = if (rest.len > 1 and try rest[0].current().equalsString("-nonewline")) blk: {
-        rest = rest[1..];
+        rest = args[2..];
         break :blk false;
     } else true;
 
@@ -47,6 +47,24 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
     const to_print = try rest[rest.len - 1].getString();
 
     if (rest.len == 2) {
+        if (try rest[0].current().equalsString("stdout")) {
+            const file = ioutil.getStdout();
+            var buffer: [1024]u8 = undefined;
+            var writer = std.Io.File.Writer.initStreaming(file, heap.global_io, &buffer);
+            writer.interface.writeAll(to_print) catch |err| return writeError(interp, err);
+            if (print_newline) writer.interface.writeAll("\n") catch |err| return writeError(interp, err);
+            writer.flush() catch |err| return writeError(interp, err);
+            return;
+        } else if (try rest[0].current().equalsString("stderr")) {
+            const file = ioutil.getStderr();
+            var buffer: [1024]u8 = undefined;
+            var writer = std.Io.File.Writer.initStreaming(file, heap.global_io, &buffer);
+            writer.interface.writeAll(to_print) catch |err| return writeError(interp, err);
+            if (print_newline) writer.interface.writeAll("\n") catch |err| return writeError(interp, err);
+            writer.flush() catch |err| return writeError(interp, err);
+            return;
+        }
+
         var det: ErrorDetails = undefined;
         const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &rest[0]));
         const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
@@ -155,7 +173,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .exists => {
             const path = try args[2].getString();
             const exists = blk: {
-                std.Io.Dir.accessAbsolute(heap.global_io, path, .{}) catch |err| switch (err) {
+                std.Io.Dir.cwd().access(heap.global_io, path, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => {
                         try interp.setResultFormatted("could not access file: {s}", .{@errorName(err)});
@@ -213,7 +231,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .readable => {
             const path = try args[2].getString();
             const readable = blk: {
-                std.Io.Dir.accessAbsolute(heap.global_io, path, .{ .read = true }) catch |err| switch (err) {
+                std.Io.Dir.cwd().access(heap.global_io, path, .{ .read = true }) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => {
                         try interp.setResultFormatted("could not access file: {s}", .{@errorName(err)});
