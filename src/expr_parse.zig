@@ -345,7 +345,7 @@ pub const Parser = struct {
             },
             .integer => {
                 const loc = p.tokenLoc(p.nextToken());
-                const value = std.fmt.parseInt(i64, p.source[loc.start..loc.end], 10) catch unreachable;
+                const value = objects.Integer.parse(null, p.source[loc.start..loc.end]) catch unreachable;
                 const int_value = objects.Integer.new(value);
 
                 return try p.addNode(.{
@@ -829,6 +829,12 @@ test "expr parsing" {
         "atan2(1 ? 10 : 5, int(0 ? 5 : 2))",
         "(.atan2 (.ternary_conditional 1 10 5) (.to_int (.ternary_conditional 0 5 2)))",
     );
+
+    // Radix-prefixed integers.
+    try testExprParse(ta, "0x1F + 1", "(31 .add 1)");
+    try testExprParse(ta, "0X1f + 1", "(31 .add 1)");
+    try testExprParse(ta, "0o17 + 1", "(15 .add 1)");
+    try testExprParse(ta, "0b101 + 1", "(5 .add 1)");
 
     // A `(...)` group must stop at its own `)`, not keep absorbing whatever
     // operator follows.

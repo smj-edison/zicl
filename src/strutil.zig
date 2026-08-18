@@ -765,6 +765,12 @@ fn octalDigitValue(c: u8) ?u3 {
     return null;
 }
 
+/// Parse a Tcl integer literal. Currently just uses Zig's parser,
+/// but placed here if different int parsing is needed.
+pub fn parseInt(bytes: []const u8) std.fmt.ParseIntError!i64 {
+    return std.fmt.parseInt(i64, bytes, 0);
+}
+
 /// Perform Tcl escape substitution of 'source', storing the result
 /// string into 'dest'. The escaped string is guaranteed to
 /// be the same length or shorter than the source string.

@@ -1119,6 +1119,33 @@ pub fn nextNumberToken(self: *Tokenizer) !Token {
     // Start by assuming it's an integer.
     token.tag = .integer;
 
+    // "0x1F", "0o17", "0b101": radix-prefixed integers have their own
+    // digit set, disjoint from the decimal/float digits below (`b`, for
+    // instance, is not a decimal digit but is a valid hex one), so they
+    // are scanned separately rather than falling into that loop.
+    if (self.current() == '0') radix: {
+        const radix_digits: []const u8 = switch (std.ascii.toLower(self.peek(1) orelse 0)) {
+            'x' => "0123456789abcdefABCDEF",
+            'o' => "01234567",
+            'b' => "01",
+            else => break :radix,
+        };
+
+        self.advance(2);
+        while (!self.atEnd() and std.mem.indexOfScalar(u8, radix_digits, self.current()) != null) self.advance(1);
+
+        if (strutil.parseInt(self.buffer[token.loc.start..self.index])) |_| {
+            token.loc.end = self.index;
+            return token;
+        } else |_| {
+            self.error_details = .{
+                .index = token.loc.start,
+                .line_no = token.loc.line_no,
+            };
+            return error.NotNumber;
+        }
+    }
+
     while (!self.atEnd()) : (self.advance(1)) {
         switch (self.current()) {
             '0'...'9' => {},
@@ -1131,7 +1158,7 @@ pub fn nextNumberToken(self: *Tokenizer) !Token {
     }
 
     // Make sure it's a valid integer.
-    if (std.fmt.parseInt(i64, self.buffer[token.loc.start..self.index], 10)) |_| {
+    if (strutil.parseInt(self.buffer[token.loc.start..self.index])) |_| {
         token.loc.end = self.index;
         return token;
     } else |_| {

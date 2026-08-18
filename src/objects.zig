@@ -917,7 +917,7 @@ pub const Integer = struct {
     }
 
     pub fn parse(det: ?*ErrorDetails, bytes: []const u8) !i64 {
-        if (std.fmt.parseInt(i64, bytes, 0)) |integer| {
+        if (strutil.parseInt(bytes)) |integer| {
             return integer;
         } else |err| switch (err) {
             error.InvalidCharacter => {
