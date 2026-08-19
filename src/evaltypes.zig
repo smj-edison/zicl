@@ -784,10 +784,32 @@ pub const Expression = struct {
 
                 return Value.newBool(floatCompare(node.tag, lhs_number.asFloat(), rhs_number.asFloat()));
             },
+            .keyword_in,
+            .keyword_not_in,
+            => {
+                const children = node.data.binary;
+                var lhs_value = try evalNode(interp, nodes, children.@"0");
+                defer lhs_value.release();
+                var rhs_value = try evalNode(interp, nodes, children.@"1");
+                defer rhs_value.release();
+
+                // `in`/`ni` is about list membership, not string membership.
+                var rhs_shim: Shimmerable = .{ .original = rhs_value };
+                defer rhs_shim.discardChanges();
+                const rhs_list = try interp.getList(&rhs_shim);
+
+                var found = false;
+                for (rhs_list.items) |item| {
+                    if (try lhs_value.equals(item)) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                return Value.newBool(if (node.tag == .keyword_in) found else !found);
+            },
             .string_equal,
             .string_not_equal,
-            .string_in,
-            .string_not_in,
             .string_less_than,
             .string_greater_than,
             .string_less_than_or_equal,
@@ -805,8 +827,6 @@ pub const Expression = struct {
                 const result = switch (node.tag) {
                     .string_equal => std.mem.eql(u8, lhs_string, rhs_string),
                     .string_not_equal => !std.mem.eql(u8, lhs_string, rhs_string),
-                    .string_in => std.mem.indexOf(u8, rhs_string, lhs_string) != null,
-                    .string_not_in => std.mem.indexOf(u8, rhs_string, lhs_string) == null,
                     .string_less_than => std.mem.order(u8, rhs_string, lhs_string).compare(.lt),
                     .string_greater_than => std.mem.order(u8, rhs_string, lhs_string).compare(.gt),
                     .string_less_than_or_equal => std.mem.order(u8, rhs_string, lhs_string).compare(.lte),

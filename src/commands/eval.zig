@@ -20,6 +20,26 @@ pub fn exprCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setResultOwning(result);
 }
 
+fn testExprInNi(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // `in`/`ni` match against list *elements*, not substrings of the
+    // right-hand side's raw string form. "p" is a substring of "colorMap"
+    // but not an element of the one-item list {colorMap}.
+    try interp.testExpectScriptResult("false", "expr {\"p\" in {colorMap}}");
+    try interp.testExpectScriptResult("false", "expr {\"o\" in {colorMap}}");
+    try interp.testExpectScriptResult("true", "expr {\"colorMap\" in {colorMap}}");
+    try interp.testExpectScriptResult("true", "expr {\"b\" in {a b c}}");
+    try interp.testExpectScriptResult("false", "expr {\"z\" in {a b c}}");
+    try interp.testExpectScriptResult("true", "expr {\"z\" ni {a b c}}");
+    try interp.testExpectScriptResult("false", "expr {\"b\" ni {a b c}}");
+}
+
+test "expr in/ni match list elements, not substrings" {
+    try memutil.checkAllocationFailures(.exhaustive, testExprInNi, .{});
+}
+
 pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
     var flags: Tokenizer.SubstFlags = .{
         .command_subst = true,
