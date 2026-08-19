@@ -1322,6 +1322,7 @@ pub const Boolean = struct {
     }
 
     pub fn getFromValue(det: ?*ErrorDetails, value: Value) !bool {
+        if (value.asInlineBool()) |boolean| return boolean;
         return try fromString(det, try value.getString());
     }
 

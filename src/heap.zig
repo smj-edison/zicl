@@ -640,7 +640,7 @@ pub const Value = extern struct {
     }
 
     pub fn asInlineBool(value: Value) ?bool {
-        return value.asInlineBool();
+        return value.raw.asInlineBool();
     }
 
     pub fn asType(value: Value, T: type) ?*T {

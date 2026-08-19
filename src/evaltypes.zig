@@ -709,6 +709,13 @@ pub const Expression = struct {
         };
     }
 
+    fn areBooleansEqual(lhs: Value, rhs: Value) !bool {
+        const lhs_bool = try objects.Boolean.getFromValue(null, lhs);
+        const rhs_bool = try objects.Boolean.getFromValue(null, rhs);
+
+        return lhs_bool == rhs_bool;
+    }
+
     pub fn evalNode(interp: *Interp, nodes: []expr_parse.Node, node_index: expr_parse.Node.Index) !Value {
         const node = nodes[@intFromEnum(node_index)];
         switch (node.tag) {
@@ -773,6 +780,18 @@ pub const Expression = struct {
                 if (objects.Float.asFloat(lhs_value)) |lhs| if (objects.Float.asFloat(rhs_value)) |rhs| {
                     return Value.newBool(floatCompare(node.tag, lhs, rhs));
                 };
+
+                // Only `==` and `!=` are allowed to compare booleans.
+                if (node.tag == .equal or node.tag == .not_equal) {
+                    if (areBooleansEqual(lhs_value, rhs_value)) |result| {
+                        return Value.newBool(if (node.tag == .equal) result else !result);
+                    } else |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.BadBoolean => {
+                            // Fall through to integer comparison.
+                        },
+                    }
+                }
 
                 // Slow case: try both as integers first, else fall back to both as floats.
                 const lhs_number = try interp.getIntOrFloatInPlace(&lhs_value);

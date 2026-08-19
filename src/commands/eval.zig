@@ -40,6 +40,58 @@ test "expr in/ni match list elements, not substrings" {
     try memutil.checkAllocationFailures(.exhaustive, testExprInNi, .{});
 }
 
+fn testExprComparisonIsStrict(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // In normal Tcl, `"hello" == "hello"` is a valid expr script, since
+    // it falls back to string comparison if both sides can't be parsed
+    // as numbers. I don't like implicit casting, so I've made `==` strict.
+    // Use `eq` for string comparison instead.
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression "abc" == "abc": expected float but got "abc", parse tree: (abc .equal abc)
+    , "expr {\"abc\" == \"abc\"}");
+    try interp.testExpectScriptResult("true", "expr {\"abc\" eq \"abc\"}");
+    try interp.testExpectScriptResult("false", "expr {\"abc\" eq \"def\"}");
+
+    // Booleans are not numbers, but `==`/`!=` compare two booleans. Only
+    // when *both* sides are booleans, though: a boolean against a number or
+    // string keeps hitting the strict failure.
+    try interp.testExpectScriptResult("true", "expr {true == true}");
+    try interp.testExpectScriptResult("false", "expr {true == false}");
+    try interp.testExpectScriptResult("true", "expr {true != false}");
+
+    // String operands shimmer to booleans for `==`/`!=`, the same way
+    // numeric strings shimmer to numbers.
+    try interp.testExpectScriptResult("true", "expr {\"true\" == true}");
+    try interp.testExpectScriptResult("true", "expr {\"true\" != \"false\"}");
+    try interp.testExpectScriptResult("true", "set x false; expr {$x == false}");
+
+    // Ordering operators never accept booleans, not even two of them.
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression true < false: expected float but got "true", parse tree: (true .less_than false)
+    , "expr {true < false}");
+
+    // Mixed boolean/non-boolean comparisons still fail strictly.
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression true == 1: expected float but got "true", parse tree: (true .equal 1)
+    , "expr {true == 1}");
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression 1 == true: expected float but got "true", parse tree: (1 .equal true)
+    , "expr {1 == true}");
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression "abc" == true: expected float but got "abc", parse tree: (abc .equal true)
+    , "expr {\"abc\" == true}");
+
+    // Still numeric when both sides genuinely are numbers.
+    try interp.testExpectScriptResult("true", "expr {1 == 1.0}");
+    try interp.testExpectScriptResult("true", "expr {2 > 1}");
+}
+
+test "expr comparisons stay strictly numeric, no implicit casting" {
+    try memutil.checkAllocationFailures(.exhaustive, testExprComparisonIsStrict, .{});
+}
+
 pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
     var flags: Tokenizer.SubstFlags = .{
         .command_subst = true,
