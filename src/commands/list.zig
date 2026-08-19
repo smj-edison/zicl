@@ -266,7 +266,7 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
     var opt_nocase = false;
 
     var i: usize = 1;
-    while (i + 2 < args.len) : (i += 1) {
+    while (i < args.len - 2) : (i += 1) {
         if (try args[i].current().equalsString("-exact")) {
             mode = .exact;
         } else if (try args[i].current().equalsString("-glob")) {
@@ -298,9 +298,7 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
     }
 
     for (as_list.items, 0..) |item, idx| {
-        var item_shim: Shimmerable = .{ .original = item };
-        defer item_shim.discardChanges();
-        const item_bytes = try item_shim.current().getString();
+        const item_bytes = try item.getString();
 
         const matched = switch (mode) {
             .exact => strutil.compare(item_bytes, pattern_bytes, null, opt_nocase) == .eq,
@@ -317,7 +315,6 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
     interp.setResultInteger(-1);
 }
 
-/// [lset]
 /// [lset]
 ///
 /// Mirrors `dict set`'s own command body: prefer mutating the variable's list
@@ -350,15 +347,12 @@ pub fn lsetCmd(interp: *Interp, args: []Shimmerable) !void {
 }
 
 const LsortMode = enum { ascii, integer, real };
-
-/// Ordering used by [lsort]'s comparator, factored out of the sort context so
-/// it isn't duplicated between the ascending and descending cases.
-fn lsortOrder(mode: LsortMode, a: Value, b: Value) std.math.Order {
+fn getValueOrder(mode: LsortMode, a: Value, b: Value) !std.math.Order {
     switch (mode) {
         .ascii => {
-            const sa = a.getString() catch "";
-            const sb = b.getString() catch "";
-            return strutil.compare(sa, sb, null, false);
+            const a_bytes = try a.getString();
+            const b_bytes = try b.getString();
+            return strutil.compare(a_bytes, b_bytes, null, false);
         },
         .integer, .real => {
             var a_shim: Shimmerable = .{ .original = a };
@@ -366,20 +360,57 @@ fn lsortOrder(mode: LsortMode, a: Value, b: Value) std.math.Order {
             var b_shim: Shimmerable = .{ .original = b };
             defer b_shim.discardChanges();
 
-            const a_num = objects.Number.getAsIntOrFloat(null, &a_shim) catch return .eq;
-            const b_num = objects.Number.getAsIntOrFloat(null, &b_shim) catch return .eq;
+            const a_num = try objects.Number.getAsIntOrFloat(null, &a_shim);
+            const b_num = try objects.Number.getAsIntOrFloat(null, &b_shim);
             return std.math.order(a_num.asFloat(), b_num.asFloat());
         },
     }
 }
 
 const LsortContext = struct {
+    pub const Command = struct {
+        interp: *Interp,
+        command: Interp.CommandVariant,
+        command_name: Value,
+    };
+
     mode: LsortMode,
     decreasing: bool,
+    /// Used to exfiltrate an error if it occured, since sort functions
+    /// can't directly return an error.
+    err: *?Interp.Error,
+    command: ?Command = null,
+
+    fn callCommand(interp: *Interp, command: *const Interp.CommandVariant, command_name: Value, a: Value, b: Value) !std.math.Order {
+        var call_args: [3]Shimmerable = .{
+            .{ .original = command_name },
+            .{ .original = a },
+            .{ .original = b },
+        };
+        defer for (&call_args) |*shim| shim.discardChanges();
+
+        try interp.invokeCommand(command, &call_args);
+
+        const num = try interp.getIntOrFloatInPlace(&interp.result);
+        return std.math.order(num.asFloat(), 0.0);
+    }
 
     fn lessThan(self: @This(), a: Value, b: Value) bool {
-        const order = lsortOrder(self.mode, a, b);
-        return if (self.decreasing) order == .gt else order == .lt;
+        if (self.err.* != null) return false;
+
+        if (self.command) |cmd| {
+            const order = callCommand(cmd.interp, &cmd.command, cmd.command_name, a, b) catch |err| {
+                self.err.* = err;
+                return false;
+            };
+            return if (self.decreasing) order == .gt else order == .lt;
+        } else {
+            const order = getValueOrder(self.mode, a, b) catch |err| {
+                self.err.* = Interp.narrowError(err);
+                return false;
+            };
+            return if (self.decreasing) order == .gt else order == .lt;
+        }
     }
 };
 
@@ -387,6 +418,8 @@ const LsortContext = struct {
 pub fn lsortCmd(interp: *Interp, args: []Shimmerable) !void {
     var mode: LsortMode = .ascii;
     var decreasing = false;
+    var command_ctx: ?LsortContext.Command = null;
+    defer if (command_ctx) |*ctx| ctx.command.deinit();
 
     var i: usize = 1;
     while (i < args.len - 1) : (i += 1) {
@@ -400,6 +433,18 @@ pub fn lsortCmd(interp: *Interp, args: []Shimmerable) !void {
             decreasing = false;
         } else if (try args[i].current().equalsString("-decreasing")) {
             decreasing = true;
+        } else if (try args[i].current().equalsString("-command")) {
+            i += 1;
+            if (i >= args.len - 1) return error.WrongUsage;
+            const command = interp.getCommandFromValue(&args[i], false) catch |err| switch (err) {
+                error.CommandNotFound => return error.EvalError, // Message already set.
+                else => return Interp.narrowError(err),
+            };
+            command_ctx = .{
+                .interp = interp,
+                .command = command,
+                .command_name = args[i].current(),
+            };
         } else {
             return error.WrongUsage;
         }
@@ -408,8 +453,16 @@ pub fn lsortCmd(interp: *Interp, args: []Shimmerable) !void {
     const as_list = try interp.getList(&args[i]);
     const items = try heap.local_arena.dupe(Value, as_list.items);
 
-    const ctx: LsortContext = .{ .mode = mode, .decreasing = decreasing };
+    var error_out: ?Interp.Error = null;
+    const ctx: LsortContext = .{
+        .mode = mode,
+        .decreasing = decreasing,
+        .command = command_ctx,
+        .err = &error_out,
+    };
     std.mem.sort(Value, items, ctx, LsortContext.lessThan);
+
+    if (error_out) |err| return Interp.narrowError(err);
 
     const result = try List.new(items);
     interp.setResultOwning(result.asHead().asValue());
@@ -835,4 +888,27 @@ fn testLsortBasic(ta: std.mem.Allocator) !void {
 
 test "lsort basic" {
     try memutil.checkAllocationFailures(.exhaustive, testLsortBasic, .{});
+}
+
+fn testLsortCommand(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult(
+        "a b c",
+        "lsort -command [fn {a b} {string compare $a $b}] {c a b}",
+    );
+    try interp.testExpectScriptResult(
+        "30 10 2",
+        "lsort -command [fn {a b} {expr {$b - $a}}] {10 2 30}",
+    );
+    try interp.testExpectScriptError(
+        error.EvalError,
+        "not a valid function: \"notACommand\"",
+        "lsort -command notACommand {c a b}",
+    );
+}
+
+test "lsort -command sorts using a closure comparator" {
+    try memutil.checkAllocationFailures(.exhaustive, testLsortCommand, .{});
 }
