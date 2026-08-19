@@ -549,6 +549,24 @@ pub fn globCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setResultOwning(list.asHead().asValue());
 }
 
+const ns_per_second: f64 = @floatFromInt(std.time.ns_per_s);
+
+/// [sleep]
+pub fn sleepCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    var det: ErrorDetails = undefined;
+    const seconds = (try interp.wrapError(&det, objects.Number.getAsIntOrFloat(&det, &args[1]))).asFloat();
+
+    if (!std.math.isFinite(seconds) or seconds < 0) {
+        return interp.setErrorFormatted("invalid sleep duration \"{d}\"", .{seconds});
+    }
+
+    const duration: std.Io.Duration = .fromNanoseconds(@trunc(seconds * ns_per_second));
+
+    std.Io.sleep(heap.global_io, duration, .awake) catch |err| switch (err) {
+        error.Canceled => return interp.setErrorString("sleep was canceled"),
+    };
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
     try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1);
@@ -556,6 +574,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2);
     try registerCommand(interp, "read", readCmd, "fileId", 1, 1);
     try registerCommand(interp, "glob", globCmd, "?-nocomplain? ?--? pattern ?pattern ...?", 1, null);
+    try registerCommand(interp, "sleep", sleepCmd, "seconds", 1, 1);
 }
 
 const testing = std.testing;
