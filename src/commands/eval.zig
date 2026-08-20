@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const options = @import("options");
 
 const Tokenizer = @import("../Tokenizer.zig");
 const evaltypes = @import("../evaltypes.zig");
@@ -733,6 +734,10 @@ test "tailcall passes through return" {
 }
 
 test "tailcall large number of invocations" {
+    // Not an allocation-failure test; the 3000-deep tailcall chain is just
+    // slow, and this option is the build's opt-in for slow tests.
+    if (!options.full_oom_testing) return;
+
     const ta = std.testing.allocator;
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);

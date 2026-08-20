@@ -962,8 +962,9 @@ const ParsedName = extern struct {
     id: Capability.Id,
 };
 
-/// Initializes `id`, `closed`, and `ref_count`, since C construction bypasses
-/// the Zig defaults.
+/// Registers `head` and boxes the capability that names it as a value.
+/// Initializes `id`, `closed`, and `ref_count` on `head`, since C
+/// construction bypasses the Zig defaults.
 export fn Zicl_CapabilityNew(out: *Value, head: *Capability.Head) callconv(.c) ReturnCode {
     head.closed = .init(false);
     head.ref_count = .init(1);
@@ -973,52 +974,86 @@ export fn Zicl_CapabilityNew(out: *Value, head: *Capability.Head) callconv(.c) R
     return .ok;
 }
 
-export fn Zicl_CapabilityClose(value: Value) callconv(.c) void {
-    if (value.asType(Capability)) |cap| cap.close();
-}
-
-/// Returns ZICL_OOM if allocating the shimmered object fails.
-export fn Zicl_ResolveCapability(value: *Value) callconv(.c) ReturnCode {
-    var shim: Shimmerable = .{ .original = value.* };
-    errdefer shim.discardChanges();
-    _ = Capability.shimmerFrom(null, &shim) catch |err| return ReturnCode.fromError(narrowError(err));
-    value.* = shim.consume();
-    return .ok;
-}
-
-export fn Zicl_CapabilityTypeName(value: Value) callconv(.c) ?[*:0]const u8 {
-    const cap = value.asType(Capability) orelse return null;
-    return cap.head.vtable.name;
-}
-
-export fn Zicl_CapabilityIsClosed(value: Value) callconv(.c) bool {
-    const cap = value.asType(Capability) orelse return false;
-    return cap.head.isClosed();
-}
-
-export fn Zicl_GetBacking(
-    value: Value,
+/// Resolves `shim` to a live capability, folding what would otherwise be two
+/// calls (string resolution, then the type and closed-ness check) into one, since
+/// C code -- an argument converter, chiefly -- always starts from a
+/// `Zicl_Shimmerable*` that may still hold a string, never an
+/// already-resolved value. Returns NULL if `shim` doesn't name a capability,
+/// names one of some other type than `expected` (pass NULL to skip the type
+/// check), or names one that has been closed. The returned head is borrowed
+/// from the capability: valid while the capability stays alive and open.
+/// Recover the backing struct with `Zicl_ContainerOf(head, MyBacking, head)`.
+/// The type name lives on the head itself (`head->vtable->name`), so there's
+/// no separate accessor for it.
+export fn Zicl_ResolveCapability(
+    shim: *Shimmerable,
     expected: ?*const Capability.Head.VTable,
-    out: *?*Capability.Head,
-) callconv(.c) ReturnCode {
-    const cap = value.asType(Capability) orelse return .@"error";
+) callconv(.c) ?*Capability.Head {
+    const cap = Capability.shimmerFrom(null, shim) catch return null;
     if (expected) |vt| {
-        if (cap.head.vtable != vt) return .@"error";
+        if (cap.head.vtable != vt) return null;
     }
-    if (cap.head.isClosed()) {
-        // Match getBacking: a closed capability reports staleness. Generating
-        // the string rep for the message can allocate, so report OOM if it does.
-        _ = @constCast(cap).asHead().getString() catch return .oom;
-        return .@"error";
-    }
-    out.* = cap.head;
-    return .ok;
+    if (cap.head.isClosed()) return null;
+    return cap.head;
 }
 
 export fn Zicl_NewFileFromDescriptor(descriptor: i32, out: *Value) callconv(.c) ReturnCode {
     const capability = capabilities.File.openDescriptor(descriptor) catch return .oom;
     out.* = capability.asHead().asValue();
     return .ok;
+}
+
+/// Wraps `ptr` in a "pointer" capability whose lifetime is now managed by
+/// Zicl. `type_name` is copied, and must match exactly what's later passed to
+/// `Zicl_GetPointerCapability` -- see that function for why. If `destructor`
+/// is non-NULL, it runs once, handed back `ptr`, when the capability is
+/// closed (explicitly, or at process shutdown if never closed); it never runs
+/// if `ptr` itself is NULL, since there is nothing to destroy. `ptr` may be
+/// NULL: the capability's own identity (id, refcount, open/closed) is
+/// independent of the pointer value it happens to carry, so a C API whose
+/// pointer type uses NULL as a meaningful state (not just "allocation
+/// failed") still round-trips through a capability like any other value.
+export fn Zicl_NewPointerCapability(
+    ptr: ?*anyopaque,
+    type_name: [*:0]const u8,
+    destructor: ?*const fn (ptr: *anyopaque) callconv(.c) void,
+    out: *Value,
+) callconv(.c) ReturnCode {
+    const capability = capabilities.Pointer.new(ptr, std.mem.span(type_name), destructor) catch return .oom;
+    out.* = capability.asHead().asValue();
+    return .ok;
+}
+
+/// Recovers the pointer from a "pointer" capability into `*out`, resolving
+/// `shim` in place first (same as `Zicl_GetLong`/`Zicl_ListShimmer` do for
+/// their own target type) -- so this works directly on a value that's still
+/// in string form, which is the common case for an argument coming from Tcl.
+/// The type check can't ride on vtable identity the way `Zicl_ResolveCapability`
+/// rides on it for capability types with their own vtable, since every
+/// `Pointer` capability shares one vtable; `expected_type_name` is required
+/// and compared against what the capability was created with instead. Errors
+/// (rather than writing NULL to `*out`) if `shim` doesn't resolve to a live
+/// pointer capability, or if it's a pointer capability of some other type --
+/// `*out` alone can't carry that distinction, since NULL is itself a valid
+/// pointer to recover (see `Zicl_NewPointerCapability`).
+export fn Zicl_GetPointerCapability(
+    shim: *Shimmerable,
+    expected_type_name: [*:0]const u8,
+    out: *?*anyopaque,
+) callconv(.c) ReturnCode {
+    const cap = Capability.shimmerFrom(null, shim) catch |err| return if (err == error.OutOfMemory) .oom else .@"error";
+    const ptr = capabilities.Pointer.getTyped(cap, std.mem.span(expected_type_name), null) catch |err| return if (err == error.OutOfMemory) .oom else .@"error";
+    out.* = ptr.ptr;
+    return .ok;
+}
+
+/// The type_name a pointer capability was created with, or NULL if `value`
+/// isn't a pointer capability. Borrowed; valid as long as the capability is.
+export fn Zicl_PointerCapabilityTypeName(value: Value) callconv(.c) ?[*:0]const u8 {
+    const cap = value.asType(Capability) orelse return null;
+    if (cap.head.vtable != &capabilities.Pointer.Backing.vtable) return null;
+    const backing: *capabilities.Pointer.Backing = @fieldParentPtr("head", cap.head);
+    return backing.body.type_name.ptr;
 }
 
 export fn Zicl_HeadBorrow(head: *Capability.Head) callconv(.c) *Capability.Head {

@@ -7,6 +7,9 @@ const ioutil = @import("ioutil.zig");
 
 const heap = @import("heap.zig");
 const Capability = @import("Capability.zig");
+const memutil = @import("memutil.zig");
+const objects = @import("objects.zig");
+const ErrorDetails = objects.ErrorDetails;
 
 const process = std.process;
 
@@ -262,6 +265,195 @@ pub const Process = struct {
         };
     };
 };
+
+/// A raw pointer whose lifetime has been handed over to Zicl. Meant for C code
+/// (chiefly generated FFI wrappers, see `folk/lib/c.tcl`) that returns a
+/// pointer it wants a script to be able to hold, pass around by its capability
+/// URL, and eventually release -- without requiring a bespoke capability type
+/// (and `Zicl_CapabilityHeadVTable`) for every pointed-to C type.
+///
+/// All `Pointer` capabilities share one vtable/name ("pointer"), so the type
+/// checking a real per-type vtable would give `Capability.getBacking` for
+/// free doesn't apply here -- passing a `v4l2_capability*` where a `Gpu*` is
+/// expected would otherwise type-check fine at the capability layer and blow
+/// up in the C function instead. `type_name` exists to close that hole:
+/// `getTyped` checks it explicitly, so callers that care what the pointer
+/// points to (which is effectively everyone using this from generated FFI
+/// code) get the same safety a per-type vtable would have given them.
+pub const Pointer = struct {
+    /// Null is a legitimate value here (e.g. a C API whose pointer type uses
+    /// NULL as a meaningful "empty" state, not just "allocation failed") --
+    /// distinct from the capability itself, which always has a real identity
+    /// whether or not the pointer it carries is null.
+    ptr: ?*anyopaque,
+    type_name: [:0]const u8,
+    /// Runs once when the capability closes (explicitly, or via
+    /// `Capability.deinitGlobals` at shutdown if never closed), and is handed
+    /// back the original pointer. Null for a pointer that needs no cleanup,
+    /// e.g. one borrowed from elsewhere. Never runs if `ptr` itself is null,
+    /// since there is nothing to destroy.
+    destructor: ?*const fn (ptr: *anyopaque) callconv(.c) void,
+
+    pub fn new(ptr: ?*anyopaque, type_name: []const u8, destructor: ?*const fn (ptr: *anyopaque) callconv(.c) void) !*Capability {
+        const owned_type_name = try heap.global_gpa.dupeSentinel(u8, type_name, 0);
+        errdefer heap.global_gpa.free(owned_type_name);
+
+        const cap_backing = try heap.global_gpa.create(Backing);
+        errdefer heap.global_gpa.destroy(cap_backing);
+        cap_backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .body = .{ .ptr = ptr, .type_name = owned_type_name, .destructor = destructor },
+        };
+
+        return try Capability.new(&cap_backing.head);
+    }
+
+    /// Like `Capability.getBacking`, but also requires the capability's
+    /// `type_name` to equal `expected_type_name`, so a pointer of one C type
+    /// can't stand in for another.
+    pub fn getTyped(cap: *const Capability, expected_type_name: []const u8, det: ?*ErrorDetails) !*Pointer {
+        const backing = try cap.getBacking(Backing, det);
+        if (!std.mem.eql(u8, backing.body.type_name, expected_type_name)) {
+            if (det) |details| details.* = .{
+                .message = try objects.allocPrintZ(
+                    "expected a pointer capability of type \"{s}\" but got \"{s}\"",
+                    .{ expected_type_name, backing.body.type_name },
+                ),
+            };
+            return error.BadCapability;
+        }
+        return &backing.body;
+    }
+
+    pub const Backing = struct {
+        head: Capability.Head,
+        body: Pointer,
+
+        fn deinitBody(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            const ptr = backing.body.ptr orelse return;
+            if (backing.body.destructor) |destroy| destroy(ptr);
+        }
+
+        fn destroyBacking(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            heap.global_gpa.free(backing.body.type_name);
+            heap.global_gpa.destroy(backing);
+        }
+
+        pub const vtable: Capability.Head.VTable = .{
+            .deinitBody = deinitBody,
+            .destroyBacking = destroyBacking,
+            .name = "pointer",
+        };
+    };
+};
+
+fn testPointerDestructorRunsOnClose(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    const Impl = struct {
+        var destroyed: bool = false;
+        var last_ptr: ?*anyopaque = null;
+
+        fn destroy(ptr: *anyopaque) callconv(.c) void {
+            destroyed = true;
+            last_ptr = ptr;
+        }
+    };
+    Impl.destroyed = false;
+    Impl.last_ptr = null;
+
+    var payload: u64 = 42;
+    const cap = try Pointer.new(&payload, "u64*", Impl.destroy);
+    defer cap.asHead().release();
+    defer cap.close();
+
+    const backing = try cap.getBacking(Pointer.Backing, null);
+    try testing.expectEqual(@as(?*anyopaque, &payload), backing.body.ptr);
+    try testing.expectEqualStrings("u64*", backing.body.type_name);
+
+    try testing.expect(!Impl.destroyed);
+    cap.close();
+    try testing.expect(Impl.destroyed);
+    try testing.expectEqual(@as(*anyopaque, &payload), Impl.last_ptr.?);
+
+    // Closing again must not run the destructor a second time.
+    Impl.destroyed = false;
+    cap.close();
+    try testing.expect(!Impl.destroyed);
+}
+
+test "pointer capability destructor runs on close" {
+    try testing.checkAllAllocationFailures(testing.allocator, testPointerDestructorRunsOnClose, .{});
+}
+
+fn testPointerNullDestructorIsNoop(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    var payload: u64 = 7;
+    const cap = try Pointer.new(&payload, "u64*", null);
+    defer cap.asHead().release();
+    defer cap.close();
+
+    const backing = try cap.getBacking(Pointer.Backing, null);
+    try testing.expectEqual(@as(?*anyopaque, &payload), backing.body.ptr);
+
+    cap.close();
+    try memutil.expectErrorOrOom(error.StaleCapability, cap.getBacking(Pointer.Backing, null));
+}
+
+test "pointer capability with null destructor is a no-op close" {
+    try testing.checkAllAllocationFailures(testing.allocator, testPointerNullDestructorIsNoop, .{});
+}
+
+fn testPointerGetTypedChecksTypeName(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    var payload: u64 = 99;
+    const cap = try Pointer.new(&payload, "Gpu*", null);
+    defer cap.asHead().release();
+    defer cap.close();
+
+    const matched = try Pointer.getTyped(cap, "Gpu*", null);
+    try testing.expectEqual(@as(?*anyopaque, &payload), matched.ptr);
+
+    try memutil.expectErrorOrOom(error.BadCapability, Pointer.getTyped(cap, "v4l2_capability*", null));
+}
+
+test "pointer capability getTyped checks type_name" {
+    try testing.checkAllAllocationFailures(testing.allocator, testPointerGetTypedChecksTypeName, .{});
+}
+
+fn testPointerNullPtrClosesWithoutRunningDestructor(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    const Impl = struct {
+        var destroyed: bool = false;
+        fn destroy(_: *anyopaque) callconv(.c) void {
+            destroyed = true;
+        }
+    };
+    Impl.destroyed = false;
+
+    const cap = try Pointer.new(null, "Gpu*", Impl.destroy);
+    defer cap.asHead().release();
+    defer cap.close();
+
+    const matched = try Pointer.getTyped(cap, "Gpu*", null);
+    try testing.expectEqual(@as(?*anyopaque, null), matched.ptr);
+
+    cap.close();
+    try testing.expect(!Impl.destroyed);
+}
+
+test "pointer capability with null ptr closes without running destructor" {
+    try testing.checkAllAllocationFailures(testing.allocator, testPointerNullPtrClosesWithoutRunningDestructor, .{});
+}
 
 test "file" {
     try heap.testStart(testing.allocator, testing.io);

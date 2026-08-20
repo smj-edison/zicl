@@ -8,6 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__cplusplus)
+#define ZICL_NORETURN [[noreturn]]
+#define ZICL_ALIGNAS(n) alignas(n)
+#else
+#define ZICL_NORETURN _Noreturn
+#define ZICL_ALIGNAS(n) _Alignas(n)
+#endif
+
 /* ===== Values, types, and conventions ===== */
 
 /* A ref-counted heap object. Forward-declared here because it and
@@ -285,7 +293,7 @@ static inline int Zicl_NewStringFormatted(Zicl_Value *out, const char *fmt, ...)
  * Zicl_InternStrTooLong rather than truncating. Unlike Zicl_NewString,
  * this does not take ownership and does not copy, so it must not be used for
  * buffers that will be freed or mutated. */
-_Noreturn void Zicl_InternStrTooLong(void);
+ZICL_NORETURN void Zicl_InternStrTooLong(void);
 static inline Zicl_Value Zicl_InternStr(const char *ptr) {
     size_t len = strlen(ptr);
     if (len > 0xffff) Zicl_InternStrTooLong();
@@ -437,7 +445,7 @@ struct Zicl_Object {
     uint8_t metadata;
     uint32_t string_metadata;
     uint8_t hash_metadata;
-    _Alignas(8) uint8_t body_backing[ZICL_OBJECT_BODY_MAX_SIZE];
+    ZICL_ALIGNAS(8) uint8_t body_backing[ZICL_OBJECT_BODY_MAX_SIZE];
 };
 
 /* For a type with no cross-thread hazards: nothing in its body that another
@@ -928,8 +936,8 @@ void Zicl_ClearStop(Zicl_Interp *interp);
  * capability types: allocate a backing struct that embeds a `Zicl_CapabilityHead` as a
  * field, point the head's `vtable` at a static `Zicl_CapabilityHeadVTable`, and register
  * it with `Zicl_CapabilityNew`. The same vtable pointer is what
- * `Zicl_GetBacking` compares against, so each capability type has exactly one
- * vtable instance. These layouts mirror `Capability.Head` and
+ * `Zicl_ResolveCapability` compares against, so each capability type has
+ * exactly one vtable instance. These layouts mirror `Capability.Head` and
  * `Capability.Head.VTable` on the Zig side, field-for-field, so they match on
  * any target both are compiled for. Recover the backing from the head Zicl
  * hands back with `Zicl_ContainerOf`. */
@@ -966,30 +974,62 @@ typedef struct Zicl_CapabilityHead {
     uint32_t ref_count;
 } Zicl_CapabilityHead;
 
-/* Register `head` and return the capability object that names it. `head` is a
- * `Zicl_CapabilityHead` embedded in a backing struct the caller allocated (at any offset);
- * Zicl initializes `id`, `closed`, and `ref_count`. The caller owns the returned
- * value, and recovers its backing from the head with `Zicl_ContainerOf`. */
+/* Registers `head` and boxes the capability that names it as a value. `head`
+ * is a `Zicl_CapabilityHead` embedded in a backing struct the caller
+ * allocated (at any offset); Zicl initializes `id`, `closed`, and
+ * `ref_count`. The caller owns the returned value, and recovers its backing
+ * from `head` itself (the same pointer passed in, now registered) with
+ * `Zicl_ContainerOf`. */
 int Zicl_CapabilityNew(Zicl_Value *out, Zicl_CapabilityHead *head);
-/* Close a capability (idempotent). No-op if `value` is not a capability. */
-void Zicl_CapabilityClose(Zicl_Value value);
-/* Resolve a capability URL string in place, replacing `*value` with the
- * capability object it names. Returns ZICL_ERR for a malformed or stale name. */
-int Zicl_ResolveCapability(Zicl_Value *value);
-/* The type segment of a capability's URL (e.g. "file-handle"), or NULL if
- * `value` is not a capability. */
-const char *Zicl_CapabilityTypeName(Zicl_Value value);
-/* Whether the capability has been closed, or false if `value` is not one. */
-bool Zicl_CapabilityIsClosed(Zicl_Value value);
 
-/* The C counterpart of Capability.getBacking. Validates that `value` is a
- * capability whose head carries `expected` (pass NULL to skip the type check),
- * that it has not been closed, and writes its head to `*out`. The head is
- * borrowed from the capability: valid while the capability stays alive and
- * open. Recover the backing with `Zicl_ContainerOf(*out, MyBacking, head)`. */
-int Zicl_GetBacking(Zicl_Value value, const Zicl_CapabilityHeadVTable *expected, Zicl_CapabilityHead **out);
+/* Resolves `shim` to a live capability, folding what would otherwise be two
+ * calls (string resolution, then the type and closed-ness check) into one, since C
+ * code -- an argument converter, chiefly -- always starts from a
+ * Zicl_Shimmerable* that may still hold a string, never an already-resolved
+ * value. Returns NULL if `shim` doesn't name a capability, names one of some
+ * other type than `expected` (pass NULL to skip the type check), or names
+ * one that has been closed. The returned head is borrowed from the
+ * capability: valid while the capability stays alive and open. Recover the
+ * backing struct with `Zicl_ContainerOf(head, MyBacking, head)`. The type
+ * name lives on the head itself (`head->vtable->name`), so there's no
+ * separate accessor for it; likewise closed-ness and lifetime from here on
+ * are the `Zicl_CapabilityHead*` operations below, not a `Zicl_Value` one. */
+Zicl_CapabilityHead *Zicl_ResolveCapability(Zicl_Shimmerable *shim, const Zicl_CapabilityHeadVTable *expected);
 
 int Zicl_NewFileFromDescriptor(int descriptor, Zicl_Value *out);
+
+/* Wraps `ptr` in a "pointer" capability whose lifetime is now managed by
+ * Zicl -- useful for C code (chiefly generated FFI wrappers) that wants to
+ * hand a script a raw pointer to hold and eventually release, without
+ * defining a bespoke Zicl_CapabilityHeadVTable for every pointed-to type.
+ * `type_name` is copied, and must match exactly what's later passed to
+ * Zicl_GetPointerCapability -- see that function for why. If `destructor`
+ * is non-NULL, it runs once, handed back `ptr`, when the capability is
+ * closed (explicitly, or at process shutdown if never closed); it never runs
+ * if `ptr` itself is NULL, since there is nothing to destroy. `ptr` may be
+ * NULL: the capability's own identity (id, refcount, open/closed) is
+ * independent of the pointer value it happens to carry, so a C API whose
+ * pointer type uses NULL as a meaningful state (not just "allocation
+ * failed") still round-trips through a capability like any other value. */
+int Zicl_NewPointerCapability(void *ptr, const char *type_name,
+                               void (*destructor)(void *ptr), Zicl_Value *out);
+/* Recovers the pointer from a "pointer" capability into `*out`, resolving
+ * `shim` in place first (same as Zicl_GetLong/Zicl_ListShimmer do for their
+ * own target type) -- so this works directly on a value that's still in
+ * string form, which is the common case for an argument coming from Tcl. The
+ * type check can't ride on vtable identity the way Zicl_ResolveCapability
+ * rides on it for capability types with their own vtable, since every
+ * pointer capability shares one vtable; `expected_type_name` is required and
+ * compared against what the capability was created with instead. Errors
+ * (rather than writing NULL to `*out`) if `shim` doesn't resolve to a live
+ * pointer capability, or if it's a pointer capability of some other type
+ * (e.g. passing a "Gpu*" capability where "v4l2_capability*" was expected)
+ * -- `*out` alone can't carry that distinction, since NULL is itself a valid
+ * pointer to recover (see Zicl_NewPointerCapability). */
+int Zicl_GetPointerCapability(Zicl_Shimmerable *shim, const char *expected_type_name, void **out);
+/* The type_name a pointer capability was created with, or NULL if `value`
+ * isn't a pointer capability. Borrowed; valid as long as the capability is. */
+const char *Zicl_PointerCapabilityTypeName(Zicl_Value value);
 
 /* Head operations, mirroring Capability.Head. */
 Zicl_CapabilityHead *Zicl_CapabilityHeadBorrow(Zicl_CapabilityHead *head);
