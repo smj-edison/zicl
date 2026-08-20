@@ -59,7 +59,7 @@ pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !
         return error.BadCapability;
     }
 
-    if (self.head.isClosed()) return staleError(det, try @constCast(self).asHead().getString());
+    if (self.head.hasCloseBeenInitiated()) return staleError(det, try @constCast(self).asHead().getString());
 
     const backing: *Backing = @fieldParentPtr("head", self.head);
     return backing;
@@ -146,15 +146,17 @@ pub const vtable: Object.VTable = .zig(@typeName(Capability), .{
 /// implemented as `const Backing = struct { head: Head, body: Body }`, and
 /// `body` is recovered using @parentFieldPtr on the `head` pointer.
 ///
-/// `extern` so a C program can embed a `Zicl_Head` as the first field of its own
-/// backing struct and register it through the C API; the vtable-identity check
-/// in `getBacking` then works uniformly for Zig- and C-created capabilities.
+/// Marked `extern` so a C program can create its own capabilities by embedding a
+/// `Zicl_Head` as the first field of its own backing struct.
 pub const Head = extern struct {
+    const State = packed struct(u32) {
+        in_flight: u31 = 0,
+        close_initiated: bool = false,
+    };
+
     vtable: *const VTable,
     id: Id,
-    /// Whether the capability is dead. Needed because a capability can be
-    /// closed while there are still active references to the Head.
-    closed: std.atomic.Value(bool) = .init(false),
+    state: std.atomic.Value(State) = .init(.{}),
     ref_count: std.atomic.Value(u32) = .init(1),
 
     pub fn takeReference(head: *Head) *Head {
@@ -168,29 +170,69 @@ pub const Head = extern struct {
 
         // Reaching zero implies the capability was closed, since the registry
         // holds a reference until the capability is closed.
-        assert(head.closed.load(.monotonic));
+        const state = head.state.load(.monotonic);
+        assert(state.close_initiated and state.in_flight == 0);
         head.vtable.destroyBacking(head);
     }
 
-    /// Deinits the body and takes the capability out of the registry, so that
-    /// its string rep stops resolving from here on. Idempotent.
-    pub fn close(head: *Head) void {
-        if (head.closed.swap(true, .acq_rel) == true) return;
-        head.vtable.deinitBody(head); // This is the implementation of closing the capability.
+    /// Attempts to mark this capability as in flight.
+    pub fn markInFlight(head: *Head) error{AlreadyClosed}!void {
+        var prev_state = head.state.load(.monotonic);
+        while (true) {
+            if (prev_state.close_initiated) return error.AlreadyClosed;
+            var new_state = prev_state;
+            new_state.in_flight += 1;
+            prev_state = head.state.cmpxchgWeak(prev_state, new_state, .monotonic, .monotonic) orelse break;
+        }
+    }
 
-        // We won the swap, so we get to deregister.
+    /// Marks this as no longer in flight, and calls `deinitBody` if it's the
+    /// last thing in flight.
+    pub fn dropInFlight(head: *Head) void {
+        var prev_state = head.state.load(.monotonic);
+        const new_state = while (true) {
+            var new_state = prev_state;
+            new_state.in_flight -= 1;
+            prev_state = head.state.cmpxchgWeak(prev_state, new_state, .monotonic, .monotonic) orelse break new_state;
+        };
+
+        if (new_state.close_initiated and new_state.in_flight == 0) {
+            head.vtable.deinitBody(head); // This is the implementation of closing the capability.
+        }
+    }
+
+    /// Returns whether the caller is responsible for calling `deinitBody`.
+    pub fn markAsClosed(head: *Head) error{AlreadyClosed}!bool {
+        var prev_state = head.state.load(.monotonic);
+        const new_state = while (true) {
+            if (prev_state.close_initiated) return error.AlreadyClosed;
+            var new_state = prev_state;
+            new_state.close_initiated = true;
+            prev_state = head.state.cmpxchgWeak(prev_state, new_state, .monotonic, .monotonic) orelse break new_state;
+        };
+
+        return new_state.in_flight == 0;
+    }
+
+    /// Marks the capability as closing and removes from the registry.
+    pub fn close(head: *Head) void {
+        const deinit_needed = head.markAsClosed() catch return; // Closing is idempotent.
+        if (deinit_needed) head.vtable.deinitBody(head);
+
+        // We were the ones who marked it as closed, so we'll remove it
+        // from the registry.
         registry.deregister(head);
     }
 
-    pub fn isClosed(head: *const Head) bool {
-        return head.closed.load(.monotonic);
+    pub fn hasCloseBeenInitiated(head: *const Head) bool {
+        return head.state.load(.monotonic).close_initiated;
     }
 
     pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const head: *const Head = @ptrCast(@alignCast(info.node));
         const helper: objects.IterHelper = .{ .ctx = ctx, .info = info };
         try helper.addField([]const u8, "type", "{s}", .{std.mem.span(head.vtable.name)});
-        try helper.addField(bool, "closed", "{}", .{head.isClosed()});
+        try helper.addField(State, "state", "{any}", .{head.state.load(.monotonic)});
         try helper.addField(u32, "ref_count", "{}", .{head.ref_count.load(.monotonic)});
     }
 
@@ -198,7 +240,8 @@ pub const Head = extern struct {
         /// Path segment a string rep uses, such as "file-handle". NUL-terminated
         /// so the vtable is layout-compatible with C (see `Zicl_HeadVTable`).
         name: [*:0]const u8,
-        /// Deinits the underlying body. Runs exactly once, from `close`.
+        /// Deinits the underlying body. Runs exactly once, when the capability is closed
+        /// and no longer in use.
         deinitBody: *const fn (head: *Head) callconv(.c) void,
         /// This may be called much later than `deinitBody`, as closing the capability
         /// is not the same thing as freeing the entry and body.
@@ -286,15 +329,14 @@ pub fn deinitGlobals() void {
     registry.mutex.unlock(heap.global_io);
     registry = .{};
 
-    // Close and release whatever capabilities were left open. We do
+    // Close and drop whatever capabilities were left open. We do
     // this manually, since we can't deregister anything, since we've
     // swapped out the registry table.
     var iter = heads.valueIterator();
     while (iter.next()) |head_ptr| {
         const head = head_ptr.*;
-        if (head.closed.swap(true, .acq_rel) == false) {
-            head.vtable.deinitBody(head);
-        }
+        const deinit_needed = head.markAsClosed() catch false;
+        if (deinit_needed) head.vtable.deinitBody(head);
         head.dropReference();
     }
     heads.deinit(heap.global_gpa);

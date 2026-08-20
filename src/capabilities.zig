@@ -57,10 +57,9 @@ pub const File = struct {
         return try Capability.new(&cap_backing.head);
     }
 
-    pub fn writeAll(file: *File, bytes: []const u8) !void {
+    pub fn writeAll(backing: *Backing, bytes: []const u8) !void {
         var buffer: [1024]u8 = undefined;
-
-        var writer = std.Io.File.Writer.initStreaming(file.file, heap.global_io, &buffer);
+        var writer = std.Io.File.Writer.initStreaming(backing.file.file, heap.global_io, &buffer);
         writer.interface.writeAll(bytes) catch return writer.err.?;
         writer.flush() catch return writer.err.?;
     }
