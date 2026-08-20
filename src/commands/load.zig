@@ -66,17 +66,17 @@ pub fn loadLibrary(interp: *Interp, path: [:0]const u8) Interp.Error!void {
     };
 
     const registered = init_fn(interp) orelse return error.EvalError;
-    defer registered.asHead().release();
+    defer registered.asHead().dropReference();
 
     const dict = try objects.Dictionary.newWithCapacity(&.{}, registered.items.len / 2);
-    errdefer dict.asHead().release();
+    errdefer dict.asHead().dropReference();
 
     var i: usize = 0;
     while (i < registered.items.len) : (i += 2) {
         const clean_name = registered.items[i];
         const registry_name = registered.items[i + 1];
         const tagged = try objects.List.new(&.{ interned_nativefn, registry_name });
-        defer tagged.asHead().release();
+        defer tagged.asHead().dropReference();
         try dict.put(clean_name, tagged.asHead().asValue());
     }
 

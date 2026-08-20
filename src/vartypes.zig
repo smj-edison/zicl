@@ -30,18 +30,18 @@ pub const VariableSlot = union(enum) {
         call_frame: u32,
     };
 
-    pub fn borrow(slot: VariableSlot) VariableSlot {
+    pub fn takeReference(slot: VariableSlot) VariableSlot {
         switch (slot) {
-            .normal => |value| _ = value.borrow(),
-            .upvar => |link| _ = link.linked_name.borrow(),
+            .normal => |value| _ = value.takeReference(),
+            .upvar => |link| _ = link.linked_name.takeReference(),
         }
         return slot;
     }
 
-    pub fn release(slot: VariableSlot) void {
+    pub fn dropReference(slot: VariableSlot) void {
         switch (slot) {
-            .normal => |value| value.release(),
-            .upvar => |link| link.linked_name.release(),
+            .normal => |value| value.dropReference(),
+            .upvar => |link| link.linked_name.dropReference(),
         }
     }
 };
@@ -88,8 +88,8 @@ pub const VarTable = struct {
     }
 
     pub fn destroy(table: *VarTable) void {
-        for (table.map.keys()) |key| key.release();
-        for (table.map.values()) |slot| slot.release();
+        for (table.map.keys()) |key| key.dropReference();
+        for (table.map.values()) |slot| slot.dropReference();
         table.map.deinit(heap.global_gpa);
         heap.global_gpa.destroy(table);
     }
@@ -114,11 +114,11 @@ pub const VarTable = struct {
         try heap.hashutil.cacheQuickHash(name);
         const result = try table.map.getOrPut(heap.global_gpa, name);
         if (result.found_existing) {
-            result.value_ptr.release();
+            result.value_ptr.dropReference();
         } else {
-            result.key_ptr.* = name.borrow();
+            result.key_ptr.* = name.takeReference();
         }
-        result.value_ptr.* = slot.borrow();
+        result.value_ptr.* = slot.takeReference();
         return result.index;
     }
 
@@ -127,8 +127,8 @@ pub const VarTable = struct {
     pub fn remove(table: *VarTable, name: Value) error{OutOfMemory}!bool {
         try heap.hashutil.cacheQuickHash(name);
         const entry = table.map.fetchOrderedRemove(name) orelse return false;
-        entry.key.release();
-        entry.value.release();
+        entry.key.dropReference();
+        entry.value.dropReference();
         return true;
     }
 };
@@ -224,10 +224,10 @@ pub const DictSugar = struct {
 
         const start_at = std.mem.indexOf(u8, var_name, "::").?;
         const dict_name = try objects.String.newValue(var_name[0..start_at]);
-        errdefer dict_name.release();
+        errdefer dict_name.dropReference();
 
         var dict_path: *objects.List = try objects.List.new(&.{});
-        errdefer dict_path.asHead().release();
+        errdefer dict_path.asHead().dropReference();
 
         var last_path_start: ?usize = null;
         var i = start_at;
@@ -236,7 +236,7 @@ pub const DictSugar = struct {
                 if (last_path_start) |val| {
                     const path_section = var_name[val..i];
                     const path_section_value = try objects.String.newValue(path_section);
-                    defer path_section_value.release();
+                    defer path_section_value.dropReference();
                     try dict_path.append(path_section_value);
                 }
 
@@ -258,8 +258,8 @@ pub const DictSugar = struct {
             error.BadVariableName => unreachable,
         };
         const dict_sugar = maybe_dict_sugar.?;
-        errdefer dict_sugar.dict_name.release();
-        errdefer dict_sugar.dict_path.asHead().release();
+        errdefer dict_sugar.dict_name.dropReference();
+        errdefer dict_sugar.dict_path.asHead().dropReference();
 
         const as_dict_sugar = try name.prepareToShimmer(DictSugar);
         as_dict_sugar.* = .{
@@ -272,8 +272,8 @@ pub const DictSugar = struct {
 
     fn freeInternalRep(src: *Object) void {
         const as_dict_sugar = src.asType(DictSugar).?;
-        as_dict_sugar.dict_name.release();
-        as_dict_sugar.dict_path.asHead().release();
+        as_dict_sugar.dict_name.dropReference();
+        as_dict_sugar.dict_path.asHead().dropReference();
     }
 
     fn makeCrossthread(obj: *Object) void {
@@ -361,7 +361,7 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
         if (dict_shim.takeShimmered().asValue()) |new_dict| {
             const old_inner = letrec_scope.*;
             letrec_scope.* = new_dict.asType(Dictionary).?; // Shimmer writeback.
-            old_inner.asHead().release();
+            old_inner.asHead().dropReference();
         }
 
         if (in_linked_scope.asValue()) |val| {
@@ -377,7 +377,7 @@ fn resolveVariable(interp: *Interp, det: ?*ErrorDetails, var_call_frame: u32, va
         if (dict_shim.takeShimmered().asValue()) |new_dict| {
             const old_inner = scope.*;
             scope.* = new_dict.asType(Dictionary).?; // Shimmer writeback.
-            old_inner.asHead().release();
+            old_inner.asHead().dropReference();
         }
 
         if (in_linked_scope.asValue()) |val| {
@@ -515,14 +515,14 @@ pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
                     dict_mut.putRecursively(det, path, value) catch |err| return asLookupFailure(err);
                 } else {
                     const duped = existing_dict.duplicateAsType(Dictionary, det) catch |err| return asLookupFailure(err);
-                    defer duped.asHead().release();
+                    defer duped.asHead().dropReference();
                     duped.putRecursively(det, path, value) catch |err| return asLookupFailure(err);
                     try setVariable(interp, det, call_frame_idx, &dict_name, duped.asHead().asValue());
                 }
             } else {
                 // Create a new dictionary, since this variable doesn't exist.
                 const new_dict = try Dictionary.new(&.{});
-                defer new_dict.asHead().release();
+                defer new_dict.asHead().dropReference();
 
                 new_dict.putRecursively(det, path, value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -543,8 +543,8 @@ pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, na
                     },
                     .normal => {
                         const slot = local_var.getCurrentSlot();
-                        slot.release();
-                        slot.* = .{ .normal = value.borrow() };
+                        slot.dropReference();
+                        slot.* = .{ .normal = value.takeReference() };
                     },
                 }
             } else if (name.current().asType(CachedLexicalVar)) |_| {
@@ -652,7 +652,7 @@ pub fn setVariableUpvar(
     // Duplicated so the link is unaffected by whatever the caller's name object
     // later shimmers into.
     const target_name_duped = try target_name.duplicateAsBoxed();
-    defer target_name_duped.release();
+    defer target_name_duped.dropReference();
 
     const slot: VariableSlot = .{ .upvar = .{
         .call_frame = target_call_frame_idx,
@@ -699,7 +699,7 @@ pub fn unsetVariable(
                     };
                 } else {
                     const duped = try resolved_dict.duplicateAsType(Dictionary, det);
-                    defer duped.asHead().release();
+                    defer duped.asHead().dropReference();
                     const removed = duped.removeRecursively(null, path) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => false,
@@ -844,7 +844,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
     try testing.expect(null == try resolveVariable(&interp, null, 0, str_foo.current()));
 
     const str_value = try objects.String.newValue("value");
-    defer str_value.release();
+    defer str_value.dropReference();
     try setVariable(&interp, null, 0, &str_foo, str_value);
 
     const cached_lookup = (try resolveVariable(&interp, null, 0, str_foo.current())).?.local_variable;
@@ -852,7 +852,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
     try testing.expectEqualStrings("value", try cached_lookup_value.getString());
     // Also try resolving the value from a new string.
     const str2_foo = try objects.String.newValue("foo");
-    defer str2_foo.release();
+    defer str2_foo.dropReference();
     const lookup = (try resolveVariable(&interp, null, 0, str2_foo)).?.local_variable;
     const lookup_value = lookup.table_in.slotAt(lookup.index).normal;
     try testing.expectEqualStrings("value", try lookup_value.getString());
@@ -861,7 +861,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
     var str_foo_bar: Shimmerable = .{ .original = try objects.String.newValue("foo::bar") };
     defer str_foo_bar.deinit();
     const str_baz = try objects.String.newValue("baz");
-    defer str_baz.release();
+    defer str_baz.dropReference();
 
     // Make sure trying to read a dict value fails when it's not a dict.
     try expectErrorOrOom(error.LookupFailed, getVariable(&interp, null, 0, &str_foo_bar));
@@ -889,7 +889,7 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
 
     try testing.expect(null == try resolveVariable(&interp, null, 0, str_foo.current()));
     const str_value = try objects.String.newValue("value");
-    defer str_value.release();
+    defer str_value.dropReference();
     try setVariable(&interp, null, 0, &str_foo, str_value);
 
     var str_bar: Shimmerable = .{ .original = try objects.String.newValue("bar") };
@@ -902,7 +902,7 @@ fn testVariableLink(ta: std.mem.Allocator) !void {
 
     // Modify `foo` through `bar`.
     const str_new_value = try objects.String.newValue("new value");
-    defer str_new_value.release();
+    defer str_new_value.dropReference();
     try setVariable(&interp, null, 0, &str_bar, str_new_value);
     lookup_value = (try getVariable(&interp, null, 0, &str_foo)).?;
     try testing.expectEqualStrings("new value", try lookup_value.getString());

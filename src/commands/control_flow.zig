@@ -116,7 +116,7 @@ pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { forea
     }
 
     const result_list = if (mode == .map) try List.new(&.{}) else null;
-    errdefer if (result_list) |list| list.asHead().release();
+    errdefer if (result_list) |list| list.asHead().dropReference();
 
     outer: while (true) {
         // Continue only if any list still has unconsumed elements.
@@ -302,7 +302,7 @@ pub fn ifCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 fn commandMatch(interp: *Interp, command: Value, pattern: Value, string: Value) !bool {
     const script = try objects.List.new(&.{ command, pattern, string });
-    defer script.asHead().release();
+    defer script.asHead().dropReference();
     try interp.evalValue(script.asHead().asValue());
     return try interp.getBooleanInPlace(&interp.result);
 }
@@ -347,8 +347,8 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
     }
 
     // Value we're switching on.
-    const to_match_on = args[arg_index].current().borrow();
-    defer to_match_on.release();
+    const to_match_on = args[arg_index].current().takeReference();
+    defer to_match_on.dropReference();
     arg_index += 1;
     const to_match_on_bytes = try to_match_on.getString();
 
@@ -366,7 +366,7 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
 
     // We need to borrow `body_to_run`, since it may mutate under us when `commandMatch` is called.
     var body_to_run: ?Value = null;
-    defer if (body_to_run) |val| val.release();
+    defer if (body_to_run) |val| val.dropReference();
 
     // Go through each switch arm until we find one that matches.
     var arm_idx: usize = 0;
@@ -378,14 +378,14 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
             switch (match_type) {
                 .exact => {
                     if (try to_match_on.equals(switch_body[arm_idx].current())) {
-                        body_to_run = switch_body[arm_idx + 1].current().borrow();
+                        body_to_run = switch_body[arm_idx + 1].current().takeReference();
                         break;
                     }
                 },
                 .glob => {
                     const matches = strutil.globMatch(try switch_body[arm_idx].current().getString(), to_match_on_bytes, false);
                     if (matches) {
-                        body_to_run = switch_body[arm_idx + 1].current().borrow();
+                        body_to_run = switch_body[arm_idx + 1].current().takeReference();
                         break;
                     }
                 },
@@ -396,21 +396,21 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
 
                     const matches = try interp.wrapError(&det, regex.doesStringMatch(&det, regexp.regexp, to_match_on_bytes));
                     if (matches) {
-                        body_to_run = switch_body[arm_idx + 1].current().borrow();
+                        body_to_run = switch_body[arm_idx + 1].current().takeReference();
                         break; // Match!
                     } else continue;
                 },
                 .command => {
                     const matches = try commandMatch(interp, command_to_match.?, switch_body[arm_idx].current(), to_match_on);
                     if (matches) {
-                        body_to_run = switch_body[arm_idx + 1].current().borrow();
+                        body_to_run = switch_body[arm_idx + 1].current().takeReference();
                         break; // Match!
                     } else continue;
                 },
             }
         } else {
             // Truly the default.
-            body_to_run = switch_body[arm_idx + 1].current().borrow();
+            body_to_run = switch_body[arm_idx + 1].current().takeReference();
         }
     }
 
@@ -440,7 +440,7 @@ pub fn errorCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     if (args.len >= 3) {
         // Store the error code so [catch]/[try] can pick it up.
-        interp.pending_error_code.swap(args[2].current().borrow());
+        interp.pending_error_code.swap(args[2].current().takeReference());
     }
 
     return error.EvalError;
@@ -478,7 +478,7 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 i += 2;
             },
             .@"-errorcode" => {
-                interp.pending_error_code.swap(value.current().borrow());
+                interp.pending_error_code.swap(value.current().takeReference());
                 i += 2;
             },
         } else {

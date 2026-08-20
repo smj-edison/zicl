@@ -30,8 +30,8 @@ pub const Shimmerable = extern struct {
     shimmered: OptionalValue = .none,
 
     pub fn deinit(self: *Shimmerable) void {
-        self.original.release();
-        self.shimmered.release();
+        self.original.dropReference();
+        self.shimmered.dropReference();
         self.* = undefined;
     }
 
@@ -42,7 +42,7 @@ pub const Shimmerable = extern struct {
     pub fn consume(self: *Shimmerable) Value {
         defer self.* = undefined;
         if (self.shimmered.asValue()) |shimmered| {
-            self.original.release();
+            self.original.dropReference();
             return shimmered;
         } else {
             return self.original;
@@ -115,13 +115,13 @@ pub const Shimmerable = extern struct {
         // to that type.
         const duped = try shim.current().duplicate();
         if (duped.asType(T)) |val| return val; // Fast path: duplication returned the same object type.
-        defer duped.release();
+        defer duped.dropReference();
 
         var duped_shim: Shimmerable = .{ .original = duped };
         defer duped_shim.discardChanges();
         _ = try T.shimmerFrom(det, &duped_shim);
 
-        return duped_shim.current().borrow().asType(T).?;
+        return duped_shim.current().takeReference().asType(T).?;
     }
 
     pub fn getString(self: *const Shimmerable) ![:0]const u8 {
@@ -406,7 +406,7 @@ fn testString(ta: std.mem.Allocator) !void {
     defer heap.testFinish();
 
     const obj = try String.newObject("hello");
-    defer obj.release();
+    defer obj.dropReference();
     try testing.expectEqualStrings("hello", try obj.getString());
 }
 
@@ -425,7 +425,7 @@ pub const Source = extern struct {
         obj.vtable = &vtable;
         const as_source = obj.asType(Source).?;
         as_source.* = .{
-            .file_name = file_name.borrow(),
+            .file_name = file_name.takeReference(),
             .line_no = line,
             .hash = .init(null),
         };
@@ -439,7 +439,7 @@ pub const Source = extern struct {
         obj.vtable = &vtable;
         const as_source = obj.asType(Source).?;
         as_source.* = .{
-            .file_name = file_name.borrow(),
+            .file_name = file_name.takeReference(),
             .line_no = line,
             .hash = .init(null),
         };
@@ -475,7 +475,7 @@ pub const Source = extern struct {
 
         const cast_src = src.asTypeConst(Source).?;
         new_obj.body.* = .{
-            .file_name = cast_src.file_name.borrow(),
+            .file_name = cast_src.file_name.takeReference(),
             .line_no = cast_src.line_no,
             .hash = .init(null),
         };
@@ -485,7 +485,7 @@ pub const Source = extern struct {
 
     fn freeInternalRep(obj: *Object) void {
         const as_source = obj.asType(Source).?;
-        as_source.file_name.release();
+        as_source.file_name.dropReference();
         if (as_source.hash.load(.acquire)) |hash_ptr| heap.global_gpa.destroy(hash_ptr);
     }
 
@@ -516,7 +516,7 @@ pub const HashReference = struct {
 
     pub fn new(referent: *Object) !*HashReference {
         const new_obj = try Object.newObject(HashReference);
-        new_obj.body.* = .{ .ref = referent.borrow() };
+        new_obj.body.* = .{ .ref = referent.takeReference() };
         return new_obj.body;
     }
 
@@ -525,7 +525,7 @@ pub const HashReference = struct {
             return try new(obj);
         } else {
             const boxed = try value.raw.box();
-            errdefer boxed.release();
+            errdefer boxed.dropReference();
             return try new(boxed);
         }
     }
@@ -600,14 +600,14 @@ pub const HashReference = struct {
         try src.duplicateHeadOnto(new_obj.head);
         errdefer new_obj.head.invalidateString();
 
-        new_obj.body.ref = src.asTypeConst(HashReference).?.ref.borrow();
+        new_obj.body.ref = src.asTypeConst(HashReference).?.ref.takeReference();
 
         return new_obj.head;
     }
 
     fn freeInternalRep(obj: *Object) void {
         const as_hash_ref = obj.asType(HashReference).?;
-        as_hash_ref.ref.release();
+        as_hash_ref.ref.dropReference();
     }
 
     fn updateString(obj: *Object) !void {
@@ -1136,11 +1136,11 @@ test "tcl enum" {
     const MyTclEnum = EnumConstructor(MyEnum, true);
 
     var foo_str = try String.newValue("foo");
-    defer foo_str.release();
+    defer foo_str.dropReference();
     var one_str = try String.newValue("1");
-    defer one_str.release();
+    defer one_str.dropReference();
     var bad_str = try String.newValue("bad");
-    defer bad_str.release();
+    defer bad_str.dropReference();
 
     var working: Shimmerable = .{ .original = foo_str, .shimmered = .none };
     try testing.expectEqual(MyEnum.foo, MyTclEnum.get(null, &working));
@@ -1402,7 +1402,7 @@ pub const List = struct {
 
         const new_items = try heap.global_gpa.alloc(Value, capacity);
         for (items, new_items[0..items.len]) |item, *new_item| {
-            new_item.* = item.borrow();
+            new_item.* = item.takeReference();
         }
         new_list.body.items = new_items[0..items.len];
         new_list.body.capacity = capacity;
@@ -1418,7 +1418,7 @@ pub const List = struct {
 
         const new_items = try heap.global_gpa.alloc(Value, capacity);
         for (shims, new_items[0..shims.len]) |shim, *new_item| {
-            new_item.* = shim.current().borrow();
+            new_item.* = shim.current().takeReference();
         }
         new_list.body.items = new_items[0..shims.len];
         new_list.body.capacity = capacity;
@@ -1437,7 +1437,7 @@ pub const List = struct {
     }
 
     pub fn appendAssumeCapacity(list: *List, value: Value) void {
-        list.appendAssumeCapacityOwning(value.borrow());
+        list.appendAssumeCapacityOwning(value.takeReference());
     }
 
     pub fn appendAssumeCapacityOwning(list: *List, value: Value) void {
@@ -1452,7 +1452,7 @@ pub const List = struct {
     /// `list` must be mutable.
     pub fn set(list: *List, index: usize, value: Value) void {
         assert(list.asHead().canMutate());
-        list.items[index].swap(value.borrow());
+        list.items[index].swap(value.takeReference());
         list.asHead().invalidateString();
     }
 
@@ -1466,7 +1466,7 @@ pub const List = struct {
     /// the string rep.
     pub fn shimmerWriteback(list: *List, index: usize, value: Value) void {
         assert(!list.asHead().metadata.cross_thread);
-        list.items[index].swap(value.borrow());
+        list.items[index].swap(value.takeReference());
         // Don't invalidate the string, since string parsing isn't injective.
     }
 
@@ -1516,7 +1516,7 @@ pub const List = struct {
             list.asHead().invalidateString();
         } else {
             const child_mut = try child_shim.getMutable(List, det);
-            defer child_mut.asHead().release();
+            defer child_mut.asHead().dropReference();
             try child_mut.setRecursively(det, indexes[1..], value);
             list.set(index, child_mut.asHead().asValue());
         }
@@ -1567,7 +1567,7 @@ pub const List = struct {
 
         var new_items: std.ArrayList(Value) = .empty;
         errdefer {
-            for (new_items.items) |item| item.release();
+            for (new_items.items) |item| item.dropReference();
             new_items.deinit(heap.global_gpa);
         }
 
@@ -1580,10 +1580,10 @@ pub const List = struct {
                 .simple_string, .escaped_string => {
                     const token_value = bytes[next_token.loc.start..next_token.loc.end];
                     const source = if (next_token.tag == .escaped_string)
-                        try Source.newFromEscaped(token_value, file_name.borrow(), line_no)
+                        try Source.newFromEscaped(token_value, file_name.takeReference(), line_no)
                     else
-                        try Source.new(token_value, file_name.borrow(), line_no);
-                    errdefer source.asHead().release();
+                        try Source.new(token_value, file_name.takeReference(), line_no);
+                    errdefer source.asHead().dropReference();
 
                     try new_items.append(heap.global_gpa, source.asHead().asValue());
                 },
@@ -1622,7 +1622,7 @@ pub const List = struct {
 
         const new_items = try heap.global_gpa.alloc(Value, as_list.capacity);
         for (as_list.items, new_items[0..as_list.items.len]) |item, *new_item| {
-            new_item.* = item.borrow();
+            new_item.* = item.takeReference();
         }
         new_obj.body.items = new_items[0..as_list.items.len];
         new_obj.body.capacity = as_list.capacity;
@@ -1632,7 +1632,7 @@ pub const List = struct {
 
     fn freeInternalRep(obj: *Object) void {
         const as_list = obj.asType(List).?;
-        for (as_list.items) |item| item.release();
+        for (as_list.items) |item| item.dropReference();
         heap.global_gpa.free(as_list.items.ptr[0..as_list.capacity]);
     }
 
@@ -1673,17 +1673,17 @@ fn testLists(ta: std.mem.Allocator) !void {
 
     // Simple case: two objects in a list
     const obj1 = try String.newValue("object 1");
-    defer obj1.release();
+    defer obj1.dropReference();
     const obj2 = try String.newValue("object 2");
-    defer obj2.release();
+    defer obj2.dropReference();
     var list1 = try List.new(&.{ obj1, obj2 });
-    defer list1.asHead().release();
+    defer list1.asHead().dropReference();
 
     try testing.expectEqual(2, list1.items.len);
     try testing.expectEqualStrings("object 1", try list1.items[0].getString());
 
     const to_append = try String.newValue("appended item");
-    defer to_append.release();
+    defer to_append.dropReference();
 
     try list1.append(to_append);
     try testing.expectEqualStrings("appended item", try list1.items[2].getString());
@@ -1703,7 +1703,7 @@ fn testLists(ta: std.mem.Allocator) !void {
     // (same pointer) afterwards. `set`, by contrast, would free it.
     const int_val = Integer.new(5);
     var wb_list = try List.new(&.{int_val});
-    defer wb_list.asHead().release();
+    defer wb_list.asHead().dropReference();
     _ = try wb_list.asHead().getString();
     const cached_before = wb_list.asHead().maybeGetString().?;
     wb_list.shimmerWriteback(0, Integer.new(5));
@@ -1792,9 +1792,9 @@ pub const Dictionary = struct {
 
         const new_items = item_backing[0..items.len];
         for (items, new_items) |item, *new_item| {
-            new_item.* = item.borrow();
+            new_item.* = item.takeReference();
         }
-        errdefer for (new_items) |item| item.release();
+        errdefer for (new_items) |item| item.dropReference();
 
         new_dict.body.* = .{
             .items = new_items,
@@ -1901,7 +1901,7 @@ pub const Dictionary = struct {
         // to have a precomputed hash.
         try heap.hashutil.cacheQuickHash(key);
         const value_index = dict.table.get(key).?; // Key is replaced in place, so it must exist.
-        dict.items[value_index].swap(value.borrow());
+        dict.items[value_index].swap(value.takeReference());
 
         // Note, we don't invalidate the string or remove duplicates here, since
         // this is a completely transparent operation as far as the user is concerned.
@@ -1920,7 +1920,7 @@ pub const Dictionary = struct {
         try heap.hashutil.cacheQuickHash(key);
         if (dict.table.get(key)) |existing_value_index| {
             // Key exists, so replace the value in place.
-            dict.items[existing_value_index].swap(value.borrow());
+            dict.items[existing_value_index].swap(value.takeReference());
 
             dict.asHead().invalidateString();
             const shifted_index = removeDuplicates(dict, existing_value_index).?;
@@ -1938,8 +1938,8 @@ pub const Dictionary = struct {
 
             // Expand the items slice to include the new items we made room for.
             dict.items = dict.backingSlice()[0..(old_len + 2)];
-            dict.items[new_key_index] = key.borrow();
-            dict.items[new_value_index] = value.borrow();
+            dict.items[new_key_index] = key.takeReference();
+            dict.items[new_value_index] = value.takeReference();
 
             dict.asHead().invalidateString();
             const shifted_index = removeDuplicates(dict, new_value_index);
@@ -2020,8 +2020,8 @@ pub const Dictionary = struct {
         var item_index: usize = 0;
         while (item_index < original_len) : (item_index += 2) {
             if (dict.items[item_index].equals(key) catch unreachable) {
-                dict.items[item_index].release();
-                dict.items[item_index + 1].release();
+                dict.items[item_index].dropReference();
+                dict.items[item_index + 1].dropReference();
                 pairs_removed += 1;
             } else if (pairs_removed > 0) {
                 // Be sure to shift items back after we've removed one or more pairs.
@@ -2072,8 +2072,8 @@ pub const Dictionary = struct {
             const value = dict.items[item_index + 1];
             if (dict.table.contains(key)) {
                 // A later pair already claimed this key.
-                key.release();
-                value.release();
+                key.dropReference();
+                value.dropReference();
             } else {
                 // Canonical. Build the kept region back-to-front.
                 new_len += 2;
@@ -2155,7 +2155,7 @@ pub const Dictionary = struct {
         // Duplicating the parent rather than taking `deeper` keeps the parent's
         // own `~parent`, which is what leaves the rest of the chain linked.
         const to_add_to = deeper orelse (try parent_shim.current().duplicate()).asType(Dictionary).?;
-        errdefer to_add_to.asHead().release();
+        errdefer to_add_to.asHead().dropReference();
 
         var pair_index: u32 = 0;
         while (pair_index < dict.items.len) : (pair_index += 2) {
@@ -2246,7 +2246,7 @@ pub const Dictionary = struct {
             } else {
                 // Create a new child dictionary.
                 const new_child_dict = (try new(&.{})).asHead().asValue();
-                defer new_child_dict.release();
+                defer new_child_dict.dropReference();
 
                 try dict.put(context.get(0), new_child_dict);
                 break :blk new_child_dict;
@@ -2263,7 +2263,7 @@ pub const Dictionary = struct {
             dict.asHead().invalidateString();
         } else {
             const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
-            defer child_dict_mut.asHead().release();
+            defer child_dict_mut.asHead().dropReference();
             try child_dict_mut.putRecursively(det, context.sliceAfter(1), value);
             try dict.put(context.get(0), child_dict_mut.asHead().asValue());
         }
@@ -2286,7 +2286,7 @@ pub const Dictionary = struct {
                     break :blk try as_dict.removeRecursively(det, context.sliceAfter(1));
                 } else {
                     const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
-                    defer child_dict_mut.asHead().release();
+                    defer child_dict_mut.asHead().dropReference();
                     const did_remove = try child_dict_mut.removeRecursively(det, context.sliceAfter(1));
                     try dict.put(context.get(0), child_dict_mut.asHead().asValue());
                     break :blk did_remove;
@@ -2317,8 +2317,8 @@ pub const Dictionary = struct {
         }, true),
 
         pub fn deinit(result: *KvResult, arena: std.mem.Allocator) void {
-            for (result.mapping.keys()) |key| key.release();
-            for (result.mapping.values()) |value| value.release();
+            for (result.mapping.keys()) |key| key.dropReference();
+            for (result.mapping.values()) |value| value.dropReference();
             result.mapping.deinit(arena);
         }
     };
@@ -2355,7 +2355,7 @@ pub const Dictionary = struct {
 
             if (parent_shim.shimmered.asValue()) |new_parent| {
                 const new_hash_ref = try HashReference.newFromValue(new_parent);
-                errdefer new_hash_ref.asHead().release();
+                errdefer new_hash_ref.asHead().dropReference();
                 try shim.ensureShimmerable();
                 const as_shimmerable = shim.current().asType(Dictionary).?;
                 try as_shimmerable.shimmerWriteback(interned_tilde_parent, new_hash_ref.asHead().asValue());
@@ -2370,8 +2370,8 @@ pub const Dictionary = struct {
 
             const gop = try result.mapping.getOrPut(arena, key);
             if (!gop.found_existing) {
-                gop.key_ptr.* = key.borrow();
-                gop.value_ptr.* = value.borrow();
+                gop.key_ptr.* = key.takeReference();
+                gop.value_ptr.* = value.takeReference();
             }
         }
     }
@@ -2388,9 +2388,9 @@ pub const Dictionary = struct {
 
         const new_items = item_backing[0..as_dict.items.len];
         for (as_dict.items, new_items) |item, *new_item| {
-            new_item.* = item.borrow();
+            new_item.* = item.takeReference();
         }
-        errdefer for (new_items) |item| item.release();
+        errdefer for (new_items) |item| item.dropReference();
 
         new_obj.body.* = .{
             .items = new_items,
@@ -2403,7 +2403,7 @@ pub const Dictionary = struct {
 
     fn freeInternalRep(obj: *Object) void {
         const as_dict = obj.asType(Dictionary).?;
-        for (as_dict.items) |item| item.release();
+        for (as_dict.items) |item| item.dropReference();
         heap.global_gpa.free(as_dict.backingSlice());
         as_dict.table.deinit(heap.global_gpa);
     }
@@ -2443,21 +2443,21 @@ fn testDicts(ta: std.mem.Allocator) !void {
     var det: ErrorDetails = undefined;
 
     const key_foo = try String.newValue("foo");
-    defer key_foo.release();
+    defer key_foo.dropReference();
     const value1 = try String.newValue("1");
-    defer value1.release();
+    defer value1.dropReference();
     const key_bar = try String.newValue("bar");
-    defer key_bar.release();
+    defer key_bar.dropReference();
     const value2 = try String.newValue("2");
-    defer value2.release();
+    defer value2.dropReference();
 
     const dict1 = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
-    defer dict1.asHead().release();
+    defer dict1.asHead().dropReference();
 
     const good_key = try String.newValue("foo");
-    defer good_key.release();
+    defer good_key.dropReference();
     const bad_key = try String.newValue("bogus");
-    defer bad_key.release();
+    defer bad_key.dropReference();
 
     try testing.expectEqualStrings("1", try (try dict1.getNoFollow(good_key)).asValue().?.getString());
     try testing.expectEqual(.none, (try dict1.getNoFollow(bad_key)).raw.tag);
@@ -2476,11 +2476,11 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     // Dict put.
     const dict_for_put = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
-    defer dict_for_put.asHead().release();
+    defer dict_for_put.asHead().dropReference();
     const key3 = try String.newValue("baz");
-    defer key3.release();
+    defer key3.dropReference();
     const value3 = try String.newValue("3");
-    defer value3.release();
+    defer value3.dropReference();
 
     try testing.expectEqual(2, dict_for_put.items.len / 2);
     // Replace an existing key's value; pair count stays the same.
@@ -2502,7 +2502,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     // Edge cases: using internal objects as keys and values.
     const dict_edge_cases = try Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
-    defer dict_edge_cases.asHead().release();
+    defer dict_edge_cases.asHead().dropReference();
 
     // Use a value as a key, and a key as the value.
     try dict_edge_cases.put(dict_edge_cases.items[1], dict_edge_cases.items[2]);
@@ -2526,25 +2526,25 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
     defer heap.testFinish();
 
     const key_foo = try String.newValue("foo");
-    defer key_foo.release();
+    defer key_foo.dropReference();
     const key_bar = try String.newValue("bar");
-    defer key_bar.release();
+    defer key_bar.dropReference();
     const key_baz = try String.newValue("baz");
-    defer key_baz.release();
+    defer key_baz.dropReference();
     const key_qux = try String.newValue("qux");
-    defer key_qux.release();
+    defer key_qux.dropReference();
     const bad_key = try String.newValue("bogus");
-    defer bad_key.release();
+    defer bad_key.dropReference();
     const value2 = try String.newValue("2");
-    defer value2.release();
+    defer value2.dropReference();
     const value3 = try String.newValue("3");
-    defer value3.release();
+    defer value3.dropReference();
 
     // Build {foo {bar 2}} as a nested dict.
     const inner_dict = try Dictionary.new(&.{ key_bar, value2 });
-    defer inner_dict.asHead().release();
+    defer inner_dict.asHead().dropReference();
     const outer_dict = try Dictionary.new(&.{ key_foo, inner_dict.asHead().asValue() });
-    defer outer_dict.asHead().release();
+    defer outer_dict.asHead().dropReference();
     var outer_shim: Shimmerable = .{ .original = outer_dict.asHead().asValue() };
     defer outer_shim.discardChanges();
 

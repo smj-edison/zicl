@@ -365,7 +365,7 @@ pub const Parser = struct {
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
                 const str = try objects.String.newValue(p.source[loc.start..loc.end]);
-                errdefer str.release();
+                errdefer str.dropReference();
 
                 return try p.addNode(.{
                     .tag = .value,
@@ -375,7 +375,7 @@ pub const Parser = struct {
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
                 const str = try objects.String.newFromEscaped(p.source[loc.start..loc.end]);
-                errdefer str.asHead().release();
+                errdefer str.asHead().dropReference();
 
                 return try p.addNode(.{
                     .tag = .value,
@@ -389,7 +389,7 @@ pub const Parser = struct {
                     p.source_file_name,
                     loc.line_no,
                 )).asHead();
-                errdefer command_obj.release();
+                errdefer command_obj.dropReference();
 
                 return try p.addNode(.{
                     .tag = .command_subst,
@@ -399,7 +399,7 @@ pub const Parser = struct {
             .variable_subst => {
                 const loc = p.tokenLoc(p.nextToken());
                 var string_handle = try objects.String.newValue(p.source[loc.start..loc.end]);
-                errdefer string_handle.release();
+                errdefer string_handle.dropReference();
 
                 return try p.addNode(.{
                     .tag = .variable_subst,
@@ -550,7 +550,7 @@ pub const Parser = struct {
 
     pub fn deinit(p: *Parser) void {
         for (p.nodes.items) |node| switch (node.tag) {
-            .variable_subst, .command_subst, .value => node.data.value.release(),
+            .variable_subst, .command_subst, .value => node.data.value.dropReference(),
             else => {},
         };
         p.nodes.deinit(p.gpa);
@@ -795,7 +795,7 @@ pub const Parsed = struct {
 
     pub fn deinit(parsed: *Parsed, gpa: std.mem.Allocator) void {
         for (parsed.nodes) |node| switch (node.tag) {
-            .variable_subst, .command_subst, .value => node.data.value.release(),
+            .variable_subst, .command_subst, .value => node.data.value.dropReference(),
             else => {},
         };
         gpa.free(parsed.nodes);

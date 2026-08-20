@@ -197,7 +197,7 @@ fn resolveHandle(interp: *Interp, name: []const u8) Interp.Error!File {
     // Shimmered through a temporary, because the name may be a slice out of the
     // middle of a word (`>@<zicl://...>`) rather than a word of its own.
     const named = try objects.String.newValue(name);
-    defer named.release();
+    defer named.dropReference();
     var shim: Shimmerable = .{ .original = named };
     defer shim.discardChanges();
 
@@ -894,9 +894,9 @@ fn reportResult(interp: *Interp, pipeline: Pipeline, collected: *const Collected
 /// it instead, rendering a killed stage as 128 plus its signal as a shell does.
 fn reportSplitResult(interp: *Interp, collected: *const Collected) Interp.Error!void {
     const out_value = try objects.String.newValue(withoutTrailingNewline(collected.stdout));
-    defer out_value.release();
+    defer out_value.dropReference();
     const err_value = try objects.String.newValue(withoutTrailingNewline(collected.stderr));
-    defer err_value.release();
+    defer err_value.dropReference();
 
     const code: i64 = switch (collected.term) {
         .exited => |exit_code| exit_code,
@@ -1324,8 +1324,8 @@ test "closing a background pipeline reaps it" {
 
     // Closing has to end a child that is still running. Without the kill this
     // would block for the sleep.
-    const cap = (try interp.testRunScript("set p [exec " ++ sh_path ++ " -c {sleep 30} &]")).borrow();
-    defer cap.release();
+    const cap = (try interp.testRunScript("set p [exec " ++ sh_path ++ " -c {sleep 30} &]")).takeReference();
+    defer cap.dropReference();
     try interp.testExpectScriptResult("", "close $p");
 
     // The name stops resolving once closed, so [wait] reports it as unknown

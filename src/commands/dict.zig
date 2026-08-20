@@ -28,7 +28,7 @@ fn dictAppendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: [
         try buf.appendSlice(heap.global_gpa, try value_shim.current().getString());
     }
     const new_str = try String.newOwning(try buf.toOwnedSliceSentinel(heap.global_gpa, 0));
-    defer new_str.asHead().release();
+    defer new_str.asHead().dropReference();
     try dict_mut.put(key, new_str.asHead().asValue());
 }
 
@@ -40,13 +40,13 @@ fn dictLappendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: 
             dict_mut.asHead().invalidateString();
         } else {
             const list_mut = try interp.duplicateAsType(List, existing);
-            defer list_mut.asHead().release();
+            defer list_mut.asHead().dropReference();
             for (pieces) |*value_shim| try list_mut.append(value_shim.current());
             try dict_mut.put(key, list_mut.asHead().asValue());
         }
     } else {
         const list_mut = try List.newFromShimmerables(pieces);
-        defer list_mut.asHead().release();
+        defer list_mut.asHead().dropReference();
         try dict_mut.put(key, list_mut.asHead().asValue());
     }
 }
@@ -118,7 +118,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const pairs = args[2..];
             if (@mod(pairs.len, 2) != 0) return error.WrongUsage;
             const new_dict = try Dictionary.newWithCapacity(&.{}, pairs.len);
-            errdefer new_dict.asHead().release();
+            errdefer new_dict.asHead().dropReference();
             var arg_i: usize = 2;
             while (arg_i < args.len) : (arg_i += 2) try new_dict.put(args[arg_i].current(), args[arg_i + 1].current());
             interp.setResultOwning(new_dict.asHead().asValue());
@@ -152,7 +152,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 }
             } else {
                 const new_dict = try objects.Dictionary.newWithCapacity(&.{}, 4);
-                defer new_dict.asHead().release();
+                defer new_dict.asHead().dropReference();
                 try interp.putDictValueRecursively(new_dict, key_context, value);
                 try interp.setVariable(var_name, new_dict.asHead().asValue());
             }
@@ -174,7 +174,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 }
             } else {
                 const new_dict = try objects.Dictionary.new(&.{});
-                defer new_dict.asHead().release();
+                defer new_dict.asHead().dropReference();
                 try interp.setVariable(var_name, new_dict.asHead().asValue());
             }
         },
@@ -215,7 +215,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             }
 
             var result = try Dictionary.new(&.{});
-            errdefer result.asHead().release();
+            errdefer result.asHead().dropReference();
 
             for (dicts) |*dict| {
                 const as_dict: *const Dictionary = try interp.wrapError(&det, Dictionary.shimmerFrom(&det, dict));
@@ -233,10 +233,10 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const dict = &args[3];
 
             const dict_mut: *Dictionary = try interp.wrapError(&det, dict.getMutable(Dictionary, &det));
-            errdefer dict_mut.asHead().release();
+            errdefer dict_mut.asHead().dropReference();
 
             const hash_ref = try objects.HashReference.newFromValue(referent.current());
-            defer hash_ref.asHead().release();
+            defer hash_ref.asHead().dropReference();
             try dict_mut.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
 
             interp.setResultOwning(dict_mut.asHead().asValue());
@@ -260,7 +260,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .remove => {
             const dict = &args[2];
             const dict_mut: *Dictionary = try interp.wrapError(&det, dict.getMutable(Dictionary, &det));
-            errdefer dict_mut.asHead().release();
+            errdefer dict_mut.asHead().dropReference();
 
             for (args[3..]) |*key_shim| {
                 _ = try interp.wrapError(&det, dict_mut.remove(&det, key_shim.current()));
@@ -274,7 +274,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if (@mod(pairs.len, 2) != 0) return error.WrongUsage;
 
             const dict_mut: *Dictionary = try interp.wrapError(&det, dict.getMutable(Dictionary, &det));
-            errdefer dict_mut.asHead().release();
+            errdefer dict_mut.asHead().dropReference();
 
             var idx: usize = 0;
             while (idx < pairs.len) : (idx += 2) {
@@ -295,14 +295,14 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     interp.setResult(dict_mut.asHead().asValue());
                 } else {
                     const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
-                    defer dict_mut.asHead().release();
+                    defer dict_mut.asHead().dropReference();
                     try dictAppendValue(interp, dict_mut, key, pieces);
                     try interp.setVariable(var_name, dict_mut.asHead().asValue());
                     interp.setResult(dict_mut.asHead().asValue());
                 }
             } else {
                 const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
-                defer dict_mut.asHead().release();
+                defer dict_mut.asHead().dropReference();
                 try dictAppendValue(interp, dict_mut, key, pieces);
                 try interp.setVariable(var_name, dict_mut.asHead().asValue());
                 interp.setResult(dict_mut.asHead().asValue());
@@ -319,14 +319,14 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     interp.setResult(dict_mut.asHead().asValue());
                 } else {
                     const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
-                    defer dict_mut.asHead().release();
+                    defer dict_mut.asHead().dropReference();
                     try dictLappendValue(interp, dict_mut, key, pieces);
                     try interp.setVariable(var_name, dict_mut.asHead().asValue());
                     interp.setResult(dict_mut.asHead().asValue());
                 }
             } else {
                 const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
-                defer dict_mut.asHead().release();
+                defer dict_mut.asHead().dropReference();
                 try dictLappendValue(interp, dict_mut, key, pieces);
                 try interp.setVariable(var_name, dict_mut.asHead().asValue());
                 interp.setResult(dict_mut.asHead().asValue());
@@ -343,14 +343,14 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     interp.setResult(dict_mut.asHead().asValue());
                 } else {
                     const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
-                    defer dict_mut.asHead().release();
+                    defer dict_mut.asHead().dropReference();
                     try dictIncrValue(interp, dict_mut, key, increment);
                     try interp.setVariable(var_name, dict_mut.asHead().asValue());
                     interp.setResult(dict_mut.asHead().asValue());
                 }
             } else {
                 const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
-                defer dict_mut.asHead().release();
+                defer dict_mut.asHead().dropReference();
                 try dictIncrValue(interp, dict_mut, key, increment);
                 try interp.setVariable(var_name, dict_mut.asHead().asValue());
                 interp.setResult(dict_mut.asHead().asValue());
@@ -511,32 +511,32 @@ fn testDictKeys(ta: std.mem.Allocator) !void {
     try interp.testExpectScriptResult("a", "dict keys {a 1 b 2} a*");
 
     const foo_str = try String.newValue("foo");
-    defer foo_str.release();
+    defer foo_str.dropReference();
     const bar_str = try String.newValue("bar");
-    defer bar_str.release();
+    defer bar_str.dropReference();
     const baz_str = try String.newValue("baz");
-    defer baz_str.release();
+    defer baz_str.dropReference();
     const one_str = try String.newValue("1");
-    defer one_str.release();
+    defer one_str.dropReference();
     const two_str = try String.newValue("2");
-    defer two_str.release();
+    defer two_str.dropReference();
     const three_str = try String.newValue("3");
-    defer three_str.release();
+    defer three_str.dropReference();
     const four_str = try String.newValue("4");
-    defer four_str.release();
+    defer four_str.dropReference();
 
     // Parent links: parent keys first, then child keys not already present.
     const parent = try objects.Dictionary.new(&.{ foo_str, one_str, bar_str, two_str });
-    defer parent.asHead().release();
+    defer parent.asHead().dropReference();
 
     var child = try objects.Dictionary.new(&.{
         foo_str, three_str,
         baz_str, four_str,
     });
-    defer child.asHead().release();
+    defer child.asHead().dropReference();
 
     var hash_ref = try objects.HashReference.new(parent.asHead());
-    defer hash_ref.asHead().release();
+    defer hash_ref.asHead().dropReference();
     try child.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
 
     {
@@ -561,10 +561,10 @@ test "dict keys" {
 fn linkedDict(parent: *objects.Dictionary, key: heap.Value, value: heap.Value) !*objects.Dictionary {
     _ = try parent.asHead().getHashRegistering();
     const hash_ref = try objects.HashReference.new(parent.asHead());
-    defer hash_ref.asHead().release();
+    defer hash_ref.asHead().dropReference();
 
     const child = try objects.Dictionary.new(&.{ key, value });
-    errdefer child.asHead().release();
+    errdefer child.asHead().dropReference();
     try child.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
     return child;
 }
@@ -583,11 +583,11 @@ fn testPartialFlatten(ta: std.mem.Allocator) !void {
     // Removing `a` from 3 has to absorb 2, which also holds `a`, but must leave
     // 1 linked since nothing there shadows `a`.
     const gp = try objects.Dictionary.new(&.{ c, objects.Integer.new(30) });
-    defer gp.asHead().release();
+    defer gp.asHead().dropReference();
     const parent = try linkedDict(gp, a, objects.Integer.new(20));
-    defer parent.asHead().release();
+    defer parent.asHead().dropReference();
     const child = try linkedDict(parent, a, objects.Integer.new(10));
-    defer child.asHead().release();
+    defer child.asHead().dropReference();
 
     var det: ErrorDetails = undefined;
     try std.testing.expect(try child.remove(&det, a));

@@ -62,7 +62,7 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
 
         break :blk try String.newOwningNoFree(new_bytes);
     };
-    defer combined_str.asHead().release();
+    defer combined_str.asHead().dropReference();
 
     try interp.setVariable(var_name, combined_str.asHead().asValue());
     interp.setResult(combined_str.asHead().asValue());

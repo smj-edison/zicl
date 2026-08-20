@@ -37,14 +37,14 @@ pub fn lappendCmd(interp: *Interp, args: []Shimmerable) !void {
             interp.setResult(list_mut.asHead().asValue());
         } else {
             const list_mut: *List = try interp.wrapError(&det, var_value.duplicateAsType(List, &det));
-            defer list_mut.asHead().release();
+            defer list_mut.asHead().dropReference();
             for (args[2..]) |item| try list_mut.append(item.current());
             try interp.setVariable(&args[1], list_mut.asHead().asValue());
             interp.setResult(list_mut.asHead().asValue());
         }
     } else {
         const list = (try List.newFromShimmerables(args[2..])).asHead().asValue();
-        defer list.release();
+        defer list.dropReference();
         try interp.setVariable(&args[1], list);
         interp.setResult(list);
     }
@@ -120,7 +120,7 @@ pub fn concatCmd(interp: *Interp, args: []Shimmerable) !void {
         for (to_concat) |arg| total += arg.current().asType(List).?.items.len;
 
         const result = try List.newWithCapacity(&.{}, total);
-        errdefer result.asHead().release();
+        errdefer result.asHead().dropReference();
         for (to_concat) |arg| {
             for (arg.current().asType(List).?.items) |item| result.appendAssumeCapacity(item);
         }
@@ -195,7 +195,7 @@ pub fn lreplaceCmd(interp: *Interp, args: []Shimmerable) !void {
     const new_elements = args[4..];
     const total = first + new_elements.len + (len - delete_end);
     const result = try List.newWithCapacity(&.{}, total);
-    errdefer result.asHead().release();
+    errdefer result.asHead().dropReference();
 
     for (as_list.items[0..first]) |item| result.appendAssumeCapacity(item);
     for (new_elements) |elem| result.appendAssumeCapacity(elem.current());
@@ -226,7 +226,7 @@ pub fn linsertCmd(interp: *Interp, args: []Shimmerable) !void {
     const new_elements = args[3..];
     const total = len + new_elements.len;
     const result = try List.newWithCapacity(&.{}, total);
-    errdefer result.asHead().release();
+    errdefer result.asHead().dropReference();
 
     for (as_list.items[0..insert_at]) |item| result.appendAssumeCapacity(item);
     for (new_elements) |elem| result.appendAssumeCapacity(elem.current());
@@ -250,7 +250,7 @@ pub fn lrepeatCmd(interp: *Interp, args: []Shimmerable) !void {
     const total_raw = std.math.mulWide(usize, count, elements.len);
     const total = std.math.cast(usize, total_raw) orelse return interp.integerOverflowError(u128, total_raw);
     const result = try List.newWithCapacity(&.{}, total);
-    errdefer result.asHead().release();
+    errdefer result.asHead().dropReference();
 
     for (0..count) |_| {
         for (elements) |elem| result.appendAssumeCapacity(elem.current());

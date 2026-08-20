@@ -198,11 +198,11 @@ export fn Zicl_GetString(value: Value, len: ?*c_int) callconv(.c) ?[*:0]const u8
 // See the header docs for how these behave on primitives.
 
 export fn Zicl_Release(value: Value) callconv(.c) void {
-    value.release();
+    value.dropReference();
 }
 
 export fn Zicl_Borrow(value: Value) callconv(.c) Value {
-    return value.borrow();
+    return value.takeReference();
 }
 
 export fn Zicl_Duplicate(value: Value, out: *Value) callconv(.c) ReturnCode {
@@ -212,7 +212,7 @@ export fn Zicl_Duplicate(value: Value, out: *Value) callconv(.c) ReturnCode {
 
 export fn Zicl_ReleaseArrayItems(argv: [*]Value, argc: c_int) callconv(.c) void {
     const count: usize = @intCast(argc);
-    for (argv[0..count]) |v| v.release();
+    for (argv[0..count]) |v| v.dropReference();
 }
 
 export fn Zicl_AsPtr(value: Value) callconv(.c) ?*heap.Object {
@@ -462,7 +462,7 @@ export fn Zicl_BoxList(list: *List) callconv(.c) Value {
 }
 
 export fn Zicl_ReleaseList(list: *List) callconv(.c) void {
-    list.asHead().release();
+    list.asHead().dropReference();
 }
 
 export fn Zicl_BorrowList(list: *List) callconv(.c) *List {
@@ -571,7 +571,7 @@ export fn Zicl_BoxDict(dict: *Dictionary) callconv(.c) Value {
 }
 
 export fn Zicl_ReleaseDict(dict: *Dictionary) callconv(.c) void {
-    dict.asHead().release();
+    dict.asHead().dropReference();
 }
 
 export fn Zicl_BorrowDict(dict: *Dictionary) callconv(.c) *Dictionary {
@@ -651,7 +651,7 @@ export fn Zicl_DictShimmerWriteback(dict: *Dictionary, key: Value, value: Value)
 /// borrowed, and boxed first if it is a primitive. Returns NULL on OOM.
 export fn Zicl_DictLink(dict: *const Dictionary, parent: Value) callconv(.c) ?*Dictionary {
     const hash_ref = objects.HashReference.newFromValue(parent) catch return null;
-    defer hash_ref.asHead().release();
+    defer hash_ref.asHead().dropReference();
 
     const items = heap.global_gpa.alloc(Value, dict.items.len + 2) catch return null;
     defer heap.global_gpa.free(items);
@@ -689,7 +689,7 @@ export fn Zicl_BoxSource(source: *objects.Source) callconv(.c) Value {
 }
 
 export fn Zicl_ReleaseSource(source: *objects.Source) callconv(.c) void {
-    source.asHead().release();
+    source.asHead().dropReference();
 }
 
 export fn Zicl_BorrowSource(source: *objects.Source) callconv(.c) *objects.Source {
@@ -714,7 +714,7 @@ export fn Zicl_AttachSource(value: *Value, filename: [*:0]const u8, line_no: c_i
     const file_name = objects.String.newValue(std.mem.span(filename)) catch return .oom;
     // `Source.new` borrows `file_name`, so the constructing reference is ours
     // to release either way.
-    defer file_name.release();
+    defer file_name.dropReference();
 
     const source = objects.Source.new(bytes, file_name.asOptional(), @intCast(line_no)) catch return .oom;
     value.swap(source.asHead().asValue());
@@ -755,7 +755,7 @@ export fn Zicl_EvalValue(interp: *Interp, script: Value) callconv(.c) ReturnCode
 
 export fn Zicl_Eval(interp: *Interp, script: [*:0]const u8) callconv(.c) ReturnCode {
     const script_value = objects.String.newValue(std.mem.span(script)) catch return .oom;
-    defer script_value.release();
+    defer script_value.dropReference();
     return Zicl_EvalValue(interp, script_value);
 }
 
@@ -784,7 +784,7 @@ export fn Zicl_GetClosure(interp: *Interp, closure_value: Value, out: *?*Closure
     const closure_and_key = interp.getClosure(closure_value, false) catch |err| return ReturnCode.fromError(err);
 
     const handle = heap.global_gpa.create(ClosureHandle) catch {
-        closure_and_key.closure.asHead().release();
+        closure_and_key.closure.asHead().dropReference();
         return .oom;
     };
     handle.* = closure_and_key;
@@ -795,7 +795,7 @@ export fn Zicl_GetClosure(interp: *Interp, closure_value: Value, out: *?*Closure
 
 /// Release a handle obtained from Zicl_GetClosure.
 export fn Zicl_ReleaseClosure(closure: *ClosureHandle) callconv(.c) void {
-    closure.closure.asHead().release();
+    closure.closure.asHead().dropReference();
     heap.global_gpa.destroy(closure);
 }
 
@@ -922,7 +922,7 @@ export fn Zicl_SetVariableString(interp: *Interp, name: [*:0]const u8, value: Va
 
 export fn Zicl_MakeErrorMessage(interp: *Interp) callconv(.c) ReturnCode {
     // The stack is a flat list: {name file line args ...} repeated.
-    var stack_shim: Shimmerable = .{ .original = interp.stack_trace.orEmpty().borrow() };
+    var stack_shim: Shimmerable = .{ .original = interp.stack_trace.orEmpty().takeReference() };
     defer stack_shim.deinit();
     const as_list = interp.getList(&stack_shim) catch |err| return ReturnCode.fromError(err);
 
@@ -1057,11 +1057,11 @@ export fn Zicl_PointerCapabilityTypeName(value: Value) callconv(.c) ?[*:0]const 
 }
 
 export fn Zicl_HeadBorrow(head: *Capability.Head) callconv(.c) *Capability.Head {
-    return head.borrow();
+    return head.takeReference();
 }
 
 export fn Zicl_HeadRelease(head: *Capability.Head) callconv(.c) void {
-    head.release();
+    head.dropReference();
 }
 
 export fn Zicl_HeadClose(head: *Capability.Head) callconv(.c) void {

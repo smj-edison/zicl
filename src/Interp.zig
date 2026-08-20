@@ -226,9 +226,9 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
     defer heap.global_gpa.free(as_nativefn);
 
     var var_name = try String.newValue(name);
-    defer var_name.release();
+    defer var_name.dropReference();
     const var_value = try String.newValue(as_nativefn);
-    defer var_value.release();
+    defer var_value.dropReference();
 
     var var_name_wb: Shimmerable = .{ .original = var_name };
     defer var_name_wb.discardChanges();
@@ -290,7 +290,7 @@ pub fn callClosure(
         if (signature_idx == arg_names.len - 1 and closure.has_args_parameter) {
             // Assign remaining arguments to `args`.
             const list = try List.newWithCapacity(&.{}, args.len - called_idx);
-            defer list.asHead().release();
+            defer list.asHead().dropReference();
             for (args[called_idx..]) |arg| list.appendAssumeCapacity(arg.current());
 
             try interp.setVariableInFrame(call_frame_idx, &var_name, list.asHead().asValue());
@@ -348,7 +348,7 @@ pub fn callClosure(
         var self_var_name: Shimmerable = .{ .original = arg_names[0] };
         defer self_var_name.discardChanges(); // TODO PERF don't discard, write back.
         if (vartypes.getVariableOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
-            args[1].shimmered.swap(updated_self.borrow());
+            args[1].shimmered.swap(updated_self.takeReference());
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadVariableName => {
@@ -399,13 +399,13 @@ fn callNative(interp: *Interp, command: *const evaltypes.NativeCommand, args: []
 }
 
 fn freeLastResult(interp: *Interp) void {
-    interp.result.release();
+    interp.result.dropReference();
     interp.result = heap.interned_empty_string;
 }
 
 pub fn setResult(interp: *Interp, value: Value) void {
     interp.freeLastResult();
-    interp.result = value.borrow();
+    interp.result = value.takeReference();
 }
 
 pub fn setResultOwning(interp: *Interp, value: Value) void {
@@ -568,9 +568,9 @@ const CallFrame = struct {
     pub fn deinit(frame: *CallFrame) void {
         // Args are managed externally, so we don't free them.
         frame.variables.destroy();
-        frame.signature.name.release();
-        if (frame.signature.scope) |scope| scope.asHead().release();
-        if (frame.signature.letrec_scope) |letrec_scope| letrec_scope.asHead().release();
+        frame.signature.name.dropReference();
+        if (frame.signature.scope) |scope| scope.asHead().dropReference();
+        if (frame.signature.letrec_scope) |letrec_scope| letrec_scope.asHead().dropReference();
     }
 };
 
@@ -596,13 +596,13 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
 
     // We create a snapshot of the current variables, since they're stored in a non-dict type.
     const new_scope = try Dictionary.newWithCapacity(&.{}, table.count() * 2 + 2);
-    errdefer new_scope.asHead().release();
+    errdefer new_scope.asHead().dropReference();
 
     if (frame.signature.scope) |ref| {
         // `~parent` links are always `HashReference`s (see `Dictionary.getFollowingLinks`),
         // so the direct `*Dictionary` we hold here has to be wrapped, not stored as-is.
         const hash_ref = try objects.HashReference.new(ref.asHead());
-        defer hash_ref.asHead().release();
+        defer hash_ref.asHead().dropReference();
         try new_scope.put(objects.interned_tilde_parent, hash_ref.asHead().asValue());
     }
 
@@ -616,7 +616,7 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadVariableName => undefined,
             };
-            defer letrec_entry.asHead().release();
+            defer letrec_entry.asHead().dropReference();
             try new_scope.put(pair.key_ptr.*, letrec_entry.asHead().asValue());
         }
 
@@ -726,7 +726,7 @@ fn pushCallFrame(
         .call_epoch = interp.nextCallEpoch(),
         .signature = .{
             .cache_id = signature.cache_id,
-            .name = signature.name.borrow(),
+            .name = signature.name.takeReference(),
             .scope = signature.scope,
             .letrec_scope = letrec_scope,
             .is_method = signature.is_method,
@@ -758,13 +758,13 @@ fn popEvalFrame(interp: *Interp) void {
 fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !Value {
     switch (tag) {
         .simple_string => {
-            return value.borrow();
+            return value.takeReference();
         },
         .variable_subst => {
             var name_shim: Shimmerable = .{ .original = value };
             defer name_shim.discardChanges();
             const var_target: Value = try interp.getVariableOrError(&name_shim);
-            return var_target.borrow();
+            return var_target.takeReference();
         },
         .expression_sugar => {
             return try interp.evalExpression(value);
@@ -772,7 +772,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !
         .command_subst => {
             const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try value.getHashNoRegister();
             try interp.evalValueInner(interp.callFrameIdx(), value, nested_cache_key);
-            return interp.result.borrow();
+            return interp.result.takeReference();
         },
         else => {
             std.debug.panic("Tried to substitute token {}", .{tag});
@@ -788,7 +788,7 @@ fn interpolateTokens(
     value_len: usize,
 ) !Value {
     var new_values = try std.ArrayList(Value).initCapacity(heap.local_arena, value_len);
-    defer for (new_values.items) |value| value.release();
+    defer for (new_values.items) |value| value.dropReference();
 
     // Substitute all the tokens, placing them in `new_values`.
     for (tags, value_start..(value_start + value_len)) |tag, value_index| {
@@ -836,7 +836,7 @@ pub fn getScript(interp: *Interp, value: Value, cache_key: u256) !*Script {
     } else {
         var det: ErrorDetails = undefined;
         const new_script = try interp.wrapError(&det, Script.parse(&det, value));
-        if (interp.parsed_scripts.put(cache_key, new_script)) |ejected| ejected.asHead().release();
+        if (interp.parsed_scripts.put(cache_key, new_script)) |ejected| ejected.asHead().dropReference();
         new_script.asHead().incrRefCount();
         return new_script;
     }
@@ -848,7 +848,7 @@ pub fn getSubstitution(interp: *Interp, value: Value, cache_key: u256, flags: To
     } else {
         var det: ErrorDetails = undefined;
         const new_subst = try interp.wrapError(&det, Substitution.parse(&det, value, flags));
-        if (interp.parsed_substs.put(cache_key, new_subst)) |ejected| ejected.asHead().release();
+        if (interp.parsed_substs.put(cache_key, new_subst)) |ejected| ejected.asHead().dropReference();
         return new_subst;
     }
 }
@@ -873,7 +873,7 @@ pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAn
             // We need to parse the closure.
             var det: ErrorDetails = undefined;
             const closure = try interp.wrapError(&det, Closure.parse(&det, try value.getString()));
-            if (interp.parsed_closures.put(cache_key, closure)) |ejected| ejected.asHead().release();
+            if (interp.parsed_closures.put(cache_key, closure)) |ejected| ejected.asHead().dropReference();
             break :blk .{ .closure = closure, .cache_key = cache_key };
         }
     };
@@ -897,10 +897,10 @@ pub const CommandVariant = union(enum) {
 
     pub fn deinit(self: *CommandVariant) void {
         switch (self.*) {
-            .closure => |*closure| closure.closure.asHead().release(),
+            .closure => |*closure| closure.closure.asHead().dropReference(),
             .letrec => |*letrec| {
-                letrec.closure.closure.asHead().release();
-                letrec.scope.asHead().release();
+                letrec.closure.closure.asHead().dropReference();
+                letrec.scope.asHead().dropReference();
             },
             else => {},
         }
@@ -1122,7 +1122,7 @@ pub fn getExpression(interp: *Interp, value: Value, cache_key: u256) !*Expressio
     } else {
         var det: objects.ErrorDetails = undefined;
         const new_expr = try interp.wrapError(&det, Expression.parse(&det, value));
-        if (interp.parsed_exprs.put(cache_key, new_expr)) |ejected| ejected.asHead().release();
+        if (interp.parsed_exprs.put(cache_key, new_expr)) |ejected| ejected.asHead().dropReference();
 
         return new_expr;
     }
@@ -1159,14 +1159,14 @@ test "eval expression" {
     defer interp.deinit();
 
     var expr = try String.newValue("5 + 10");
-    defer expr.release();
+    defer expr.dropReference();
     const result = try interp.evalExpression(expr);
     try testing.expect(try Value.newInt(15).equals(result));
 }
 
 pub fn getBoolFromExpression(interp: *Interp, value: Value) !bool {
     var expr_result = try interp.evalExpression(value);
-    defer expr_result.release();
+    defer expr_result.dropReference();
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, objects.Boolean.getFromValue(&det, expr_result));
 }
@@ -1195,7 +1195,7 @@ pub fn setErrorStack(interp: *Interp) error{OutOfMemory}!void {
 /// frame. The top (innermost) frame is emitted first.
 pub fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
     var trace = try objects.List.newWithCapacity(&.{}, interp.eval_frames.items.len * 4);
-    errdefer trace.asHead().release();
+    errdefer trace.asHead().dropReference();
 
     var last_call_frame_idx: ?u32 = null;
 
@@ -1221,7 +1221,7 @@ pub fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
         const absolute_line = base + eval_frame.current_line;
 
         const args_list = try List.newWithCapacity(&.{}, eval_frame.args.len);
-        defer args_list.asHead().release();
+        defer args_list.asHead().dropReference();
 
         for (eval_frame.args) |arg| args_list.appendAssumeCapacity(arg.original);
 
@@ -1294,7 +1294,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         }
 
         if (maybe_self.asValue()) |self| {
-            return .{ .command = command, .self = self.borrow().asOptional() };
+            return .{ .command = command, .self = self.takeReference().asOptional() };
         } else {
             const var_name = try method_dict_path.current().getString();
             // Shave off the end, because we're looking up `self`, not the method in this case.
@@ -1462,7 +1462,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
 
             if (argument_expansion) {
                 // `getListInPlace` can fail, so we put the `defer` here.
-                defer resultant_word.release();
+                defer resultant_word.dropReference();
 
                 // Argument expansion, so we'll need to shimmer the result to a list.
                 const as_list = try interp.getListInPlace(&resultant_word);
@@ -1476,7 +1476,7 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
                 }
 
                 for (0..expansion_len) |list_idx| {
-                    args[args_written] = .{ .original = as_list.items[list_idx].borrow() };
+                    args[args_written] = .{ .original = as_list.items[list_idx].takeReference() };
                     args_written += 1;
                 }
             } else {
@@ -1503,7 +1503,7 @@ pub fn evalValueInner(interp: *Interp, call_frame: u32, script: Value, cache_key
 
     // Try to get the script, parsing if necessary.
     const parsed = (try interp.getScript(script, cache_key));
-    defer parsed.asHead().release(); // `parsed` was borrowed by `getScript`.
+    defer parsed.asHead().dropReference(); // `parsed` was borrowed by `getScript`.
 
     // Don't evaluate empty scripts.
     if (parsed.tags.len <= 1) return;
@@ -1603,9 +1603,9 @@ pub fn evalFile(interp: *Interp, filename: []const u8) InternalEvalError!void {
     defer heap.global_gpa.free(bytes);
 
     const filename_value = try objects.String.newValue(filename);
-    defer filename_value.release();
+    defer filename_value.dropReference();
     const source = try objects.Source.new(bytes, filename_value.asOptional(), 1);
-    defer source.asHead().release();
+    defer source.asHead().dropReference();
 
     try interp.evalValue(source.asHead().asValue());
 }
@@ -1632,14 +1632,14 @@ pub fn evalFileAsModule(interp: *Interp, filename: []const u8) InternalEvalError
     defer heap.global_gpa.free(bytes);
 
     const filename_value = try objects.String.newValue(filename);
-    defer filename_value.release();
+    defer filename_value.dropReference();
     const source = try objects.Source.new(bytes, filename_value.asOptional(), 1);
-    defer source.asHead().release();
+    defer source.asHead().dropReference();
     const script = source.asHead().asValue();
 
     var arg_names = try objects.List.new(&.{});
     arg_names.asHead().makeCrossthread();
-    defer arg_names.asHead().release();
+    defer arg_names.asHead().dropReference();
 
     const call_frame_idx = try interp.pushCallFrame(&.{}, &.{
         .arg_names = arg_names,
@@ -1676,7 +1676,7 @@ pub fn evalFileAsModule(interp: *Interp, filename: []const u8) InternalEvalError
 
 pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     const unknown_str = try objects.String.newValue("unknown");
-    errdefer unknown_str.release();
+    errdefer unknown_str.dropReference();
 
     var new_interp: Interp = .{
         .result = heap.interned_empty_string,
@@ -1715,7 +1715,7 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
     {
         var arg_names = try objects.List.new(&.{});
         arg_names.asHead().makeCrossthread();
-        defer arg_names.asHead().release();
+        defer arg_names.asHead().dropReference();
 
         // Push root call frame.
         _ = try new_interp.pushCallFrame(&.{}, &.{
@@ -1746,12 +1746,12 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
 }
 
 pub fn deinit(interp: *Interp) void {
-    interp.result.release();
+    interp.result.dropReference();
     interp.stack_trace.swapWithNone();
     interp.pending_error_code.swapWithNone();
     interp.pending_error_during.swapWithNone();
     if (interp.pending_tailcall) |*tailcall| tailcall.deinit();
-    interp.unknown_str.release();
+    interp.unknown_str.dropReference();
     interp.global_commands.deinit(heap.global_gpa);
 
     // Deinit all frames.
@@ -1762,11 +1762,11 @@ pub fn deinit(interp: *Interp) void {
 
     // Clean up caches as well.
     var scripts = interp.parsed_scripts.valueIterator();
-    while (scripts.next()) |script| script.*.asHead().release();
+    while (scripts.next()) |script| script.*.asHead().dropReference();
     interp.parsed_scripts.deinit(heap.global_gpa);
 
     var exprs = interp.parsed_exprs.valueIterator();
-    while (exprs.next()) |expr| expr.*.asHead().release();
+    while (exprs.next()) |expr| expr.*.asHead().dropReference();
     interp.parsed_exprs.deinit(heap.global_gpa);
 
     var closures = interp.parsed_closures.valueIterator();
@@ -1774,7 +1774,7 @@ pub fn deinit(interp: *Interp) void {
     interp.parsed_closures.deinit(heap.global_gpa);
 
     var substs = interp.parsed_substs.valueIterator();
-    while (substs.next()) |subst| subst.*.asHead().release();
+    while (substs.next()) |subst| subst.*.asHead().dropReference();
     interp.parsed_substs.deinit(heap.global_gpa);
 }
 
@@ -1983,7 +1983,7 @@ pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, conte
     } else {
         // Create a list containing all the keys, so we can render the error message.
         const keys_list = try objects.List.newWithCapacity(&.{}, @intCast(context.len()));
-        defer keys_list.asHead().release();
+        defer keys_list.asHead().dropReference();
         for (0..context.len()) |i| keys_list.appendAssumeCapacity(context.get(i));
 
         try interp.setResultFormatted("could not find value for keys \"{s}\"", .{try keys_list.asHead().asValue().getString()});
@@ -2025,15 +2025,15 @@ test "recursive dict keys" {
     defer interp.deinit();
 
     var dict = try objects.Dictionary.new(&.{});
-    defer dict.asHead().release();
+    defer dict.asHead().dropReference();
     var key_foo = try objects.String.newValue("foo");
-    defer key_foo.release();
+    defer key_foo.dropReference();
     var key_bar = try objects.String.newValue("bar");
-    defer key_bar.release();
+    defer key_bar.dropReference();
     var key_baz = try objects.String.newValue("baz");
-    defer key_baz.release();
+    defer key_baz.dropReference();
     const value_qux = try objects.String.newValue("qux");
-    defer value_qux.release();
+    defer value_qux.dropReference();
 
     try interp.putDictValueRecursively(
         dict,
@@ -2080,15 +2080,15 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     defer interp.deinit();
 
     var dict = try objects.Dictionary.new(&.{});
-    defer dict.asHead().release();
+    defer dict.asHead().dropReference();
     var key_foo = try objects.String.newValue("foo");
-    defer key_foo.release();
+    defer key_foo.dropReference();
     var key_bar = try objects.String.newValue("bar");
-    defer key_bar.release();
+    defer key_bar.dropReference();
     var key_baz = try objects.String.newValue("baz");
-    defer key_baz.release();
+    defer key_baz.dropReference();
     const value_qux = try objects.String.newValue("qux");
-    defer value_qux.release();
+    defer value_qux.dropReference();
 
     // Test 1: Remove a deeply nested value (3 levels).
     try interp.putDictValueRecursively(
@@ -2149,7 +2149,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
 
     // Test 7: Removal when intermediate dict is shared (copy-on-write).
     var interm_test_dict = try objects.Dictionary.new(&.{});
-    defer interm_test_dict.asHead().release();
+    defer interm_test_dict.asHead().dropReference();
     try interp.putDictValueRecursively(
         interm_test_dict,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar, key_baz } },
@@ -2171,7 +2171,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
     )).asValue().?;
     intermediate.asPtr().?.incrRefCount();
-    defer intermediate.release();
+    defer intermediate.dropReference();
 
     const initial_refcount = intermediate.asPtr().?.getRefCount();
     try testing.expectEqualStrings("baz qux foo qux", try intermediate.getString());
@@ -2196,7 +2196,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
 
     // Test 8: Remove multiple items from a nested dict.
     var dict_multiple_items = try objects.Dictionary.new(&.{});
-    defer dict_multiple_items.asHead().release();
+    defer dict_multiple_items.asHead().dropReference();
     try interp.putDictValueRecursively(dict_multiple_items, objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } }, value_qux);
     try interp.putDictValueRecursively(dict_multiple_items, objects.ValueSliceContext{ .items = &.{ key_foo, key_baz } }, value_qux);
     try testing.expectEqualStrings("foo {bar qux baz qux}", try dict_multiple_items.asHead().getString());
@@ -2214,7 +2214,7 @@ test "recursive dict removal" {
 
 pub fn testRunScript(interp: *Interp, script: []const u8) !Value {
     var script_handle = try objects.String.newValue(script);
-    defer script_handle.release();
+    defer script_handle.dropReference();
     try interp.evalTopLevel(script_handle);
     return interp.result;
 }

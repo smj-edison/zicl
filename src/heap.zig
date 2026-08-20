@@ -156,7 +156,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
 /// Only safe once no script can run again: `[catch]` reaches for this dict with
 /// `.?`, so a caller that frees it and keeps evaluating panics on the next OOM.
 pub fn freeOomErrorOptionsDict() void {
-    if (oom_error_options_dict) |dict| dict.release();
+    if (oom_error_options_dict) |dict| dict.dropReference();
     oom_error_options_dict = null;
 }
 
@@ -332,7 +332,7 @@ pub const HashRegistry = struct {
 
         if (registry.entries.getPtr(hash)) |entry| {
             assert(entry.instances.load(.monotonic) > 0);
-            return entry.representative.borrow(); // Borrow while still locked.
+            return entry.representative.takeReference(); // Borrow while still locked.
         } else return null;
     }
 
@@ -368,7 +368,7 @@ pub const HashRegistry = struct {
         } else {
             new_entry.key_ptr.* = key;
             new_entry.value_ptr.* = .{
-                .representative = obj.borrow(),
+                .representative = obj.takeReference(),
                 .instances = .init(1),
             };
 
@@ -412,7 +412,7 @@ pub const HashRegistry = struct {
 
                     // Make sure to `decrRefCount` only after unlocking the mutex, to avoid
                     // recursive locking.
-                    entry_derefed.representative.release();
+                    entry_derefed.representative.dropReference();
                 } else {
                     registry.rw_lock.unlockShared(global_io);
                 }
@@ -581,8 +581,8 @@ pub const OptionalValue = extern struct {
         return .{ .raw = .{ .tag = .none, .as = undefined } };
     }
 
-    pub fn borrow(optional: OptionalValue) OptionalValue {
-        if (optional.asValue()) |val| return val.borrow().asOptional();
+    pub fn takeReference(optional: OptionalValue) OptionalValue {
+        if (optional.asValue()) |val| return val.takeReference().asOptional();
         return .none;
     }
 
@@ -592,8 +592,8 @@ pub const OptionalValue = extern struct {
         obj.makeCrossthread();
     }
 
-    pub fn release(optional: OptionalValue) void {
-        if (optional.asValue()) |val| val.release();
+    pub fn dropReference(optional: OptionalValue) void {
+        if (optional.asValue()) |val| val.dropReference();
     }
 
     pub fn orElse(optional: OptionalValue, otherwise: Value) Value {
@@ -605,12 +605,12 @@ pub const OptionalValue = extern struct {
     }
 
     pub fn swap(ref: *OptionalValue, new: Value) void {
-        if (ref.asValue()) |obj| obj.release();
+        if (ref.asValue()) |obj| obj.dropReference();
         ref.* = new.asOptional();
     }
 
     pub fn swapWithNone(ref: *OptionalValue) void {
-        if (ref.asValue()) |val| val.release();
+        if (ref.asValue()) |val| val.dropReference();
         ref.* = .none;
     }
 };
@@ -693,13 +693,13 @@ pub const Value = extern struct {
         if (value.asPtr()) |obj| obj.incrRefCount();
     }
 
-    pub fn borrow(value: Value) Value {
+    pub fn takeReference(value: Value) Value {
         value.incrRefCount();
         return value;
     }
 
-    pub fn release(value: Value) void {
-        if (value.asPtr()) |obj| obj.release();
+    pub fn dropReference(value: Value) void {
+        if (value.asPtr()) |obj| obj.dropReference();
     }
 
     pub fn duplicate(value: Value) !Value {
@@ -730,7 +730,7 @@ pub const Value = extern struct {
     pub fn swap(ref: *Value, new: Value) void {
         const old = ref.*;
         ref.* = new;
-        old.release();
+        old.dropReference();
     }
 
     pub fn makeCrossthread(value: Value) void {
@@ -861,7 +861,7 @@ pub const SpecialString = struct {
                 global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
             },
         }
-        for (self.tracked_hashes) |hash| if (hash.value) |val| val.release();
+        for (self.tracked_hashes) |hash| if (hash.value) |val| val.dropReference();
         global_gpa.free(self.tracked_hashes);
         if (self.hash.load(.monotonic)) |hash| global_gpa.destroy(hash);
 
@@ -1285,7 +1285,7 @@ pub const Object = extern struct {
     pub fn setStringOwning(obj: *Object, bytes: [:0]u8) error{ OutOfMemory, OtherThreadSet }!void {
         const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
-        errdefer for (hashes) |hash| if (hash.value) |val| val.release();
+        errdefer for (hashes) |hash| if (hash.value) |val| val.dropReference();
 
         if (hashes.len > 0 or bytes.len > 1024) {
             const special_string = try global_gpa.create(SpecialString);
@@ -1335,7 +1335,7 @@ pub const Object = extern struct {
 
         const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, bytes);
         errdefer global_gpa.free(hashes);
-        errdefer for (hashes) |hash| if (hash.value) |val| val.release();
+        errdefer for (hashes) |hash| if (hash.value) |val| val.dropReference();
 
         if (hashes.len > 0 or bytes.len > 1024) {
             const special_string = try global_gpa.create(SpecialString);
@@ -1378,12 +1378,12 @@ pub const Object = extern struct {
         leak_check.globalTrace(obj, .{ .incr_ref_count = .{ .new_ref_count = new_ref_count } });
     }
 
-    pub fn borrow(obj: *Object) *Object {
+    pub fn takeReference(obj: *Object) *Object {
         obj.incrRefCount();
         return obj;
     }
 
-    pub fn release(obj: *Object) void {
+    pub fn dropReference(obj: *Object) void {
         if (!obj.metadata.cross_thread) {
             // We don't deal with hash unregistering here, since an object
             // is always marked as crossthread when it's registered.
@@ -1427,7 +1427,7 @@ pub const Object = extern struct {
     pub fn swap(ref: **Object, new: *Object) void {
         const old = ref.*;
         ref.* = new;
-        old.release();
+        old.dropReference();
     }
 
     fn freeStringInner(obj: *Object) void {
@@ -1633,7 +1633,7 @@ pub const hashutil = struct {
             for (found_hashes.items, resolved_hashes) |found_hash, *resolved_hash| {
                 resolved_hash.* = .{
                     .str_index = found_hash.index,
-                    .value = if (registered_hashes.entries.get(found_hash.hash)) |resolved| resolved.representative.borrow() else null,
+                    .value = if (registered_hashes.entries.get(found_hash.hash)) |resolved| resolved.representative.takeReference() else null,
                 };
             }
         }
@@ -1703,7 +1703,7 @@ fn testBoxInteger(ta: std.mem.Allocator) !void {
     defer testFinish();
 
     const obj = try Value.newInt(42).raw.box();
-    defer obj.release();
+    defer obj.dropReference();
     try testing.expectEqualStrings("42", try obj.getString());
 }
 
@@ -1716,7 +1716,7 @@ fn testBoxFloat(ta: std.mem.Allocator) !void {
     defer testFinish();
 
     const obj = try Value.newFloat(3.14).raw.box();
-    defer obj.release();
+    defer obj.dropReference();
     try testing.expectEqualStrings("3.14", try obj.getString());
 }
 
@@ -1729,11 +1729,11 @@ fn testBoxBool(ta: std.mem.Allocator) !void {
     defer testFinish();
 
     const true_obj = try Value.newBool(true).raw.box();
-    defer true_obj.release();
+    defer true_obj.dropReference();
     try testing.expectEqualStrings("true", try true_obj.getString());
 
     const false_obj = try Value.newBool(false).raw.box();
-    defer false_obj.release();
+    defer false_obj.dropReference();
     try testing.expectEqualStrings("false", try false_obj.getString());
 }
 
@@ -1747,11 +1747,11 @@ fn testReferenceCounting(ta: std.mem.Allocator) !void {
 
     const obj = (try objects.String.new("foo")).asHead();
     try testing.expectEqual(@as(u32, 1), obj.getRefCount());
-    _ = obj.borrow();
+    _ = obj.takeReference();
     try testing.expectEqual(@as(u32, 2), obj.getRefCount());
-    obj.release();
+    obj.dropReference();
     try testing.expectEqual(@as(u32, 1), obj.getRefCount());
-    obj.release();
+    obj.dropReference();
 }
 
 test "object ref count" {
@@ -1763,9 +1763,9 @@ fn testDuplicateObject(ta: std.mem.Allocator) !void {
     defer testFinish();
 
     const original = (try objects.String.new("to duplicate")).asHead();
-    defer original.release();
+    defer original.dropReference();
     const dup_obj = try original.duplicate();
-    defer dup_obj.release();
+    defer dup_obj.dropReference();
     try testing.expectEqualStrings("to duplicate", try dup_obj.getString());
 }
 
@@ -1783,7 +1783,7 @@ fn testSpecialSourceHash(ta: std.mem.Allocator) !void {
     const script = "set x 1\n" ** 200;
     comptime assert(script.len > hashutil.quick_hash_cutoff);
     const source = try objects.Source.new(script, .none, 1);
-    defer source.asHead().release();
+    defer source.asHead().dropReference();
 
     const hash = try source.asHead().getHashRegistering();
 

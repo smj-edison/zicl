@@ -197,7 +197,7 @@ pub const Script = struct {
         // Initialize the Heap-stored list that will contain the corrisponding value for each token.
         var new_token_values: std.ArrayList(Value) = .empty;
         errdefer new_token_values.deinit(heap.global_gpa);
-        errdefer for (new_token_values.items) |val| val.release();
+        errdefer for (new_token_values.items) |val| val.dropReference();
 
         var new_token_tags: std.ArrayList(Tokenizer.Token.Tag) = .empty;
         errdefer new_token_tags.deinit(heap.global_gpa);
@@ -250,7 +250,7 @@ pub const Script = struct {
             if (command_arg_count == 0) {
                 try new_token_tags.append(heap.global_gpa, .start_of_command);
                 const parsed_script_cmd = try Object.newObject(ParsedScriptCommand);
-                errdefer parsed_script_cmd.head.release();
+                errdefer parsed_script_cmd.head.dropReference();
                 parsed_script_cmd.body.* = .{
                     .line = tokens.items[i].loc.line_no,
                     .word_count = 0,
@@ -289,7 +289,7 @@ pub const Script = struct {
                             file_name,
                             token.loc.line_no + line_no,
                         );
-                        errdefer source.asHead().release();
+                        errdefer source.asHead().dropReference();
                         try new_token_tags.append(heap.global_gpa, .simple_string);
                         try new_token_values.append(heap.global_gpa, source.asHead().asValue());
                     },
@@ -299,7 +299,7 @@ pub const Script = struct {
                             file_name,
                             token.loc.line_no + line_no,
                         );
-                        errdefer source.asHead().release();
+                        errdefer source.asHead().dropReference();
                         try new_token_tags.append(heap.global_gpa, token.tag);
                         try new_token_values.append(heap.global_gpa, source.asHead().asValue());
                     },
@@ -361,7 +361,7 @@ pub const Script = struct {
     fn freeInternalRep(src: *Object) void {
         const as_script = src.asType(Script).?;
         heap.global_gpa.free(as_script.tags);
-        for (as_script.values) |value| value.release();
+        for (as_script.values) |value| value.dropReference();
         heap.global_gpa.free(as_script.values);
     }
 
@@ -438,7 +438,7 @@ pub const Substitution = struct {
         // This list will contain the corrisponding value for each token.
         var new_token_values: std.ArrayList(Value) = .empty;
         errdefer new_token_values.deinit(heap.global_gpa);
-        errdefer for (new_token_values.items) |val| val.release();
+        errdefer for (new_token_values.items) |val| val.dropReference();
 
         var new_token_tags: std.ArrayList(Tokenizer.Token.Tag) = .empty;
         errdefer new_token_tags.deinit(heap.global_gpa);
@@ -453,7 +453,7 @@ pub const Substitution = struct {
                         file_name,
                         token.loc.line_no + line_no,
                     );
-                    errdefer source.asHead().release();
+                    errdefer source.asHead().dropReference();
                     try new_token_tags.append(heap.global_gpa, .simple_string); // Switch it to .simple_string.
                     try new_token_values.append(heap.global_gpa, source.asHead().asValue());
                 },
@@ -463,7 +463,7 @@ pub const Substitution = struct {
                         file_name,
                         token.loc.line_no + line_no,
                     );
-                    errdefer source.asHead().release();
+                    errdefer source.asHead().dropReference();
                     try new_token_tags.append(heap.global_gpa, token.tag);
                     try new_token_values.append(heap.global_gpa, source.asHead().asValue());
                 },
@@ -489,7 +489,7 @@ pub const Substitution = struct {
     fn freeInternalRep(obj: *Object) void {
         const as_subst = obj.asType(Substitution).?;
         heap.global_gpa.free(as_subst.tags);
-        for (as_subst.values) |value| value.release();
+        for (as_subst.values) |value| value.dropReference();
         heap.global_gpa.free(as_subst.values);
     }
 
@@ -518,7 +518,7 @@ pub const Expression = struct {
     }
 
     pub fn parse(det: ?*ErrorDetails, value: Value) !*Expression {
-        const file_name: OptionalValue = if (value.asType(objects.Source)) |val| val.file_name.borrow() else .none;
+        const file_name: OptionalValue = if (value.asType(objects.Source)) |val| val.file_name.takeReference() else .none;
         const line_no: u32 = if (value.asType(objects.Source)) |val| val.line_no else 1;
 
         // The expression object we'll store the result in.
@@ -735,9 +735,9 @@ pub const Expression = struct {
             => {
                 const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
-                defer lhs_value.release();
+                defer lhs_value.dropReference();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
-                defer rhs_value.release();
+                defer rhs_value.dropReference();
 
                 // Fast case: both are already integers/both are already floats.
                 if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
@@ -768,9 +768,9 @@ pub const Expression = struct {
             => {
                 const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
-                defer lhs_value.release();
+                defer lhs_value.dropReference();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
-                defer rhs_value.release();
+                defer rhs_value.dropReference();
 
                 // Fast case: both are already integers/both are already floats.
                 if (objects.Integer.asInt(lhs_value)) |lhs| if (objects.Integer.asInt(rhs_value)) |rhs| {
@@ -808,9 +808,9 @@ pub const Expression = struct {
             => {
                 const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
-                defer lhs_value.release();
+                defer lhs_value.dropReference();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
-                defer rhs_value.release();
+                defer rhs_value.dropReference();
 
                 // `in`/`ni` is about list membership, not string membership.
                 var rhs_shim: Shimmerable = .{ .original = rhs_value };
@@ -836,9 +836,9 @@ pub const Expression = struct {
             => {
                 const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
-                defer lhs_value.release();
+                defer lhs_value.dropReference();
                 var rhs_value = try evalNode(interp, nodes, children.@"1");
-                defer rhs_value.release();
+                defer rhs_value.dropReference();
 
                 const lhs_string = try lhs_value.getString();
                 const rhs_string = try rhs_value.getString();
@@ -858,7 +858,7 @@ pub const Expression = struct {
             .ternary_conditional => {
                 const children = node.data.ternary;
                 var condition = try evalNode(interp, nodes, children.@"0");
-                defer condition.release();
+                defer condition.dropReference();
                 const condition_as_bool = try interp.getBooleanInPlace(&condition);
 
                 if (condition_as_bool) {
@@ -867,11 +867,11 @@ pub const Expression = struct {
                     return evalNode(interp, nodes, children.@"2");
                 }
             },
-            .value => return node.data.value.borrow(),
+            .value => return node.data.value.takeReference(),
             .command_subst => {
                 const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node.data.value.getHashNoRegister();
                 try interp.evalValueInner(interp.callFrameIdx(), node.data.value, nested_cache_key);
-                return interp.result.borrow();
+                return interp.result.takeReference();
             },
             .variable_subst => {
                 // `node.data.value` is the variable name. Wrap it in a
@@ -880,17 +880,17 @@ pub const Expression = struct {
                 var name_shim: Shimmerable = .{ .original = node.data.value };
                 defer name_shim.discardChanges();
                 const var_value = try interp.getVariableOrError(&name_shim);
-                return var_value.borrow();
+                return var_value.takeReference();
             },
             .bool_and => {
                 const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
-                defer lhs_value.release();
+                defer lhs_value.dropReference();
                 const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
 
                 if (lhs_as_bool) {
                     var rhs_value = try evalNode(interp, nodes, children.@"1");
-                    defer rhs_value.release();
+                    defer rhs_value.dropReference();
                     const rhs_as_bool = try interp.getBooleanInPlace(&rhs_value);
                     return Value.newBool(rhs_as_bool);
                 } else {
@@ -901,7 +901,7 @@ pub const Expression = struct {
             .bool_or => {
                 const children = node.data.binary;
                 var lhs_value = try evalNode(interp, nodes, children.@"0");
-                defer lhs_value.release();
+                defer lhs_value.dropReference();
                 const lhs_as_bool = try interp.getBooleanInPlace(&lhs_value);
 
                 if (lhs_as_bool) {
@@ -909,20 +909,20 @@ pub const Expression = struct {
                     return Value.newBool(true);
                 } else {
                     var rhs_value = try evalNode(interp, nodes, children.@"1");
-                    defer rhs_value.release();
+                    defer rhs_value.dropReference();
                     const rhs_as_bool = try interp.getBooleanInPlace(&rhs_value);
                     return Value.newBool(rhs_as_bool);
                 }
             },
             .bool_not => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const result_bool = try interp.getBooleanInPlace(&result);
                 return Value.newBool(!result_bool);
             },
             .bit_not => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .integer => |int| objects.Integer.new(~int),
@@ -940,7 +940,7 @@ pub const Expression = struct {
             },
             .negation => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .integer => |int| objects.Integer.new(-int),
@@ -949,7 +949,7 @@ pub const Expression = struct {
             },
             .to_int, .to_wide => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .integer => |int| objects.Integer.new(int),
@@ -966,7 +966,7 @@ pub const Expression = struct {
             },
             .abs => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .integer => |int| blk: {
@@ -982,7 +982,7 @@ pub const Expression = struct {
             },
             .to_double => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .integer => |int| Value.newFloat(@floatFromInt(int)),
@@ -991,7 +991,7 @@ pub const Expression = struct {
             },
             .round => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 return switch (value) {
                     .float => |float| Value.newFloat(@round(float)),
@@ -1003,7 +1003,7 @@ pub const Expression = struct {
             },
             .srand => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 const seed_int: i64 = switch (value) {
                     .integer => |int| int,
@@ -1034,7 +1034,7 @@ pub const Expression = struct {
             .sqrt,
             => {
                 var result = try evalNode(interp, nodes, node.data.unary);
-                defer result.release();
+                defer result.dropReference();
                 const value = try interp.getIntOrFloatInPlace(&result);
                 const as_float: f64 = switch (value) {
                     .integer => |int| @floatFromInt(int),
@@ -1064,9 +1064,9 @@ pub const Expression = struct {
             },
             .atan2, .fmod, .hypot => {
                 var lhs_result = try evalNode(interp, nodes, node.data.binary.@"0");
-                defer lhs_result.release();
+                defer lhs_result.dropReference();
                 var rhs_result = try evalNode(interp, nodes, node.data.binary.@"1");
-                defer rhs_result.release();
+                defer rhs_result.dropReference();
                 const lhs_number = try interp.getIntOrFloatInPlace(&lhs_result);
                 const rhs_number = try interp.getIntOrFloatInPlace(&rhs_result);
                 const lhs: f64 = switch (lhs_number) {
@@ -1158,8 +1158,8 @@ pub const Closure = struct {
                 .optional_values = content.optional_values,
                 .required_arity = content.required_arity,
                 .optional_arity = content.optional_arity,
-                .body = content.body.borrow(),
-                .name = content.name.borrow(),
+                .body = content.body.takeReference(),
+                .name = content.name.takeReference(),
                 .scope = content.scope,
                 .has_args_parameter = content.has_args_parameter,
                 .is_method = content.is_method,
@@ -1168,12 +1168,12 @@ pub const Closure = struct {
         }
 
         pub fn deinit(content: *Content) void {
-            content.arg_names.asHead().release();
-            if (content.optional_values) |vals| vals.asHead().release();
+            content.arg_names.asHead().dropReference();
+            if (content.optional_values) |vals| vals.asHead().dropReference();
 
-            content.body.release();
-            content.name.release();
-            if (content.scope) |ref| ref.asHead().release();
+            content.body.dropReference();
+            content.name.dropReference();
+            if (content.scope) |ref| ref.asHead().dropReference();
 
             content.* = undefined;
         }
@@ -1269,8 +1269,8 @@ pub const Closure = struct {
                 }
 
                 break :blk .{
-                    as_list.items[0].borrow(),
-                    as_list.items[1].borrow(),
+                    as_list.items[0].takeReference(),
+                    as_list.items[1].takeReference(),
                 };
             } else {
                 if (det) |details| details.* = .{
@@ -1279,8 +1279,8 @@ pub const Closure = struct {
                 return error.BadClosure;
             }
         };
-        defer args.release();
-        errdefer body.release();
+        defer args.dropReference();
+        errdefer body.dropReference();
 
         var args_shim: Shimmerable = .{ .original = args };
         defer args_shim.discardChanges();
@@ -1305,18 +1305,18 @@ pub const Closure = struct {
             var scope_shim: Shimmerable = .{ .original = hash_ref.ref.asValue() };
             defer scope_shim.discardChanges();
             _ = try objects.Dictionary.shimmerFrom(null, &scope_shim);
-            scope = scope_shim.current().borrow().asType(objects.Dictionary).?;
+            scope = scope_shim.current().takeReference().asType(objects.Dictionary).?;
         }
-        errdefer if (scope) |val| val.asHead().release();
+        errdefer if (scope) |val| val.asHead().dropReference();
 
         var parsed_args = try parseArgList(det, args_as_list);
         defer parsed_args.deinit();
 
         const arg_names_list = try objects.List.new(parsed_args.arg_names);
-        errdefer arg_names_list.asHead().release();
+        errdefer arg_names_list.asHead().dropReference();
         const optional_values_list =
             if (parsed_args.optional_values.len > 0) try objects.List.new(parsed_args.optional_values) else null;
-        errdefer if (optional_values_list) |list| list.asHead().release();
+        errdefer if (optional_values_list) |list| list.asHead().dropReference();
 
         const closure_content = try heap.global_gpa.create(Content);
         errdefer heap.global_gpa.destroy(closure_content);
@@ -1333,7 +1333,7 @@ pub const Closure = struct {
             .required_arity = parsed_args.required_arity,
             .optional_arity = parsed_args.optional_values.len,
             .body = body,
-            .name = maybe_name.borrow(),
+            .name = maybe_name.takeReference(),
             .scope = scope,
             .has_args_parameter = parsed_args.has_args_parameter,
             .is_method = is_method,
@@ -1351,9 +1351,9 @@ pub const Closure = struct {
         has_args_parameter: bool,
 
         pub fn deinit(self: *ParsedArgList) void {
-            for (self.arg_names) |val| val.release();
+            for (self.arg_names) |val| val.dropReference();
             heap.global_gpa.free(self.arg_names);
-            for (self.optional_values) |val| val.release();
+            for (self.optional_values) |val| val.dropReference();
             heap.global_gpa.free(self.optional_values);
             self.* = undefined;
         }
@@ -1363,10 +1363,10 @@ pub const Closure = struct {
     pub fn parseArgList(det: ?*ErrorDetails, args: *const objects.List) !ParsedArgList {
         var arg_names: std.ArrayList(Value) = .empty;
         defer arg_names.deinit(heap.global_gpa);
-        defer for (arg_names.items) |item| item.release();
+        defer for (arg_names.items) |item| item.dropReference();
         var optional_values: std.ArrayList(Value) = .empty;
         defer optional_values.deinit(heap.global_gpa);
-        defer for (optional_values.items) |item| item.release();
+        defer for (optional_values.items) |item| item.dropReference();
 
         var args_parameter_found = false;
         for (0..args.items.len) |i| {
@@ -1415,10 +1415,10 @@ pub const Closure = struct {
                 try arg_names.ensureUnusedCapacity(heap.global_gpa, 1);
 
                 // Add the optional parameter onto the optional parameters list.
-                optional_values.appendAssumeCapacity(arg_as_list.items[1].borrow());
+                optional_values.appendAssumeCapacity(arg_as_list.items[1].takeReference());
 
                 // Pull out the name from the default list (`{name default}`).
-                arg_names.appendAssumeCapacity(arg_as_list.items[0].borrow());
+                arg_names.appendAssumeCapacity(arg_as_list.items[0].takeReference());
             } else {
                 if (optional_values.items.len > 0) {
                     if (det) |details| details.* = .{
@@ -1430,13 +1430,13 @@ pub const Closure = struct {
                 if (try arg_as_list.items[0].equalsString("args")) args_parameter_found = true;
 
                 try arg_names.ensureUnusedCapacity(heap.global_gpa, 1);
-                arg_names.appendAssumeCapacity(arg_as_list.items[0].borrow());
+                arg_names.appendAssumeCapacity(arg_as_list.items[0].takeReference());
             }
         }
 
         const arg_names_slice = try arg_names.toOwnedSlice(heap.global_gpa);
         errdefer heap.global_gpa.free(arg_names_slice);
-        errdefer for (arg_names_slice) |item| item.release();
+        errdefer for (arg_names_slice) |item| item.dropReference();
         const optional_values_slice = try optional_values.toOwnedSlice(heap.global_gpa);
         errdefer comptime unreachable;
 
@@ -1599,14 +1599,14 @@ pub const Letrec = struct {
         if (try selected.equals(objects.interned_tilde_parent)) return vartypes.badVariableNameError(det, "~parent");
 
         const new_obj = try Object.newObject(Letrec);
-        errdefer new_obj.head.release();
+        errdefer new_obj.head.dropReference();
 
         assert(scope.asHead().metadata.cross_thread);
         scope.asHead().incrRefCount();
 
         new_obj.body.* = .{
             .scope = scope,
-            .selected = selected.borrow(),
+            .selected = selected.takeReference(),
         };
         return new_obj.body;
     }
@@ -1651,7 +1651,7 @@ pub const Letrec = struct {
         dict.asHead().incrRefCount();
         as_letrec.* = .{
             .scope = dict,
-            .selected = selected.borrow(),
+            .selected = selected.takeReference(),
         };
 
         return as_letrec;
@@ -1666,15 +1666,15 @@ pub const Letrec = struct {
         as_letrec.scope.asHead().incrRefCount();
         new_obj.body.* = .{
             .scope = as_letrec.scope,
-            .selected = as_letrec.selected.borrow(),
+            .selected = as_letrec.selected.takeReference(),
         };
         return new_obj.head;
     }
 
     fn freeInternalRep(obj: *Object) void {
         const as_letrec = obj.asType(Letrec).?;
-        as_letrec.scope.asHead().release();
-        as_letrec.selected.release();
+        as_letrec.scope.asHead().dropReference();
+        as_letrec.selected.dropReference();
     }
 
     fn updateString(obj: *Object) !void {

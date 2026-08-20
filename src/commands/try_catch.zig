@@ -26,7 +26,7 @@ fn buildErrorOptions(
     during: OptionalValue,
 ) error{OutOfMemory}!Value {
     const options = try Dictionary.newWithCapacity(&.{}, 10);
-    errdefer options.asHead().release();
+    errdefer options.asHead().dropReference();
 
     // The return code surfaced to the caller. `.return` is an internal code, and
     // a return still travelling outward is on its way to completing normally, so
@@ -57,7 +57,7 @@ fn buildErrorOptionsBestEffort(
     during: OptionalValue,
 ) Value {
     return buildErrorOptions(interp, exit_code, stack_trace, error_code, during) catch {
-        return heap.oom_error_options_dict.?.borrow();
+        return heap.oom_error_options_dict.?.takeReference();
     };
 }
 
@@ -124,10 +124,10 @@ fn catchTryHelper(
     };
     var error_code = interp.pending_error_code;
     interp.pending_error_code = .none;
-    defer error_code.release();
+    defer error_code.dropReference();
     const stack_trace = interp.stack_trace;
     interp.stack_trace = .none;
-    defer stack_trace.release();
+    defer stack_trace.dropReference();
 
     // In this next section, we need to find if there's a script that we need to run
     // to handle the associated error. The following logic determines what branch
@@ -141,13 +141,13 @@ fn catchTryHelper(
     // branch but haven't found its script yet.
     var branch_matched = false;
     var handler_script: ?Value = null;
-    defer if (handler_script) |val| val.release();
+    defer if (handler_script) |val| val.dropReference();
     var finally_script: ?Value = null;
-    defer if (finally_script) |val| val.release();
+    defer if (finally_script) |val| val.dropReference();
     var message_var_name: ?Value = null;
-    defer if (message_var_name) |val| val.release();
+    defer if (message_var_name) |val| val.dropReference();
     var options_var_name: ?Value = null;
-    defer if (options_var_name) |val| val.release();
+    defer if (options_var_name) |val| val.dropReference();
 
     if (mode == .@"try") {
         // For [try], we need to find either a matching `on` or a matching `trap`.
@@ -190,11 +190,11 @@ fn catchTryHelper(
                         continue;
                     }
 
-                    handler_script = on_params[3].current().borrow();
+                    handler_script = on_params[3].current().takeReference();
 
                     const vars_to_bind = try interp.getList(&on_params[2]);
-                    if (vars_to_bind.items.len > 0) message_var_name = vars_to_bind.items[0].borrow();
-                    if (vars_to_bind.items.len > 1) options_var_name = vars_to_bind.items[1].borrow();
+                    if (vars_to_bind.items.len > 0) message_var_name = vars_to_bind.items[0].takeReference();
+                    if (vars_to_bind.items.len > 1) options_var_name = vars_to_bind.items[1].takeReference();
                 },
                 .trap => {
                     if (args.len - arg_index < 4) return error.WrongUsage;
@@ -237,29 +237,29 @@ fn catchTryHelper(
                         continue;
                     }
 
-                    handler_script = trap_params[3].current().borrow();
+                    handler_script = trap_params[3].current().takeReference();
 
                     const vars_to_bind = try interp.getList(&trap_params[2]);
-                    if (vars_to_bind.items.len > 0) message_var_name = vars_to_bind.items[0].borrow();
-                    if (vars_to_bind.items.len > 1) options_var_name = vars_to_bind.items[1].borrow();
+                    if (vars_to_bind.items.len > 0) message_var_name = vars_to_bind.items[0].takeReference();
+                    if (vars_to_bind.items.len > 1) options_var_name = vars_to_bind.items[1].takeReference();
                 },
                 .finally => {
                     if (args.len - arg_index != 2) return error.WrongUsage;
                     const finally_params = args[arg_index..][0..2];
                     arg_index += 2;
 
-                    finally_script = finally_params[1].current().borrow();
+                    finally_script = finally_params[1].current().takeReference();
                     if (try finally_script.?.equalsString("-")) return error.WrongUsage;
                 },
             }
         }
     } else {
         if (args.len - arg_index > 0) {
-            message_var_name = args[arg_index].current().borrow();
+            message_var_name = args[arg_index].current().takeReference();
             arg_index += 1;
         }
         if (args.len - arg_index > 0) {
-            options_var_name = args[arg_index].current().borrow();
+            options_var_name = args[arg_index].current().takeReference();
             arg_index += 1;
         }
     }
@@ -283,7 +283,7 @@ fn catchTryHelper(
     };
 
     var options_dict: OptionalValue = .none;
-    defer options_dict.release();
+    defer options_dict.dropReference();
 
     if (options_var_name) |var_name| if ((try var_name.getString()).len > 0) {
         var var_name_shim: Shimmerable = .{ .original = var_name };
@@ -311,7 +311,7 @@ fn catchTryHelper(
                 options_dict.swap(buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none));
             }
 
-            interp.pending_error_during.swap(options_dict.asValue().?.borrow());
+            interp.pending_error_during.swap(options_dict.asValue().?.takeReference());
             options_dict.swap(buildErrorOptionsBestEffort(
                 interp,
                 Interp.ReturnCode.fromError(err),
@@ -325,8 +325,8 @@ fn catchTryHelper(
     if (finally_script) |finally| {
         // Save the previous result, so if the `finally` runs successfully,
         // we restore the previous result.
-        const previous_result = interp.result.borrow();
-        defer previous_result.release();
+        const previous_result = interp.result.takeReference();
+        defer previous_result.dropReference();
 
         if (interp.evalValue(finally)) {
             interp.setResult(previous_result);
@@ -337,7 +337,7 @@ fn catchTryHelper(
                 options_dict.swap(buildErrorOptionsBestEffort(interp, exit_code, stack_trace, error_code, .none));
             }
 
-            interp.pending_error_during.swap(options_dict.asValue().?.borrow());
+            interp.pending_error_during.swap(options_dict.asValue().?.takeReference());
         }
     }
 

@@ -4,10 +4,11 @@
 //! (file-handle), and capability id (sVye-a_2s3tvQm8xR4pLnW).
 //!
 //! Lifetime management is manual, as in all capabilities are manually created
-//! and closed. Closing is manual because everything is a string, so there's
-//! no concept of reference. We were able to get away with this in the hash
-//! registry because the hash registry addresses content only, but capabilities
-//! are a unique identifier to, well, anything.
+//! and closed. This is since there's no good way to track when an object is
+//! no longer in use, as everything in Zicl is a string. Note, we were able to get
+//! away with automatic tracking with hash references, as they are content addressed,
+//! but each capability is unique, and needs to be guaranteed to be closed at a certain
+//! point, so we defer closing to the user.
 
 const std = @import("std");
 const testing = std.testing;
@@ -36,8 +37,10 @@ pub fn asHead(self: *Capability) *Object {
     return Object.from(Capability, self);
 }
 
+/// `head` should have `id` uninitialized, as this function will assign
+/// the head its identifier. `head` should set the vtable, however.
 pub fn new(head: *Head) !*Capability {
-    try registry.register(head);
+    try registry.register(head); // Sets `head.id` while registering.
     errdefer registry.deregister(head);
 
     const new_obj = try Object.newObject(Capability);
@@ -81,7 +84,7 @@ pub fn shimmerFrom(det: ?*ErrorDetails, shim: *objects.Shimmerable) !*const Capa
     }
 
     const head = registry.resolve(parsed.id) orelse return staleError(det, bytes);
-    errdefer head.release();
+    errdefer head.dropReference();
 
     if (!std.mem.eql(u8, parsed.type_name, std.mem.span(head.vtable.name))) {
         // Capability type name and parsed type name aren't the same. We consider
@@ -116,12 +119,12 @@ fn duplicate(src: *const Object) !*Object {
     const new_obj = try Object.newObjectUninitialized(Capability);
     errdefer new_obj.head.freeBacking();
     try src.duplicateHeadOnto(new_obj.head);
-    new_obj.body.* = .{ .head = src.asTypeConst(Capability).?.head.borrow() };
+    new_obj.body.* = .{ .head = src.asTypeConst(Capability).?.head.takeReference() };
     return new_obj.head;
 }
 
 fn freeInternalRep(obj: *Object) void {
-    obj.asType(Capability).?.head.release();
+    obj.asType(Capability).?.head.dropReference();
 }
 
 fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
@@ -154,12 +157,12 @@ pub const Head = extern struct {
     closed: std.atomic.Value(bool) = .init(false),
     ref_count: std.atomic.Value(u32) = .init(1),
 
-    pub fn borrow(head: *Head) *Head {
+    pub fn takeReference(head: *Head) *Head {
         _ = head.ref_count.fetchAdd(1, .monotonic);
         return head;
     }
 
-    pub fn release(head: *Head) void {
+    pub fn dropReference(head: *Head) void {
         if (head.ref_count.fetchSub(1, .release) != 1) return;
         _ = head.ref_count.load(.acquire);
 
@@ -223,7 +226,7 @@ pub const Registry = struct {
 
         // Generated while the mutex is locked because the generator is shared state.
         head.id = self.csprng.random().int(Id);
-        self.heads.putAssumeCapacity(head.id, head.borrow());
+        self.heads.putAssumeCapacity(head.id, head.takeReference());
     }
 
     pub fn deregister(self: *Registry, head: *Head) void {
@@ -234,14 +237,14 @@ pub const Registry = struct {
         // Note that we assert that there was a value with `.?`,
         // since you can't deregister something that was never
         // registered.
-        removed.?.value.release();
+        removed.?.value.dropReference();
     }
 
     /// Resolves a registered identifier, borrowing the head for the caller.
     pub fn resolve(self: *Registry, id: Id) ?*Head {
         self.mutex.lockUncancelable(heap.global_io);
         defer self.mutex.unlock(heap.global_io);
-        return (self.heads.get(id) orelse return null).borrow();
+        return (self.heads.get(id) orelse return null).takeReference();
     }
 };
 
@@ -292,7 +295,7 @@ pub fn deinitGlobals() void {
         if (head.closed.swap(true, .acq_rel) == false) {
             head.vtable.deinitBody(head);
         }
-        head.release();
+        head.dropReference();
     }
     heads.deinit(heap.global_gpa);
 
@@ -405,7 +408,7 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
 
     var deinited = false;
     const cap = try TestCapability.new(&deinited, .{ 1, 2, 3 });
-    defer cap.asHead().release();
+    defer cap.asHead().dropReference();
     // Nothing reclaims a capability on its own, so every exit from here has to
     // close, including the ones an injected allocation failure takes.
     defer cap.close();
@@ -477,7 +480,7 @@ fn testRegistryWorksWithoutOriginalObject(ta: std.mem.Allocator) !void {
     // object.
     {
         const cap = try TestCapability.new(&deinited, .{ 4, 5, 6 });
-        defer cap.asHead().release();
+        defer cap.asHead().dropReference();
         errdefer cap.close();
 
         head_ref = cap.head;

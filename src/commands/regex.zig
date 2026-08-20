@@ -29,7 +29,7 @@ pub fn matchToList(
     opt_indices: bool,
 ) !*objects.List {
     const list = try objects.List.newWithCapacity(&.{}, ovector.len);
-    errdefer list.asHead().release();
+    errdefer list.asHead().dropReference();
 
     var pair_idx: usize = 0;
     while (pair_idx < ovector.len) : (pair_idx += 2) {
@@ -147,7 +147,7 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     var result_list: ?*objects.List = null;
     if (opt_inline and opt_all) result_list = try objects.List.new(&.{});
-    errdefer if (result_list) |val| val.asHead().release();
+    errdefer if (result_list) |val| val.asHead().dropReference();
 
     var match_count: usize = 0;
 
@@ -180,7 +180,7 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         if (opt_inline) {
             if (opt_all) {
                 const match_list = try matchToList(subject, ovector, opt_indices);
-                defer match_list.asHead().release();
+                defer match_list.asHead().dropReference();
                 // `append` borrows, so the items stay owned by `match_list`
                 // until it is released above.
                 for (match_list.items) |item| try result_list.?.append(item);
@@ -239,7 +239,7 @@ fn setRegexpCaptureVars(
             if (start == std.math.maxInt(usize)) {
                 if (opt_indices) {
                     const indices_list = try createIndexPair(-1, -1);
-                    defer indices_list.release();
+                    defer indices_list.dropReference();
                     try interp.setVariable(var_name, indices_list);
                 } else {
                     try interp.setVariable(var_name, heap.interned_empty_string);
@@ -248,19 +248,19 @@ fn setRegexpCaptureVars(
                 if (opt_indices) {
                     // Inclusive end, as in `matchToList`.
                     const indices_list = try createIndexPair(@intCast(start), @as(i64, @intCast(end)) - 1);
-                    defer indices_list.release();
+                    defer indices_list.dropReference();
                     try interp.setVariable(var_name, indices_list);
                 } else {
                     const capture = subject[start..end];
                     const capture_value = try objects.String.newValue(capture);
-                    defer capture_value.release();
+                    defer capture_value.dropReference();
                     try interp.setVariable(var_name, capture_value);
                 }
             }
         } else {
             if (opt_indices) {
                 const pair = try createIndexPair(-1, -1);
-                defer pair.release();
+                defer pair.dropReference();
                 try interp.setVariable(var_name, pair);
             } else {
                 try interp.setVariable(var_name, heap.interned_empty_string);
@@ -412,7 +412,7 @@ pub fn regsubCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         // `NoFree`, since the errdefer above already frees `substituted`.
         break :blk try String.newOwningNoFree(substituted[0 .. substituted.len - 1 :0]);
     };
-    defer substituted_str.asHead().release();
+    defer substituted_str.asHead().dropReference();
 
     if (remaining.len == 4) {
         try interp.setVariable(&remaining[3], substituted_str.asHead().asValue());

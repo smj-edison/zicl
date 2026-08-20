@@ -367,7 +367,7 @@ fn testPointerDestructorRunsOnClose(ta: std.mem.Allocator) !void {
 
     var payload: u64 = 42;
     const cap = try Pointer.new(&payload, "u64*", Impl.destroy);
-    defer cap.asHead().release();
+    defer cap.asHead().dropReference();
     defer cap.close();
 
     const backing = try cap.getBacking(Pointer.Backing, null);
@@ -395,7 +395,7 @@ fn testPointerNullDestructorIsNoop(ta: std.mem.Allocator) !void {
 
     var payload: u64 = 7;
     const cap = try Pointer.new(&payload, "u64*", null);
-    defer cap.asHead().release();
+    defer cap.asHead().dropReference();
     defer cap.close();
 
     const backing = try cap.getBacking(Pointer.Backing, null);
@@ -415,7 +415,7 @@ fn testPointerGetTypedChecksTypeName(ta: std.mem.Allocator) !void {
 
     var payload: u64 = 99;
     const cap = try Pointer.new(&payload, "Gpu*", null);
-    defer cap.asHead().release();
+    defer cap.asHead().dropReference();
     defer cap.close();
 
     const matched = try Pointer.getTyped(cap, "Gpu*", null);
@@ -441,7 +441,7 @@ fn testPointerNullPtrClosesWithoutRunningDestructor(ta: std.mem.Allocator) !void
     Impl.destroyed = false;
 
     const cap = try Pointer.new(null, "Gpu*", Impl.destroy);
-    defer cap.asHead().release();
+    defer cap.asHead().dropReference();
     defer cap.close();
 
     const matched = try Pointer.getTyped(cap, "Gpu*", null);
@@ -469,7 +469,7 @@ test "file" {
     defer testing.allocator.free(path);
 
     const cap = try File.open(path, .w);
-    defer cap.asHead().release();
+    defer cap.asHead().dropReference();
     defer cap.close();
     const file = &(try cap.getBacking(File.Backing, null)).body;
     try file.writeAll("hello ");

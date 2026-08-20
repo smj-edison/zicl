@@ -619,7 +619,7 @@ test "leak" {
 
     // Leak a String on purpose, then check the leak dump for the leaked pointer.
     const obj = try objects.String.newObject("hello");
-    defer obj.release(); // Note, we do the leak check before this gets released.
+    defer obj.dropReference(); // Note, we do the leak check before this gets released.
 
     var leaked = try captureLeaks();
     defer leaked.deinit();

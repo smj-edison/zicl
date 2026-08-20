@@ -119,7 +119,7 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const eval_frame = target_eval_frame orelse return interp.setError(bad_level_err);
 
             const result_dict = try objects.Dictionary.newWithCapacity(&.{}, 10);
-            errdefer result_dict.asHead().release();
+            errdefer result_dict.asHead().dropReference();
             try result_dict.put(heap.InternedString.newValue("type"), heap.InternedString.newValue("source"));
             if (eval_frame.currently_evaluating.asType(objects.Source)) |source| {
                 try result_dict.put(heap.InternedString.newValue("line"), objects.Integer.new(source.line_no));
@@ -183,7 +183,7 @@ pub fn errorinfoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const stack_trace = if (args.len == 3) args[2].current() else if (args.len == 2) interp.stack_trace.orEmpty() else unreachable;
 
     // The stack is a flat list: {name file line args ...} repeated.
-    var stack_list: Shimmerable = .{ .original = stack_trace.borrow() };
+    var stack_list: Shimmerable = .{ .original = stack_trace.takeReference() };
     defer stack_list.deinit();
     const as_list = try interp.getList(&stack_list);
 

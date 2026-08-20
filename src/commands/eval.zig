@@ -155,10 +155,10 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     };
 
     const script = if (args.len - script_start == 1)
-        args[script_start].current().borrow()
+        args[script_start].current().takeReference()
     else
         (try objects.List.newFromShimmerables(args[script_start..])).asHead().asValue();
-    defer script.release();
+    defer script.dropReference();
 
     const cache_key = @as(u256, interp.call_frames.items[target_frame].signature.cache_id) ^ try script.getHashNoRegister();
     return interp.evalValueInner(target_frame, script, cache_key);
@@ -169,7 +169,7 @@ pub fn evalCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         try interp.evalValue(args[1].current());
     } else {
         const new = try objects.List.newFromShimmerables(args[1..]);
-        defer new.asHead().release();
+        defer new.asHead().dropReference();
         try interp.evalValue(new.asHead().asValue());
     }
 }
@@ -236,7 +236,7 @@ pub fn letrecCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             // A dumb wrapper: it wraps every key in `scope`, whether it holds a
             // function or plain data, since it has no way to tell the two apart.
             const result = try objects.Dictionary.newWithCapacity(&.{}, scope_mut.items.len);
-            errdefer result.asHead().release();
+            errdefer result.asHead().dropReference();
 
             var iter = scope_mut.table.iterator();
             while (iter.next()) |pair| {
@@ -280,7 +280,7 @@ pub fn tailcallCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
         const tailcall_args = try heap.global_gpa.alloc(Shimmerable, args.len - 1);
         for (args[1..], 0..) |*arg, i| {
-            tailcall_args[i] = .{ .original = arg.current().borrow() };
+            tailcall_args[i] = .{ .original = arg.current().takeReference() };
         }
 
         if (interp.pending_tailcall) |*prev| prev.deinit();
@@ -312,7 +312,7 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
 
         // Capture the current scope.
         const scope: *objects.Dictionary = try Interp.narrowToEvalError(interp.captureCurrentScope());
-        errdefer scope.asHead().release();
+        errdefer scope.asHead().dropReference();
         // As well as reference it.
 
         const closure_obj = try Object.newObject(evaltypes.Closure);
@@ -320,7 +320,7 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
         const closure_content = try heap.global_gpa.create(evaltypes.Closure.Content);
         errdefer heap.global_gpa.destroy(closure_content);
         const arg_names = try objects.List.new(parsed_args.arg_names);
-        errdefer arg_names.asHead().release();
+        errdefer arg_names.asHead().dropReference();
         const optional_values =
             if (parsed_args.optional_values.len > 0) try objects.List.new(parsed_args.optional_values) else null;
         errdefer comptime unreachable; // We now take ownership of everything.
@@ -332,8 +332,8 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
 
         closure_content.* = .{
             .arg_names = arg_names,
-            .body = body.current().borrow(),
-            .name = if (fn_name) |val| val.current().borrow().asOptional() else .none,
+            .body = body.current().takeReference(),
+            .name = if (fn_name) |val| val.current().takeReference().asOptional() else .none,
             .scope = scope,
             .required_arity = parsed_args.required_arity,
             .optional_arity = parsed_args.optional_values.len,
@@ -346,7 +346,7 @@ fn closureHelper(interp: *Interp, args: []Shimmerable, mode: enum { function, me
         closure_obj.body.content = closure_content;
         break :blk closure_obj.head;
     };
-    defer new_closure.release();
+    defer new_closure.dropReference();
 
     if (fn_name) |val| {
         try interp.setVariable(val, new_closure.asValue());
