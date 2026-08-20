@@ -1,8 +1,8 @@
 //! Memory-related functions and objects.
 
 const builtin = @import("builtin");
-const std = @import("std");
 const options = @import("options");
+const std = @import("std");
 const math = std.math;
 const heap = std.heap;
 const mem = std.mem;
@@ -11,8 +11,17 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
-// These functions are all when appending to the free list (it should have
-// already resized itself)
+var null_ctx: usize = 0;
+/// Use to always fail any allocation operation.
+pub const null_allocator: Allocator = .{
+    .ptr = &null_ctx,
+    .vtable = &.{
+        .alloc = null_alloc,
+        .resize = null_resize,
+        .remap = null_remap,
+        .free = null_free,
+    },
+};
 fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
     _ = ctx;
     _ = n;
@@ -42,16 +51,6 @@ fn null_free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_addres
     _ = alignment;
     _ = return_address;
 }
-var null_ctx: usize = 0;
-pub const null_allocator: Allocator = .{
-    .ptr = &null_ctx,
-    .vtable = &.{
-        .alloc = null_alloc,
-        .resize = null_resize,
-        .remap = null_remap,
-        .free = null_free,
-    },
-};
 
 /// Note, this will hand out allocations that potentially alias. Really only useful for debugging.
 pub const RingBufferAllocator = struct {
@@ -100,6 +99,7 @@ pub const RingBufferAllocator = struct {
         } else {
             // Wrap the buffer around.
             self.end_index = 0;
+            // Try again after looping around, since we have more room.
             if (self.calculateOffset(n, alignment)) |val| {
                 self.end_index = val.new_end;
                 return val.alloc_at;

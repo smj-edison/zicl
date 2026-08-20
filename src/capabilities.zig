@@ -345,6 +345,53 @@ pub const Pointer = struct {
         };
     };
 };
+pub const DynLib = struct {
+    handle: std.DynLib,
+    /// The `{fnName {nativefn fnName} ...}` dict this library registered at load time
+    /// (see [dynlib fns]).
+    fns: heap.Value,
+
+    /// Takes ownership of `handle` and `fns`.
+    pub fn new(handle: std.DynLib, fns: heap.Value) !*Capability {
+        const cap_backing = try heap.global_gpa.create(Backing);
+        errdefer heap.global_gpa.destroy(cap_backing);
+        fns.makeCrossthread();
+        cap_backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .body = .{ .handle = handle, .fns = fns },
+        };
+
+        return try Capability.new(&cap_backing.head);
+    }
+
+    /// The address of `symbol_name` in this library, or null if it isn't
+    /// exported.
+    pub fn lookup(self: *DynLib, symbol_name: [:0]const u8) ?*anyopaque {
+        return self.handle.lookup(*anyopaque, symbol_name);
+    }
+
+    pub const Backing = struct {
+        head: Capability.Head,
+        body: DynLib,
+
+        fn deinitBody(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            backing.body.handle.close();
+        }
+
+        fn destroyBacking(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            backing.body.fns.dropReference();
+            heap.global_gpa.destroy(backing);
+        }
+
+        pub const vtable: Capability.Head.VTable = .{
+            .deinitBody = deinitBody,
+            .destroyBacking = destroyBacking,
+            .name = "dynlib",
+        };
+    };
+};
 
 fn testPointerDestructorRunsOnClose(ta: std.mem.Allocator) !void {
     try heap.testStart(ta, testing.io);

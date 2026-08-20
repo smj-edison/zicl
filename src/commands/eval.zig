@@ -242,7 +242,7 @@ pub fn letrecCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             while (iter.next()) |pair| {
                 if (try pair.key_ptr.equals(objects.interned_tilde_parent)) continue;
                 const letrec_entry = try interp.wrapError(&det, evaltypes.Letrec.new(&det, scope_mut, pair.key_ptr.*));
-                defer letrec_entry.asHead().release();
+                defer letrec_entry.asHead().dropReference();
                 try result.put(pair.key_ptr.*, letrec_entry.asHead().asValue());
             }
 

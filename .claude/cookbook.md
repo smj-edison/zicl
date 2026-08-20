@@ -10,18 +10,18 @@ Recipes for working with the heap and object system. The examples below use the
 Primitives (`integer`, `float`, `boolean`, `interned`) live inline in a 16-byte `Value`
 and never allocate. Constructors return a `Value` when the value fits inline, or a heap
 object when it does not. When the result is a heap object the caller owns it and must
-release it; `release` on a primitive is a no-op, so it is always safe to `defer` it.
+drop it; `dropReference` on a primitive is a no-op, so it is always safe to `defer` it.
 
 ```zig
 const num = objects.Integer.new(42);  // Inline Value; never allocates, never fails.
 const big = objects.Integer.new(math.maxInt(i64)); // Also inline: integers are i64.
 
 const str = try objects.String.newValue("hello"); // Always allocates a String object.
-defer str.release();
+defer str.dropReference();
 
-const list = try objects.List.new(&.{ str });    // Borrows `str` into the list.
-defer list.asHead().release();
-// `str` is still owned by you; releasing both is correct because `List.new` borrowed it.
+const list = try objects.List.new(&.{ str });    // References `str` into the list.
+defer list.asHead().dropReference();
+// `str` is still owned by you; releasing both is correct because `List.new` referenced it.
 ```
 
 Use `objects.String.newOwning(bytes)` when you already own the byte slice and want to
@@ -29,33 +29,33 @@ avoid a copy. On error the bytes are freed for you.
 
 ```zig
 const bytes = try heap.global_gpa.dupeSentinel(u8, "built elsewhere", 0);
-const str = try objects.String.newOwning(bytes); // Takes ownership of `bytes`.
-defer str.asHead().release();
+const str = try objects.String.newOwning(bytes); // References ownership of `bytes`.
+defer str.asHead().dropReference();
 ```
 
 ### Reference counting recipes.
 
-Functions that allocate return owned values. The caller releases them.
+Functions that allocate return owned values. The caller drops them.
 
 ```zig
 const str = try objects.String.newValue("hello");
-defer str.release();
+defer str.dropReference();
 ```
 
-Borrow when you need to keep a value alive across a scope but do not own it.
+Reference when you need to keep a value alive across a scope but do not own it.
 
 ```zig
-const borrowed = list.items[0].borrow();
-defer borrowed.release();
+const referenced = list.items[0].takeReference();
+defer referenced.dropReference();
 ```
 
-`Value.swap` / `OptionalValue.swap` release the old value when overwriting a slot, so
+`Value.swap` / `OptionalValue.swap` drop the old value when overwriting a slot, so
 they are safe to use even when the slot already held a value.
 
 ```zig
 var slot: heap.OptionalValue = .none;
-slot.swap(str_value);       // Releases nothing (was .none), stores str_value.
-slot.swapWithNone();        // Releases str_value, resets to .none.
+slot.swap(str_value);       // Drops nothing (was .none), stores str_value.
+slot.swapWithNone();        // Drops str_value, resets to .none.
 ```
 
 ### Shimmering with a `Shimmerable`.
@@ -75,20 +75,20 @@ const list = try objects.List.shimmerFrom(&det, &shim);
 ```
 
 Writeback usually needs custom logic, so the common pattern is to check whether the
-object moved and act on the borrowed value:
+object moved and act on the referenced value:
 
 ```zig
 if (shim.shimmered.asValue()) |new_value| {
-    // `new_value` is borrowed from `shim`. Build whatever the slot needs from it
+    // `new_value` is referenced from `shim`. Build whatever the slot needs from it
     // (the receiver takes its own reference); `defer shim.discardChanges()` then
-    // releases `new_value`. For example, re-wrap a shimmered dict as a hash ref:
+    // drop `new_value`. For example, re-wrap a shimmered dict as a hash ref:
     const new_ref = try objects.HashReference.new(new_value.asPtr().?);
     some_slot.swap(new_ref.asHead().asValue());
 }
 ```
 
 For the simple case of moving the result into a slot you own, `.consume()` takes
-ownership of `shim.current()` and releases the original in one step. It is used less
+ownership of `shim.current()` and drops the original in one step. It is used less
 often. When you use it, do _not_ also `defer shim.discardChanges()` -- it is invalid
 after `.consume()` runs (which zeroes the buffer). Use `errdefer shim.discardChanges()`
 for the error path instead, so the duplicate is freed only if an error occurs before
@@ -98,23 +98,20 @@ for the error path instead, so the duplicate is freed only if an error occurs be
 
 Mutation is copy-on-write. `Value.asMutableInPlace(T, det)` is the preferred entry
 point: it returns a `*T` you can write to when the value can be shimmered to `T` _and_
-mutated in place, and null when it cannot, leaving the copy to you.
+mutated in place, and null when it cannot, leaving copying logic to you.
 
 ```zig
-var det: objects.ErrorDetails = undefined;
-
-if (try dict_raw.asMutableInPlace(Dictionary, &det)) |dict_mut| {
+if (try interp.asMutableInPlace(Dictionary, dict)) |dict_mut| {
     try dict_mut.put(key, value);
     // Mutated in place, so the owner's string rep is now stale.
-    interp.callFrame().variables.asHead().invalidateString();
+    dict_owner.asHead().invalidateString();
 } else {
     // Copy-on-write. The duplicate is exclusively ours, so the second
     // `asMutableInPlace` always succeeds.
-    const duped = try dict_raw.duplicateAsBoxed();
-    defer duped.release();
-    const dict_mut = (try duped.asValue().asMutableInPlace(Dictionary, &det)).?;
-    try dict_mut.put(key, value);
-    try interp.setVariable(var_name, duped.asValue()); // Store the copy back.
+    const duped = try interp.duplicateAsType(Dictionary, dict);
+    defer duped.dropReference();
+    try duped.put(key, value);
+    try interp.setVariable(var_name, duped.asHead().asValue()); // Store the copy back.
 }
 ```
 
@@ -130,14 +127,14 @@ Two things about it drive its call sites:
     only ever writes back something with the same string rep. The one shortcut is that
     when the shimmer already had to build a mutable duplicate, it steals `shimmered`
     rather than duplicating a second time.
-2.  The `*T` it returns is **owned by you and detached from the shim**. Release it when
+2.  The `*T` it returns is **owned by you and detached from the shim**. Drop it when
     you are done and write it back explicitly; the shim still holds the original, so
     `shim.current()` is not the object you mutated and `shim.consume()` would return
     the wrong value.
 
 ```zig
 const dict = try shim.getMutable(objects.Dictionary, &det);
-defer dict.asHead().release();
+defer dict.asHead().dropReference();
 try dict.put(key, value);
 try parent.put(child_key, dict.asHead().asValue()); // Write the copy back.
 ```
@@ -236,7 +233,7 @@ Create a dict from alternating keys and values.
 
 ```zig
 const dict = try objects.Dictionary.new(&.{ key_foo, value1, key_bar, value2 });
-defer dict.asHead().release();
+defer dict.asHead().dropReference();
 ```
 
 Insert or update a key. `put` asserts the dict is mutable, so reach it through the
@@ -248,7 +245,7 @@ if (try dict_raw.asMutableInPlace(Dictionary, &det)) |dict| {
     owner.asHead().invalidateString();
 } else {
     const duped = try dict_raw.duplicateAsBoxed();
-    defer duped.release();
+    defer duped.dropReference();
     try (try duped.asValue().asMutableInPlace(Dictionary, &det)).?.put(key, value);
     try storeBack(duped.asValue());
 }
@@ -284,11 +281,11 @@ const val = try objects.Dictionary.getFollowingLinks(&det, &shim, key);
 
 ### List operations.
 
-Build a list from a slice of `Value`s (each is borrowed into the list).
+Build a list from a slice of `Value`s (each is referenced into the list).
 
 ```zig
 const list = try objects.List.new(&.{ str_value, int_value });
-defer list.asHead().release();
+defer list.asHead().dropReference();
 ```
 
 When building a list from command arguments (which arrive as `[]Shimmerable`), use
@@ -296,7 +293,7 @@ When building a list from command arguments (which arrive as `[]Shimmerable`), u
 
 ```zig
 const list = try objects.List.newFromShimmerables(args[1..]);
-defer list.asHead().release();
+defer list.asHead().dropReference();
 ```
 
 Append to a list via a `Shimmerable`.
@@ -318,7 +315,7 @@ the object system would otherwise do on every access.
 Read items by index. The returned `Value` is non-owning.
 
 ```zig
-const item = list.items[0]; // Non-owning; borrow if you need to keep it.
+const item = list.items[0]; // Non-owning; take if you need to keep it.
 ```
 
 ### Error handling with `ErrorDetails`.
@@ -326,7 +323,7 @@ const item = list.items[0]; // Non-owning; borrow if you need to keep it.
 Object-level functions take an optional `det: ?*ErrorDetails` to report user-facing
 errors without touching the interpreter result. `det` is not set when the function
 returns `error.OutOfMemory`. Otherwise, on a non-OOM error, `det.message` is a heap
-allocation owned by the caller, who must release it or transfer it to the interpreter.
+allocation owned by the caller, who must drop it or transfer it to the interpreter.
 
 ```zig
 var det: objects.ErrorDetails = undefined;
@@ -380,7 +377,7 @@ const hash = try obj.getHashRegistering(); // Idempotent.
 var shim: objects.Shimmerable = .{ .original = hash_string_value };
 defer shim.discardChanges();
 const resolved = try objects.HashReference.shimmerFrom(&det, &shim);
-// `resolved.ref` is the original object, borrowed.
+// `resolved.ref` is the original object, referenced.
 ```
 
 ### Cross-thread sharing.
@@ -395,13 +392,13 @@ it.
 It does not synchronize the _transfer_: the caller is responsible for establishing a
 happens-before relationship when handing the object off (for example, by sending it
 through a mutex-protected channel or joining a `std.Thread`). After that handoff, the
-receiving thread can `borrow`/`release` freely, and can free the object without
+receiving thread can `takeReference`/`dropReference` freely, and can free the object without
 cooperating with the originating thread.
 
 ```zig
 shared_value.makeCrossthread();
 // Establish happens-before here (e.g. enqueue on a locked channel).
-// The receiving thread can `borrow`/`release` it freely, and can free it
+// The receiving thread can `takeReference`/`dropReference` it freely, and can free it
 // without cooperating with this thread.
 ```
 
@@ -417,7 +414,7 @@ fn testVariables(ta: std.mem.Allocator) !void {
     defer heap.testFinish();
 
     const str = try objects.String.newValue("hello");
-    defer str.release();
+    defer str.dropReference();
     try testing.expectEqualStrings("hello", try str.asHead().getString());
 }
 
@@ -481,7 +478,7 @@ the test with `tw.errorAlways`, and finish with `tw.end(.reset)`.
 
 Commands live in `src/commands/`, take `args: []Shimmerable` (with `args[0]` being the
 command name), and report their result through the interpreter rather than returning it.
-Arguments are _not_ borrowed: shimmer them in place and let the caller own them.
+Arguments are _not_ referenced: shimmer them in place and let the caller own them.
 
 ```zig
 const common = @import("common.zig");

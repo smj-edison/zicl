@@ -151,7 +151,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
     initialized = true;
 }
 
-/// Release the preallocated fallback. Separate from `deinitGlobals` because the
+/// Drop the preallocated fallback dict. Separate from `deinitGlobals` because the
 /// leak check has to run after it, and `deinitGlobals` tears the leak check down.
 /// Only safe once no script can run again: `[catch]` reaches for this dict with
 /// `.?`, so a caller that frees it and keeps evaluating panics on the next OOM.
@@ -291,9 +291,9 @@ pub const LazyFnRegistry = struct {
 ///    to be called the "representative". The representative will have an identical value
 ///    to every other object by virtue of hashing, so we only need to hold onto the
 ///    representative. What gets tricky though is that we need the representative to stay
-///    alive, even when everyone else has released the representative, since a second object
+///    alive, even when everyone else has dropped the representative, since a second object
 ///    could resolve to the representative's hash and then cause a UAF. Hence, the registry
-///    borrows the representative until every instance of the hash reference has disappeared.
+///    references the representative until every instance of the hash reference has disappeared.
 ///    You might wonder then, won't that mean that there's a circular reference between the
 ///    hash registry and the representative? The representative only unregisters when it's
 ///    freed, but the hash registry owns the representative. The way around this is that
@@ -326,13 +326,13 @@ pub const HashRegistry = struct {
         }
     }, 80) = .empty,
 
-    pub fn getAndBorrow(registry: *HashRegistry, hash: u256) ?*Object {
+    pub fn getAndTakeReference(registry: *HashRegistry, hash: u256) ?*Object {
         registry.rw_lock.lockSharedUncancelable(global_io);
         defer registry.rw_lock.unlockShared(global_io);
 
         if (registry.entries.getPtr(hash)) |entry| {
             assert(entry.instances.load(.monotonic) > 0);
-            return entry.representative.takeReference(); // Borrow while still locked.
+            return entry.representative.takeReference(); // Take while still locked.
         } else return null;
     }
 
@@ -1394,7 +1394,7 @@ pub const Object = extern struct {
         }
 
         // We need to load `metadata` before decrementing, because decrementing means
-        // we've released our ownership of the object, and so another thread could
+        // we've dropped our ownership of the object, and so another thread could
         // swoop in and free the object before we read the metadata (ask me how I know).
         const metadata = obj.hash_metadata.load(.monotonic);
         const new_ref_count = decrRefCountOf(u32, &obj.ref_count, true);

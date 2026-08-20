@@ -687,7 +687,7 @@ pub fn evalFrame(interp: *Interp) *EvalFrame {
     return &interp.eval_frames.items[interp.evalFrameIdx()];
 }
 
-/// `signature` does not need to outlive this function call, as this borrows everything
+/// `signature` does not need to outlive this function call, as this references everything
 /// needed from `signature` when creating the call frame.
 fn pushCallFrame(
     interp: *Interp,
@@ -754,7 +754,7 @@ fn popEvalFrame(interp: *Interp) void {
     _ = interp.eval_frames.pop() orelse unreachable;
 }
 
-/// Caller should release return value when they're done.
+/// Caller should drop return value when they're done.
 fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !Value {
     switch (tag) {
         .simple_string => {
@@ -857,8 +857,8 @@ pub const ClosureAndCacheKey = struct {
     closure: *Closure,
     cache_key: u256,
 };
-/// Returns the closure borrowed. The caller owns the reference and must
-/// release it (directly, or via `CommandVariant.deinit()`).
+/// Returns the closure references. The caller owns the reference and must
+/// drop it (directly, or via `CommandVariant.deinit()`).
 pub fn getClosure(interp: *Interp, value: Value, can_be_method: bool) !ClosureAndCacheKey {
     const closure_and_key: ClosureAndCacheKey = blk: {
         if (value.asType(Closure)) |closure| {
@@ -907,8 +907,8 @@ pub const CommandVariant = union(enum) {
     }
 };
 
-/// Borrows the closure in the case of letrec and closure. Use `CommandVariant.deinit()` for
-/// proper cleanup.
+/// References the closure in the case of letrec and closure. Use `CommandVariant.deinit()` for
+/// proper cleanup in all cases.
 pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: bool) !CommandVariant {
     var det: ErrorDetails = undefined;
 
@@ -982,7 +982,7 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
     }
 }
 
-/// If variant is `closure`, then the closure is returned borrowed.
+/// If variant is `closure`, then the closure is returned referenced.
 pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
     var det: ErrorDetails = undefined;
 
@@ -1234,7 +1234,7 @@ pub fn buildErrorStack(interp: *Interp) error{OutOfMemory}!Value {
     return trace.asHead().asValue();
 }
 
-/// Self will be returned borrowed. Caller is responsible for decrementing the ref count.
+/// Self will be returned referenced. Caller is responsible for decrementing the ref count.
 fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { command: ?CommandVariant, self: OptionalValue } {
     var command = interp.getCommand(interp.callFrameIdx(), &args[0], true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1381,7 +1381,7 @@ pub fn invokeCommandMaybeMethod(
             const put_ctx = objects.ValueSliceContext{ .items = all_but_last };
 
             const duplicate = if (dict_resolved.canMutate()) null else try dict_resolved.duplicate();
-            defer if (duplicate) |dup| dup.release();
+            defer if (duplicate) |dup| dup.dropReference();
             const to_use = duplicate orelse dict_resolved;
 
             var dict_resolved_shim: Shimmerable = .{ .original = to_use };
@@ -1503,7 +1503,7 @@ pub fn evalValueInner(interp: *Interp, call_frame: u32, script: Value, cache_key
 
     // Try to get the script, parsing if necessary.
     const parsed = (try interp.getScript(script, cache_key));
-    defer parsed.asHead().dropReference(); // `parsed` was borrowed by `getScript`.
+    defer parsed.asHead().dropReference(); // `parsed` was referenced by `getScript`.
 
     // Don't evaluate empty scripts.
     if (parsed.tags.len <= 1) return;
@@ -1615,7 +1615,7 @@ pub fn evalFile(interp: *Interp, filename: []const u8) InternalEvalError!void {
 pub fn evalFileAsModule(interp: *Interp, filename: []const u8) InternalEvalError!*Dictionary {
     const parent_scope = try narrowToEvalError(interp.captureCurrentScope());
     parent_scope.asHead().makeCrossthread();
-    defer parent_scope.asHead().release();
+    defer parent_scope.asHead().dropReference();
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         heap.global_io,
@@ -2165,7 +2165,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     var interm_shim: Shimmerable = .{ .original = interm_test_dict.asHead().asValue() };
     defer interm_shim.discardChanges();
 
-    // Borrow the intermediate dict.
+    // Reference the intermediate dict.
     const intermediate = (try interp.getDictValueRecursively(
         &interm_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },

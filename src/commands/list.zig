@@ -53,17 +53,6 @@ pub fn lappendCmd(interp: *Interp, args: []Shimmerable) !void {
 /// [lassign]
 pub fn lassignCmd(interp: *Interp, args: []Shimmerable) !void {
     // args[0] = "lassign", args[1] = list, args[2..] = varNames
-
-    // `args[1]` holds its own borrow of the list, which matters when one of the
-    // target variables is the one the list came from:
-    //
-    // ```
-    // set l {a b}
-    // lassign $l l other
-    // ```
-    //
-    // Assigning to `l` releases the list that `$l` substituted, so without that
-    // borrow `as_list.items` would dangle before `other` is assigned.
     const as_list = try interp.getList(&args[1]);
     const list_len = as_list.items.len;
     const var_count = args.len - 2;
@@ -339,7 +328,7 @@ pub fn lsetCmd(interp: *Interp, args: []Shimmerable) !void {
         interp.setResult(list_mut.asHead().asValue());
     } else {
         const duped = try interp.wrapError(&det, current.duplicateAsType(List, &det));
-        defer duped.asHead().release();
+        defer duped.asHead().dropReference();
         try interp.setListValueRecursively(duped, args[2..(args.len - 1)], new_value);
         try interp.setVariable(var_name, duped.asHead().asValue());
         interp.setResult(duped.asHead().asValue());
@@ -559,7 +548,7 @@ fn testLassignCanAssignBackOverTheVariableItsListCameFrom(ta: std.mem.Allocator)
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    // `l` is reassigned partway through, which releases the list still being
+    // `l` is reassigned partway through, which drops the list still being
     // read for the remaining variables.
     try interp.testExpectScriptResult("b",
         \\ set l {a b}

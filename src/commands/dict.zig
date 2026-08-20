@@ -146,7 +146,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     try interp.putDictValueRecursively(dict_mut, key_context, value);
                 } else {
                     const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
-                    defer duped.asHead().release();
+                    defer duped.asHead().dropReference();
                     try interp.putDictValueRecursively(duped, key_context, value);
                     try interp.setVariable(var_name, duped.asHead().asValue());
                 }
@@ -168,7 +168,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     _ = try interp.removeDictValueRecursively(dict_mut, unset_ctx);
                 } else {
                     const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
-                    defer duped.asHead().release();
+                    defer duped.asHead().dropReference();
                     _ = try interp.removeDictValueRecursively(duped, unset_ctx);
                     try interp.setVariable(var_name, duped.asHead().asValue());
                 }
@@ -254,7 +254,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .size => {
             var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[2]));
-            defer kv_result.deinit(heap.local_arena); // Still need to release the values.
+            defer kv_result.deinit(heap.local_arena); // Still need to drop the values.
             interp.setResultInteger(@intCast(kv_result.mapping.count()));
         },
         .remove => {

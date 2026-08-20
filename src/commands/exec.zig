@@ -23,6 +23,8 @@
 //! exit raises, so `[exec cc ...]` hands back compiler warnings rather than
 //! throwing on them. `-split` reports the parts separately instead, and does not
 //! raise, so a failure can be inspected rather than caught.
+//!
+//! TODO properly audit this, as it is mostly vibe coded.
 
 const std = @import("std");
 
@@ -94,7 +96,23 @@ const Pipeline = struct {
     stdout_stage: ?usize = null,
     background: bool = false,
     split: bool = false,
+    /// Capabilities named by a `<@`/`>@`/`2>@` redirect, resolved and marked
+    /// in-flight as soon as they're parsed (see `resolveHandle`) and held
+    /// until `execCmd` is done with the pipeline, however it ends -- see
+    /// `releaseHeld`.
+    held: std.ArrayList(*Capability) = .empty,
 };
+
+/// Drops the in-flight mark and reference every redirect target in `pipeline`
+/// is still holding. Called both when `parse` fails partway through (whatever
+/// had accumulated in `held` by then) and once `execCmd` is entirely done
+/// with a successfully parsed pipeline.
+fn releaseHeld(pipeline: *const Pipeline) void {
+    for (pipeline.held.items) |cap| {
+        cap.head.dropInFlight();
+        cap.asHead().dropReference();
+    }
+}
 
 /// What one redirection token means: which stream it names, and how its
 /// operand is meant to be read.
@@ -179,8 +197,11 @@ fn takeOperand(
 
 /// Resolves the operand of an `@` redirection to an open file. Takes a file
 /// capability or one of the three standard stream names, checking `direction`,
-/// what the child will do with it, against how a capability was opened.
-fn resolveHandle(interp: *Interp, name: []const u8) Interp.Error!File {
+/// what the child will do with it, against how a capability was opened. A
+/// capability resolved here is marked in-flight and referenced until
+/// `pipeline` releases it (see `Pipeline.held`), since the fd handed back is
+/// only safe to use for as long as that mark is held.
+fn resolveHandle(interp: *Interp, pipeline: *Pipeline, name: []const u8) Interp.Error!File {
     // Read straight out of the redirect cell. `ioutil`'s lock only orders
     // writers that go through it, and the child writes on a dup of its own, so
     // taking the lock here would order nothing.
@@ -196,23 +217,33 @@ fn resolveHandle(interp: *Interp, name: []const u8) Interp.Error!File {
 
     // Shimmered through a temporary, because the name may be a slice out of the
     // middle of a word (`>@<zicl://...>`) rather than a word of its own.
-    const named = try objects.String.newValue(name);
-    defer named.dropReference();
-    var shim: Shimmerable = .{ .original = named };
-    defer shim.discardChanges();
+    var shim: Shimmerable = .{ .original = try objects.String.newValue(name) };
+    errdefer shim.deinit();
 
     var det: ErrorDetails = undefined;
-    const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &shim));
-    const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
+    _ = try interp.wrapError(&det, Capability.shimmerFrom(&det, &shim));
+    const cap_mut = shim.current().asType(Capability).?;
+
+    const backing = try interp.wrapError(&det, cap_mut.getBacking(capabilities.File.Backing, &det));
+
+    errdefer {
+        cap_mut.head.dropInFlight();
+        cap_mut.asHead().dropReference();
+    }
+    try pipeline.held.append(heap.local_arena, cap_mut);
 
     return backing.body.file;
 }
 
 /// Parses `args[1..]` into a `Pipeline`. Everything the result points at is
 /// either a slice of an argument's string rep or an allocation in
-/// `heap.local_arena`, so it needs no freeing.
+/// `heap.local_arena`, so it needs no freeing -- except `held`, which a
+/// `<@`/`>@`/`2>@` redirect can populate before a later word fails to parse;
+/// releasing that is this function's own job on every error path, and the
+/// caller's from here on once `parse` returns successfully.
 fn parse(interp: *Interp, args: []Shimmerable) Interp.Error!Pipeline {
     var pipeline: Pipeline = .{ .stages = &.{} };
+    errdefer releaseHeld(&pipeline);
 
     var rest = args[1..];
 
@@ -423,7 +454,7 @@ fn parseRedirection(
         }
         const target = try takeOperand(interp, rest, index, classified.attached, word);
         pipeline.stdin = if (flags.handle)
-            .{ .file = try resolveHandle(interp, target) }
+            .{ .file = try resolveHandle(interp, pipeline, target) }
         else if (flags.text)
             .{ .text = target }
         else
@@ -445,7 +476,7 @@ fn parseRedirection(
             return;
         }
         stage.stderr = if (flags.handle)
-            .{ .file = try resolveHandle(interp, target) }
+            .{ .file = try resolveHandle(interp, pipeline, target) }
         else
             .{ .path = .{ .bytes = target, .append = flags.append } };
         return;
@@ -457,7 +488,7 @@ fn parseRedirection(
     }
     const target = try takeOperand(interp, rest, index, classified.attached, word);
     pipeline.stdout = if (flags.handle)
-        .{ .file = try resolveHandle(interp, target) }
+        .{ .file = try resolveHandle(interp, pipeline, target) }
     else
         .{ .path = .{ .bytes = target, .append = flags.append } };
     pipeline.stdout_stage = stage_index;
@@ -932,6 +963,7 @@ fn reportBackground(interp: *Interp, spawned: *Spawned) Interp.Error!void {
 /// [exec]
 pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const pipeline = try parse(interp, args);
+    defer releaseHeld(&pipeline);
 
     var env_map = try buildEnviron(interp);
     defer if (env_map) |*map| map.deinit();
@@ -958,6 +990,7 @@ pub fn waitCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var det: ErrorDetails = undefined;
     const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
     const backing = try interp.wrapError(&det, cap.getBacking(capabilities.Process.Backing, &det));
+    defer backing.head.dropInFlight();
 
     const term = backing.body.wait() catch |err| {
         return interp.setErrorFormatted("error waiting for child: {t}", .{err});

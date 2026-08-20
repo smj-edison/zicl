@@ -20,7 +20,7 @@ Common patterns to watch for in this codebase:
 - **Dict access patterns** -- Manual key lookups followed by `dictLookupFollowRefs` or `dictGetTable` when `Interp.getDictValue`, `getDictValueOrError`, `getDictValueRecursively`, `getDictValueRecursivelyOrError`, `putDictValue`, `putDictValueRecursively`, `removeDictValue`, `removeDictValueRecursively`, `getDictValueInPlace`, or `putDictValueInPlace` would handle the shimmer and error plumbing.
 - **List construction** -- `createObject` + manual field initialization when `newList`, `newListWithCapacity`, or `listAppendAssumeCapacity` would suffice.
 - **String allocation** -- `createString` + `setNormalString` when `newString`, `newStringFmt`, `newStringToFill`, or `setStringOwning` would work.
-- **Ref-count dance** -- Manual `incrRefCount`/`decrRefCount` pairs when `borrow()`, `dupOrRef()`, `reference()`, or `referenceTakeOwnership()` express the intent more directly.
+- **Ref-count dance** -- Manual `incrRefCount`/`decrRefCount` pairs when `takeReference()`, `dupOrRef()`, `reference()`, or `referenceTakeOwnership()` express the intent more directly.
 - **Error-details plumbing** -- Creating a local `ErrorDetails` and passing it through multiple layers when `interp.wrapError` or `interp.wrapShimmerFn` could collapse the boilerplate.
 - **Range/index resolution** -- Manual index arithmetic when `Heap.ListIndex.asAbsoluteIndex`, `Range.fromIndexes`, `getRange`, or `getRangeInPlace` already exists.
 - **Expression evaluation** -- Manual tokenization or AST walking when `evalExpression`, `evalExpressionInPlace`, or `getBoolFromExpression` should be used.

@@ -423,7 +423,7 @@ export fn Zicl_ShimGetString(shim: *Shimmerable, len: ?*c_int) callconv(.c) ?[*:
     return str;
 }
 
-/// Release any shimmered duplicate and roll the shimmerable back to its original
+/// Drop any shimmered duplicate and roll the shimmerable back to its original
 /// value. The caller still owns `original`.
 export fn Zicl_ShimDiscardChanges(shim: *Shimmerable) callconv(.c) void {
     shim.discardChanges();
@@ -648,7 +648,7 @@ export fn Zicl_DictShimmerWriteback(dict: *Dictionary, key: Value, value: Value)
 
 /// Like [dict link], but builds a fresh dict rather than mutating `dict` in
 /// place: the caller keeps both `dict` and `parent` untouched. `parent` is
-/// borrowed, and boxed first if it is a primitive. Returns NULL on OOM.
+/// referenced, and boxed first if it is a primitive. Returns NULL on OOM.
 export fn Zicl_DictLink(dict: *const Dictionary, parent: Value) callconv(.c) ?*Dictionary {
     const hash_ref = objects.HashReference.newFromValue(parent) catch return null;
     defer hash_ref.asHead().dropReference();
@@ -713,7 +713,7 @@ export fn Zicl_AttachSource(value: *Value, filename: [*:0]const u8, line_no: c_i
 
     const file_name = objects.String.newValue(std.mem.span(filename)) catch return .oom;
     // `Source.new` borrows `file_name`, so the constructing reference is ours
-    // to release either way.
+    // to drop either way.
     defer file_name.dropReference();
 
     const source = objects.Source.new(bytes, file_name.asOptional(), @intCast(line_no)) catch return .oom;
@@ -850,7 +850,7 @@ export fn Zicl_GetScriptBeingEvaluated(interp: *Interp) callconv(.c) Value {
 }
 
 /// The name of the closure currently executing in the current call frame,
-/// borrowed from the frame (valid only while it remains on the stack).
+/// referenced from the frame (valid only while it remains on the stack).
 /// ZICL_NONE for the top-level frame, or a closure invoked without a name
 /// (e.g. [apply] on a literal).
 export fn Zicl_GetClosureNameBeingEvaluated(interp: *Interp) callconv(.c) OptionalValue {
@@ -963,10 +963,10 @@ const ParsedName = extern struct {
 };
 
 /// Registers `head` and boxes the capability that names it as a value.
-/// Initializes `id`, `closed`, and `ref_count` on `head`, since C
+/// Initializes `id`, `state`, and `ref_count` on `head`, since C
 /// construction bypasses the Zig defaults.
 export fn Zicl_CapabilityNew(out: *Value, head: *Capability.Head) callconv(.c) ReturnCode {
-    head.closed = .init(false);
+    head.state = .init(.{ .in_flight = 0, .close_initiated = false });
     head.ref_count = .init(1);
     head.id = 0;
     const cap = Capability.new(head) catch return .oom;
@@ -975,16 +975,18 @@ export fn Zicl_CapabilityNew(out: *Value, head: *Capability.Head) callconv(.c) R
 }
 
 /// Resolves `shim` to a live capability, folding what would otherwise be two
-/// calls (string resolution, then the type and closed-ness check) into one, since
-/// C code -- an argument converter, chiefly -- always starts from a
-/// `Zicl_Shimmerable*` that may still hold a string, never an
+/// calls (string resolution, then the type check and marking it in-flight)
+/// into one, since C code -- an argument converter, chiefly -- always starts
+/// from a `Zicl_Shimmerable*` that may still hold a string, never an
 /// already-resolved value. Returns NULL if `shim` doesn't name a capability,
 /// names one of some other type than `expected` (pass NULL to skip the type
-/// check), or names one that has been closed. The returned head is borrowed
-/// from the capability: valid while the capability stays alive and open.
-/// Recover the backing struct with `Zicl_ContainerOf(head, MyBacking, head)`.
-/// The type name lives on the head itself (`head->vtable->name`), so there's
-/// no separate accessor for it.
+/// check), or names one that has been closed. On success the returned head
+/// is marked in-flight, deferring a concurrent close's cleanup until the
+/// caller drops that mark with `Zicl_HeadDropInFlight` -- required before the
+/// capability can actually close, so every successful call must be paired
+/// with one. Recover the backing struct with `Zicl_ContainerOf(head,
+/// MyBacking, head)`. The type name lives on the head itself
+/// (`head->vtable->name`), so there's no separate accessor for it.
 export fn Zicl_ResolveCapability(
     shim: *Shimmerable,
     expected: ?*const Capability.Head.VTable,
@@ -993,7 +995,7 @@ export fn Zicl_ResolveCapability(
     if (expected) |vt| {
         if (cap.head.vtable != vt) return null;
     }
-    if (cap.head.isClosed()) return null;
+    cap.head.markInFlight() catch return null;
     return cap.head;
 }
 
@@ -1035,15 +1037,20 @@ export fn Zicl_NewPointerCapability(
 /// (rather than writing NULL to `*out`) if `shim` doesn't resolve to a live
 /// pointer capability, or if it's a pointer capability of some other type --
 /// `*out` alone can't carry that distinction, since NULL is itself a valid
-/// pointer to recover (see `Zicl_NewPointerCapability`).
+/// pointer to recover (see `Zicl_NewPointerCapability`). On success, `*out_head`
+/// is the capability's head, marked in-flight for as long as `*out` is used --
+/// pass it to `Zicl_HeadDropInFlight` once done with the pointer, the same
+/// pairing `Zicl_ResolveCapability` requires.
 export fn Zicl_GetPointerCapability(
     shim: *Shimmerable,
     expected_type_name: [*:0]const u8,
     out: *?*anyopaque,
+    out_head: *?*Capability.Head,
 ) callconv(.c) ReturnCode {
     const cap = Capability.shimmerFrom(null, shim) catch |err| return if (err == error.OutOfMemory) .oom else .@"error";
     const ptr = capabilities.Pointer.getTyped(cap, std.mem.span(expected_type_name), null) catch |err| return if (err == error.OutOfMemory) .oom else .@"error";
     out.* = ptr.ptr;
+    out_head.* = cap.head;
     return .ok;
 }
 
@@ -1069,7 +1076,16 @@ export fn Zicl_HeadClose(head: *Capability.Head) callconv(.c) void {
 }
 
 export fn Zicl_HeadIsClosed(head: *Capability.Head) callconv(.c) bool {
-    return head.isClosed();
+    return head.hasCloseBeenInitiated();
+}
+
+/// Drops an in-flight mark taken by `Zicl_ResolveCapability` or
+/// `Zicl_GetPointerCapability`, once the caller is done with the head or
+/// pointer those returned. Required for a concurrent close to actually run
+/// its cleanup: the capability defers that until every in-flight mark on it
+/// has been dropped.
+export fn Zicl_HeadDropInFlight(head: *Capability.Head) callconv(.c) void {
+    head.dropInFlight();
 }
 
 export fn Zicl_HeadGetId(head: *Capability.Head, out: *Capability.Id) callconv(.c) void {

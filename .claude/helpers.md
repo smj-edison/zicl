@@ -21,7 +21,7 @@ this before implementing anything that might already exist.
 - `heap.LazyRegisterFn` -- Signature for a lazy native command initializer: `*const fn (interp: *anyopaque) callconv(.c) void`.
 - `heap.nativefn_registry.register(gpa, name, init_fn)` -- Register a lazy C command initializer; `error.DuplicateLazyFn` on duplicates.
 - `heap.nativefn_registry.get(name)` -- Look up a lazy initializer by name, or null.
-- `heap.registered_hashes.getAndBorrow(hash)` -- Look up a `u256` hash and return a borrowed `*Object` (or null). Thread-safe via shared lock.
+- `heap.registered_hashes.getAndTakeReference(hash)` -- Look up a `u256` hash and return a referenced `*Object` (or null). Thread-safe via shared lock.
 - `heap.registered_hashes.register(key, obj)` -- Idempotently register `obj` under `key`; marks it cross-thread and bumps the instance count.
 - `heap.registered_hashes.unregister(key, obj)` -- Decrement the instance count for `key`; frees the representative when the last instance goes away.
 
@@ -44,17 +44,17 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Value.canMutate(value)` -- True if the value points at an exclusively-owned, non-cross-thread, non-hash-registered object (false for primitives).
 - `Value.asMutableInPlace(value, T, det)` -- Return `?*T` when the value can be shimmered to `T` _and_ mutated without duplicating; null when the caller has to duplicate instead (`duplicateAsBoxed`, mutate the copy, store it back). The preferred entry point for mutation; see the copy-on-write recipe in the cookbook.
 - `Value.incrRefCount(value)` -- Increment the ref count if the value is a pointer (no-op for primitives).
-- `Value.borrow(value)` -- Increment ref count and return the same `Value`.
-- `Value.release(value)` -- Decrement ref count and free if zero (no-op for primitives).
+- `Value.takeReference(value)` -- Increment ref count and return the same `Value`.
+- `Value.dropReference(value)` -- Decrement ref count and free if zero (no-op for primitives).
 - `Value.duplicate(value)` -- Shallow copy (deep for the string rep); primitives return themselves.
 - `Value.duplicateAsBoxed(value)` -- Like `duplicate` but always returns a heap `*Object` (boxes primitives).
-- `Value.swap(ref, new)` -- Set `ref.* = new` and release the old value.
+- `Value.swap(ref, new)` -- Set `ref.* = new` and drop the old value.
 - `Value.makeCrossthread(value)` -- Recursively mark a pointer value cross-thread (no-op for primitives).
 - `Value.getString(value)` -- Return the string rep, generating it if needed (may allocate for objects; primitives render into `local_arena`).
 - `Value.getStringWithBuffer(value, buf)` -- Like `getString` but takes a `*[350]u8` stack buffer so primitives never allocate. Only OOMs when the value is an object that OOMs generating its string.
 - `Value.equals(a, b)` -- Deep string equality, with fast paths per tag pair (compares hashes when both sides are special strings).
 - `Value.equalsString(value, str)` -- Compare a value's string rep to a byte slice.
-- `Value.getHashNoRegister(value)` -- Return the `u256` Blake3 content hash without registering in the hash registry. This is the hash that travels between machines; for a hash table's index use `heap.indexHash` instead.
+- `Value.getHashNoRegister(value)` -- Return the `u256` Blake3 content hash without registering in the hash registry. This is the hash that travels between machines; for a hash table's index use `hashutil.quickHash` instead.
 - `Value.trace(value, fmt, args)` -- Append a trace entry (only when `trace_mem` is enabled).
 
 ### OptionalValue
@@ -62,13 +62,13 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `OptionalValue.isNone(optional)` / `.isSome(optional)` -- Tag checks.
 - `OptionalValue.asValue(optional)` -- Return `?Value` (null if none).
 - `OptionalValue.fromValue(value)` -- Convert `?Value` to `OptionalValue`.
-- `OptionalValue.borrow(optional)` -- Borrow the contained value (nop if none).
+- `OptionalValue.takeReference(optional)` -- Take the contained value (nop if none).
 - `OptionalValue.makeCrossthread(optional)` -- Mark the contained value cross-thread (nop if none).
-- `OptionalValue.release(optional)` -- Release the contained value (nop if none).
+- `OptionalValue.dropReference(optional)` -- Drop the contained value (nop if none).
 - `OptionalValue.orElse(optional, otherwise)` -- Return the contained value or `otherwise`.
 - `OptionalValue.orEmpty(optional)` -- Return the contained value or the interned empty string.
 - `OptionalValue.swap(ref, new)` -- Overwrite `ref.*` with `new`, releasing the old value.
-- `OptionalValue.swapWithNone(ref)` -- Release the contained value and set to none (use in `errdefer`).
+- `OptionalValue.swapWithNone(ref)` -- Drop the contained value and set to none (use in `errdefer`).
 
 ### Interned strings
 - `heap.InternedString.new(comptime bytes)` -- Build an `InternedString` from a comptime `[:0]const u8` in rodata.
@@ -111,9 +111,9 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Object.setStringLocalObject(obj, bytes)` -- Non-atomic set for a known thread-local object (asserts not cross-thread).
 - `Object.getRefCount(obj)` -- Atomic load for cross-thread objects, plain read otherwise.
 - `Object.incrRefCount(obj)` -- Increment (atomic for cross-thread).
-- `Object.borrow(obj)` -- Increment and return the same `*Object`.
-- `Object.release(obj)` -- Decrement and free at zero; unregisters from the hash registry when a representative or registered object reaches the threshold.
-- `Object.swap(ref, new)` -- Set `ref.* = new` and release the old object.
+- `Object.takeReference(obj)` -- Increment and return the same `*Object`.
+- `Object.dropReference(obj)` -- Decrement and free at zero; unregisters from the hash registry when a representative or registered object reaches the threshold.
+- `Object.swap(ref, new)` -- Set `ref.* = new` and drop the old object.
 - `Object.invalidateString(obj)` -- Free the string rep (asserts `canShimmer`).
 - `Object.invalidateInternalRep(obj)` -- Dispatch to the vtable's `free_internal_rep`.
 - `Object.getHashNoRegister(obj)` -- Return the `u256` hash from the cached string/special/source hash, computing if needed.
@@ -127,13 +127,12 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `hashutil.hashBytes(bytes)` -- Blake3 hash of a byte slice, returning `u256`.
 - `hashutil.scanStringForHashRefs(arena, bytes)` -- Find all `blake3~<hash>` occurrences; returns an `ArrayList(HashInstance)`.
 - `hashutil.parseHashReference(bytes)` -- Parse a string that is exactly one `blake3~<hash>` reference; return the `u256` or null.
-- `hashutil.scanAndResolveHashRefs(arena, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, borrowing representatives; returns `[]SpecialString.HashAndInfo`.
+- `hashutil.scanAndResolveHashRefs(arena, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, taking representatives; returns `[]SpecialString.HashAndInfo`.
 
-### Index hashing (for hash tables, not for content addressing)
-- `heap.indexHash(value)` -- Hash a value for a table's index. Wyhash below `index_hash_cutoff`, the cached Blake3 at or above it. Infallible, so it can be called from a hash context; run `ensureIndexHashable` first.
-- `heap.ensureIndexHashable(value)` -- Prepare a key so `indexHash` and `Value.equals` cannot allocate. Primitives need nothing; an object needs its string rep, and a long one also needs its content hash forced.
-- `heap.hasIndexHash(value)` -- Whether the above has been done. For asserting the precondition where it is relied on.
-- `heap.index_hash_cutoff` (1024) -- The switch point. Chosen on length, not object type, because a `SpecialString` will not imply a large string once mmapped strings exist.
+### Quick hashing (for hash tables, not for content addressing)
+- `hashutil.quick_hash_cutoff` (1024) -- The switch point between Wyhash and the cached Blake3 hash.
+- `hashutil.quickHash(value)` -- Hash a value for a table's index (dictionary keys, variable tables). Wyhash below `quick_hash_cutoff`, the truncated cached Blake3 hash at or above it. Not cryptographically secure; only for hash tables paired with equality, not content addressing.
+- `hashutil.cacheQuickHash(value)` -- Force the object's content hash to be cached ahead of time, for a key at or above `quick_hash_cutoff`, so a later `quickHash` on it cannot OOM.
 
 ### Refcount primitives
 - `heap.incrRefCountOf(T, ref, is_atomic)` -- Generic ref count increment; returns the new count.
@@ -144,16 +143,17 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 ## src/objects.zig
 
 ### Shimmerable (working buffer for shimmer and mutation)
-- `Shimmerable.deinit(self)` -- Release original and shimmered, poison the struct.
+- `Shimmerable.deinit(self)` -- Drop original and shimmered, poison the struct.
 - `Shimmerable.current(self)` -- Return the effective `Value` (`shimmered` if set, else `original`).
-- `Shimmerable.consume(self)` -- Take ownership: release the original, return the effective value, poison the struct.
-- `Shimmerable.discardChanges(self)` -- Release any shimmered duplicate and roll back to `original`.
+- `Shimmerable.consume(self)` -- Take ownership: drop the original, return the effective value, poison the struct.
+- `Shimmerable.discardChanges(self)` -- Drop any shimmered duplicate and roll back to `original`.
 - `Shimmerable.takeShimmered(self)` -- Steal the `shimmered` slot without releasing it.
 - `Shimmerable.getString(self)` -- Shorthand for `.current().getString()`.
 - `Shimmerable.ensureBoxed(self)` -- Box a primitive into a heap object if needed; returns the `*Object`.
 - `Shimmerable.ensureShimmerable(self)` -- `ensureBoxed`, then duplicate into `shimmered` if the object cannot shimmer.
 - `Shimmerable.prepareToShimmer(self, T)` -- `ensureShimmerable`, cache the string rep, free the old body, install `T`'s vtable, and return the `*T` body to fill in. Call this from inside a `shimmerFrom`.
-- `Shimmerable.getMutable(self, T, det)` -- Shimmer to `T`, then return an owned `*T` to mutate. Essentially always duplicates, and the result is detached from the shim: release it yourself and write it back explicitly. Prefer `Value.asMutableInPlace` unless a shim is already in hand.
+- `Shimmerable.prepareToShimmerVTable(self, vtable)` -- The vtable-typed counterpart to `prepareToShimmer`, for callers such as the C API that only have a `*const Object.VTable`, not a Zig type. Returns the raw `*anyopaque` body storage.
+- `Shimmerable.getMutable(self, T, det)` -- Shimmer to `T`, then return an owned `*T` to mutate. Essentially always duplicates, and the result is detached from the shim: drop it yourself and write it back explicitly. Prefer `Value.asMutableInPlace` unless a shim is already in hand.
 
 ### IterHelper (leak-graph field walking)
 - `IterHelper.follow(helper, T, field_name, ptr)` -- Follow a child struct (rejects object bodies; follow their `*Object` instead).
@@ -188,11 +188,12 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Source` caches its content hash so re-hashing a script is cheap.
 
 ### HashReference (a `blake3~<hash>` pointer to a registered object)
-- `HashReference.new(referent)` -- Allocate a `HashReference` borrowing `referent`.
+- `HashReference.new(referent)` -- Allocate a `HashReference` taking `referent`.
 - `HashReference.newFromValue(value)` -- Same, boxing `value` first if it is a primitive.
 - `HashReference.shimmerFrom(det, shim)` -- Parse `shim`'s string as a hash ref and resolve it via `registered_hashes`; returns `*const HashReference`.
 - `HashReference.resolveAsDictionary(det, shim)` -- Resolve a hash ref and shimmer the target to a `Dictionary`; returns `*const Dictionary`.
 - `HashReference.asHead(self)` -- Get the `*Object` header.
+- `HashReference.render(hash)` -- Render a `u256` hash as a `blake3~<hash>` reference string (fixed-size, no allocation).
 
 ### Index (list index: int or `end?[+-]int`)
 - `Index.as_end` -- The bare `end` index.
@@ -235,13 +236,17 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Boolean.shimmerFrom(det, shim)` -- Shimmer `shim` to a boolean and return the `bool`.
 
 ### List
-- `List.new(items)` -- Allocate a `List` from a slice of `Value`s (borrows each).
+- `List.new(items)` -- Allocate a `List` from a slice of `Value`s (references each).
 - `List.newWithCapacity(items, capacity)` -- Allocate with a pre-reserved backing capacity.
-- `List.newFromShimmerables(shims)` -- Allocate a `List` from `[]const Shimmerable`, borrowing each `.current()`. Use this instead of collecting `.current()` by hand.
-- `List.append(list, value)` -- Append a value (borrows it); grows backing if needed.
-- `List.appendAssumeCapacity(list, value)` -- Append without growing (borrows `value`).
+- `List.newFromShimmerables(shims)` -- Allocate a `List` from `[]const Shimmerable`, taking each `.current()`. Use this instead of collecting `.current()` by hand.
+- `List.append(list, value)` -- Append a value (references it); grows backing if needed.
+- `List.appendAssumeCapacity(list, value)` -- Append without growing (references `value`).
 - `List.appendAssumeCapacityOwning(list, value)` -- Append without growing, taking the caller's reference.
-- `List.set(list, index, value)` -- Replace a slot, releasing the old value and _taking ownership_ of `value` (it does not borrow).
+- `List.set(list, index, value)` -- Replace a slot, releasing the old value and _taking ownership_ of `value` (it does not take).
+- `List.resolveIndex(list, index)` -- Resolve an `Index` against this list's length; null when out of range.
+- `List.shimmerWriteback(list, index, value)` -- Replace the item at `index` in place without invalidating the string rep, since string parsing isn't injective.
+- `List.getRecursively(det, shim, indexes)` -- Nested lookup along a chain of `Index`-shimmerable positions; returns `OptionalValue`.
+- `List.setRecursively(list, det, indexes, value)` -- Nested insert/update along a chain of positions. `list` must already be mutable.
 - `List.shimmerFrom(det, shim)` -- Shimmer to a list (dict -> list reuses the items; string -> tokenized list). Returns `*const List`.
 - `List.asHead(self)` -- Get the `*Object` header.
 - `objects.valuesToShimmerables(gpa, values)` -- Wrap a `[]Value` as `[]Shimmerable` (non-owning; each `Shimmerable` points at the existing value).
@@ -255,15 +260,17 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Dictionary.newWithCapacity(items, capacity)` -- Allocate with a pre-reserved backing capacity.
 - `Dictionary.asHead(self)` -- Get the `*Object` header.
 - `Dictionary.shimmerFrom(det, shim)` -- Shimmer to a dict (list -> dict, requires an even count). Returns `*const Dictionary`.
+- `Dictionary.keyNotFoundError(det, key)` -- Populate `det` with a "could not find value for key" message and return `error.KeyNotFound`.
 - `Dictionary.getNoFollow(self, key)` -- Look up a key returning `OptionalValue` (no parent-link following).
+- `Dictionary.getFollowingLinksMut(self, det, key)` -- Like `getFollowingLinks`, but called directly on an already-mutable `Dictionary`; asserts `canMutate` rather than going through a `Shimmerable`.
 - `Dictionary.getPtrNoFollow(self, key)` -- Look up a key returning `?*Value` into the items slice.
-- `Dictionary.put(dict, key, value)` -- Insert/update a key (borrows both), invalidating the string. Asserts `canMutate`.
+- `Dictionary.put(dict, key, value)` -- Insert/update a key (references both), invalidating the string. Asserts `canMutate`.
 - `Dictionary.putInner(dict, key, value)` -- Like `put` but returns the value's index in `items`.
 - `Dictionary.shimmerWriteback(dict, key, value)` -- Replace an existing key's value in place without invalidating the string; for writing back a shimmered form of the same value.
 - `Dictionary.resolveParentDict(dict, det)` -- Follow the `~parent` link to the parent `Dictionary` (or null).
 - `Dictionary.remove(dict, det, key)` -- Remove all pairs with `key`; flattens parent links first if the key shadows a parent. Returns true if any were removed.
-- `Dictionary.flatten(dict, det)` -- Collapse a `~parent` chain into a single flat dict (mutates in place).
-- `Dictionary.flattenInner(dict, det)` -- Recursive helper; returns a new flat `Dictionary` or null if there is no parent.
+- `Dictionary.flattenForKey(dict, det, key)` -- Collapse only as much of the `~parent` chain as shadows `key`: an ancestor that doesn't hold `key` stays a link, preserving its sharing across threads. Mutates in place; a no-op when nothing needs collapsing.
+- `Dictionary.flattenForKeyInner(dict, det, key)` -- Recursive helper; returns a new flat `Dictionary` combining every ancestor that holds `key`, or null when no ancestor holds it and the chain can stay as-is.
 - `Dictionary.getFollowingLinks(det, shim, key)` -- Look up `key`, following `~parent` links recursively; returns `OptionalValue`.
 - `Dictionary.getRecursively(det, shim, context)` -- Nested lookup along a key path (`context` is a `ValueSliceContext` or `ShimmerableSliceContext`).
 - `Dictionary.putRecursively(dict, det, context, value)` -- Nested insert/update along a key path (creates child dicts as needed).
@@ -278,6 +285,7 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 
 ### Misc
 - `objects.allocPrintZ(comptime fmt, args)` -- Allocate a `[:0]u8` with `global_gpa` from a format string. This is a zicl helper, distinct from (and not deprecated like) the stdlib function of the same name; prefer it over spelling out `std.fmt.allocPrintSentinel(heap.global_gpa, ..., 0)`.
+- `objects.quoteValues(gpa, items)` -- Quote and join a slice of `Value`s into one `[:0]u8`, the `Value` counterpart to `strutil.quoteStrings`.
 - `objects.interned_tilde_parent` -- The interned `"~parent"` dict-link key `Value`.
 - `objects.ErrorDetails` -- `{ message: [:0]u8, index: ?u32 = null }`; populated by object-level functions on user-facing errors. `message` is owned by the caller when `det != null` and the error is not OOM. `index` reports which argument was at fault, when the function knows.
 
@@ -302,6 +310,51 @@ The interpreter's object types and error plumbing. `Interp` re-exports `Error`,
   - `Closure.parseArgList(det, args)` -- Parse an argument-spec list into a `ParsedArgList` (`.deinit()` when done).
   - `Closure.interned_name` / `interned_impl` / `interned_scope` -- The interned dict keys a closure serializes to.
 - `NativeCommand` -- The command-table entry. `.getUsageInfo(gpa, command_name)`, `.minArity()`, `.maxArity()`, `.multipleOf()`.
+- `CachedNativeCommand` -- Caches a resolved `*const NativeCommand` plus the command-table epoch it was resolved at, stashed onto a `Shimmerable` by `Interp.getCommandFromValue` so a repeated call by the same literal name skips re-resolution.
+- `Letrec` -- Wraps a live `scope: *objects.Dictionary` plus a `selected: Value` key, so resolving it as a command re-reads `scope[selected]` on every call instead of freezing a value at wrap time (see the "letrec" section of CLAUDE.md for why). `Letrec.new(det, scope, selected)` builds one (`scope` must already be cross-thread). `Letrec.shimmerFrom(det, shim)` parses the `letrec <hash>` string form. `Letrec.asHead(self)` gets the header; `Letrec.interned_select` is the interned `"select"` key `[letrec select]` dispatches on; `Letrec.prefix` (`"letrec "`) is the string-form prefix.
+
+---
+
+## src/Tokenizer.zig
+
+The shared tokenizer for both scripts and expressions ("cobbled together from Molt,
+Zig's tokenizer, and Jimtcl" per the file's own header). `evaltypes.Script.parse` and
+`evaltypes.Expression.parse` drive it; most command code never touches it directly.
+
+- `Tokenizer.init(buffer, line_no)` -- Start tokenizing `buffer` from `line_no`.
+- `Tokenizer.Error` -- `ScriptError || ExpressionError`, the union of every tokenizing failure.
+- `Token` / `Token.Tag` / `Token.Location` -- One token: its tag, and its `{start, end, line_no}` span in the source.
+- `tokenizer.nextScriptToken()` -- Next token in script grammar (words, command/variable substitution, braces, quotes).
+- `Tokenizer.SubstFlags` -- `packed struct(u3) { command_subst, variable_subst, escape_subst }`, which kinds of substitution `[subst]` should perform; all default true.
+- `tokenizer.nextSubstToken(flags)` -- Next token for a `[subst]` body, honoring `flags`.
+- `tokenizer.nextStringToken()` -- Next plain/escaped string token within a word.
+- `tokenizer.nextVariableToken()` -- Next `$name`/`$name(key)`/`${brace name}` token; `error.NotVariable` for a bare `$` that isn't one.
+- `tokenizer.nextCommandToken()` -- Next `[...]` command-substitution token.
+- `tokenizer.nextBracedStringToken()` -- Next `{...}` literal token.
+- `tokenizer.nextEolToken()` / `tokenizer.nextSeparatorToken()` -- Next end-of-line / word-separator token.
+- `tokenizer.nextCommentToken()` -- Consume a `#`-prefixed comment; produces no token.
+- `tokenizer.nextListToken()` / `tokenizer.nextListStringToken()` -- Tokenize one element of Tcl list syntax (used by `List.shimmerFrom` on the string -> list path).
+- `tokenizer.nextExpressionToken()` -- Next token in expression grammar (operators, numbers, function names, parens).
+- `Tokenizer.function_names` -- The recognized `expr` function names (`abs`, `sin`, ...), matched by `nextExpressionToken`.
+- `tokenizer.nextOperatorToken()` / `tokenizer.nextIrrationalFloatToken()` / `tokenizer.nextBooleanToken()` / `tokenizer.nextNumberToken()` -- Sub-parsers `nextExpressionToken` and `nextScriptToken` dispatch into.
+- `Tokenizer.boolean_mapping` -- The literal-to-`bool` table (`"1"`/`"true"`/`"yes"`/`"on"` and their false counterparts) `nextBooleanToken` and `objects.Boolean.fromString` both key off.
+- `Tokenizer.convertTokenizerError(gpa, err)` -- Render a `Tokenizer.Error` as a user-facing `[:0]u8` message.
+
+---
+
+## src/expr_parse.zig
+
+Builds the `expr` AST that `evaltypes.Expression.parse`/`evalNode` walk. Operates on
+tokens already produced by `Tokenizer.nextExpressionToken`.
+
+- `Node` / `Node.Tag` / `Node.Data` / `Node.Index` -- One AST node: its operator/operand tag, its `unary`/`binary`/`ternary` child indexes or literal `value`, addressed by an opaque `Index` rather than a pointer (stable across the backing slice's reallocation).
+- `Parser.init(gpa, source_file_name, source, tokens)` -- Build a parser over an already-tokenized expression.
+- `parser.parseExpr()` -- Parse the full expression by precedence climbing; returns a `Parsed` or `error.ParseError` (details in `parser.err`).
+- `parser.deinit()` -- Drop any `Value`s held by parsed nodes and free the node list.
+- `Parser.Error` / `Parser.Error.Tag` -- The parse failure recorded in `parser.err`, one variant per grammar mistake (`missing_operand`, `too_many_r_parens`, `comma_outside_function`, ...). `.sourceIndex(err, p)` maps it back to a byte offset.
+- `parser.renderError(parse_error, w)` -- Render a `rustc`-style single-line-context error (line number gutter, source line, `^` caret under the offending token).
+- `parser.dump(node)` -- Debug: print a node's rendered form to stderr.
+- `Parsed` -- `{ nodes: []Node, root_node: Node.Index }`, the parse result. `.render(writer)` writes it back out as expression syntax (round-trips `expr_parse` -> text); `.renderInner(writer, node_index)` renders a specific subtree. `.enumerateStruct(ctx, info)` is the leak-graph walker hook.
 
 ---
 
@@ -315,7 +368,10 @@ Variable resolution and the cache object types behind it.
 - `vartypes.getVariableOrError(interp, det, call_frame_idx, name)` -- Like `getVariable` but reports "no such variable".
 - `vartypes.unsetVariable(interp, det, call_frame_idx, name)` -- Remove a variable.
 - `vartypes.ensureValidVariableType(...)` -- Validate/normalize the object stored in a variable slot.
+- `vartypes.badVariableNameError(det, name)` -- Populate `det` with a "not a valid variable name" message and return `error.BadVariableName`.
 - `vartypes.expectErrorOrOom(expected_error, actual_error_union)` -- Test helper mirroring `memutil.expectErrorOrOom`.
+- `VariableSlot` -- `union(enum) { normal: Value, upvar: Upvar }`, what one call frame slot holds; an upvar is a variant here rather than its own object type since a slot is never handed to Tcl as a value. `.takeReference(slot)` / `.dropReference(slot)` take/drop the contained value.
+- `VarTable` -- The variables of one call frame: an insertion-ordered `Value`-to-`VariableSlot` map, deliberately not an `Object` (no string rep to keep in sync, cannot be referenced, cannot shimmer). `.create()` / `.destroy(table)` allocate and free. `.count(table)`, `.getIndex(table, name)`, `.slotAt(table, index)` -- lookups by name or stable index. `.put(table, name, slot)` -- insert or overwrite, taking both. `.remove(table, name)` -- remove by name, returning whether it was present.
 - `CachedLocalVar` / `CachedLexicalVar` -- Cached variable-name objects carrying a resolved slot plus the epoch it was resolved at. `CachedLocalVar.getCurrentValue(self)` reads through the cache.
 - `UpvarLink` -- A variable name that resolves into another call frame.
 - `DictSugar` -- `var(key)` names. `.isValidDictSugar(name)`, `.parseDictSugar(name)`, `.shimmerAssumeValid(name)`.
@@ -343,35 +399,101 @@ context lifecycle, and the foundation must not import from the command layer.
 
 ---
 
+## src/Capability.zig
+
+Capabilities are the object type for handles that can't be automatically tracked the
+way content-addressed hash references are (an open file, a running process, a raw C
+pointer) -- unforgeable URLs like `<zicl://host/file-handle/sVye-a...>`, manually
+opened and closed rather than ref-count-freed on last use. See the file's own header
+comment for the full design rationale.
+
+- `Capability.new(head)` -- Wrap an already-constructed `Head` (with its vtable set, `id` left uninitialized) as a `*Capability` object, registering it.
+- `capability.asHead(self)` -- Get the `*Object` header (name collision with `Capability.Head` below is intentional: this is the object-system `asHead`, not the capability's own head).
+- `capability.getBacking(self, Backing, det)` -- Recover the typed `*Backing` behind a capability, checking its vtable matches `Backing.vtable` and that it isn't closed.
+- `capability.close(self)` -- Close the underlying `Head` (idempotent).
+- `Capability.shimmerFrom(det, shim)` -- Parse a capability URL string and resolve it against the registry; rejects a capability from a different host and a stale (deregistered) id.
+- `Capability.Head` -- The generic, atomically ref-counted part of a capability; `extern` so a C program can embed `Zicl_Head` as its backing struct's first field. `.takeReference(head)` / `.dropReference(head)`, `.close(head)` (runs `deinitBody` once, then deregisters), `.isClosed(head)`.
+- `Capability.Head.VTable` -- `extern struct { name: [*:0]const u8, deinitBody: *const fn(*Head) callconv(.c) void, destroyBacking: *const fn(*Head) callconv(.c) void }`, one per capability kind (`"file-handle"`, `"process"`, `"pointer"`, ...).
+- `Capability.Registry` -- Maps `Id` (`i128`) to `Head`, holding a strong reference to each. `.register(self, head)` assigns a CSPRNG id and inserts; `.deregister(self, head)` removes; `.resolve(self, id)` looks up, taking.
+- `Capability.registry` -- The global `Registry` instance.
+- `Capability.initGlobals(options)` / `Capability.deinitGlobals()` -- Set up the registry's CSPRNG and host name (or `deinitGlobals`: close and drop whatever capabilities are still open, e.g. at process shutdown). Wired into `heap.initGlobals`/`deinitGlobals`.
+- `Capability.ParsedName` -- `{ host, type_name, id }`, the parsed form of a capability URL string.
+- `Capability.parseName(det, bytes)` -- Parse a `<zicl://host/type/id>` string into a `ParsedName`, without resolving it against the registry.
+
+---
+
+## src/capabilities.zig
+
+The concrete capability kinds built on `Capability.Head`. Each is a `Backing = struct
+{ head: Capability.Head, body: <Kind> }` with its own `deinitBody`/`destroyBacking`.
+
+- `capabilities.File` -- An open file. `.open(path, mode)` (`Mode` is `r`/`r+`/`w`/`w+`) creates a `"file-handle"` capability; `.openDescriptor(handle)` wraps an already-open fd without closing it when the capability closes. `.writeAll(file, bytes)` / `.readAll(file)` (whole-file slurp only; no partial/character-counted read yet).
+- `capabilities.Process` -- A running pipeline, held as one capability regardless of stage count, since nothing else reaps its children. `.new(stages)` takes ownership of an already-spawned `[]Stage`. `.wait(self)` blocks until every stage exits and returns the pipeline's overall `Term` (an earlier failure is not masked by a later success); safe to call from two threads or call again after any outcome. `.pids(self, out)` reports each stage's pid, or null once reaped. `.pipelineTerm(stages)` / `.isNormalExit(term)` compute the overall result from already-waited stages. `Process.Stage.wait(self)` / `.kill(self)` operate on one stage.
+- `capabilities.Pointer` -- A raw C pointer whose lifetime Zicl now owns, for FFI wrappers that want to hand a script an opaque handle without a bespoke capability type per pointed-to C type. `.new(ptr, type_name, destructor)` creates a `"pointer"` capability; `destructor` runs once at close (never for a null `ptr`). `.getTyped(cap, expected_type_name, det)` is `Capability.getBacking` plus a `type_name` check, since every `Pointer` shares one vtable and so gets no vtable-identity type safety for free.
+
+---
+
 ## src/Interp.zig
 
 Beyond `evalObject`/`callClosure`, `Interp` carries the helpers command code leans on
 most.
 
 ### Results
-- `interp.setResult(value)` / `setResultOwning(value)` -- Set the result, borrowing or taking ownership.
+- `interp.setResult(value)` / `setResultOwning(value)` -- Set the result, taking or taking ownership.
 - `interp.setResultInteger` / `setResultFloat` / `setResultBoolean` / `setResultString` / `setResultStringOwning` / `setResultFormatted` / `setEmptyResult`.
-- `interp.setResultError(value)` -- Set the result and return `error.EvalError`.
+- `interp.setError(value)` -- Set the result and return `error.EvalError`.
+- `interp.setErrorString(bytes)` -- `setResultString` plus `error.EvalError`.
+- `interp.setErrorFormatted(comptime fmt, args)` -- `setResultFormatted` plus `error.EvalError`.
+- `interp.nextRandomFloat()` -- Draw the next `f64` in `[0, 1)` from the interpreter's PRNG.
 
 ### Coercions (these wrap the `objects` shimmer functions with interpreter error reporting)
 - `interp.getInteger(shim)` / `getIntegerInPlace(ref)`
 - `interp.getFloat(shim)`
 - `interp.getBoolean(shim)` / `getBooleanInPlace(ref)`
 - `interp.getIntOrFloatInPlace(ref)` -- Returns an `objects.Number`.
-- `interp.getIndex(shim)`, `interp.getList(shim)` / `getListInPlace(ref)`, `interp.resolveHash(shim)`
+- `interp.getIndex(shim)`, `interp.getList(shim)` / `getListInPlace(ref)`, `interp.getDict(shim)` / `getDictInPlace(ref)`, `interp.resolveHash(shim)`
 - `interp.wrapShimmerFn(...)` / `wrapShimmerInPlaceFn(...)` -- Build the above wrappers for a new type.
 - `interp.integerOverflowError(IntType, rendered_int)` -- Interpreter-level counterpart to `Integer.overflowError`.
 - `interp.wrapError(det, result)` / `Interp.narrowError(err)` / `Interp.narrowToEvalError(result)` -- Convert an object-level error plus `ErrorDetails` into an interpreter error with a message set.
 
+### Variables and dict/list access (interp-level wrappers)
+Thin wrappers over `vartypes`/`objects.Dictionary`/`objects.List` that default to the
+interp's current call frame (`interp.callFrameIdx()`) and report failures into the
+interpreter result via `wrapError`, instead of taking an explicit `call_frame_idx` and
+`*ErrorDetails` the way the `vartypes`/`objects` free functions do.
+
+- `interp.setVariable(name, value)` / `setVariableInFrame(call_frame_idx, name, value)` -- Set a variable, in the current or a given frame.
+- `interp.setVariableSilent(name, value)` -- Like `setVariable` but propagates the raw error instead of writing a result message.
+- `interp.setVariableUpvar(name, target_call_frame_idx, target_name)` -- Create an upvar link from the current frame into `target_call_frame_idx`.
+- `interp.getVariable(name)` / `getVariableInFrame(call_frame_idx, name)` -- Look up a variable, returning `OptionalValue`.
+- `interp.getVariableOrError(name)` -- Like `getVariable` but reports "no such variable".
+- `interp.unsetVariable(name)` / `unsetVariableSilent(name)` -- Remove a variable, with or without setting a result message on failure.
+- `interp.getDictValue(dict, key)` -- `Dictionary.getFollowingLinks` through a `Shimmerable`, reporting into the interp result.
+- `interp.getMutDictValue(dict, key)` -- Same, but through `Dictionary.getFollowingLinksMut` on an already-mutable dict.
+- `interp.getDictValueOrError(dict, key)` -- Like `getDictValue` but sets a "could not find value for key" result on a miss.
+- `interp.getDictValueInPlace(dict, key)` -- Like `getDictValue` but uses `*Value` directly, wrapping it in a throwaway `Shimmerable` and writing back any shimmer.
+- `interp.getDictValueRecursively(shim, context)` / `getDictValueRecursivelyOrError(shim, context)` -- Nested key-path lookup (`context` is a `ValueSliceContext` or `ShimmerableSliceContext`); the `OrError` variant renders all path keys into the error message.
+- `interp.putDictValueRecursively(dict, context, value)` -- Nested key-path insert/update.
+- `interp.removeDictValue(dict, key)` -- Remove a key; returns whether anything was removed.
+- `interp.removeDictValueRecursively(dict, context)` -- Nested key-path remove.
+- `interp.getListValueRecursively(shim, keys)` / `setListValueRecursively(list, indexes, value)` -- Nested list-index lookup/update.
+
 ### Evaluation and scope
-- `interp.evalObject(script)` / `evalObjectInner(call_frame, script, cache_key)` / `evalFile(filename)`.
+- `interp.evalValue(script)` -- Evaluate a script value in the current call frame, resetting the stack trace for this top-level invocation. `evalValueInner(call_frame, script, cache_key)` is the shared inner loop both this and looping constructs call per iteration, so an iterating script doesn't accumulate arena usage.
+- `interp.evalTopLevel(script)` -- `evalValue` for scripts entered from outside the interpreter (a file, an embedder call): a `[return]` reaching this boundary ends the script and keeps its result rather than escaping as an error, and a stray `[tailcall]` is rejected since there is no closure left to call from C.
+- `interp.evalFile(filename)` -- Read and evaluate a file.
 - `interp.evalExpression(value)` / `getBoolFromExpression(value)` / `evalSubstitution(value, flags)`.
 - `interp.getScript` / `getExpression` / `getClosure` / `getSubstitution` -- Cache-aware parse entry points.
-- `interp.getCommand(call_frame_idx, name, can_be_method)` -- Resolve a command or closure.
+- `interp.getCommand(call_frame_idx, name, can_be_method)` -- Resolve a variable name to a `CommandVariant`, referenced; plumbs a letrec's scope through inner closure calls automatically. Use `CommandVariant.deinit()` for cleanup.
+- `interp.getCommandFromValue(shim, can_be_method)` -- The value-level half of `getCommand`, for a value already in hand rather than a variable name; also caches native-command lookups onto `shim` as a `CachedNativeCommand`.
+- `interp.invokeCommand(command_variant, args)` -- Dispatch a resolved `CommandVariant` (enforces `max_eval_depth`).
+- `interp.invokeCommandMaybeMethod(args_raw)` -- Resolve `args_raw[0]` and invoke it, populating the `self` parameter when the name is a method-style dict-sugar path. `args_raw` must have room at `[0]` beyond `args_raw[1..]` for the method rewrite.
 - `interp.registerCommand(name, command)` -- Register a `NativeCommand`.
 - `interp.callFrame()` / `callFrameIdx()` / `evalFrame()` / `evalFrameIdx()` / `nextCallEpoch()`.
+- `interp.getRelativeCallFrame(from, levels_up)` -- Walk `levels_up` parent links starting at `from`; null if the chain runs out first.
 - `interp.captureScope(call_frame_idx)` / `captureCurrentScope()` -- Snapshot a frame's variables as a `Dictionary`.
-- `interp.setErrorStack()` -- Populate `errorInfo` from the current eval frames.
+- `interp.setErrorStack()` -- Populate `errorInfo` from the current eval frames, if not already set.
+- `interp.buildErrorStack()` -- Build the stack trace as a flat `{name file line args}` list, one group per call frame, innermost first. Called by `setErrorStack`; use directly to build a trace outside the normal error path.
 - `Interp.init(cfg)` / `interp.deinit()` -- Create and destroy an interpreter. `cfg` currently carries only `cache_capacity` (default 512).
 
 ### Test helpers
@@ -425,6 +547,8 @@ this as `common` and re-use its `heap`/`objects`/`Interp` aliases.
 
 ### Testing
 - `memutil.expectErrorOrOom(expected_error, actual_error_union)` -- Assert an error matches `expected_error` (passes through OOM).
+- `memutil.OomTesting` -- `union(enum) { exhaustive, unsupported: []const u8 }`, the per-test declaration of whether it takes part in the full OOM sweep.
+- `memutil.checkAllocationFailures(comptime mode, comptime func, args)` -- Runs `func` once against `testing.allocator` normally, and only performs the full `checkAllAllocationFailures` sweep when `mode == .exhaustive` and `-Dfull-oom-testing` is enabled. Use `testing.checkAllAllocationFailures` directly instead when a test is cheap enough to always sweep.
 
 ### Hash context
 - `memutil` string hash context: `.hash(self, s)` (Wyhash), `.eql(self, a, b)` (byte equality).
@@ -435,6 +559,7 @@ this as `common` and re-use its `heap`/`objects`/`Interp` aliases.
 
 - `strutil.checkAllAscii(bytes, check)` -- True if every byte passes the predicate.
 - `strutil.isGraph(c)` / `strutil.isPunct(c)` -- ASCII character class checks.
+- `strutil.encodeCodepoint(cp, buf)` -- Encode one codepoint into a `*[4]u8` (UTF-8) or 1 byte (ASCII build); can fail like `std.unicode.utf8Encode` on a surrogate half or an out-of-range codepoint, though every in-tree caller sources `cp` from decoding valid UTF-8 or remapping a valid codepoint, so that path never actually fires here.
 - `strutil.toTitle` / `strutil.toUpper` / `strutil.toLower` -- Case conversion functions (UTF-8 or ASCII depending on `-Duse-utf8`).
 - `strutil.compare(a, b, up_to_cp, case_insensitive)` -- Lexicographic codepoint-order comparison.
 - `strutil.cpIndexUtf8(str, index)` / `strutil.cpIndexAscii(str, index)` / `strutil.cpIndex` -- Convert a codepoint index to a byte offset.
@@ -444,49 +569,92 @@ this as `common` and re-use its `heap`/`objects`/`Interp` aliases.
 - `strutil.charsetMatch(pattern, cp, flags)` -- Match a Tcl charset pattern (e.g. `[a-z]`) against a codepoint.
 - `strutil.globMatch(pattern, str, case_insensitive)` -- Glob-style pattern match on byte slices.
 - `strutil.findFirstOccurrence(needle, haystack, cp_index)` / `strutil.findLastOccurrence(needle, haystack)` -- Substring search by codepoint offset.
+- `strutil.findLastOccurrenceBounded(needle, haystack, max_start_byte)` -- Like `findLastOccurrence`, but only considers matches starting at or before `max_start_byte` (the match itself may extend past it). What `[string last]` uses for its optional `lastIndex` argument.
 - `strutil.hexDigitValue(c)` / `strutil.isHexDigit(c)` -- Hex digit helpers.
+- `strutil.parseInt(bytes)` -- Parse a Tcl integer literal into `i64`. Currently just `std.fmt.parseInt`, kept as its own entry point in case Tcl-specific parsing is needed later.
 - `strutil.removeEscaping(source, dest)` -- Process backslash escapes; return the resulting length.
 - `strutil.QuotingType` -- `enum { bare, brace, escape }`.
 - `strutil.calculateNeededQuotingType(str)` -- Determine how a string must be quoted.
 - `strutil.quoteSize(quoting_type, str_len)` -- Output buffer size needed to quote a string.
 - `strutil.quoteString(quoting_type, src, dest, escape_first_pound)` -- Write a quoted string into `dest`; return bytes written.
 - `strutil.quoteStrings(gpa, items)` -- Quote and join a slice of strings into one `[:0]u8`.
-- `strutil.Iterator.init(bytes)` / `.next()` / `.peek()` -- Codepoint iterator (UTF-8 or ASCII).
+- `strutil.Iterator.init(bytes)` / `.next()` / `.peek()` / `.prev()` -- Codepoint iterator (UTF-8 or ASCII depending on `-Duse-utf8`); `prev` scans backwards by one codepoint, symmetric with `next`.
 
 ---
 
 ## src/ioutil.zig
 
-Stdout and stderr are mutex-protected and redirectable, so never write to them
-directly.
+Stdout and stderr are threadlocal fd overrides, not a process-wide lock, so
+redirecting one thread's output never affects another thread's.
 
-- `ioutil.lockStdout()` / `ioutil.unlockStdout()` -- Lock and return the current stdout `std.Io.File`.
-- `ioutil.lockStderr()` / `ioutil.unlockStderr()` -- Same for stderr.
-- `ioutil.global_stdout_fd` / `ioutil.global_stderr_fd` -- Atomic fd overrides, for redirecting output in tests and embedders.
-- `ioutil.debug(comptime fmt, args)` -- Print to stderr, taking the lock for you.
+- `ioutil.local_stdout_fd` / `ioutil.local_stderr_fd` -- Threadlocal fd overrides (default to the real stdout/stderr fds), for redirecting output in tests and embedders.
+- `ioutil.getStdout()` / `ioutil.getStderr()` -- Return the current thread's stdout/stderr as a `std.Io.File`.
+- `ioutil.debug(comptime fmt, args)` -- Print to stderr via `getStderr()`.
 
 ---
 
 ## src/leak_check.zig
 
-- `leak_check.init()` -- Initialize the trace log and debug allocator (only when `trace_mem` is on).
-- `leak_check.deinit()` -- Reset the trace log and counts.
-- `leak_check.globalTrace(category, value, fmt, args)` -- Append a trace entry (alloc/free/other) with a stack trace. Inlined; no-op when `trace_mem` is off.
+- `leak_check.initThread()` -- Set up this thread's ring-buffer allocator for trace-log string copies (only when `trace_mem` is on; idempotent).
+- `leak_check.deinitThread()` -- Free this thread's ring-buffer allocator.
+- `leak_check.deinit()` -- Reset the (process-wide) trace log and counts.
+- `leak_check.dupeForTrace(bytes)` -- Copy `bytes` into this thread's ring buffer so a log entry can hold string content that outlives the object it came from. Old copies can be overwritten by later traces on the same thread; only for debugging output, never load-bearing.
+- `leak_check.globalTrace(ptr, info)` -- Append a trace entry for `ptr` with a stack trace; `info` is the `LogInfo` union (`.alloc`, `.incr_ref_count`, `.decr_ref_count`, `.invalidate_rep`, `.invalidate_string`, `.set_string`, `.free`). Inlined; no-op when `trace_mem` is off.
 - `leak_check.captureLeaks()` -- Walk every leaked object via `GraphWalker`/`StructIterator`; returns a `LeakResult` (dot graph + per-object logs).
 - `leak_check.dumpLeaks()` -- Capture leaks and dump the dot graph + details to stderr. Quiet when there are no leaks. Called from `heap.testFinish`.
 - `leak_check.dumpLastTouchedTrace(fd)` -- Dump the operation history of the most recently touched object (hooked into the panic path). Re-entrancy guarded.
 - `LeakResult.dumpDot(writer)` -- Render the leak graph as a Graphviz dot digraph.
 - `LeakResult.dumpDetails(terminal)` -- Print each leaked object's operation history with stack traces, to a `std.Io.Terminal`.
 - `LeakResult.deinit(result)` -- Free the result's arena.
+- `leak_check.checkCrossthreadInvariant()` -- Walk every currently-live object (from the trace log's net alloc-minus-free count, not a particular container) looking for an edge from a crossthread object into a non-crossthread one, the invariant `Object.makeCrossthread` is supposed to establish for its whole subgraph. Returns a `CrossthreadCheckResult`; only meaningful when `trace_mem` is on.
+- `leak_check.dumpCrossthreadCheck()` -- `checkCrossthreadInvariant` plus dump the result to stderr. Callable from gdb.
+- `CrossthreadViolation` -- `{ parent: *const Object, child: *const Object, field_name: []const u8 }`, one crossthread-into-non-crossthread edge found by `checkCrossthreadInvariant`.
+- `CrossthreadCheckResult.deinit(result)` -- Free the result's arena.
+- `CrossthreadCheckResult.dump(result, writer)` -- Print each violation, or "No crossthread violations found." when clean.
 
 ---
 
-## src/tripwire.zig
+## src/libzicl.zig
 
-Vendored failure injection, for exercising `errdefer` paths that
-`checkAllAllocationFailures` cannot reach.
+The C API surface: almost entirely `export fn Zicl_*` bindings (C ABI, `callconv(.c)`)
+over the Zig types documented elsewhere in this file, not `pub fn` helpers meant to be
+called from other Zig code. Out of scope for a "what already exists in Zig" index;
+consult the file directly (or `.claude/cookbook.md`'s C API recipes) when working on
+the C boundary itself. The handful of genuinely internal `pub` declarations:
 
-- `tripwire.module(FailPoints, func)` -- Comptime: build a fail-point module for one function, where `FailPoints` is a hand-curated enum and the error set comes from `func`.
-  - `tw.check(.point)` -- A failure point; `try` it where you want a testable error.
-  - `tw.errorAlways(.point)` and friends -- Arm a failure point from a test.
-  - `tw.end(.reset)` -- Verify the armed expectations fired and reset for the next test.
+- `ziclLog(level, scope, format, args)` -- The `std.log` implementation this binary installs (`std_options.logFn`), writing through `ioutil.getStderr()`.
+- `ziclPanic(msg, first_trace_addr)` -- The `panic` implementation (`std.debug.FullPanic(ziclPanic)`): dumps the last-touched-object trace, prints the panic message and stack trace to stderr, then aborts. Guards against recursive panics with a threadlocal stage counter.
+
+---
+
+## src/test_runner.zig
+
+The project's custom unit-test runner (`build.zig` points `zig build test` at this
+instead of Zig's default), so it can hook `dumpLastTouchedTrace` into both the panic
+and segfault paths.
+
+- `panicFn(msg, first_trace_addr)` -- The `panic` implementation: dumps the last-touched-object trace to fd 2, then defers to `std.debug.defaultPanic`.
+- `debug.handleSegfault(addr, name, opt_ctx)` -- Overrides Zig's segfault handler the same way: a segfault does not route through `panicFn` (Zig's signal handler calls this directly), so without this override a use-after-free that faults rather than panics would skip the trace dump entirely.
+- `panicFmt(comptime format, args)` -- `std.debug.panicExtra` wrapper used by the runner's own assertions.
+- `main(init)` / `log(...)` / `mainSimple(...)` / `fuzz(...)` -- The test-running entry points (normal run, simple/no-server mode, fuzz mode); not meant to be called directly, only referenced by `zig build test`'s generated root.
+
+---
+
+## src/root.zig
+
+The standalone `zicl` binary's entry point (as opposed to the library surface in
+`libzicl.zig`). Also re-exports every module under `test {}` so `zig build test`
+sees them.
+
+- `main(init)` -- Sets up the heap/thread/interpreter, registers core commands, then runs a REPL loop over stdin/stdout (`> ` prompt, evaluate each line with `interp.evalValue`, print the result).
+- `panic` / `panicAndPrintTraces(msg, first_trace_addr)` -- Dumps the last-touched-object trace via `heap.dumpLastTouchedTrace(-1)` before deferring to `std.debug.defaultPanic`.
+
+---
+
+## src/repl.zig
+
+Not part of the build graph reachable from `main` or the test root; a standalone
+scratch file exploring `uucode`'s case-mapping API (`uucode.get(.uppercase_mapping,
+...)`). It references `ioutil` without importing it, so it does not currently compile.
+Nothing here is a reusable helper; flagging its existence only so it isn't mistaken
+for the REPL (that's `root.zig`'s `main`).

@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const str_handle = try objects.String.newValue(line_read.items);
-        defer str_handle.release();
+        defer str_handle.dropReference();
         interp.evalValue(str_handle) catch |err| {
             ioutil.debug("Error code: {s}\n", .{@errorName(err)});
         };

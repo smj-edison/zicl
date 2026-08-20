@@ -52,7 +52,7 @@ pub const VariableSlot = union(enum) {
 /// could not. It is never handed to Tcl as a value (`Interp.captureScope`
 /// materializes a separate `Dictionary` for that), so it has no string
 /// representation to keep in sync and no invalidate-on-every-write obligation.
-/// Not being a value, it also cannot be borrowed, so a frame's variables can
+/// Not being a value, it also cannot be referenced, so a frame's variables can
 /// never outlive the frame that owns them. And having no vtable, it can never
 /// shimmer away from being a table, which a shared `Dictionary` always could.
 ///
@@ -107,7 +107,7 @@ pub const VarTable = struct {
         return &table.map.values()[index];
     }
 
-    /// Insert or overwrite `name`, borrowing both the name and the slot's
+    /// Insert or overwrite `name`, referencing both the name and the slot's
     /// contents. Returns the entry's index, which is stable until a variable is
     /// removed from this frame (which bumps the frame's call epoch).
     pub fn put(table: *VarTable, name: Value, slot: VariableSlot) !usize {

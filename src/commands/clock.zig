@@ -288,8 +288,8 @@ fn testClock(ta: std.mem.Allocator) !void {
     // the real local offset is system-dependent (whatever /etc/localtime
     // says), and `-gmt true` always passes offset 0, which can never
     // overflow regardless of how extreme `unix_seconds` is.
-    try std.testing.expectError(error.EvalError, civilTimeFromUnix(&interp, std.math.maxInt(i64), 1, "TEST"));
-    try std.testing.expectError(error.EvalError, civilTimeFromUnix(&interp, std.math.minInt(i64), -1, "TEST"));
+    try common.expectErrorOrOom(error.EvalError, civilTimeFromUnix(&interp, std.math.maxInt(i64), 1, "TEST"));
+    try common.expectErrorOrOom(error.EvalError, civilTimeFromUnix(&interp, std.math.minInt(i64), -1, "TEST"));
     try interp.testExpectScriptResult("true", "expr {[string length [clock format -9223372036854775808 -gmt true]] > 0}");
     try interp.testExpectScriptResult("true", "expr {[string length [clock format 9223372036854775807 -gmt true]] > 0}");
 

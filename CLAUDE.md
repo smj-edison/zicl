@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**zicl** (Zig Tcl) is a Tcl interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe Tcl implementation with optional threading support and modern memory management. It is being developed mainly for the use in Folk Computer (https://folk.computer/), an interactive environment.
+**zicl** (Zig Tcl) is a Tcl-inspired interpreter implementation written in Zig. It aims to provide a high-performance, memory-safe Tcl implementation with deep threading support and modern memory management. It is being developed mainly for the use in Folk Computer (https://folk.computer/), an interactive environment.
 
 ### Design Constraints
 -   **Out of memory is considered recoverable.** Zig has strong support for OOM scenarios, and so we follow this idiom and make sure our OOM paths recover correctly.
--   **Fail fast and loud.** This has come up so so many times, please stop writing defensive code and either crash loudly or report the error clearly to the user. Also, don't _ever_ leave a piece of code unimplemented without panicking or raising an appropriate error. The last thing we need in an interpreter is silent correctness issues.
--   **Cross-thread sharing is a primary goal.** Cross-thread object sharing is a first-class use case, not an afterthought. Objects opt into cross-thread access via `Object.makeCrossthread()`, which recursively marks an object and its children and switches their reference counts to atomic operations. The global `HashRegistry` lets any thread resolve a shared object by content hash without cooperation from the originating thread.
--   **Interpreters can block indefinitely.** Blocking in C FFI (or otherwise) is considered normal operation. Nothing in the system may require an interpreter's owning thread to be active in order to make progress. In particular, foreign threads must be able to free objects belonging to a blocked interpreter without any cooperation from the owning thread. This is why cross-thread frees use atomic ref-counting directly, with no deferred queue that the owning thread would have to drain.
--   **Every object must be transparently treated as a string.** All design decisions revolve around this -- at the end of the day everything in Zicl is a string. A `Value`'s runtime type (its `Object.vtable`) is ephemeral and may be replaced by shimmering, so it can't be relied on as a permanent type. Zicl data structures can't depend on the current vtable outside of optimization, since that would break the contract that all objects are transparently strings.
+-   **Fail fast and loud.** Don't write defensive code, and instead either crash loudly or report the error clearly to the user. Also, never leave a piece of code unimplemented without panicking or raising an appropriate error. The last thing we need in an interpreter is silent correctness issues.
+-   **Cross-thread sharing is a primary goal.** Cross-thread object sharing is a first-class use case. Objects opt into cross-thread access via `Object.makeCrossthread()`, which recursively marks an object and its children and switches their reference counts to atomic operations.
+-   **Interpreters can block indefinitely.** Blocking in C FFI, whether on CPU or IO, is considered normal operation. Nothing in the system may require an interpreter's owning thread to be active in order to make progress. In particular, foreign threads must be able to free objects belonging to a blocked interpreter without any cooperation from the owning thread. This is why cross-thread frees use atomic ref-counting directly, with no deferred queue that the owning thread would have to drain.
+-   **Every object must be transparently treated as a string.** All design decisions revolve around this -- at the end of the day everything in Zicl is a string. A `Value`'s internal rep (its `Object.vtable`) is ephemeral and may be replaced by shimmering, so it can't be relied on as a permanent type. Zicl data structures can't depend on the current vtable outside of optimization, since that would break the contract that all objects are transparently strings.
 -   **We don't use standard malloc/free.** When doing C FFI, make sure that we've registered our custom allocators, and called the functions accordingly.
 
 ## Build Commands
@@ -37,7 +37,7 @@ zig build test -Dtest-filter="test_name_pattern"
 
 Remember that the default zig test runner (the one we use) does not print anything on success, it only returns a successful code. To get feedback, use `zig build test --summary line`, alongside any other needed parameters.
 
-Run `zig fmt` on any file you touch, without asking. The editor formats on save, so an unformatted file just shows up as noise in the next diff.
+Run `zig fmt` on any file you touch, without asking. I develop with auto formatting, so you should as well.
 
 Build with specific options:
 
@@ -45,9 +45,6 @@ Build with specific options:
 # Disable memory tracing (memory tracing can take up a lot of processing
 # power, but has really useful leak/double free messages)
 zig build -Dtrace-mem=false
-
-# Disable the expensive internal state checks (on by default in Debug)
-zig build -Dexpensive-checks=false
 
 # Force LLVM backend
 zig build -Duse-llvm=true
@@ -59,56 +56,27 @@ zig build -Dtoken-debugging=true
 Run the allocation-failure sweep on the slow tests:
 
 ```bash
-# Does anything leak? Roughly six times faster than Debug.
+# Does anything leak? Much faster than running unoptimized.
 zig build test -Dfull-oom-testing -Doptimize=ReleaseSafe
 
-# Why does it leak? Keeps the leak graph and per-object history, which
-# ReleaseSafe would otherwise switch off along with `trace_mem`.
-zig build test -Dfull-oom-testing -Doptimize=ReleaseSafe -Dtrace-mem=true
+# Why does it leak? Returns the leak graph and per-object history.
+zig build test -Dfull-oom-testing -Dtest-filter="the one that leaked" -Dtrace-mem=true
 ```
-
-Tests that drive a whole interpreter re-run once per allocation they make under
-`testing.checkAllAllocationFailures`, which costs roughly the square of how much
-they allocate. Those go through `memutil.checkAllocationFailures`, which takes a
-`memutil.OomTesting` saying how that test takes part:
-
--   `.exhaustive` -- sweep every allocation, but only under this flag. Otherwise
-    run once.
--   `.unsupported = "reason"` -- never inject, because a failure part-way leaves
-    state that says nothing about whether the code is correct. The reason is
-    recorded so a later reader can tell whether it still holds.
-
-The mode belongs on the test rather than on the file, since whether injection
-means anything depends on what the test does. Adding a new way of injecting
-failures means adding a variant, not reclassifying files.
-
-Object-level tests are cheap enough to sweep on every build and call
-`checkAllAllocationFailures` directly. Run the flag periodically: the paths it
-reaches are reached by nothing else, and real leaks hide there.
 
 Other options: `-Dstatic-link` (statically link libc, default true), `-Duse-utf8`
 (UTF-8 support in `strutil`, default true), and `-Dthreading` (default true).
 
-## Current port status
-
-The project is mid-way through a ground-up rewrite of its heap and object system. The new foundation lives in `src/heap.zig` and `src/objects.zig` and is the source of truth for everything described below. The interpreter layer has largely been migrated onto it:
-
--   `src/heap.zig`, `src/objects.zig`, `src/memutil.zig`, `src/strutil.zig`, `src/ioutil.zig`, `src/leak_check.zig`, `src/tripwire.zig` -- new foundation, compiles and is tested.
--   `src/Interp.zig`, `src/evaltypes.zig`, `src/vartypes.zig`, `src/expr_parse.zig`, `src/regex.zig`, `src/Tokenizer.zig` -- ported and wired into the test root (`src/root.zig`).
--   `src/commands/` -- every command module is ported, registered by `commands/common.zig`'s `registerCoreCommands`, and imported by its test block.
--   `src/test/` is gone. Every suite has moved next to the code it exercises, so tests live in the same file as their implementation.
--   `src/root.zig`'s `main` still panics; there is no working REPL yet.
-
-The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have been deleted. Do not resurrect them. Use `src/heap.zig` and `src/objects.zig` instead.
+## Testing
+When writing tests, use `memutil.checkAllocationFailures`, unless you're working in core object types, in which case, use `testing.checkAllAllocationFailures`. Grep for examples of how.
 
 ## Architecture Overview
 
 ### Core Components
 
-**Heap (src/heap.zig)**: The object and value system. A single global allocator (`heap.global_gpa`) backs every heap object. There is no per-thread heap and no buddy allocator; objects are individually allocated into fixed 80-byte slots. The heap module owns:
+**Heap (src/heap.zig)**: The object and value system. `heap.global_gpa` backs each object, which are individually allocated into fixed 80-byte slots. The heap module owns:
 
 -   `Value` and `OptionalValue` -- the 16-byte tagged-union value representation (see below).
--   `Object` -- the 80-byte heap-allocated object header plus body, carrying a vtable, ref count, atomic string metadata, and hash metadata.
+-   `Object` -- the 80-byte heap-allocated object header including body, carrying a vtable, ref count, atomic string metadata, and hash metadata.
 -   `SpecialString` -- the wrapper for large strings (> 1024 bytes) and strings that embed hash references, ref-counted independently of their owning object.
 -   `HashRegistry` (`heap.registered_hashes`) -- a global, `RwLock`-protected, content-addressable store mapping `u256` Blake3 hashes to a representative `*Object`. Lets any thread resolve a shared object by hash, and reclaims the representative once every instance of the hash is gone.
 -   `NativeFnRegistry` (`heap.nativefn_registry`) -- a global, mutex-protected map from command name to a lazy `LazyRegisterFn`, for lazily loading C commands.
@@ -119,10 +87,9 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 -   `objects.zig` owns the data types: `None` (untyped string-only object), `String`, `Integer`, `Float`, `Boolean`, `List`, `Dictionary`, `Index`, `Source`, and `HashReference`. `Number` is a plain tagged union (int or float), not an object type.
 -   The evaluation types live in `src/evaltypes.zig`: `Script`, `ParsedScriptCommand`, `Substitution`, `Expression`, `Closure`, and `NativeCommand` (`NativeCommand` is a plain struct held in the command table, not an object type).
 -   The variable-resolution types live in `src/vartypes.zig`: `CachedLocalVar`, `CachedLexicalVar`, `UpvarLink`, and `DictSugar`.
--   `Regexp` lives in `src/regex.zig`, next to the pcre2 bindings, because `heap.zig` drives the pcre2 context lifecycle and so cannot import from `src/commands/`. The [regexp] and [regsub] commands themselves live in `src/commands/regex.zig` like every other command.
 -   Each type provides `new`/`newObject`/`newValue` constructors and a `shimmerFrom(det, *Shimmerable)` entry point that converts a value into that type in place (or into a duplicated object when the original can't shimmer).
--   `Shimmerable` is the working buffer for shimmering. Mutation is copy-on-write: `Value.asMutableInPlace(T, det)` returns a `*T` when the value can be shimmered _and_ mutated in place, and null when the caller has to duplicate instead. `Shimmerable.getMutable(T, det)` is the shim-flavored counterpart, and returns an owned copy (see below).
--   `Dictionary` supports `~parent` links (a `HashReference` stored under the interned key `~parent`) for lexical scope chains. Lookups and iteration follow parent links recursively, with parent keys taking precedence. `Dictionary.flatten` collapses a link chain into one flat dict.
+-   `Shimmerable` is the working buffer for shimmering. Never mutate a value in a `Shimmerable` directly, instead use COW logic (see the cookbook for how).
+-   `Dictionary` supports `~parent` links (a `HashReference` stored under the interned key `~parent`) for Self-like parent chains. Lookups and iteration follow parent links recursively, with shorter depths taking precedence. `Dictionary.flattenForKey` collapses a link chain into one flat dict.
 -   `SubcommandParser` and `EnumMapping`/`EnumConstructor` are comptime helpers for dispatching Tcl subcommands and parsing Tcl-facing enums.
 
 **Memory Utilities (src/memutil.zig)**: Reusable allocator and container infrastructure:
@@ -134,9 +101,7 @@ The old `src/Heap.zig`, `src/objutil.zig`, and `src/StringAllocator.zig` have be
 -   `StructIterator` and `GraphWalker` -- the heap-graph walking machinery that powers leak diagnostics. Types opt in by providing an `enumerate_struct` vtable entry.
 -   `null_allocator` -- an allocator that always fails, used to prove a code path does not allocate.
 
-**Failure Injection (src/tripwire.zig)**: Vendored from ghostty. `tripwire.module(FailPoints, func)` builds a per-function set of named fail points; sprinkle `try tw.check(.point)` at the `try`s whose `errdefer` you want to exercise, then drive them from tests with `tw.errorAlways` and friends. Use it when `checkAllAllocationFailures` cannot reach an error path (non-OOM errors, or errors deep behind a cache hit).
-
-**Leak Checking (src/leak_check.zig)**: The diagnostic layer. When `options.trace_mem` is on, every alloc/free/borrow/release on a `Value` is logged with a stack trace into a global ring buffer. `leak_check.captureLeaks` walks every leaked object via `GraphWalker`/`StructIterator` and produces a `LeakResult` that can render a Graphviz dot digraph (`dumpDot`) of the reachable leak graph plus a per-object operation history (`dumpDetails`). `dumpLastTouchedTrace` is hooked into the panic path so a use-after-free prints the refcount history of the last-touched object alongside Zig's own stack trace.
+**Leak Checking (src/leak_check.zig)**: The diagnostic layer. When `options.trace_mem` is on, this tracks every alloc/free/incr ref/decr ref and prints if a leak occured.
 
 **Interpreter (src/Interp.zig)**: Executes parsed scripts, using the `Value`/`Object`/`Shimmerable` API:
 
@@ -168,7 +133,7 @@ Objects automatically "shimmer" between types. Shimmering replaces the vtable an
 
 2.  **Shimmerable**: The working buffer for in-place type changes.
     -   `Shimmerable = { original: Value, shimmered: OptionalValue }`. `shimmered` holds a duplicated object when the original could not be shimmered in place.
-    -   `.current()` returns the effective `Value`; `.consume()` takes ownership and releases the original; `.discardChanges()` releases any duplicate and rolls back; `.prepareToShimmer(T)` ensures the object is exclusively owned (boxing a primitive if needed), caches the string rep, frees the old body, installs `T`'s vtable, and returns the `*T` body to fill in.
+    -   `.current()` returns the effective `Value`; `.consume()` takes ownership and drops the original; `.discardChanges()` drops any duplicate and rolls back; `.prepareToShimmer(T)` ensures the object is exclusively owned (boxing a primitive if needed), caches the string rep, frees the old body, installs `T`'s vtable, and returns the `*T` body to fill in.
 
 3.  **Mutation is copy-on-write, and the caller picks the branch.** `Value.asMutableInPlace(T, det)` returns a `*T` when the value shimmers to `T` and is exclusively owned, and null otherwise. The two outcomes have different lifetimes, which is why every call site spells out both:
     -   In place: no new object; the mutated object's owner keeps its reference, and you must invalidate that owner's string rep.
@@ -176,14 +141,14 @@ Objects automatically "shimmer" between types. Shimmering replaces the vtable an
 
     `Shimmerable.getMutable(T, det)` is the same operation phrased over a shim, used where one is already in hand. It essentially always duplicates (it will not hand back `original` even at ref count 1, since the shim's contract is that only an equal-stringed value is written back); its one shortcut is stealing `shimmered` when the shimmer already built a mutable duplicate. The `*T` it returns is owned by the caller and detached from the shim, so `shim.current()` is _not_ the mutated object and `shim.consume()` would return the wrong value.
 
-4.  **Reference Counting**: All heap objects are ref-counted. `Value.borrow()` / `Object.borrow()` increment and return the same value; `Value.release()` / `Object.release()` decrement and free at zero. Cross-thread objects (`metadata.cross_thread == true`) use atomic ref counts; thread-local objects use plain integers. A hash-registered object that is the registry's representative unregisters itself when its ref count drops to 1 (the registry holds the last borrow), breaking the circular reference.
+4.  **Reference Counting**: All heap objects are ref-counted. `Value.takeReference()` / `Object.takeReference()` increment and return the same value; `Value.dropReference()` / `Object.dropReference()` decrement and free at zero. Cross-thread objects (`metadata.cross_thread == true`) use atomic ref counts; thread-local objects use plain integers. A hash-registered object that is the registry's representative unregisters itself when its ref count drops to 1 (the registry holds the last reference), breaking the circular reference.
 
 5.  **Ownership Patterns**:
-    -   Functions that allocate return owned values/objects (caller must release).
-    -   `borrow()` increases ref count and returns the same value.
-    -   `duplicate()` creates a shallow copy (deep for the string rep; collection items are borrowed).
-    -   `release()` decrements ref count and frees if zero (use in `defer` for cleanup).
-    -   `Value.swap` / `OptionalValue.swap` release the old value when overwriting a slot.
+    -   Functions that allocate return owned values/objects (caller must drop).
+    -   `takeReference()` increases ref count and returns the same value.
+    -   `duplicate()` creates a shallow copy (deep for the string rep; collection items are referenced).
+    -   `dropReference()` decrements ref count and frees if zero (use in `defer` for cleanup).
+    -   `Value.swap` / `OptionalValue.swap` drop the old value when overwriting a slot.
 
 ### Script Execution Model
 
@@ -260,10 +225,10 @@ Helper functions available (in `src/Interp.zig`):
 
 ```zig
 const str_value = try objects.String.newValue("hello");
-defer str_value.release();
+defer str_value.dropReference();
 
 const list = try objects.List.new(&.{ str_value });
-defer list.asHead().release();
+defer list.asHead().dropReference();
 ```
 
 **Shimmering with a `Shimmerable`**:
@@ -273,7 +238,7 @@ var det: objects.ErrorDetails = undefined;
 var shim: objects.Shimmerable = .{ .original = some_value };
 defer shim.discardChanges();
 const list = try objects.List.shimmerFrom(&det, &shim);
-// `shim.current()` is the list. Any duplicate is released by the defer.
+// `shim.current()` is the list. Any duplicate is dropped by the defer.
 ```
 
 **Mutating a value (copy-on-write)**:
@@ -284,7 +249,7 @@ if (try dict_raw.asMutableInPlace(objects.Dictionary, &det)) |dict| {
     owner.asHead().invalidateString(); // Mutated in place; owner's string is stale.
 } else {
     const duped = try dict_raw.duplicateAsBoxed();
-    defer duped.release();
+    defer duped.dropReference();
     const dict = (try duped.asValue().asMutableInPlace(objects.Dictionary, &det)).?;
     try dict.put(key, value);
     try storeBack(duped.asValue()); // The copy is ours; put it where it belongs.
@@ -319,9 +284,9 @@ const result = try processData(data);  // Ownership transferred on success.
 
 ## Common Issues
 
-**Double Free**: If you see double-free panics, check the memory trace. Collection items (list/dict slots) are borrowed and ref-counted individually, but you should only call `release()` on values you explicitly borrowed. Enable `options.trace_mem` to dump the full allocation/deallocation trace.
+**Double Free**: If you see double-free panics, check the memory trace. Collection items (list/dict slots) are referenced and ref-counted individually, but you should only call `dropReference()` on values you explicitly referenced. Enable `options.trace_mem` to dump the full allocation/deallocation trace.
 
-**Overlapping errdefers after ownership transfer**: When you transfer ownership of a `Value` into a collection slot inside a nested block with its own `errdefer`, null out the source variable afterward. Otherwise an outer `errdefer shim.discardChanges()` and an inner `errdefer` on the receiving container will both try to release the same backing object if an error occurs after the transfer, causing a double-free under OOM.
+**Overlapping errdefers after ownership transfer**: When you transfer ownership of a `Value` into a collection slot inside a nested block with its own `errdefer`, null out the source variable afterward. Otherwise an outer `errdefer shim.discardChanges()` and an inner `errdefer` on the receiving container will both try to drop the same backing object if an error occurs after the transfer, causing a double-free under OOM.
 
 **Shimmer Errors**: If shimmering fails, ensure the value is not shared or cross-thread. `Shimmerable.ensureShimmerable()` and `Shimmerable.getMutable(T, det)` automatically duplicate when the object cannot shimmer or mutate in place.
 
@@ -347,13 +312,13 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 -   `continue` runs to the recorded crash. If a cast's type name won't resolve (Zig's DWARF naming rarely matches a guessed `heap.Object`/`Object`), dump raw bytes instead (`x/80xb <addr>`, sized to the known struct) and look for `0xaa` fill, Zig's undefined-memory poison, to see which field was freed out from under a live reference.
 -   Once a suspect field's address is known, set a hardware watchpoint directly on it, no type needed: `watch -location *(unsigned long *)<addr>`. Then `reverse-continue` repeatedly; each hit stops at the exact instruction that last wrote that memory, with a live backtrace, walking the object's write history backwards until the corrupting write turns up.
 
-This combination, poison-byte inspection to find what broke plus a watchpoint and `reverse-continue` to find which write broke it, is what found a `defer`/`errdefer` mixup in `Closure.parse`: `scope`'s ownership transferred into `closure_content.scope` without a `.borrow()`, but a plain `defer` released it anyway on the successful return path, one release too many, freeing the closure's own lexical scope out from under it.
+This combination, poison-byte inspection to find what broke plus a watchpoint and `reverse-continue` to find which write broke it, is what found a `defer`/`errdefer` mixup in `Closure.parse`: `scope`'s ownership transferred into `closure_content.scope` without a `.takeReference()`, but a plain `defer` dropped it anyway on the successful return path, one drop too many, freeing the closure's own lexical scope out from under it.
 
 ## Style guide
 @.claude/style.md
 
 ## Available helper functions
-@.claude/helpers.md
+Read .claude/helpers.md for available helper functions.
 
 ## Cookbook
-@.claude/cookbook.md
+Read .claude/cookbook.md for examples of common operations.

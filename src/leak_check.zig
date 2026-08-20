@@ -504,12 +504,12 @@ var dump_in_progress: std.atomic.Value(bool) = .init(false);
 /// `heap.dumpLastTouchedTrace`, called from the panic handlers in
 /// `test_runner.zig` and `libzicl.zig`), so a use-after-free or refcount bug
 /// that crashes the interpreter prints, alongside Zig's own stack trace, the
-/// sequence of alloc/borrow/release/free events (each with its stack trace)
-/// that led up to the dangling access.
+/// sequence of alloc/takeReference/dropReference/free events (each with its
+/// stack trace) that led up to the dangling access.
 ///
 /// The last-touched object is the prime suspect -- its trace tends to end in
 /// the operation that left it dangling (a `Freed` while a dict/table still holds
-/// a raw reference, an unmatched `borrow`, etc.). We never dereference the
+/// a raw reference, an unmatched `takeReference`, etc.). We never dereference the
 /// object pointer here: it may already be freed and poisoned, and reading
 /// through it would crash the dumper. The log entries keep their own copies of
 /// the address and message, which is all we read.

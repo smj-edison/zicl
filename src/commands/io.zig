@@ -68,6 +68,7 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
         var det: ErrorDetails = undefined;
         const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &rest[0]));
         const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
+        defer backing.head.dropInFlight();
         const body: *capabilities.File = &backing.body;
 
         body.writeAll(to_print) catch |err| return writeError(interp, err);
@@ -101,6 +102,7 @@ pub fn readCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var det: ErrorDetails = undefined;
     const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
     const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
+    defer backing.head.dropInFlight();
     const body: *capabilities.File = &backing.body;
 
     const bytes = body.readAll() catch |err| return readError(interp, err);
@@ -122,6 +124,7 @@ pub fn pidCmd(interp: *Interp, args: []Shimmerable) !void {
     var det: ErrorDetails = undefined;
     const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
     const backing = try interp.wrapError(&det, cap.getBacking(capabilities.Process.Backing, &det));
+    defer backing.head.dropInFlight();
 
     var pid_buffer: [exec.max_pipeline_stages]?std.process.Child.Id = undefined;
     const pids = backing.body.pids(&pid_buffer);
@@ -244,7 +247,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 force = true;
                 path_arg = &args[3];
             }
-            const path = try args[path_arg].getString();
+            const path = try path_arg.current().getString();
             if (force) {
                 // `deleteTree` treats a deleting missing path as success.
                 std.Io.Dir.cwd().deleteTree(heap.global_io, path) catch |err| {
@@ -749,7 +752,7 @@ fn testFileTempfileCreatesAFileAndReturnsItsPath(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
 
-    // The result is borrowed from the interpreter, so copy the path before the
+    // The result is referenced from the interpreter, so copy the path before the
     // next script overwrites it.
     const result = try interp.testRunScript("set path [file tempfile]");
     const path = try heap.global_gpa.dupe(u8, try result.getString());
@@ -866,9 +869,6 @@ fn testFileCapability(ta: std.mem.Allocator) !void {
     , .{absolute_path});
     defer ta.free(script);
 
-    // Borrowed, since `testRunScript` hands back the interpreter's result
-    // without taking a reference, and the failing script at the end of this
-    // test replaces that result while `name` below is still in use.
     const handle = (try interp.testRunScript(script)).takeReference();
     defer handle.dropReference();
 

@@ -181,8 +181,6 @@ pub fn regexpCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if (opt_all) {
                 const match_list = try matchToList(subject, ovector, opt_indices);
                 defer match_list.asHead().dropReference();
-                // `append` borrows, so the items stay owned by `match_list`
-                // until it is released above.
                 for (match_list.items) |item| try result_list.?.append(item);
             } else {
                 const list = try matchToList(subject, ovector, opt_indices);

@@ -1410,7 +1410,7 @@ pub const Closure = struct {
                     return error.BadClosure;
                 }
 
-                // Reserved up front, since a failing append would strand the borrow in its argument.
+                // Reserved up front, since a failing append would strand the reference in its argument.
                 try optional_values.ensureUnusedCapacity(heap.global_gpa, 1);
                 try arg_names.ensureUnusedCapacity(heap.global_gpa, 1);
 

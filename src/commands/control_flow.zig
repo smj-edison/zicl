@@ -364,7 +364,7 @@ pub fn switchCmd(interp: *Interp, args: []Shimmerable) !void {
     };
     defer if (should_discard_changes) for (switch_body) |*wb| wb.discardChanges();
 
-    // We need to borrow `body_to_run`, since it may mutate under us when `commandMatch` is called.
+    // We need to reference `body_to_run`, since it may mutate under us when `commandMatch` is called.
     var body_to_run: ?Value = null;
     defer if (body_to_run) |val| val.dropReference();
 

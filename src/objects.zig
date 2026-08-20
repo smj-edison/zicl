@@ -545,7 +545,7 @@ pub const HashReference = struct {
             };
             return error.NotHashReference;
         };
-        const target = heap.registered_hashes.getAndBorrow(hash) orelse {
+        const target = heap.registered_hashes.getAndTakeReference(hash) orelse {
             if (det) |details| details.* = .{
                 .message = try std.fmt.allocPrintSentinel(
                     heap.global_gpa,
@@ -2484,8 +2484,8 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     try testing.expectEqual(2, dict_for_put.items.len / 2);
     // Replace an existing key's value; pair count stays the same.
-    // `put` borrows the value into the dict, so the caller retains its handle
-    // (released by `defer value3.release()` above) -- no extra `.borrow()` or
+    // `put` references the value into the dict, so the caller retains its handle
+    // (dropped by `defer value3.dropReference()` above) -- no extra `.takeReference()` or
     // the call leaks a ref.
     try dict_for_put.put(key_bar, value3);
     try testing.expectEqual(2, dict_for_put.items.len / 2);

@@ -38,6 +38,9 @@ const std = @import("std");
 const common = @import("common.zig");
 const heap = common.heap;
 const objects = common.objects;
+const Capability = common.Capability;
+const capabilities = common.capabilities;
+const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
@@ -49,13 +52,12 @@ const InitFn = *const fn (*Interp) callconv(.c) ?*objects.Dictionary;
 
 const interned_nativefn = heap.InternedString.newValue("nativefn");
 
-/// Loads `path` and calls its `Zicl_<pkgname>Init`, leaving the resulting
-/// `{cleanName {nativefn registryName} ...}` dict as the interp's result.
+/// Loads `path`, calls its `Zicl_<pkgname>Init`, and returns a DyLib capability.
 pub fn loadLibrary(interp: *Interp, path: [:0]const u8) Interp.Error!void {
     var lib = std.DynLib.open(path) catch |err| {
         return interp.setErrorFormatted("error loading extension \"{s}\": {t}", .{ path, err });
     };
-    // Not closed: see module doc comment.
+    errdefer lib.close();
 
     const basename = std.Io.Dir.path.basename(path);
     const pkgname = if (std.mem.indexOfScalar(u8, basename, '.')) |dot| basename[0..dot] else basename;
@@ -65,11 +67,13 @@ pub fn loadLibrary(interp: *Interp, path: [:0]const u8) Interp.Error!void {
         return interp.setErrorFormatted("no {s} symbol found in extension {s}", .{ symbol, path });
     };
 
-    const registered = init_fn(interp) orelse return error.EvalError;
+    const registered = init_fn(interp) orelse {
+        return interp.setErrorString("failed to initialize dynlib");
+    };
     defer registered.asHead().dropReference();
 
-    const dict = try objects.Dictionary.newWithCapacity(&.{}, registered.items.len / 2);
-    errdefer dict.asHead().dropReference();
+    const fns_dict = try objects.Dictionary.newWithCapacity(&.{}, registered.items.len / 2);
+    errdefer fns_dict.asHead().dropReference();
 
     var i: usize = 0;
     while (i < registered.items.len) : (i += 2) {
@@ -77,10 +81,11 @@ pub fn loadLibrary(interp: *Interp, path: [:0]const u8) Interp.Error!void {
         const registry_name = registered.items[i + 1];
         const tagged = try objects.List.new(&.{ interned_nativefn, registry_name });
         defer tagged.asHead().dropReference();
-        try dict.put(clean_name, tagged.asHead().asValue());
+        try fns_dict.put(clean_name, tagged.asHead().asValue());
     }
 
-    interp.setResultOwning(dict.asHead().asValue());
+    const dynlib_cap = try capabilities.DynLib.new(lib, fns_dict.asHead().asValue());
+    interp.setResultOwning(dynlib_cap.asHead().asValue());
 }
 
 pub fn loadCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -88,6 +93,43 @@ pub fn loadCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     try loadLibrary(interp, path);
 }
 
+/// [dynlib]: operations on a `DynLib` capability (what `[load]` returns).
+///
+/// `dynlib fns $cap` -- the `{fnName {nativefn fnName} ...}` dict
+/// of commands the library registered at load time; this is what `[load]`
+/// itself used to return directly.
+///
+/// `dynlib lookup $cap $symbolName` -- the address of `symbolName` in the
+/// library, as an integer. Errors if the symbol isn't exported, rather than
+/// returning some sentinel a caller could mistake for a real address.
+pub fn dynlibCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
+    const Subcommands = enum { fns, lookup };
+    const Parser = objects.SubcommandParser(Subcommands, &.{
+        .{ .variant = .fns, .usage = "dynlibCapability", .min_args = 1, .max_args = 1 },
+        .{ .variant = .lookup, .usage = "dynlibCapability symbolName", .min_args = 2, .max_args = 2 },
+    });
+
+    var det: ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[2]));
+    const backing = try interp.wrapError(&det, cap.getBacking(capabilities.DynLib.Backing, &det));
+    defer backing.head.dropInFlight();
+
+    switch (subcommand) {
+        .fns => interp.setResult(backing.body.fns),
+        .lookup => {
+            const symbol_name = try args[3].getString();
+            const addr = backing.body.lookup(symbol_name) orelse {
+                try interp.setResultFormatted("no such symbol \"{s}\"", .{symbol_name});
+                return error.EvalError;
+            };
+            interp.setResultInteger(@intCast(@intFromPtr(addr)));
+        },
+    }
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "load", loadCmd, "libraryFile", 1, 1);
+    try registerCommand(interp, "dynlib", dynlibCmd, "subcommand ?arg ...?", 2, 3);
 }
