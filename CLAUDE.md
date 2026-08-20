@@ -350,23 +350,7 @@ This project has comprehensive tracing for all memory operations. _Always_ read 
 This combination, poison-byte inspection to find what broke plus a watchpoint and `reverse-continue` to find which write broke it, is what found a `defer`/`errdefer` mixup in `Closure.parse`: `scope`'s ownership transferred into `closure_content.scope` without a `.borrow()`, but a plain `defer` released it anyway on the successful return path, one release too many, freeing the closure's own lexical scope out from under it.
 
 ## Style guide
--   Write for a reader who is fluent in low-level programming, but only has a high level understanding of this project, and who was not present for the discussion that produced the code actively being written. Assume they can read Zig and reason about atomics, ownership, and memory layout. Do not assume they know why some alternative was rejected, what a symbol used to be called, which bug prompted a line, or what any of it looked like an hour ago. A comment that only makes sense to someone who watched the code being written is scratch work, not documentation.
--   Write Tcl as Tcl, not TCL.
--   Prefer commas or parenthesis over em-dashes. Also, write in ASCII characters exclusively (i.e. no — or →). Double hypens, --, can substitute for a proper em dash.
--   Use "why" commands, and occasional "how" comments, but avoid "what" comments unless the logic is dense.
--   Split a function's comments by what the reader needs. The doc comment on the signature says how to call it: what it takes, what it gives back, what the caller is then responsible for, plus whatever rationale a caller has to know to use it correctly. Everything about _how_ it works goes in the body, next to the code it explains. A signature that opens with three paragraphs on lock ordering is telling callers something they cannot act on and burying it from the person changing the implementation.
--   Comment the exceptions, not the conventions. If a reader who knows this codebase would already predict what a line does, leave it alone; spend the comment where the code departs from what they'd predict. This is the "what" comment rule applied to design rules rather than to syntax: that `interp.getInteger` reports its own errors is the convention and needs no note, whereas a call site that deliberately bypasses it does.
--   Seek for brevity in all comments. Unnecessary details and only tenously related points make it harder to follow.
--   Give a complicated edge case a concrete example, in a triple-backtick block under the prose that introduces it (see `DictSugar` in `src/vartypes.zig`). If a comment describes a situation the reader has to construct in their head (an aliased variable, a shared object, a specific argument shape), show the two or three lines of Tcl that produce it. An edge case worth an example is usually also worth a test.
--   End every comment with a period, exclaimation point, or similar (what's important is that the thought is properly terminated).
--   Don't use UPPERCASE, instead use _emphasis_. TODO, FIXME, PERF, HACK, etc are exceptions to this rule, as they're used for grepping.
--   If there's a short `if (optional) |val|`, use `val` as the capture name, not `h`.
--   Avoid using overly terse names, like `ef` for an evaluation frame. Use something like `frame` or `eval_frame` instead. Use `err` instead of `e` as well.
--   Follow the known-new contract when writing: every sentence, always introduce something that the reader has previously read before introducing something new.
--   Whenever you refer to a variable or a piece of code, enclose it in backticks. Exceptions to this rule include integer types (i.e. i64, u5), error types (i.e. error.OutOfMemory), and command/subcommand names surrounded by brackets (e.g. [puts], not `puts`).
--   Don't remove comments when porting code. There's been multiple instances where code lost important comments during porting or refactoring. It makes it unnecessarily hard to reason about.
--   Make sure comments don't include internal thought processes or references to temporary state. Comments should be written for future readers of the code, not for scratch work.
--   Don't leave comments behind after fixing ownership/ref counting bugs, unless it's significantly outside of normal ownership patterns. They quickly balloon out of control and make the code incomprehensible. See "don't make comments with internal thought process."
+@.claude/style.md
 
 ## Available helper functions
 @.claude/helpers.md
