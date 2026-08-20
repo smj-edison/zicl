@@ -1784,6 +1784,16 @@ pub fn integerOverflowError(interp: *Interp, IntType: type, rendered_int: IntTyp
     return interp.wrapError(&det, objects.Integer.overflowError(IntType, &det, rendered_int));
 }
 
+pub fn asMutableInPlace(interp: *Interp, T: type, value: Value) !?*T {
+    var det: ErrorDetails = undefined;
+    return interp.wrapError(&det, value.asMutableInPlace(T, &det));
+}
+
+pub fn duplicateAsType(interp: *Interp, T: type, value: Value) !*T {
+    var det: ErrorDetails = undefined;
+    return interp.wrapError(&det, value.duplicateAsType(T, &det));
+}
+
 pub fn wrapShimmerFn(
     interp: *Interp,
     ReturnType: type,
@@ -1933,6 +1943,12 @@ pub fn unsetVariableSilent(interp: *Interp, name: *Shimmerable) !void {
 pub fn getDictValue(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!?Value {
     var det: ErrorDetails = undefined;
     const opt = try interp.wrapError(&det, objects.Dictionary.getFollowingLinks(&det, dict, key));
+    return opt.asValue();
+}
+
+pub fn getMutDictValue(interp: *Interp, dict: *Dictionary, key: Value) heap.Error!?Value {
+    var det: ErrorDetails = undefined;
+    const opt = try interp.wrapError(&det, dict.getFollowingLinksMut(&det, key));
     return opt.asValue();
 }
 

@@ -1,11 +1,13 @@
 const std = @import("std");
 
 const strutil = @import("../strutil.zig");
+const control_flow = @import("control_flow.zig");
 
 const common = @import("common.zig");
 const heap = common.heap;
 const objects = common.objects;
 const String = objects.String;
+const Value = common.Value;
 const ErrorDetails = common.ErrorDetails;
 const Interp = common.Interp;
 const Shimmerable = common.Shimmerable;
@@ -13,6 +15,55 @@ const registerCommand = common.registerCommand;
 const memutil = common.memutil;
 
 const Dictionary = objects.Dictionary;
+const List = objects.List;
+
+/// Equivalent to [append], but for a dict key.
+fn dictAppendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: []Shimmerable) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(heap.global_gpa);
+    if (try interp.getMutDictValue(dict_mut, key)) |existing| {
+        try buf.appendSlice(heap.global_gpa, try existing.getString());
+    }
+    for (pieces) |*value_shim| {
+        try buf.appendSlice(heap.global_gpa, try value_shim.current().getString());
+    }
+    const new_str = try String.newOwning(try buf.toOwnedSliceSentinel(heap.global_gpa, 0));
+    defer new_str.asHead().release();
+    try dict_mut.put(key, new_str.asHead().asValue());
+}
+
+/// Equivalent to [lappend], but for a dict key.
+fn dictLappendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: []Shimmerable) !void {
+    if (try interp.getMutDictValue(dict_mut, key)) |existing| {
+        if (try interp.asMutableInPlace(List, existing)) |list_mut| {
+            for (pieces) |*value_shim| try list_mut.append(value_shim.current());
+            dict_mut.asHead().invalidateString();
+        } else {
+            const list_mut = try interp.duplicateAsType(List, existing);
+            defer list_mut.asHead().release();
+            for (pieces) |*value_shim| try list_mut.append(value_shim.current());
+            try dict_mut.put(key, list_mut.asHead().asValue());
+        }
+    } else {
+        const list_mut = try List.newFromShimmerables(pieces);
+        defer list_mut.asHead().release();
+        try dict_mut.put(key, list_mut.asHead().asValue());
+    }
+}
+
+/// Equivalent to [incr], but for a dict key.
+fn dictIncrValue(interp: *Interp, dict_mut: *Dictionary, key: Value, increment: i64) !void {
+    const base: i64 = if (try interp.getMutDictValue(dict_mut, key)) |val| blk: {
+        var val_shim: Shimmerable = .{ .original = val };
+        defer val_shim.discardChanges();
+        break :blk try interp.getInteger(&val_shim);
+    } else 0;
+
+    const new_contents = std.math.add(i64, base, increment) catch {
+        return interp.integerOverflowError(i65, @as(i65, base) + @as(i65, increment));
+    };
+    try dict_mut.put(key, Value.newInt(new_contents));
+}
 
 /// [dict]
 pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -25,9 +76,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         exists,
         keys,
         size,
-        info,
         merge,
-        with,
         append,
         lappend,
         incr,
@@ -48,9 +97,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .exists, .usage = "dictionary key ?key ...?", .min_args = 2 },
         .{ .variant = .keys, .usage = "dictionary ?pattern?", .min_args = 1, .max_args = 2 },
         .{ .variant = .size, .usage = "dictionary", .min_args = 1, .max_args = 1 },
-        .{ .variant = .info, .usage = "dictionary", .min_args = 1, .max_args = 1 },
         .{ .variant = .merge, .usage = "?...?" },
-        .{ .variant = .with, .usage = "dictVar ?key ...? script", .min_args = 2 },
         .{ .variant = .append, .usage = "varName key ?value ...?", .min_args = 2 },
         .{ .variant = .lappend, .usage = "varName key ?value ...?", .min_args = 2 },
         .{ .variant = .incr, .usage = "varName key ?increment?", .min_args = 2, .max_args = 3 },
@@ -205,7 +252,146 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             }
             interp.setResult(dict.current());
         },
-        else => std.debug.panic("unimplemented: {}", .{subcommand}),
+        .size => {
+            var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[2]));
+            defer kv_result.deinit(heap.local_arena); // Still need to release the values.
+            interp.setResultInteger(@intCast(kv_result.mapping.count()));
+        },
+        .remove => {
+            const dict = &args[2];
+            const dict_mut: *Dictionary = try interp.wrapError(&det, dict.getMutable(Dictionary, &det));
+            errdefer dict_mut.asHead().release();
+
+            for (args[3..]) |*key_shim| {
+                _ = try interp.wrapError(&det, dict_mut.remove(&det, key_shim.current()));
+            }
+
+            interp.setResultOwning(dict_mut.asHead().asValue());
+        },
+        .replace => {
+            const dict = &args[2];
+            const pairs = args[3..];
+            if (@mod(pairs.len, 2) != 0) return error.WrongUsage;
+
+            const dict_mut: *Dictionary = try interp.wrapError(&det, dict.getMutable(Dictionary, &det));
+            errdefer dict_mut.asHead().release();
+
+            var idx: usize = 0;
+            while (idx < pairs.len) : (idx += 2) {
+                try dict_mut.put(pairs[idx].current(), pairs[idx + 1].current());
+            }
+
+            interp.setResultOwning(dict_mut.asHead().asValue());
+        },
+        .append => {
+            const var_name = &args[2];
+            const key = args[3].current();
+            const pieces = args[4..];
+
+            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
+                    try dictAppendValue(interp, dict_mut, key, pieces);
+                    // Mutated in place, so no `setVariable` needed.
+                    interp.setResult(dict_mut.asHead().asValue());
+                } else {
+                    const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
+                    defer dict_mut.asHead().release();
+                    try dictAppendValue(interp, dict_mut, key, pieces);
+                    try interp.setVariable(var_name, dict_mut.asHead().asValue());
+                    interp.setResult(dict_mut.asHead().asValue());
+                }
+            } else {
+                const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
+                defer dict_mut.asHead().release();
+                try dictAppendValue(interp, dict_mut, key, pieces);
+                try interp.setVariable(var_name, dict_mut.asHead().asValue());
+                interp.setResult(dict_mut.asHead().asValue());
+            }
+        },
+        .lappend => {
+            const var_name = &args[2];
+            const key = args[3].current();
+            const pieces = args[4..];
+
+            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
+                    try dictLappendValue(interp, dict_mut, key, pieces);
+                    interp.setResult(dict_mut.asHead().asValue());
+                } else {
+                    const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
+                    defer dict_mut.asHead().release();
+                    try dictLappendValue(interp, dict_mut, key, pieces);
+                    try interp.setVariable(var_name, dict_mut.asHead().asValue());
+                    interp.setResult(dict_mut.asHead().asValue());
+                }
+            } else {
+                const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
+                defer dict_mut.asHead().release();
+                try dictLappendValue(interp, dict_mut, key, pieces);
+                try interp.setVariable(var_name, dict_mut.asHead().asValue());
+                interp.setResult(dict_mut.asHead().asValue());
+            }
+        },
+        .incr => {
+            const var_name = &args[2];
+            const key = args[3].current();
+            const increment: i64 = if (args.len == 5) (try interp.getInteger(&args[4])) else 1;
+
+            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
+                    try dictIncrValue(interp, dict_mut, key, increment);
+                    interp.setResult(dict_mut.asHead().asValue());
+                } else {
+                    const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
+                    defer dict_mut.asHead().release();
+                    try dictIncrValue(interp, dict_mut, key, increment);
+                    try interp.setVariable(var_name, dict_mut.asHead().asValue());
+                    interp.setResult(dict_mut.asHead().asValue());
+                }
+            } else {
+                const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
+                defer dict_mut.asHead().release();
+                try dictIncrValue(interp, dict_mut, key, increment);
+                try interp.setVariable(var_name, dict_mut.asHead().asValue());
+                interp.setResult(dict_mut.asHead().asValue());
+            }
+        },
+        .@"for" => {
+            const var_list = try interp.getList(&args[2]);
+            if (var_list.items.len != 2) {
+                try interp.setResultString("must have exactly two variable names");
+                return error.EvalError;
+            }
+            var key_var: Shimmerable = .{ .original = var_list.items[0] };
+            defer key_var.discardChanges();
+            var value_var: Shimmerable = .{ .original = var_list.items[1] };
+            defer value_var.discardChanges();
+
+            var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[3]));
+            defer kv_result.deinit(heap.local_arena);
+            const keys = kv_result.mapping.keys();
+            const values = kv_result.mapping.values();
+
+            const body = &args[4];
+
+            var idx: usize = 0;
+            while (idx < keys.len) : (idx += 1) {
+                try interp.setVariable(&key_var, keys[idx]);
+                try interp.setVariable(&value_var, values[idx]);
+
+                switch (try control_flow.propagateLoopControl(interp, interp.evalValue(body.current()))) {
+                    .@"break" => break,
+                    .@"continue" => continue,
+                    .none => {},
+                }
+            }
+
+            interp.setEmptyResult();
+        },
+        else => {
+            try interp.setResultFormatted("dict {s} is not yet implemented", .{@tagName(subcommand)});
+            return error.EvalError;
+        },
     }
 }
 
@@ -422,4 +608,124 @@ fn testPartialFlatten(ta: std.mem.Allocator) !void {
 
 test "dict remove flattens only as far as the key reaches" {
     try memutil.checkAllocationFailures(.exhaustive, testPartialFlatten, .{});
+}
+
+fn testDictSize(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("0", "dict size {}");
+    try interp.testExpectScriptResult("2", "dict size {a 1 b 2}");
+}
+
+test "dict size" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictSize, .{});
+}
+
+fn testDictRemoveCommand(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("a 1 c 3", "dict remove {a 1 b 2 c 3} b");
+    // Doesn't mutate the original variable.
+    try interp.testExpectScriptResult("a 1 b 2 c 3",
+        \\ set d {a 1 b 2 c 3}
+        \\ dict remove $d b
+        \\ set d
+    );
+}
+
+test "dict remove command" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictRemoveCommand, .{});
+}
+
+fn testDictReplace(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("a 1 b 20 c 3", "dict replace {a 1 b 2 c 3} b 20");
+    try interp.testExpectScriptResult("a 1 b 2 c 30", "dict replace {a 1 b 2} c 30");
+}
+
+test "dict replace" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictReplace, .{});
+}
+
+fn testDictAppendLappendIncr(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Force COW path on `shared`.
+    try interp.testExpectScriptResult("a 1 k v",
+        \\ set shared {a 1}
+        \\ set alias $shared
+        \\ dict append shared k v
+        \\ set shared
+    );
+
+    try interp.testExpectScriptResult("ab",
+        \\ dict append seq k a
+        \\ dict append seq k b
+        \\ set seq::k
+    );
+
+    // Stress test [dict lappend], by making sure that its COW logic works
+    // correctly when a dictionary value is aliased.
+    try interp.testExpectScriptResult("1 2 3 | 1 2",
+        \\ set inner {1 2}
+        \\ set d1 [dict create k $inner]
+        \\ set d2 [dict create k $inner]
+        \\ dict lappend d1 k 3
+        \\ concat [dict get $d1 k] | [dict get $d2 k]
+    );
+
+    // Create a new dictionary when the variable doesn't exist.
+    try interp.testExpectScriptResult("helloworld",
+        \\ dict append d k hello world
+        \\ dict get $d k
+    );
+
+    try interp.testExpectScriptResult("1 2 3",
+        \\ dict lappend l k 1
+        \\ dict lappend l k 2 3
+        \\ dict get $l k
+    );
+
+    try interp.testExpectScriptResult("5",
+        \\ dict set i k 2
+        \\ dict incr i k 3
+        \\ dict get $i k
+    );
+
+    try interp.testExpectScriptResult("newKey 1", "dict incr newDict newKey");
+}
+
+test "dict append, lappend, incr" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictAppendLappendIncr, .{});
+}
+
+fn testDictFor(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("a=1 b=2 c=3",
+        \\ set out {}
+        \\ dict for {k v} {a 1 b 2 c 3} {
+        \\     lappend out "$k=$v"
+        \\ }
+        \\ join $out " "
+    );
+
+    try interp.testExpectScriptResult("a",
+        \\ set out {}
+        \\ dict for {k v} {a 1 b 2 c 3} {
+        \\     lappend out $k
+        \\     break
+        \\ }
+        \\ join $out " "
+    );
+}
+
+test "dict for" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictFor, .{});
 }

@@ -1509,9 +1509,9 @@ pub const List = struct {
         var child_shim: Shimmerable = .{ .original = list.items[index] };
         defer child_shim.discardChanges();
 
-        if (child_shim.shimmered.isNone() and child_shim.original.canMutate()) {
+        if (child_shim.shimmered.isNone() and list.items[index].canMutate()) {
             // Mutate in place.
-            const as_list = child_shim.original.asType(List).?;
+            const as_list = list.items[index].asType(List).?;
             try as_list.setRecursively(det, indexes[1..], value);
             list.asHead().invalidateString();
         } else {
@@ -1868,6 +1868,22 @@ pub const Dictionary = struct {
         return .none;
     }
 
+    pub fn getFollowingLinksMut(self: *Dictionary, det: *ErrorDetails, key: Value) !OptionalValue {
+        assert(self.asHead().canMutate());
+        try heap.hashutil.cacheQuickHash(key);
+
+        var dict_shim: Shimmerable = .{ .original = self.asHead().asValue() };
+        const result = try getFollowingLinks(det, &dict_shim, key);
+        // `getFollowingLinks` currently only ever uses the `dict_shim`
+        // when calling `shim.ensureShimmerable()` for shimmer writeback.
+        // Because `shim.ensureShimmerable()` only sets `shimmered` if
+        // `original` can't shimmer, and we know `dict_shim` can mutate,
+        // `dict_shim` will never have `shimmered` set.
+        assert(dict_shim.shimmered.isNone());
+
+        return result;
+    }
+
     pub fn getPtrNoFollow(self: *const Dictionary, key: Value) !?*Value {
         try heap.hashutil.cacheQuickHash(key);
         if (self.table.get(key)) |idx| return &self.items[idx];
@@ -1967,14 +1983,14 @@ pub const Dictionary = struct {
         // Before removing a key from the dictionary, we first need to check if
         // that key is contained in a linked parent. For example, say we have
         // 1: {a 5}
-        // 2: {a 10 parent 1}
-        // then we remove "a" from 2. So it would look something like
+        // 2: {a 10 parent #1}
+        // then we remove "a" from #2. So it would look something like
         // 1: {a 5}
-        // 2: {parent 1}
-        // The problem is when "a" is looked up, it will traverse to 1, thus returning
-        // "5" as the value of "a", instead of returning none. So we have to flatten
-        // the linked dictionaries into a singular dictionary so we can remove "a"
-        // without resolving to a parent.
+        // 2: {parent #1}
+        // The problem is when "a" is later looked up, it will traverse to #1,
+        // thus returning "5" as the value of "a", instead of returning none. So
+        // we have to flatten the linked dictionaries into a singular dictionary
+        // so we can remove "a" without resolving to a parent.
         var dict_shim: Shimmerable = .{ .original = dict.asHead().asValue() };
         const in_parent_dict = try getFollowingLinks(det, &dict_shim, key);
         assert(dict_shim.shimmered.isNone()); // We already checked that `dict` is mutable.
@@ -2084,19 +2100,17 @@ pub const Dictionary = struct {
         return to_track_new_location;
     }
 
-    /// Collapse just enough of the `~parent` chain that `key` appears only in
+    /// Flatten just enough of the `~parent` chain that `key` appears only in
     /// `dict`, leaving everything past the last holder of `key` still linked.
     ///
     /// Only the part of the chain that shadows `key` has to be flattened, so
     /// given
-    ///
     /// ```
     /// 1: {c 30}
-    /// 2: {a 20 ~parent 1}
-    /// 3: {a 10 ~parent 2}
+    /// 2: {a 20 ~parent #1}
+    /// 3: {a 10 ~parent #2}
     /// ```
-    ///
-    /// flattening 3 for `a` yields `{a 10 ~parent 1}`: 2 is absorbed because it
+    /// flattening 3 for `a` yields `{a 10 ~parent #1}`: 2 is absorbed because it
     /// also holds `a`, while 1 stays a link. Collapsing 1 as well would copy its
     /// pairs for nothing and, more importantly, break the sharing that makes the
     /// deeper scopes cheap, since those are the ones most likely to be
@@ -2242,9 +2256,9 @@ pub const Dictionary = struct {
         var child_dict_shim: Shimmerable = .{ .original = child_dict };
         defer child_dict_shim.discardChanges();
         _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
-        if (child_dict_shim.shimmered.isNone() and child_dict_shim.original.canMutate()) {
+        if (child_dict_shim.shimmered.isNone() and child_dict.canMutate()) {
             // Mutate in place.
-            const as_dict = child_dict_shim.original.asType(Dictionary).?;
+            const as_dict = child_dict.asType(Dictionary).?;
             try as_dict.putRecursively(det, context.sliceAfter(1), value);
             dict.asHead().invalidateString();
         } else {
@@ -2266,9 +2280,9 @@ pub const Dictionary = struct {
             _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
 
             const did_remove = blk: {
-                if (child_dict_shim.shimmered.isNone() and child_dict_shim.original.canMutate()) {
+                if (child_dict_shim.shimmered.isNone() and child_dict.canMutate()) {
                     // Mutate in place, if possible.
-                    const as_dict = child_dict_shim.original.asType(Dictionary).?;
+                    const as_dict = child_dict.asType(Dictionary).?;
                     break :blk try as_dict.removeRecursively(det, context.sliceAfter(1));
                 } else {
                     const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
