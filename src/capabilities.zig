@@ -57,9 +57,9 @@ pub const File = struct {
         return try Capability.new(&cap_backing.head);
     }
 
-    pub fn writeAll(backing: *Backing, bytes: []const u8) !void {
+    pub fn writeAll(file: *File, bytes: []const u8) !void {
         var buffer: [1024]u8 = undefined;
-        var writer = std.Io.File.Writer.initStreaming(backing.file.file, heap.global_io, &buffer);
+        var writer = std.Io.File.Writer.initStreaming(file.file, heap.global_io, &buffer);
         writer.interface.writeAll(bytes) catch return writer.err.?;
         writer.flush() catch return writer.err.?;
     }
@@ -241,11 +241,7 @@ pub const Process = struct {
         /// longer be named and nothing could ever wait for its children.
         fn deinitBody(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
-            const self = &backing.body;
-
-            self.mutex.lockUncancelable(heap.global_io);
-            defer self.mutex.unlock(heap.global_io);
-            for (self.stages) |*stage| stage.kill();
+            for (backing.body.stages) |*stage| stage.kill();
         }
 
         /// Runs at ref count zero rather than at close, so a thread holding the
@@ -268,7 +264,7 @@ pub const Process = struct {
 /// A raw pointer whose lifetime has been handed over to Zicl. Meant for C code
 /// (chiefly generated FFI wrappers, see `folk/lib/c.tcl`) that returns a
 /// pointer it wants a script to be able to hold, pass around by its capability
-/// URL, and eventually release -- without requiring a bespoke capability type
+/// URL, and eventually drop -- without requiring a bespoke capability type
 /// (and `Zicl_CapabilityHeadVTable`) for every pointed-to C type.
 ///
 /// All `Pointer` capabilities share one vtable/name ("pointer"), so the type
@@ -289,7 +285,7 @@ pub const Pointer = struct {
     /// Runs once when the capability closes (explicitly, or via
     /// `Capability.deinitGlobals` at shutdown if never closed), and is handed
     /// back the original pointer. Null for a pointer that needs no cleanup,
-    /// e.g. one borrowed from elsewhere. Never runs if `ptr` itself is null,
+    /// e.g. one referenced from elsewhere. Never runs if `ptr` itself is null,
     /// since there is nothing to destroy.
     destructor: ?*const fn (ptr: *anyopaque) callconv(.c) void,
 
@@ -309,9 +305,11 @@ pub const Pointer = struct {
 
     /// Like `Capability.getBacking`, but also requires the capability's
     /// `type_name` to equal `expected_type_name`, so a pointer of one C type
-    /// can't stand in for another.
+    /// can't stand in for another. On success, the capability will be marked
+    /// as in-flight.
     pub fn getTyped(cap: *const Capability, expected_type_name: []const u8, det: ?*ErrorDetails) !*Pointer {
         const backing = try cap.getBacking(Backing, det);
+        errdefer backing.head.dropInFlight();
         if (!std.mem.eql(u8, backing.body.type_name, expected_type_name)) {
             if (det) |details| details.* = .{
                 .message = try objects.allocPrintZ(
@@ -369,9 +367,12 @@ fn testPointerDestructorRunsOnClose(ta: std.mem.Allocator) !void {
     defer cap.asHead().dropReference();
     defer cap.close();
 
-    const backing = try cap.getBacking(Pointer.Backing, null);
-    try testing.expectEqual(@as(?*anyopaque, &payload), backing.body.ptr);
-    try testing.expectEqualStrings("u64*", backing.body.type_name);
+    {
+        const backing = try cap.getBacking(Pointer.Backing, null);
+        defer backing.head.dropInFlight();
+        try testing.expectEqual(@as(?*anyopaque, &payload), backing.body.ptr);
+        try testing.expectEqualStrings("u64*", backing.body.type_name);
+    }
 
     try testing.expect(!Impl.destroyed);
     cap.close();
@@ -397,8 +398,11 @@ fn testPointerNullDestructorIsNoop(ta: std.mem.Allocator) !void {
     defer cap.asHead().dropReference();
     defer cap.close();
 
-    const backing = try cap.getBacking(Pointer.Backing, null);
-    try testing.expectEqual(@as(?*anyopaque, &payload), backing.body.ptr);
+    {
+        const backing = try cap.getBacking(Pointer.Backing, null);
+        defer backing.head.dropInFlight();
+        try testing.expectEqual(@as(?*anyopaque, &payload), backing.body.ptr);
+    }
 
     cap.close();
     try memutil.expectErrorOrOom(error.StaleCapability, cap.getBacking(Pointer.Backing, null));
@@ -417,8 +421,11 @@ fn testPointerGetTypedChecksTypeName(ta: std.mem.Allocator) !void {
     defer cap.asHead().dropReference();
     defer cap.close();
 
-    const matched = try Pointer.getTyped(cap, "Gpu*", null);
-    try testing.expectEqual(@as(?*anyopaque, &payload), matched.ptr);
+    {
+        const matched = try Pointer.getTyped(cap, "Gpu*", null);
+        defer cap.head.dropInFlight();
+        try testing.expectEqual(@as(?*anyopaque, &payload), matched.ptr);
+    }
 
     try memutil.expectErrorOrOom(error.BadCapability, Pointer.getTyped(cap, "v4l2_capability*", null));
 }
@@ -443,8 +450,11 @@ fn testPointerNullPtrClosesWithoutRunningDestructor(ta: std.mem.Allocator) !void
     defer cap.asHead().dropReference();
     defer cap.close();
 
-    const matched = try Pointer.getTyped(cap, "Gpu*", null);
-    try testing.expectEqual(@as(?*anyopaque, null), matched.ptr);
+    {
+        const matched = try Pointer.getTyped(cap, "Gpu*", null);
+        defer cap.head.dropInFlight();
+        try testing.expectEqual(@as(?*anyopaque, null), matched.ptr);
+    }
 
     cap.close();
     try testing.expect(!Impl.destroyed);
@@ -467,12 +477,15 @@ test "file" {
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/test.txt", .{dir_path});
     defer testing.allocator.free(path);
 
-    const cap = try File.open(path, .w);
-    defer cap.asHead().dropReference();
-    defer cap.close();
-    const file = &(try cap.getBacking(File.Backing, null)).body;
-    try file.writeAll("hello ");
-    try file.writeAll("world");
+    {
+        const cap = try File.open(path, .w);
+        defer cap.asHead().dropReference();
+        defer cap.close();
+        const backing = try cap.getBacking(File.Backing, null);
+        defer backing.head.dropInFlight();
+        try backing.body.writeAll("hello ");
+        try backing.body.writeAll("world");
+    }
 
     const written = try tmp.dir.readFileAlloc(heap.global_io, "test.txt", testing.allocator, .limited(64));
     defer testing.allocator.free(written);

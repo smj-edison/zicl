@@ -59,7 +59,7 @@ pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !
         return error.BadCapability;
     }
 
-    if (self.head.hasCloseBeenInitiated()) return staleError(det, try @constCast(self).asHead().getString());
+    self.head.markInFlight() catch return staleError(det, try @constCast(self).asHead().getString());
 
     const backing: *Backing = @fieldParentPtr("head", self.head);
     return backing;
@@ -283,7 +283,7 @@ pub const Registry = struct {
         removed.?.value.dropReference();
     }
 
-    /// Resolves a registered identifier, borrowing the head for the caller.
+    /// Resolves a registered identifier, referencing the head for the caller.
     pub fn resolve(self: *Registry, id: Id) ?*Head {
         self.mutex.lockUncancelable(heap.global_io);
         defer self.mutex.unlock(heap.global_io);
@@ -455,43 +455,50 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
     // close, including the ones an injected allocation failure takes.
     defer cap.close();
 
-    // The body survives the trip through the type-erased head.
-    const backing = try cap.getBacking(TestCapability.Backing, null);
-    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &backing.body.payload);
+    {
+        // The body survives the trip through the type-erased head.
+        const backing = try cap.getBacking(TestCapability.Backing, null);
+        defer backing.head.dropInFlight();
+        try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &backing.body.payload);
 
-    const string_rep = try cap.asHead().getString();
-    try testing.expect(std.mem.startsWith(u8, string_rep, "<" ++ scheme));
-    try testing.expect(std.mem.endsWith(u8, string_rep, ">"));
-    try testing.expect(std.mem.indexOf(u8, string_rep, "/test-handle/") != null);
+        const string_rep = try cap.asHead().getString();
+        try testing.expect(std.mem.startsWith(u8, string_rep, "<" ++ scheme));
+        try testing.expect(std.mem.endsWith(u8, string_rep, ">"));
+        try testing.expect(std.mem.indexOf(u8, string_rep, "/test-handle/") != null);
 
-    // Check that we can get the capability back from its string.
-    var shim: objects.Shimmerable = .{ .original = try objects.String.newValue(string_rep) };
-    defer shim.deinit();
-    const resolved = try Capability.shimmerFrom(null, &shim);
-    try testing.expectEqual(backing, try resolved.getBacking(TestCapability.Backing, null));
+        // Check that we can get the capability back from its string.
+        var shim: objects.Shimmerable = .{ .original = try objects.String.newValue(string_rep) };
+        defer shim.deinit();
+        const resolved = try Capability.shimmerFrom(null, &shim);
+        {
+            const reresolved_backing = try resolved.getBacking(TestCapability.Backing, null);
+            defer reresolved_backing.head.dropInFlight();
+            try testing.expectEqual(backing, reresolved_backing);
+        }
 
-    // Trailing '>' trimmed along with the leading segments.
-    const encoded_id = string_rep[std.mem.lastIndexOfScalar(u8, string_rep, '/').? + 1 .. string_rep.len - 1];
+        // Trailing '>' trimmed along with the leading segments.
+        const encoded_id = string_rep[std.mem.lastIndexOfScalar(u8, string_rep, '/').? + 1 .. string_rep.len - 1];
 
-    // A name asserting another machine does not resolve here, even when the
-    // identifier is one this machine would recognise. There is no remote
-    // dereference, so honouring the assertion is the only correct answer.
-    const elsewhere = try std.fmt.allocPrint(ta, "<{s}other-host/test-handle/{s}>", .{
-        scheme, encoded_id,
-    });
-    defer ta.free(elsewhere);
-    var elsewhere_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(elsewhere) };
-    defer elsewhere_shim.deinit();
-    try memutil.expectErrorOrOom(error.BadCapability, Capability.shimmerFrom(null, &elsewhere_shim));
+        // A name asserting another machine does not resolve here, even when the
+        // identifier is one this machine would recognise. There is no remote
+        // dereference, so honouring the assertion is the only correct answer.
+        const elsewhere = try std.fmt.allocPrint(ta, "<{s}other-host/test-handle/{s}>", .{
+            scheme, encoded_id,
+        });
+        defer ta.free(elsewhere);
+        var elsewhere_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(elsewhere) };
+        defer elsewhere_shim.deinit();
+        try memutil.expectErrorOrOom(error.BadCapability, Capability.shimmerFrom(null, &elsewhere_shim));
 
-    // We create a malicious capability with an existing id, but wrong type.
-    const wrong_type = try std.fmt.allocPrint(ta, "<{s}{s}/other-handle/{s}>", .{
-        scheme, host_name, encoded_id,
-    });
-    defer ta.free(wrong_type);
-    var wrong_type_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(wrong_type) };
-    defer wrong_type_shim.deinit();
-    try memutil.expectErrorOrOom(error.StaleCapability, Capability.shimmerFrom(null, &wrong_type_shim));
+        // We create a malicious capability with an existing id, but wrong type.
+        const wrong_type = try std.fmt.allocPrint(ta, "<{s}{s}/other-handle/{s}>", .{
+            scheme, host_name, encoded_id,
+        });
+        defer ta.free(wrong_type);
+        var wrong_type_shim: objects.Shimmerable = .{ .original = try objects.String.newValue(wrong_type) };
+        defer wrong_type_shim.deinit();
+        try memutil.expectErrorOrOom(error.StaleCapability, Capability.shimmerFrom(null, &wrong_type_shim));
+    }
 
     try testing.expect(!deinited);
     cap.close();
@@ -539,6 +546,7 @@ fn testRegistryWorksWithoutOriginalObject(ta: std.mem.Allocator) !void {
     defer shim.deinit();
     const resolved = try Capability.shimmerFrom(null, &shim);
     const backing = try resolved.getBacking(TestCapability.Backing, null);
+    defer backing.head.dropInFlight();
     try testing.expectEqualSlices(u64, &.{ 4, 5, 6 }, &backing.body.payload);
 }
 
