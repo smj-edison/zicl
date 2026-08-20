@@ -136,6 +136,17 @@ pub fn pidCmd(interp: *Interp, args: []Shimmerable) !void {
     interp.setResultOwning(list.asHead().asValue());
 }
 
+/// [pwd] -- the process's current working directory, as an absolute path.
+pub fn pwdCmd(interp: *Interp, args: []Shimmerable) !void {
+    _ = args;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = std.Io.Dir.cwd().realPathFile(heap.global_io, ".", &buf) catch |err| {
+        try interp.setResultFormatted("could not get current directory: {s}", .{@errorName(err)});
+        return error.EvalError;
+    };
+    try interp.setResultString(buf[0..len]);
+}
+
 pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const Subcommands = enum {
         exists,
@@ -144,6 +155,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         rootname,
         join,
         mkdir,
+        delete,
         size,
         readable,
         isdirectory,
@@ -158,6 +170,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .rootname, .usage = "name", .min_args = 1, .max_args = 1 },
         .{ .variant = .join, .usage = "name ?name ...?", .min_args = 1, .max_args = null },
         .{ .variant = .mkdir, .usage = "dir", .min_args = 1, .max_args = 1 },
+        .{ .variant = .delete, .usage = "?-force? name", .min_args = 1, .max_args = 2 },
         .{ .variant = .size, .usage = "name", .min_args = 1, .max_args = 1 },
         .{ .variant = .readable, .usage = "name", .min_args = 1, .max_args = 1 },
         .{ .variant = .isdirectory, .usage = "name", .min_args = 1, .max_args = 1 },
@@ -218,6 +231,37 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                     return error.EvalError;
                 },
             };
+            interp.setEmptyResult();
+        },
+        .delete => {
+            var force = false;
+            var path_arg = &args[2];
+            if (args.len == 4) {
+                if (!try args[2].current().equalsString("-force")) {
+                    try interp.setResultFormatted("bad option \"{s}\": must be -force", .{try args[2].getString()});
+                    return error.EvalError;
+                }
+                force = true;
+                path_arg = &args[3];
+            }
+            const path = try args[path_arg].getString();
+            if (force) {
+                // `deleteTree` treats a deleting missing path as success.
+                std.Io.Dir.cwd().deleteTree(heap.global_io, path) catch |err| {
+                    try interp.setResultFormatted("could not delete file: {s}", .{@errorName(err)});
+                    return error.EvalError;
+                };
+            } else {
+                std.Io.Dir.cwd().deleteFile(heap.global_io, path) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        // Tcl file deletion is idempotent, so we match our behavior.
+                    },
+                    else => {
+                        try interp.setResultFormatted("could not delete file: {s}", .{@errorName(err)});
+                        return error.EvalError;
+                    },
+                };
+            }
             interp.setEmptyResult();
         },
         .size => {
@@ -542,7 +586,7 @@ pub fn globCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     }
 
     const list = try objects.List.newWithCapacity(&.{}, results.items.len);
-    errdefer list.asHead().release();
+    errdefer list.asHead().dropReference();
     for (results.items) |path| {
         list.appendAssumeCapacityOwning(try objects.String.newValue(path));
     }
@@ -570,6 +614,7 @@ pub fn sleepCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
     try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1);
+    try registerCommand(interp, "pwd", pwdCmd, "", 0, 0);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2);
     try registerCommand(interp, "read", readCmd, "fileId", 1, 1);
@@ -722,6 +767,74 @@ test "file tempfile creates a file and returns its path" {
     try memutil.checkAllocationFailures(.exhaustive, testFileTempfileCreatesAFileAndReturnsItsPath, .{});
 }
 
+fn testFileDeleteIsIdempotent(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    const result = try interp.testRunScript("set path [file tempfile]");
+    const path = try heap.global_gpa.dupe(u8, try result.getString());
+    defer heap.global_gpa.free(path);
+    // Be sure to clean up the file if something goes wrong.
+    defer std.Io.Dir.deleteFileAbsolute(heap.global_io, path) catch {};
+
+    try interp.testExpectScriptResult("true", "file exists $path");
+    try interp.testExpectScriptResult("", "file delete $path");
+    try interp.testExpectScriptResult("false", "file exists $path");
+
+    // Deleting an already-absent file is not an error.
+    try interp.testExpectScriptResult("", "file delete $path");
+}
+
+test "file delete is idempotent" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileDeleteIsIdempotent, .{});
+}
+
+fn testFileDeleteForceDeletesDirectory(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(heap.global_io, "sub", .default_dir);
+    {
+        var sub = try tmp.dir.openDir(heap.global_io, "sub", .{});
+        defer sub.close(heap.global_io);
+        const f = try sub.createFile(heap.global_io, "inner.txt", .{});
+        f.close(heap.global_io);
+    }
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "sub", &path_buffer))];
+
+    const is_dir_script = try std.fmt.allocPrint(ta, "file isdirectory {s}", .{dir_path});
+    defer ta.free(is_dir_script);
+    try interp.testExpectScriptResult("true", is_dir_script);
+
+    const delete_script = try std.fmt.allocPrint(ta, "file delete -force {s}", .{dir_path});
+    defer ta.free(delete_script);
+    try interp.testExpectScriptResult("", delete_script);
+
+    try interp.testExpectScriptResult("false", is_dir_script);
+}
+
+test "file delete -force deletes directory" {
+    try memutil.checkAllocationFailures(.exhaustive, testFileDeleteForceDeletesDirectory, .{});
+}
+
+fn testPwdReturnsAbsolutePath(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+    const path = (try interp.testRunScript("pwd")).takeReference();
+    defer path.dropReference();
+    try testing.expect(std.Io.Dir.path.isAbsolute(try path.getString()));
+    const script = try std.fmt.allocPrint(ta, "file isdirectory {s}", .{try path.getString()});
+    defer ta.free(script);
+    try interp.testExpectScriptResult("true", script);
+}
+
+test "pwd returns absolute path" {
+    try memutil.checkAllocationFailures(.exhaustive, testPwdReturnsAbsolutePath, .{});
+}
+
 fn testFileReportsAUsageErrorForABadSubcommand(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
@@ -756,8 +869,8 @@ fn testFileCapability(ta: std.mem.Allocator) !void {
     // Borrowed, since `testRunScript` hands back the interpreter's result
     // without taking a reference, and the failing script at the end of this
     // test replaces that result while `name` below is still in use.
-    const handle = (try interp.testRunScript(script)).borrow();
-    defer handle.release();
+    const handle = (try interp.testRunScript(script)).takeReference();
+    defer handle.dropReference();
 
     // The capability renders as a delimited URL naming this machine.
     const name = try handle.getString();
@@ -851,8 +964,8 @@ fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
     , .{absolute_path});
     defer testing.allocator.free(script);
 
-    const handle = (try interp.testRunScript(script)).borrow();
-    defer handle.release();
+    const handle = (try interp.testRunScript(script)).takeReference();
+    defer handle.dropReference();
 
     // Closing takes the name out of circulation, so writing through it fails as
     // an unknown name rather than as something reporting itself closed.
