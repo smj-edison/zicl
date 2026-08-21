@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const testing = std.testing;
 
 const strutil = @import("strutil.zig");
 const ioutil = @import("ioutil.zig");
@@ -716,7 +717,15 @@ pub const Expression = struct {
         return lhs_bool == rhs_bool;
     }
 
-    pub fn evalNode(interp: *Interp, nodes: []expr_parse.Node, node_index: expr_parse.Node.Index) !Value {
+    /// Explicitly set as return type to avoid cycles in error type inference.
+    pub const EvalNodeError = Interp.Error || error{
+        BadInteger,
+        DivisionByZero,
+        IntegerOverflow,
+        NegativeDenominator,
+    };
+
+    pub fn evalNode(interp: *Interp, nodes: []expr_parse.Node, node_index: expr_parse.Node.Index) EvalNodeError!Value {
         const node = nodes[@intFromEnum(node_index)];
         switch (node.tag) {
             .mul,
@@ -868,6 +877,7 @@ pub const Expression = struct {
                 }
             },
             .value => return node.data.value.takeReference(),
+            .interpolated_string => return interp.evalSubstitution(node.data.value, .{}),
             .command_subst => {
                 const nested_cache_key = @as(u256, interp.callFrame().signature.cache_id) ^ try node.data.value.getHashNoRegister();
                 try interp.evalValueInner(interp.callFrameIdx(), node.data.value, nested_cache_key);

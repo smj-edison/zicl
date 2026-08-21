@@ -67,6 +67,7 @@ pub const Node = struct {
         value,
         command_subst,
         variable_subst,
+        interpolated_string,
         // Unary operators
         bool_not,
         bit_not,
@@ -364,22 +365,44 @@ pub const Parser = struct {
             },
             .simple_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const str = try objects.String.newValue(p.source[loc.start..loc.end]);
-                errdefer str.dropReference();
+                const source = (try objects.Source.new(
+                    p.source[loc.start..loc.end],
+                    p.source_file_name,
+                    loc.line_no,
+                )).asHead().asValue();
+                errdefer source.dropReference();
 
                 return try p.addNode(.{
                     .tag = .value,
-                    .data = .{ .value = str },
+                    .data = .{ .value = source },
                 });
             },
             .escaped_string => {
                 const loc = p.tokenLoc(p.nextToken());
-                const str = try objects.String.newFromEscaped(p.source[loc.start..loc.end]);
-                errdefer str.asHead().dropReference();
+                const source = (try objects.Source.newFromEscaped(
+                    p.source[loc.start..loc.end],
+                    p.source_file_name,
+                    loc.line_no,
+                )).asHead().asValue();
+                errdefer source.dropReference();
 
                 return try p.addNode(.{
                     .tag = .value,
-                    .data = .{ .value = str.asHead().asValue() },
+                    .data = .{ .value = source },
+                });
+            },
+            .interpolated_string => {
+                const loc = p.tokenLoc(p.nextToken());
+                const source = (try objects.Source.new(
+                    p.source[loc.start..loc.end],
+                    p.source_file_name,
+                    loc.line_no,
+                )).asHead().asValue();
+                errdefer source.dropReference();
+
+                return try p.addNode(.{
+                    .tag = .interpolated_string,
+                    .data = .{ .value = source },
                 });
             },
             .command_subst => {
@@ -436,6 +459,7 @@ pub const Parser = struct {
             switch (token_tag) {
                 .simple_string,
                 .escaped_string,
+                .interpolated_string,
                 .variable_subst,
                 .command_subst,
                 .l_paren,
@@ -550,7 +574,7 @@ pub const Parser = struct {
 
     pub fn deinit(p: *Parser) void {
         for (p.nodes.items) |node| switch (node.tag) {
-            .variable_subst, .command_subst, .value => node.data.value.dropReference(),
+            .variable_subst, .command_subst, .interpolated_string, .value => node.data.value.dropReference(),
             else => {},
         };
         p.nodes.deinit(p.gpa);
@@ -759,6 +783,7 @@ pub const Parsed = struct {
             .value => try writer.writeAll(try data.value.getString()),
             .command_subst => try writer.print("[{s}]", .{try data.value.getString()}),
             .variable_subst => try writer.print("${s}", .{try data.value.getString()}),
+            .interpolated_string => try writer.print("\"{s}\"", .{try data.value.getString()}),
             // Unary operators
             .bool_not,
             .bit_not,
@@ -795,7 +820,7 @@ pub const Parsed = struct {
 
     pub fn deinit(parsed: *Parsed, gpa: std.mem.Allocator) void {
         for (parsed.nodes) |node| switch (node.tag) {
-            .variable_subst, .command_subst, .value => node.data.value.dropReference(),
+            .variable_subst, .command_subst, .interpolated_string, .value => node.data.value.dropReference(),
             else => {},
         };
         gpa.free(parsed.nodes);
@@ -835,6 +860,11 @@ test "expr parsing" {
     try testExprParse(ta, "0X1f + 1", "(31 .add 1)");
     try testExprParse(ta, "0o17 + 1", "(15 .add 1)");
     try testExprParse(ta, "0b101 + 1", "(5 .add 1)");
+
+    // Quoted strings should parse as single nodes.
+    try testExprParse(ta, "\"abc\" eq \"abc\"", "(abc .string_equal abc)");
+    try testExprParse(ta, "\"$a/b\" eq \"c\"", "(\"$a/b\" .string_equal c)");
+    try testExprParse(ta, "\"x[foo]y\" eq \"c\"", "(\"x[foo]y\" .string_equal c)");
 
     // A `(...)` group must stop at its own `)`, not keep absorbing whatever
     // operator follows.
@@ -903,6 +933,9 @@ test "expr parsing" {
         \\1 | 10 20
         \\  |    ^^
     );
+
+    try testExprParseError(ta, "\"$a\" \"$b\"", .missing_operator, null);
+    try testExprParseError(ta, "$a $b", .missing_operator, null);
 }
 
 fn testExprParse(ta: std.mem.Allocator, expr: []const u8, comptime expected_tree: []const u8) !void {

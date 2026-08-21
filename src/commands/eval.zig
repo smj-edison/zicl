@@ -21,78 +21,6 @@ pub fn exprCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setResultOwning(result);
 }
 
-fn testExprInNi(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
-
-    // `in`/`ni` match against list *elements*, not substrings of the
-    // right-hand side's raw string form. "p" is a substring of "colorMap"
-    // but not an element of the one-item list {colorMap}.
-    try interp.testExpectScriptResult("false", "expr {\"p\" in {colorMap}}");
-    try interp.testExpectScriptResult("false", "expr {\"o\" in {colorMap}}");
-    try interp.testExpectScriptResult("true", "expr {\"colorMap\" in {colorMap}}");
-    try interp.testExpectScriptResult("true", "expr {\"b\" in {a b c}}");
-    try interp.testExpectScriptResult("false", "expr {\"z\" in {a b c}}");
-    try interp.testExpectScriptResult("true", "expr {\"z\" ni {a b c}}");
-    try interp.testExpectScriptResult("false", "expr {\"b\" ni {a b c}}");
-}
-
-test "expr in/ni match list elements, not substrings" {
-    try memutil.checkAllocationFailures(.exhaustive, testExprInNi, .{});
-}
-
-fn testExprComparisonIsStrict(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
-
-    // In normal Tcl, `"hello" == "hello"` is a valid expr script, since
-    // it falls back to string comparison if both sides can't be parsed
-    // as numbers. I don't like implicit casting, so I've made `==` strict.
-    // Use `eq` for string comparison instead.
-    try interp.testExpectScriptError(error.EvalError,
-        \\error occured when evaluating expression "abc" == "abc": expected float but got "abc", parse tree: (abc .equal abc)
-    , "expr {\"abc\" == \"abc\"}");
-    try interp.testExpectScriptResult("true", "expr {\"abc\" eq \"abc\"}");
-    try interp.testExpectScriptResult("false", "expr {\"abc\" eq \"def\"}");
-
-    // Booleans are not numbers, but `==`/`!=` compare two booleans. Only
-    // when *both* sides are booleans, though: a boolean against a number or
-    // string keeps hitting the strict failure.
-    try interp.testExpectScriptResult("true", "expr {true == true}");
-    try interp.testExpectScriptResult("false", "expr {true == false}");
-    try interp.testExpectScriptResult("true", "expr {true != false}");
-
-    // String operands shimmer to booleans for `==`/`!=`, the same way
-    // numeric strings shimmer to numbers.
-    try interp.testExpectScriptResult("true", "expr {\"true\" == true}");
-    try interp.testExpectScriptResult("true", "expr {\"true\" != \"false\"}");
-    try interp.testExpectScriptResult("true", "set x false; expr {$x == false}");
-
-    // Ordering operators never accept booleans, not even two of them.
-    try interp.testExpectScriptError(error.EvalError,
-        \\error occured when evaluating expression true < false: expected float but got "true", parse tree: (true .less_than false)
-    , "expr {true < false}");
-
-    // Mixed boolean/non-boolean comparisons still fail strictly.
-    try interp.testExpectScriptError(error.EvalError,
-        \\error occured when evaluating expression true == 1: expected float but got "true", parse tree: (true .equal 1)
-    , "expr {true == 1}");
-    try interp.testExpectScriptError(error.EvalError,
-        \\error occured when evaluating expression 1 == true: expected float but got "true", parse tree: (1 .equal true)
-    , "expr {1 == true}");
-    try interp.testExpectScriptError(error.EvalError,
-        \\error occured when evaluating expression "abc" == true: expected float but got "abc", parse tree: (abc .equal true)
-    , "expr {\"abc\" == true}");
-
-    // Still numeric when both sides genuinely are numbers.
-    try interp.testExpectScriptResult("true", "expr {1 == 1.0}");
-    try interp.testExpectScriptResult("true", "expr {2 > 1}");
-}
-
-test "expr comparisons stay strictly numeric, no implicit casting" {
-    try memutil.checkAllocationFailures(.exhaustive, testExprComparisonIsStrict, .{});
-}
-
 pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
     var flags: Tokenizer.SubstFlags = .{
         .command_subst = true,
@@ -107,13 +35,13 @@ pub fn substCmd(interp: *Interp, args: []Shimmerable) !void {
             flags.variable_subst = false;
         } else if (try args[arg_index].current().equalsString("-nobackslashes")) {
             flags.escape_subst = false;
+        } else {
+            try interp.setResultFormatted(
+                "bad option \"{s}\": must be -nocommands, -novariables, or -nobackslashes",
+                .{try args[arg_index].current().getString()},
+            );
+            return error.EvalError;
         }
-
-        try interp.setResultFormatted(
-            "bad option \"{s}\": must be -nocommands, -novariables, or -nobackslashes",
-            .{try args[arg_index].current().getString()},
-        );
-        return error.EvalError;
     }
 
     const to_substitute = &args[args.len - 1];
@@ -894,6 +822,19 @@ fn testSubstBasic(ta: std.mem.Allocator) !void {
     try interp.testExpectScriptError(error.EvalError,
         \\bad option "a": must be -nocommands, -novariables, or -nobackslashes
     , "subst a b c");
+
+    // The valid options are accepted (not just rejected-as-bad), and each
+    // actually suppresses its own kind of substitution while leaving the
+    // others alone.
+    try interp.testExpectScriptResult("v", "set x v; subst {$x}");
+    try interp.testExpectScriptResult("v", "set x v; subst -nocommands {$x}");
+    try interp.testExpectScriptResult("$x", "set x v; subst -novariables {$x}");
+    try interp.testExpectScriptResult("[set x]", "set x v; subst -nocommands {[set x]}");
+    try interp.testExpectScriptResult("v", "set x v; subst -novariables {[set x]}");
+    // With backslashes off the `\` stays literal, but `$x` still substitutes.
+    try interp.testExpectScriptResult("\\v", "set x v; subst -nobackslashes {\\$x}");
+    // Several options at once.
+    try interp.testExpectScriptResult("$x[set x]", "set x v; subst -nocommands -novariables {$x[set x]}");
 }
 
 test "subst basic" {
@@ -1367,4 +1308,115 @@ fn testArgExpansion(ta: std.mem.Allocator) !void {
 
 test "arg expansion" {
     try memutil.checkAllocationFailures(.exhaustive, testArgExpansion, .{});
+}
+
+fn testExprInNi(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // `in`/`ni` match against list *elements*, not substrings of the
+    // right-hand side's raw string form. "p" is a substring of "colorMap"
+    // but not an element of the one-item list {colorMap}.
+    try interp.testExpectScriptResult("false", "expr {\"p\" in {colorMap}}");
+    try interp.testExpectScriptResult("false", "expr {\"o\" in {colorMap}}");
+    try interp.testExpectScriptResult("true", "expr {\"colorMap\" in {colorMap}}");
+    try interp.testExpectScriptResult("true", "expr {\"b\" in {a b c}}");
+    try interp.testExpectScriptResult("false", "expr {\"z\" in {a b c}}");
+    try interp.testExpectScriptResult("true", "expr {\"z\" ni {a b c}}");
+    try interp.testExpectScriptResult("false", "expr {\"b\" ni {a b c}}");
+}
+
+test "expr in/ni match list elements, not substrings" {
+    try memutil.checkAllocationFailures(.exhaustive, testExprInNi, .{});
+}
+
+fn testExprInterpolatedString(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // A quoted string inside expr can contain $var substitutions, same as
+    // a quoted string anywhere else -- `nextExpressionToken` must resume
+    // scanning the same string (not start a new one, and not misparse the
+    // resumed literal text as operators) after each one.
+    try interp.testExpectScriptResult("bar", "set foo bar; expr {\"$foo\"}");
+    try interp.testExpectScriptResult("prebar", "set foo bar; expr {\"pre$foo\"}");
+    try interp.testExpectScriptResult("bar post", "set foo bar; expr {\"$foo post\"}");
+    try interp.testExpectScriptResult("bar/mid/bar", "set foo bar; expr {\"$foo/mid/$foo\"}");
+    try interp.testExpectScriptResult("literal, no vars", "expr {\"literal, no vars\"}");
+    try interp.testExpectScriptResult("", "expr {\"\"}");
+
+    // Dict-sugar variable names (containing `::`) inside an interpolated
+    // expr string -- the original failing case this was found from.
+    try interp.testExpectScriptResult(
+        "/home/x/y/bar",
+        "set foo bar; set d [dict create HOME /home/x]; expr {\"$d::HOME/y/$foo\"}",
+    );
+
+    // The false branch of a ternary is itself an interpolated string.
+    try interp.testExpectScriptResult(
+        "elsebar",
+        "set foo bar; expr {1 == 2 ? \"then\" : \"else$foo\"}",
+    );
+
+    // Escapes are processed alongside the substitution.
+    try interp.testExpectScriptResult("bar\nbar", "set foo bar; expr {\"$foo\\n$foo\"}");
+
+    // [cmd] substitution works inside a quoted expr string too.
+    try interp.testExpectScriptResult("cmd:bar:end", "set foo bar; expr {\"cmd:[set foo]:end\"}");
+}
+
+test "expr quoted strings support $var and [cmd] interpolation" {
+    try memutil.checkAllocationFailures(.exhaustive, testExprInterpolatedString, .{});
+}
+
+fn testExprComparisonIsStrict(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // In normal Tcl, `"hello" == "hello"` is a valid expr script, since
+    // it falls back to string comparison if both sides can't be parsed
+    // as numbers. I don't like implicit casting, so I've made `==` strict.
+    // Use `eq` for string comparison instead.
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression "abc" == "abc": expected float but got "abc", parse tree: (abc .equal abc)
+    , "expr {\"abc\" == \"abc\"}");
+    try interp.testExpectScriptResult("true", "expr {\"abc\" eq \"abc\"}");
+    try interp.testExpectScriptResult("false", "expr {\"abc\" eq \"def\"}");
+
+    // Booleans are not numbers, but `==`/`!=` compare two booleans. Only
+    // when *both* sides are booleans, though: a boolean against a number or
+    // string keeps hitting the strict failure.
+    try interp.testExpectScriptResult("true", "expr {true == true}");
+    try interp.testExpectScriptResult("false", "expr {true == false}");
+    try interp.testExpectScriptResult("true", "expr {true != false}");
+
+    // String operands shimmer to booleans for `==`/`!=`, the same way
+    // numeric strings shimmer to numbers.
+    try interp.testExpectScriptResult("true", "expr {\"true\" == true}");
+    try interp.testExpectScriptResult("true", "expr {\"true\" != \"false\"}");
+    try interp.testExpectScriptResult("true", "set x false; expr {$x == false}");
+
+    // Ordering operators never accept booleans, not even two of them.
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression true < false: expected float but got "true", parse tree: (true .less_than false)
+    , "expr {true < false}");
+
+    // Mixed boolean/non-boolean comparisons still fail strictly.
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression true == 1: expected float but got "true", parse tree: (true .equal 1)
+    , "expr {true == 1}");
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression 1 == true: expected float but got "true", parse tree: (1 .equal true)
+    , "expr {1 == true}");
+    try interp.testExpectScriptError(error.EvalError,
+        \\error occured when evaluating expression "abc" == true: expected float but got "abc", parse tree: (abc .equal true)
+    , "expr {\"abc\" == true}");
+
+    // Still numeric when both sides genuinely are numbers.
+    try interp.testExpectScriptResult("true", "expr {1 == 1.0}");
+    try interp.testExpectScriptResult("true", "expr {2 > 1}");
+}
+
+test "expr comparisons stay strictly numeric, no implicit casting" {
+    try memutil.checkAllocationFailures(.exhaustive, testExprComparisonIsStrict, .{});
 }

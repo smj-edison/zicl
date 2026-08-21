@@ -515,6 +515,10 @@ pub const HashReference = struct {
     ref: *Object,
 
     pub fn new(referent: *Object) !*HashReference {
+        // We make the referent immutable, as it should never change
+        // once it's pointed to by the hash reference.
+        referent.makeCrossthread();
+
         const new_obj = try Object.newObject(HashReference);
         new_obj.body.* = .{ .ref = referent.takeReference() };
         return new_obj.body;
@@ -617,7 +621,7 @@ pub const HashReference = struct {
     }
 
     fn makeCrossthread(obj: *Object) void {
-        obj.asType(HashReference).?.ref.makeCrossthread();
+        assert(obj.asType(HashReference).?.ref.metadata.cross_thread);
     }
 
     fn enumerateStruct(obj: *const Object, ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {

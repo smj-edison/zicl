@@ -485,6 +485,38 @@ test "dict link command" {
     try memutil.checkAllocationFailures(.exhaustive, testDictLinkCommand, .{});
 }
 
+fn testDictLinkParentIsNotMutatedThroughChild(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Appending to a key the child only sees *through* its parent link must
+    // shadow it with the child's own entry, never mutate the parent's value
+    // in place. `dict link` freezes the referent (see HashReference.new) so
+    // the interior list isn't mistaken for exclusively owned; before that,
+    // whether this corrupted the parent depended on the list's refcount,
+    // so it only showed up when nothing else held a reference to it.
+    try interp.testExpectScriptResult("{base extra} | base | base",
+        \\ set proto {flags base}
+        \\ set child [dict link $proto {}]
+        \\ dict lappend child flags extra
+        \\ set sibling [dict link $proto {}]
+        \\ list [dict get $child flags] | [dict get $proto flags] | [dict get $sibling flags]
+    );
+
+    // Same for a key reached through two levels of link.
+    try interp.testExpectScriptResult("{base deep} | base",
+        \\ set proto {flags base}
+        \\ set mid [dict link $proto {}]
+        \\ set leaf [dict link $mid {}]
+        \\ dict lappend leaf flags deep
+        \\ list [dict get $leaf flags] | [dict get $proto flags]
+    );
+}
+
+test "dict link: appending through a link does not mutate the parent" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictLinkParentIsNotMutatedThroughChild, .{});
+}
+
 fn testDictSugar(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);

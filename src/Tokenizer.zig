@@ -66,6 +66,8 @@ pub const Token = struct {
         simple_string,
         /// String that needs escape character conversion
         escaped_string,
+        /// A string that has substitutions in it ($arg, [cmd], etc).
+        interpolated_string,
         /// "{*}" token
         argument_expansion,
         /// Variable substitution
@@ -390,12 +392,19 @@ pub fn nextStringToken(self: *Tokenizer) !Token {
     }
 }
 
+/// Scans a whole quoted string as a single token, from the opening quote
+/// through the matching close, including substitutions. The token range is
+/// the part in-between the quotes.
+///
+/// This will return three types of tokens, depending on what was found:
+///  * .simple_string, no escaping or substitutions were found.
+///  * .escaped_string, escaping was found, but no substitutions were found.
+///  * .interpolated_string, substitutions were found, with or without escaping.
 fn nextQuotedStringToken(self: *Tokenizer) !Token {
-    // save for potential error message later if there's a missing close quote
     const index = self.index;
     const line_no = self.line_no;
 
-    // skip the quote
+    // skip the opening quote
     self.advance(1);
 
     var token = self.newToken();
@@ -404,7 +413,8 @@ fn nextQuotedStringToken(self: *Tokenizer) !Token {
     while (!self.atEnd()) {
         switch (self.current()) {
             '\\' => {
-                token.tag = .escaped_string;
+                // Interpolated strings are a superset of escaped strings.
+                if (token.tag != .interpolated_string) token.tag = .escaped_string;
 
                 self.advance(1); // skip character after escape
                 try self.errorIfAtEndAfterBackslash();
@@ -416,16 +426,14 @@ fn nextQuotedStringToken(self: *Tokenizer) !Token {
                 return token;
             },
             '[' => {
-                // parseCommand will advance the index just past the end of the command
+                token.tag = .interpolated_string;
+                // `parseCommand` will advance the index just past the end of the command.
                 _ = try self.nextCommandToken();
-                // skip advancing this time, because parseCommand already did that
+                // Skip advancing this time, because parseCommand already did that.
                 continue;
             },
             '$' => {
-                // Not our job to deal with variable substitution, so yield this as
-                // the end
-                token.loc.end = self.index;
-                return token;
+                token.tag = .interpolated_string;
             },
             else => {},
         }
@@ -433,7 +441,7 @@ fn nextQuotedStringToken(self: *Tokenizer) !Token {
         self.advance(1);
     }
 
-    // if we made it this far, it means we reached the end of input without
+    // If we made it this far, it means we reached the end of input without
     // finding a closing quote.
     self.error_details = .{
         .index = index,
@@ -1355,4 +1363,22 @@ fn testNextToken(parser: *Tokenizer, expected_type: Token.Tag, expected_value: [
 
     try expectEqual(expected_type, next.tag);
     try expectEqualSlices(u8, expected_value, parser.buffer[next.loc.start..next.loc.end]);
+}
+
+test "quoted string parsing" {
+    const Case = struct { src: []const u8, want: Token.Tag };
+    const cases = [_]Case{
+        .{ .src = "\"plain\"", .want = .simple_string },
+        .{ .src = "\"esc\\nape\"", .want = .escaped_string },
+        .{ .src = "\"$foo\"", .want = .interpolated_string },
+        .{ .src = "\"a$foo/b\"", .want = .interpolated_string },
+        .{ .src = "\"x[cmd]y\"", .want = .interpolated_string },
+        .{ .src = "\"esc\\nape $foo\"", .want = .interpolated_string },
+    };
+
+    for (cases) |case| {
+        var parser = Tokenizer.init(case.src, 1);
+        const token = try parser.nextExpressionToken();
+        try expectEqual(case.want, token.tag);
+    }
 }
