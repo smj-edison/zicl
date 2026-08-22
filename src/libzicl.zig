@@ -152,16 +152,16 @@ export fn Zicl_InterpDestroy(interp: *Interp) callconv(.c) void {
 // still references out of the arena (a primitive's string rep, a parse cache
 // entry) becomes invalid after a rewind.
 
-// `RewindableArena.Snapshot` is an `extern struct`, so it crosses the C ABI by
+// `ScopedArena.Snapshot` is an `extern struct`, so it crosses the C ABI by
 // value; the C side declares the layout-equivalent `Zicl_ArenaSnapshot`.
-const ArenaSnapshot = @TypeOf(heap.local_arena_instance).Snapshot;
+const ArenaSnapshot = memutil.ScopedArena.Snapshot;
 
 export fn Zicl_LocalArenaSnapshot() callconv(.c) ArenaSnapshot {
-    return heap.local_arena_instance.snapshot();
+    return heap.local_arena_instance.takeSnapshot();
 }
 
 export fn Zicl_LocalArenaRewind(snap: ArenaSnapshot) callconv(.c) void {
-    heap.local_arena_instance.rewind(snap);
+    heap.local_arena_instance.restore(snap);
 }
 
 // ===== Strings =====

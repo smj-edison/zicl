@@ -220,7 +220,7 @@ Zicl_Interp *Zicl_CreateInterp(void);
 void Zicl_InterpDestroy(Zicl_Interp *interp);
 
 /* A watermark into the calling thread's local arena, layout-equivalent to
- * `memutil.RewindableArena.Snapshot`. Treat the fields as opaque: hold the
+ * `memutil.ScopedArena.Snapshot`. Treat the fields as opaque: hold the
  * value and pass it back to `Zicl_LocalArenaRewind`. A snapshot is only valid
  * on the thread that referenced it. */
 typedef struct Zicl_ArenaSnapshot {

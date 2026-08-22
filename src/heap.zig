@@ -30,7 +30,7 @@ pub var running_leak_check: bool = false;
 pub var global_gpa: mem.Allocator = undefined;
 /// Backing of `local_arena`. Used for snapshotting + rewinding to
 /// have a scoped arena. Currently snapshotted and rewound at eval boundaries.
-pub threadlocal var local_arena_instance: memutil.RewindableArena = undefined;
+pub threadlocal var local_arena_instance: memutil.ScopedArena = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
 pub var lazy_fn_registry: LazyFnRegistry = .{};
@@ -180,7 +180,7 @@ pub fn deinitGlobals() void {
 }
 
 pub fn initThread() !void {
-    local_arena_instance = memutil.RewindableArena.init(global_gpa);
+    local_arena_instance = memutil.ScopedArena.init(global_gpa);
     local_arena = local_arena_instance.allocator();
     try leak_check.initThread();
 }

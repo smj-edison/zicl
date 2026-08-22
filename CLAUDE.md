@@ -94,7 +94,7 @@ When writing tests, use `memutil.checkAllocationFailures`, unless you're working
 
 **Memory Utilities (src/memutil.zig)**: Reusable allocator and container infrastructure:
 
--   `RewindableArena` -- a bump arena that supports `snapshot`/`rewind` while retaining its chunks for reuse, used for parse caches and other transient allocations.
+-   `ScopedArena` -- a bump arena that supports `takeSnapshot`/`restore`, used for parse caches and other transient allocations.
 -   `RingBufferAllocator` -- a fixed-size ring buffer backing a standard `Allocator`, used for the trace log's debug allocator.
 -   `IndexedMemoryPool(Item)` -- a pool that returns `usize` indices instead of pointers.
 -   `LruCache(K, V, Context)` -- the LRU cache used for parsed scripts, expressions, closures, and substitutions.

@@ -10,7 +10,7 @@ this before implementing anything that might already exist.
 ### Global lifecycle
 - `heap.initGlobals(gpa, io)` -- Initialize global heap state (`global_gpa`, `global_io`, registries, leak check, regex globals). Idempotent; call once per process (or test).
 - `heap.deinitGlobals()` -- Tear down global state. After this, `initGlobals` may be called again.
-- `heap.initThread()` -- Initialize the calling thread's `local_arena` (a `memutil.RewindableArena` over `global_gpa`).
+- `heap.initThread()` -- Initialize the calling thread's `local_arena` (a `memutil.ScopedArena` over `global_gpa`).
 - `heap.deinitThread()` -- Tear down the calling thread's arena.
 - `heap.testStart(gpa, io)` -- Test helper: `initGlobals` + `initThread`.
 - `heap.testFinish()` -- Test helper: dump leaks (if `trace_mem`), `deinitThread`, `deinitGlobals`. Use with `defer`.
@@ -521,12 +521,14 @@ this as `common` and re-use its `heap`/`objects`/`Interp` aliases.
 - `memutil.null_allocator` -- An allocator that fails every request; use it to assert a path does not allocate.
 - `RingBufferAllocator.init(buffer)` -- Initialize a ring buffer allocator over a fixed buffer.
 - `RingBufferAllocator.allocator(self)` -- Return a standard `Allocator` backed by this ring buffer. `free` is a no-op; `resize`/`remap` unsupported.
-- `RewindableArena.init(child_allocator)` -- Create an empty rewindable arena.
-- `RewindableArena.deinit(arena)` -- Free all chunks.
-- `RewindableArena.allocator(self)` -- Return a standard `Allocator` backed by this arena.
-- `RewindableArena.queryCapacity(arena)` -- Total usable bytes across all chunks (stable across `rewind`).
-- `RewindableArena.snapshot(arena)` -- Take a point-in-time watermark.
-- `RewindableArena.rewind(arena, snap)` -- Restore the arena to `snap`; chunks after `snap` are retained and overwritten as later allocations reach them.
+- `ScopedArena.init(child_allocator)` -- Create an empty scoped arena (bump allocator over a linked list of segments, modeled on std's `ArenaAllocator`).
+- `ScopedArena.deinit(arena)` -- Free all segments.
+- `ScopedArena.allocator(self)` -- Return a standard `Allocator` backed by this arena. `free` and shrink `resize` only affect the most recent allocation; growing in place works only for the last allocation with segment slack.
+- `ScopedArena.queryCapacity(arena)` -- Total buffer bytes across all segments (excluding segment headers).
+- `ScopedArena.takeSnapshot(arena)` -- Take a point-in-time `Snapshot` (`extern struct { current: ?*Segment, end_index: usize }`, safe to pass by value across the C ABI; null `current` marks a snapshot from before any segment existed).
+- `ScopedArena.restore(arena, snapshot)` -- Restore the arena to `snapshot`: segments after the snapshot point are freed and reclaimed bytes are poisoned in safety builds.
+- `ScopedArena.cascadeFreeSegments(arena, start)` -- Free `start` and every segment linked after it.
+- `ScopedArena.Segment.min_size` / `.max_default_size` -- 8 KiB / 32 KiB growth bounds; larger allocations get their own oversized segment.
 
 ### IndexedMemoryPool
 - `memutil.IndexedMemoryPool(Item)` -- Comptime: a pool returning `usize` indices instead of pointers.
