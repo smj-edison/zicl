@@ -222,17 +222,11 @@ pub const ScopedArena = struct {
     }
 
     pub fn restore(arena: *ScopedArena, snapshot: Snapshot) void {
-        if (std.debug.runtime_safety) if (snapshot.current) |segment| {
-            // Poison the remaining part of this segment.
-            const backing = segment.buffer();
-            if (snapshot.end_index < backing.len) @memset(backing[snapshot.end_index..], undefined);
-
-            // Then free all trailing segments.
+        if (snapshot.current) |segment| {
+            // Free all trailing segments.
             if (segment.next) |next| arena.cascadeFreeSegments(next);
             segment.next = null;
-        };
 
-        if (snapshot.current) |segment| {
             arena.current_segment = segment;
             segment.end_index = snapshot.end_index;
         } else {
