@@ -16,11 +16,65 @@ const Shimmerable = common.Shimmerable;
 const registerCommand = common.registerCommand;
 const memutil = common.memutil;
 
+fn writeAndFlush(writer: *std.Io.Writer, bytes: []const u8) error{WriteFailed}!void {
+    try writer.writeAll(bytes);
+    try writer.flush();
+}
+
+pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
+    const Subcommands = enum {
+        read,
+        write,
+    };
+    const Parser = objects.SubcommandParser(Subcommands, &.{
+        .{ .variant = .read, .usage = "stream", .min_args = 1, .max_args = 1 },
+        .{ .variant = .write, .usage = "stream toWrite", .min_args = 2, .max_args = 2 },
+    });
+
+    var det: ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    switch (subcommand) {
+        .read => {
+            const cap = try interp.getCapability(&args[2]);
+            cap.head.markInFlight() catch return interp.staleCapabilityError(try args[2].current().getString());
+            defer cap.head.dropInFlight();
+
+            const stream_ops = cap.head.vtable.stream_ops orelse {
+                return interp.setErrorFormatted("capability of type \"{s}\" does not support reading", .{cap.head.vtable.name});
+            };
+
+            const reader = stream_ops.lock_reader(cap.head);
+            defer stream_ops.unlock_reader(cap.head);
+
+            const bytes = reader.allocRemainingAlignedSentinel(heap.global_gpa, .unlimited, .@"8", 0) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ReadFailed => return readError(interp, stream_ops.get_reader_error(cap.head).?),
+                else => return readError(interp, err),
+            };
+            const as_string = try objects.String.newOwning(bytes);
+            interp.setResultOwning(as_string.asHead().asValue());
+        },
+        .write => {
+            const cap = try interp.getCapability(&args[2]);
+            cap.head.markInFlight() catch return interp.staleCapabilityError(try args[2].current().getString());
+            defer cap.head.dropInFlight();
+
+            const stream_ops = cap.head.vtable.stream_ops orelse {
+                return interp.setErrorFormatted("capability of type \"{s}\" does not support writing", .{cap.head.vtable.name});
+            };
+
+            const bytes_to_write = try args[3].current().getString();
+
+            const writer = stream_ops.lock_writer(cap.head);
+            defer stream_ops.unlock_writer(cap.head);
+
+            writeAndFlush(writer, bytes_to_write) catch return writeError(interp, stream_ops.get_writer_error(cap.head).?);
+        },
+    }
+}
+
 /// [puts]
-///
-/// `puts ?-nonewline? ?channel? string`. With two arguments left after the flag
-/// the first is a channel, which is how the ambiguity with the flag is settled:
-/// a bare `puts -nonewline foo` still writes `foo` to stdout.
 pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
     var rest = args[1..];
 
@@ -31,31 +85,12 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
         break :blk false;
     } else true;
 
-    if (rest.len > 2) {
-        try interp.setResultString("wrong # args: should be \"puts ?-nonewline? ?channel? string\"");
-        return error.EvalError;
-    }
-
-    // A capability always begins with '<', so a leading '-' here is a mistyped
-    // option rather than a channel, and saying so beats complaining that the
-    // option is not a capability.
-    if (rest.len == 2 and std.mem.startsWith(u8, try rest[0].getString(), "-")) {
-        try interp.setResultString("The second argument must be -nonewline");
-        return error.EvalError;
-    }
+    if (rest.len > 2) return error.WrongUsage;
 
     const to_print = try rest[rest.len - 1].getString();
 
     if (rest.len == 2) {
-        if (try rest[0].current().equalsString("stdout")) {
-            const file = ioutil.getStdout();
-            var buffer: [1024]u8 = undefined;
-            var writer = std.Io.File.Writer.initStreaming(file, heap.global_io, &buffer);
-            writer.interface.writeAll(to_print) catch |err| return writeError(interp, err);
-            if (print_newline) writer.interface.writeAll("\n") catch |err| return writeError(interp, err);
-            writer.flush() catch |err| return writeError(interp, err);
-            return;
-        } else if (try rest[0].current().equalsString("stderr")) {
+        if (try rest[0].current().equalsString("stderr")) {
             const file = ioutil.getStderr();
             var buffer: [1024]u8 = undefined;
             var writer = std.Io.File.Writer.initStreaming(file, heap.global_io, &buffer);
@@ -63,16 +98,7 @@ pub fn putsCmd(interp: *Interp, args: []Shimmerable) !void {
             if (print_newline) writer.interface.writeAll("\n") catch |err| return writeError(interp, err);
             writer.flush() catch |err| return writeError(interp, err);
             return;
-        }
-
-        var det: ErrorDetails = undefined;
-        const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &rest[0]));
-        const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
-        defer backing.head.dropInFlight();
-        const body: *capabilities.File = &backing.body;
-
-        body.writeAll(to_print) catch |err| return writeError(interp, err);
-        if (print_newline) body.writeAll("\n") catch |err| return writeError(interp, err);
+        } else return error.WrongUsage;
     } else {
         const stdout = ioutil.getStdout();
         var buf: [64]u8 = undefined;
@@ -92,21 +118,6 @@ fn writeError(interp: *Interp, err: anyerror) Interp.Error {
 fn readError(interp: *Interp, err: anyerror) Interp.Error {
     try interp.setResultFormatted("failed to read: {}", .{err});
     return error.EvalError;
-}
-
-/// [read]
-///
-/// `read fileId`, reading everything from the current position to EOF. The
-/// `numChars`/`-nonewline` forms aren't implemented yet (see `File.readAll`).
-pub fn readCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    var det: ErrorDetails = undefined;
-    const cap: *const Capability = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
-    const backing = try interp.wrapError(&det, cap.getBacking(capabilities.File.Backing, &det));
-    defer backing.head.dropInFlight();
-    const body: *capabilities.File = &backing.body;
-
-    const bytes = body.readAll() catch |err| return readError(interp, err);
-    try interp.setResultStringOwning(bytes);
 }
 
 /// [pid]
@@ -618,9 +629,9 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
     try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1);
     try registerCommand(interp, "pwd", pwdCmd, "", 0, 0);
+    try registerCommand(interp, "stream", streamCmd, "subcommand ?arg ...?", 2, 3);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2);
-    try registerCommand(interp, "read", readCmd, "fileId", 1, 1);
     try registerCommand(interp, "glob", globCmd, "?-nocomplain? ?--? pattern ?pattern ...?", 1, null);
     try registerCommand(interp, "sleep", sleepCmd, "seconds", 1, 1);
 }
@@ -903,7 +914,7 @@ fn testReadSlurpsTheRemainderOfAFile(ta: std.mem.Allocator) !void {
 
     const script = try std.fmt.allocPrint(ta,
         \\set fd [fopen {s} r]
-        \\set contents [read $fd]
+        \\set contents [stream read $fd]
         \\close $fd
         \\set contents
     , .{absolute_path});
@@ -932,8 +943,8 @@ fn testReadResumesFromWhereAPriorReadLeftOff(ta: std.mem.Allocator) !void {
     // through the same open file descriptor rather than reopening the path.
     const script = try std.fmt.allocPrint(ta,
         \\set fd [fopen {s} r]
-        \\set first [read $fd]
-        \\set second [read $fd]
+        \\set first [stream read $fd]
+        \\set second [stream read $fd]
         \\close $fd
         \\list $first $second
     , .{absolute_path});
@@ -975,7 +986,7 @@ fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
         .{try handle.getString()},
     );
     defer testing.allocator.free(stale_message);
-    try interp.testExpectScriptError(error.EvalError, stale_message, "puts $fd x");
+    try interp.testExpectScriptError(error.EvalError, stale_message, "stream write $fd x");
 }
 
 test "writing to a closed capability reports it as stale" {

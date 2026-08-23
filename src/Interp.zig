@@ -31,6 +31,7 @@ const Expression = evaltypes.Expression;
 const Substitution = evaltypes.Substitution;
 const Letrec = evaltypes.Letrec;
 const CachedNativeCommand = evaltypes.CachedNativeCommand;
+const Capability = @import("Capability.zig");
 
 // We re-export these so callers only need to import Interp and not evaltypes.
 pub const ReturnCode = heap.ReturnCode;
@@ -1784,6 +1785,11 @@ pub fn integerOverflowError(interp: *Interp, IntType: type, rendered_int: IntTyp
     return interp.wrapError(&det, objects.Integer.overflowError(IntType, &det, rendered_int));
 }
 
+pub fn staleCapabilityError(interp: *Interp, bytes: []const u8) error{ OutOfMemory, EvalError } {
+    var det: ErrorDetails = undefined;
+    return interp.wrapError(&det, Capability.staleError(&det, bytes));
+}
+
 pub fn asMutableInPlace(interp: *Interp, T: type, value: Value) !?*T {
     var det: ErrorDetails = undefined;
     return interp.wrapError(&det, value.asMutableInPlace(T, &det));
@@ -1867,6 +1873,10 @@ pub fn getDict(interp: *Interp, shim: *Shimmerable) !*const Dictionary {
 
 pub fn getDictInPlace(interp: *Interp, ref: *Value) !*const Dictionary {
     return try interp.wrapShimmerInPlaceFn(*const Dictionary, ref, Dictionary.shimmerFrom);
+}
+
+pub fn getCapability(interp: *Interp, shim: *Shimmerable) !*const Capability {
+    return try interp.wrapShimmerFn(*const Capability, shim, Capability.shimmerFrom);
 }
 
 pub fn setVariableInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, value: Value) !void {

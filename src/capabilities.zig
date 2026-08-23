@@ -14,11 +14,11 @@ const ErrorDetails = objects.ErrorDetails;
 const process = std.process;
 
 pub const StreamOps = struct {
-    lock_writer: *const fn (head: *Capability.Head) std.Io.Cancelable!*std.Io.Writer,
+    lock_writer: *const fn (head: *Capability.Head) *std.Io.Writer,
     /// Be sure to call while locked.
     get_writer_error: *const fn (head: *Capability.Head) ?anyerror,
     unlock_writer: *const fn (head: *Capability.Head) void,
-    lock_reader: *const fn (head: *Capability.Head) std.Io.Cancelable!*std.Io.Reader,
+    lock_reader: *const fn (head: *Capability.Head) *std.Io.Reader,
     /// Be sure to call while locked.
     get_reader_error: *const fn (head: *Capability.Head) ?anyerror,
     unlock_reader: *const fn (head: *Capability.Head) void,
@@ -41,7 +41,7 @@ pub const File = struct {
     pub fn open(path: []const u8, mode: Mode) !*Capability {
         const cwd = std.Io.Dir.cwd();
 
-        var file = switch (mode) {
+        const file = switch (mode) {
             .r, .@"r+" => try cwd.openFile(heap.global_io, path, .{
                 .mode = if (mode == .@"r+") .read_write else .read_only,
                 .allow_directory = false,
@@ -59,10 +59,10 @@ pub const File = struct {
             .body = .{
                 .file = file,
                 .close_when_done = true,
-                .write_mutex = .{},
+                .write_mutex = .init,
                 .writer = .init(file, heap.global_io, &cap_backing.body.write_buffer),
                 .write_buffer = undefined,
-                .read_mutex = .{},
+                .read_mutex = .init,
                 .reader = .init(file, heap.global_io, &cap_backing.body.read_buffer),
                 .read_buffer = undefined,
             },
@@ -81,11 +81,11 @@ pub const File = struct {
             .body = .{
                 .file = file,
                 .close_when_done = false,
-                .write_mutex = .{},
-                .writer = .initDetect(file, heap.global_io, &cap_backing.body.write_buffer),
+                .write_mutex = .init,
+                .writer = .initStreaming(file, heap.global_io, &cap_backing.body.write_buffer),
                 .write_buffer = undefined,
-                .read_mutex = .{},
-                .reader = .initDetect(file, heap.global_io, &cap_backing.body.read_buffer),
+                .read_mutex = .init,
+                .reader = .initStreaming(file, heap.global_io, &cap_backing.body.read_buffer),
                 .read_buffer = undefined,
             },
         };
@@ -93,9 +93,9 @@ pub const File = struct {
         return try Capability.new(&cap_backing.head);
     }
 
-    fn lockWriter(head: *Capability.Head) !*std.Io.Writer {
+    fn lockWriter(head: *Capability.Head) *std.Io.Writer {
         const backing: *Backing = @fieldParentPtr("head", head);
-        try backing.body.write_mutex.lock(heap.global_io);
+        backing.body.write_mutex.lockUncancelable(heap.global_io);
         return &backing.body.writer.interface;
     }
 
@@ -109,9 +109,9 @@ pub const File = struct {
         backing.body.write_mutex.unlock(heap.global_io);
     }
 
-    fn lockReader(head: *Capability.Head) !*std.Io.Reader {
+    fn lockReader(head: *Capability.Head) *std.Io.Reader {
         const backing: *Backing = @fieldParentPtr("head", head);
-        try backing.body.read_mutex.lock(heap.global_io);
+        backing.body.read_mutex.lockUncancelable(heap.global_io);
         return &backing.body.reader.interface;
     }
 
@@ -140,8 +140,8 @@ pub const File = struct {
         }
 
         pub const vtable: Capability.Head.VTable = .{
-            .deinitBody = deinitBody,
-            .destroyBacking = destroyBacking,
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
             .name = "file-handle",
             .stream_ops = &.{
                 .lock_writer = lockWriter,
@@ -579,8 +579,11 @@ test "file" {
         defer cap.close();
         const backing = try cap.getBacking(File.Backing, null);
         defer backing.head.dropInFlight();
-        try backing.body.writeAll("hello ");
-        try backing.body.writeAll("world");
+        const writer = backing.head.vtable.stream_ops.?.lock_writer(&backing.head);
+        defer backing.head.vtable.stream_ops.?.unlock_writer(&backing.head);
+        try writer.writeAll("hello ");
+        try writer.writeAll("world");
+        try writer.flush();
     }
 
     const written = try tmp.dir.readFileAlloc(heap.global_io, "test.txt", testing.allocator, .limited(64));

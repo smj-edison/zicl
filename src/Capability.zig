@@ -22,6 +22,7 @@ const memutil = @import("memutil.zig");
 const StructIterator = memutil.StructIterator;
 const objects = @import("objects.zig");
 const ErrorDetails = objects.ErrorDetails;
+const capabilities = @import("capabilities.zig");
 
 const Capability = @This();
 pub const scheme_name = "zicl";
@@ -172,7 +173,7 @@ pub const Head = extern struct {
         // holds a reference until the capability is closed.
         const state = head.state.load(.monotonic);
         assert(state.close_initiated and state.in_flight == 0);
-        head.vtable.destroyBacking(head);
+        head.vtable.destroy_backing(head);
     }
 
     /// Attempts to mark this capability as in flight.
@@ -197,7 +198,7 @@ pub const Head = extern struct {
         };
 
         if (new_state.close_initiated and new_state.in_flight == 0) {
-            head.vtable.deinitBody(head); // This is the implementation of closing the capability.
+            head.vtable.deinit_body(head); // This is the implementation of closing the capability.
         }
     }
 
@@ -217,7 +218,7 @@ pub const Head = extern struct {
     /// Marks the capability as closing and removes from the registry.
     pub fn close(head: *Head) void {
         const deinit_needed = head.markAsClosed() catch return; // Closing is idempotent.
-        if (deinit_needed) head.vtable.deinitBody(head);
+        if (deinit_needed) head.vtable.deinit_body(head);
 
         // We were the ones who marked it as closed, so we'll remove it
         // from the registry.
@@ -242,10 +243,12 @@ pub const Head = extern struct {
         name: [*:0]const u8,
         /// Deinits the underlying body. Runs exactly once, when the capability is closed
         /// and no longer in use.
-        deinitBody: *const fn (head: *Head) callconv(.c) void,
+        deinit_body: *const fn (head: *Head) callconv(.c) void,
         /// This may be called much later than `deinitBody`, as closing the capability
         /// is not the same thing as freeing the entry and body.
-        destroyBacking: *const fn (head: *Head) callconv(.c) void,
+        destroy_backing: *const fn (head: *Head) callconv(.c) void,
+
+        stream_ops: ?*const capabilities.StreamOps = null,
     };
 };
 
@@ -336,7 +339,7 @@ pub fn deinitGlobals() void {
     while (iter.next()) |head_ptr| {
         const head = head_ptr.*;
         const deinit_needed = head.markAsClosed() catch false;
-        if (deinit_needed) head.vtable.deinitBody(head);
+        if (deinit_needed) head.vtable.deinit_body(head);
         head.dropReference();
     }
     heads.deinit(heap.global_gpa);
@@ -360,7 +363,7 @@ fn parseError(det: ?*ErrorDetails, name: []const u8) error{ OutOfMemory, BadCapa
     return error.BadCapability;
 }
 
-fn staleError(det: ?*ErrorDetails, name: []const u8) error{ OutOfMemory, StaleCapability } {
+pub fn staleError(det: ?*ErrorDetails, name: []const u8) error{ OutOfMemory, StaleCapability } {
     if (det) |value| value.* = .{
         .message = try objects.allocPrintZ("capability \"{s}\" is stale", .{name}),
     };
@@ -437,8 +440,8 @@ const TestCapability = struct {
         }
 
         pub const vtable: Head.VTable = .{
-            .deinitBody = deinitBody,
-            .destroyBacking = destroyBacking,
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
             .name = "test-handle",
         };
     };
