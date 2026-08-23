@@ -13,11 +13,30 @@ const ErrorDetails = objects.ErrorDetails;
 
 const process = std.process;
 
+pub const StreamOps = struct {
+    lock_writer: *const fn (head: *Capability.Head) std.Io.Cancelable!*std.Io.Writer,
+    /// Be sure to call while locked.
+    get_writer_error: *const fn (head: *Capability.Head) ?anyerror,
+    unlock_writer: *const fn (head: *Capability.Head) void,
+    lock_reader: *const fn (head: *Capability.Head) std.Io.Cancelable!*std.Io.Reader,
+    /// Be sure to call while locked.
+    get_reader_error: *const fn (head: *Capability.Head) ?anyerror,
+    unlock_reader: *const fn (head: *Capability.Head) void,
+};
+
 pub const File = struct {
     pub const Mode = enum { r, @"r+", w, @"w+" };
 
     file: std.Io.File,
     close_when_done: bool,
+
+    write_mutex: std.Io.Mutex,
+    writer: std.Io.File.Writer,
+    write_buffer: [4096]u8,
+
+    read_mutex: std.Io.Mutex,
+    reader: std.Io.File.Reader,
+    read_buffer: [4096]u8,
 
     pub fn open(path: []const u8, mode: Mode) !*Capability {
         const cwd = std.Io.Dir.cwd();
@@ -37,51 +56,73 @@ pub const File = struct {
         errdefer heap.global_gpa.destroy(cap_backing);
         cap_backing.* = .{
             .head = .{ .vtable = &Backing.vtable, .id = undefined },
-            .body = .{ .file = file, .close_when_done = true },
+            .body = .{
+                .file = file,
+                .close_when_done = true,
+                .write_mutex = .{},
+                .writer = .init(file, heap.global_io, &cap_backing.body.write_buffer),
+                .write_buffer = undefined,
+                .read_mutex = .{},
+                .reader = .init(file, heap.global_io, &cap_backing.body.read_buffer),
+                .read_buffer = undefined,
+            },
         };
 
         return try Capability.new(&cap_backing.head);
     }
 
-    pub fn openDescriptor(handle: std.Io.File.Handle) !*Capability {
-        // TODO should this always be `nonblocking = false`?
-        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+    pub fn openDescriptor(handle: std.Io.File.Handle, nonblocking: bool) !*Capability {
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = nonblocking } };
 
         const cap_backing = try heap.global_gpa.create(Backing);
         errdefer heap.global_gpa.destroy(cap_backing);
         cap_backing.* = .{
             .head = .{ .vtable = &Backing.vtable, .id = undefined },
-            .body = .{ .file = file, .close_when_done = false },
+            .body = .{
+                .file = file,
+                .close_when_done = false,
+                .write_mutex = .{},
+                .writer = .initDetect(file, heap.global_io, &cap_backing.body.write_buffer),
+                .write_buffer = undefined,
+                .read_mutex = .{},
+                .reader = .initDetect(file, heap.global_io, &cap_backing.body.read_buffer),
+                .read_buffer = undefined,
+            },
         };
 
         return try Capability.new(&cap_backing.head);
     }
 
-    pub fn writeAll(file: *File, bytes: []const u8) !void {
-        var buffer: [1024]u8 = undefined;
-        var writer = std.Io.File.Writer.initStreaming(file.file, heap.global_io, &buffer);
-        writer.interface.writeAll(bytes) catch return writer.err.?;
-        writer.flush() catch return writer.err.?;
+    fn lockWriter(head: *Capability.Head) !*std.Io.Writer {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        try backing.body.write_mutex.lock(heap.global_io);
+        return &backing.body.writer.interface;
     }
 
-    /// Reads everything from the current position to EOF. Only the whole-file
-    /// slurp is implemented for now (matching [read]'s minimal boot.folk use);
-    /// a `numChars`/`-nonewline` form would need its own careful handling
-    /// since Tcl counts characters, not bytes, and a partial read must not
-    /// consume past the requested codepoint boundary.
-    pub fn readAll(file: *File) ![:0]u8 {
-        var buffer: [1024]u8 = undefined;
-        var reader = std.Io.File.Reader.initStreaming(file.file, heap.global_io, &buffer);
+    fn getWriterError(head: *Capability.Head) ?anyerror {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        return backing.body.writer.err;
+    }
 
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(heap.global_gpa);
-        reader.interface.appendRemaining(heap.global_gpa, &result, .unlimited) catch |err| switch (err) {
-            error.ReadFailed => return reader.err.?,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.StreamTooLong => unreachable, // `.unlimited` never trips this
-        };
+    fn unlockWriter(head: *Capability.Head) void {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        backing.body.write_mutex.unlock(heap.global_io);
+    }
 
-        return try result.toOwnedSliceSentinel(heap.global_gpa, 0);
+    fn lockReader(head: *Capability.Head) !*std.Io.Reader {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        try backing.body.read_mutex.lock(heap.global_io);
+        return &backing.body.reader.interface;
+    }
+
+    fn getReaderError(head: *Capability.Head) ?anyerror {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        return backing.body.reader.err;
+    }
+
+    fn unlockReader(head: *Capability.Head) void {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        backing.body.read_mutex.unlock(heap.global_io);
     }
 
     pub const Backing = struct {
@@ -102,6 +143,14 @@ pub const File = struct {
             .deinitBody = deinitBody,
             .destroyBacking = destroyBacking,
             .name = "file-handle",
+            .stream_ops = &.{
+                .lock_writer = lockWriter,
+                .get_writer_error = getWriterError,
+                .unlock_writer = unlockWriter,
+                .lock_reader = lockReader,
+                .get_reader_error = getReaderError,
+                .unlock_reader = unlockReader,
+            },
         };
     };
 };
@@ -254,8 +303,8 @@ pub const Process = struct {
         }
 
         pub const vtable: Capability.Head.VTable = .{
-            .deinitBody = deinitBody,
-            .destroyBacking = destroyBacking,
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
             .name = "process",
         };
     };
@@ -339,8 +388,8 @@ pub const Pointer = struct {
         }
 
         pub const vtable: Capability.Head.VTable = .{
-            .deinitBody = deinitBody,
-            .destroyBacking = destroyBacking,
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
             .name = "pointer",
         };
     };
@@ -386,8 +435,8 @@ pub const DynLib = struct {
         }
 
         pub const vtable: Capability.Head.VTable = .{
-            .deinitBody = deinitBody,
-            .destroyBacking = destroyBacking,
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
             .name = "dynlib",
         };
     };
