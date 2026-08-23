@@ -25,25 +25,29 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
     const Subcommands = enum {
         read,
         write,
+        gets,
+        iseos,
     };
     const Parser = objects.SubcommandParser(Subcommands, &.{
         .{ .variant = .read, .usage = "stream", .min_args = 1, .max_args = 1 },
         .{ .variant = .write, .usage = "stream toWrite", .min_args = 2, .max_args = 2 },
+        .{ .variant = .gets, .usage = "stream", .min_args = 1, .max_args = 1 },
+        .{ .variant = .iseos, .usage = "stream", .min_args = 1, .max_args = 1 },
     });
 
     var det: ErrorDetails = undefined;
     const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
 
+    const cap = try interp.getCapability(&args[2]);
+    cap.head.markInFlight() catch return interp.staleCapabilityError(try args[2].current().getString());
+    defer cap.head.dropInFlight();
+
+    const stream_ops = cap.head.vtable.stream_ops orelse {
+        return interp.setErrorFormatted("capability of type \"{s}\" does not support reading", .{cap.head.vtable.name});
+    };
+
     switch (subcommand) {
         .read => {
-            const cap = try interp.getCapability(&args[2]);
-            cap.head.markInFlight() catch return interp.staleCapabilityError(try args[2].current().getString());
-            defer cap.head.dropInFlight();
-
-            const stream_ops = cap.head.vtable.stream_ops orelse {
-                return interp.setErrorFormatted("capability of type \"{s}\" does not support reading", .{cap.head.vtable.name});
-            };
-
             const reader = stream_ops.lock_reader(cap.head);
             defer stream_ops.unlock_reader(cap.head);
 
@@ -52,24 +56,48 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
                 error.ReadFailed => return readError(interp, stream_ops.get_reader_error(cap.head).?),
                 else => return readError(interp, err),
             };
+            // We read to the end, so obviously we've reached the end of the stream.
+            stream_ops.get_eos_ptr(cap.head).* = true;
+
             const as_string = try objects.String.newOwning(bytes);
             interp.setResultOwning(as_string.asHead().asValue());
         },
         .write => {
-            const cap = try interp.getCapability(&args[2]);
-            cap.head.markInFlight() catch return interp.staleCapabilityError(try args[2].current().getString());
-            defer cap.head.dropInFlight();
-
-            const stream_ops = cap.head.vtable.stream_ops orelse {
-                return interp.setErrorFormatted("capability of type \"{s}\" does not support writing", .{cap.head.vtable.name});
-            };
-
             const bytes_to_write = try args[3].current().getString();
 
             const writer = stream_ops.lock_writer(cap.head);
             defer stream_ops.unlock_writer(cap.head);
 
             writeAndFlush(writer, bytes_to_write) catch return writeError(interp, stream_ops.get_writer_error(cap.head).?);
+        },
+        .gets => {
+            const reader = stream_ops.lock_reader(cap.head);
+            defer stream_ops.unlock_reader(cap.head);
+
+            while (true) {
+                const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                    error.ReadFailed => {
+                        return readError(interp, stream_ops.get_reader_error(cap.head).?);
+                    },
+                    error.EndOfStream => {
+                        stream_ops.get_eos_ptr(cap.head).* = true;
+                        interp.setEmptyResult();
+                        return;
+                    },
+                    error.StreamTooLong => {
+                        reader.buffer = try heap.global_gpa.realloc(reader.buffer, @max(reader.buffer.len * 2, 4096));
+                        continue;
+                    },
+                };
+
+                return try interp.setResultString(line);
+            }
+        },
+        .iseos => {
+            _ = stream_ops.lock_reader(cap.head);
+            const is_eos = stream_ops.get_eos_ptr(cap.head).*;
+            stream_ops.unlock_reader(cap.head);
+            return interp.setResultBoolean(is_eos);
         },
     }
 }
@@ -206,8 +234,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 if (args.len == 4) try interp.wrapError(&det, FileOpenMode.get(&det, &args[3])) else .r;
 
             const cap = capabilities.File.open(path, mode) catch |err| {
-                try interp.setResultFormatted("error while opening file: {}", .{err});
-                return;
+                return interp.setErrorFormatted("error while opening file: {}", .{err});
             };
             interp.setResultOwning(cap.asHead().asValue());
         },
@@ -217,8 +244,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 std.Io.Dir.cwd().access(heap.global_io, path, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => {
-                        try interp.setResultFormatted("could not access file: {s}", .{@errorName(err)});
-                        return error.EvalError;
+                        return interp.setErrorFormatted("could not access file: {s}", .{@errorName(err)});
                     },
                 };
                 break :blk true;
@@ -255,8 +281,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             std.Io.Dir.cwd().createDir(heap.global_io, path, .default_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
-                    try interp.setResultFormatted("could not create directory: {s}", .{@errorName(err)});
-                    return error.EvalError;
+                    return interp.setErrorFormatted("could not create directory: {s}", .{@errorName(err)});
                 },
             };
             interp.setEmptyResult();
@@ -266,8 +291,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             var path_arg = &args[2];
             if (args.len == 4) {
                 if (!try args[2].current().equalsString("-force")) {
-                    try interp.setResultFormatted("bad option \"{s}\": must be -force", .{try args[2].getString()});
-                    return error.EvalError;
+                    return interp.setErrorFormatted("bad option \"{s}\": must be -force", .{try args[2].getString()});
                 }
                 force = true;
                 path_arg = &args[3];
@@ -285,8 +309,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                         // Tcl file deletion is idempotent, so we match our behavior.
                     },
                     else => {
-                        try interp.setResultFormatted("could not delete file: {s}", .{@errorName(err)});
-                        return error.EvalError;
+                        return interp.setErrorFormatted("could not delete file: {s}", .{@errorName(err)});
                     },
                 };
             }
@@ -295,8 +318,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .size => {
             const path = try args[2].getString();
             const stat = std.Io.Dir.cwd().statFile(heap.global_io, path, .{}) catch |err| {
-                try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
-                return error.EvalError;
+                return interp.setErrorFormatted("could not stat file: {s}", .{@errorName(err)});
             };
             interp.setResultInteger(@intCast(stat.size));
         },
@@ -306,8 +328,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 std.Io.Dir.cwd().access(heap.global_io, path, .{ .read = true }) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => {
-                        try interp.setResultFormatted("could not access file: {s}", .{@errorName(err)});
-                        return error.EvalError;
+                        return interp.setErrorFormatted("could not access file: {s}", .{@errorName(err)});
                     },
                 };
                 break :blk true;
@@ -320,8 +341,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 const stat = std.Io.Dir.cwd().statFile(heap.global_io, path, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => {
-                        try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
-                        return error.EvalError;
+                        return interp.setErrorFormatted("could not stat file: {s}", .{@errorName(err)});
                     },
                 };
                 break :blk stat.kind == .directory;
@@ -331,8 +351,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .mtime => {
             const path = try args[2].getString();
             const stat = std.Io.Dir.cwd().statFile(heap.global_io, path, .{}) catch |err| {
-                try interp.setResultFormatted("could not stat file: {s}", .{@errorName(err)});
-                return error.EvalError;
+                return interp.setErrorFormatted("could not stat file: {s}", .{@errorName(err)});
             };
             // Convert to millseconds first so we should fit within the f64's mantissa pretty well.
             const mtime_ms: f64 = @floatFromInt(stat.mtime.toMilliseconds());
@@ -342,8 +361,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const path = try args[2].getString();
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const len = std.Io.Dir.cwd().readLink(heap.global_io, path, &buf) catch |err| {
-                try interp.setResultFormatted("could not read link: {s}", .{@errorName(err)});
-                return error.EvalError;
+                return interp.setErrorFormatted("could not read link: {s}", .{@errorName(err)});
             };
             try interp.setResultString(buf[0..len]);
         },
@@ -353,12 +371,10 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             var temp = createTempFile(template) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.NoUniqueName => {
-                    try interp.setResultString("could not create a unique temporary file");
-                    return error.EvalError;
+                    return interp.setErrorString("could not create a unique temporary file");
                 },
                 else => {
-                    try interp.setResultFormatted("could not create temp file: {s}", .{@errorName(err)});
-                    return error.EvalError;
+                    return interp.setErrorFormatted("could not create temp file: {s}", .{@errorName(err)});
                 },
             };
             temp.file.close(heap.global_io);

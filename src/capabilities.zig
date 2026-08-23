@@ -21,6 +21,8 @@ pub const StreamOps = struct {
     lock_reader: *const fn (head: *Capability.Head) *std.Io.Reader,
     /// Be sure to call while locked.
     get_reader_error: *const fn (head: *Capability.Head) ?anyerror,
+    /// Be sure to call while locked.
+    get_eos_ptr: *const fn (head: *Capability.Head) *bool,
     unlock_reader: *const fn (head: *Capability.Head) void,
 };
 
@@ -32,14 +34,26 @@ pub const File = struct {
 
     write_mutex: std.Io.Mutex,
     writer: std.Io.File.Writer,
-    write_buffer: [4096]u8,
 
     read_mutex: std.Io.Mutex,
+    /// Set to true when end of stream is hit.
+    eos_hit: bool = false,
     reader: std.Io.File.Reader,
-    read_buffer: [4096]u8,
 
     pub fn open(path: []const u8, mode: Mode) !*Capability {
         const cwd = std.Io.Dir.cwd();
+
+        const read_buffer = try heap.global_gpa.alloc(u8, 4096);
+        errdefer heap.global_gpa.free(read_buffer);
+        const write_buffer = try heap.global_gpa.alloc(u8, 4096);
+        errdefer heap.global_gpa.free(write_buffer);
+
+        const cap_backing = try heap.global_gpa.create(Backing);
+        errdefer heap.global_gpa.destroy(cap_backing);
+
+        cap_backing.head = .{ .vtable = &Backing.vtable, .id = undefined };
+        const cap = try Capability.new(&cap_backing.head);
+        errdefer cap.asHead().dropReference();
 
         const file = switch (mode) {
             .r, .@"r+" => try cwd.openFile(heap.global_io, path, .{
@@ -50,29 +64,27 @@ pub const File = struct {
                 .read = mode == .@"w+",
             }),
         };
-        errdefer file.close(heap.global_io);
+        errdefer comptime unreachable;
 
-        const cap_backing = try heap.global_gpa.create(Backing);
-        errdefer heap.global_gpa.destroy(cap_backing);
-        cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = undefined },
-            .body = .{
-                .file = file,
-                .close_when_done = true,
-                .write_mutex = .init,
-                .writer = .init(file, heap.global_io, &cap_backing.body.write_buffer),
-                .write_buffer = undefined,
-                .read_mutex = .init,
-                .reader = .init(file, heap.global_io, &cap_backing.body.read_buffer),
-                .read_buffer = undefined,
-            },
+        cap_backing.body = .{
+            .file = file,
+            .close_when_done = true,
+            .write_mutex = .init,
+            .writer = .init(file, heap.global_io, write_buffer),
+            .read_mutex = .init,
+            .reader = .init(file, heap.global_io, read_buffer),
         };
 
-        return try Capability.new(&cap_backing.head);
+        return cap;
     }
 
     pub fn openDescriptor(handle: std.Io.File.Handle, nonblocking: bool) !*Capability {
         const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = nonblocking } };
+
+        const read_buffer = try heap.global_gpa.alloc(u8, 4096);
+        errdefer heap.global_gpa.free(read_buffer);
+        const write_buffer = try heap.global_gpa.alloc(u8, 4096);
+        errdefer heap.global_gpa.free(write_buffer);
 
         const cap_backing = try heap.global_gpa.create(Backing);
         errdefer heap.global_gpa.destroy(cap_backing);
@@ -82,11 +94,9 @@ pub const File = struct {
                 .file = file,
                 .close_when_done = false,
                 .write_mutex = .init,
-                .writer = .initStreaming(file, heap.global_io, &cap_backing.body.write_buffer),
-                .write_buffer = undefined,
+                .writer = .initStreaming(file, heap.global_io, write_buffer),
                 .read_mutex = .init,
-                .reader = .initStreaming(file, heap.global_io, &cap_backing.body.read_buffer),
-                .read_buffer = undefined,
+                .reader = .initStreaming(file, heap.global_io, read_buffer),
             },
         };
 
@@ -120,6 +130,11 @@ pub const File = struct {
         return backing.body.reader.err;
     }
 
+    fn getEosPtr(head: *Capability.Head) *bool {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        return &backing.body.eos_hit;
+    }
+
     fn unlockReader(head: *Capability.Head) void {
         const backing: *Backing = @fieldParentPtr("head", head);
         backing.body.read_mutex.unlock(heap.global_io);
@@ -132,6 +147,15 @@ pub const File = struct {
         fn deinitBody(head: *Capability.Head) callconv(.c) void {
             const backing: *Backing = @fieldParentPtr("head", head);
             if (backing.body.close_when_done) backing.body.file.close(heap.global_io);
+
+            // We lock to make sure `.buffer` happens-after it was set.
+            backing.body.read_mutex.lockUncancelable(heap.global_io);
+            heap.global_gpa.free(backing.body.reader.interface.buffer);
+            backing.body.read_mutex.unlock(heap.global_io);
+
+            backing.body.write_mutex.lockUncancelable(heap.global_io);
+            heap.global_gpa.free(backing.body.writer.interface.buffer);
+            backing.body.write_mutex.unlock(heap.global_io);
         }
 
         fn destroyBacking(head: *Capability.Head) callconv(.c) void {
@@ -149,6 +173,7 @@ pub const File = struct {
                 .unlock_writer = unlockWriter,
                 .lock_reader = lockReader,
                 .get_reader_error = getReaderError,
+                .get_eos_ptr = getEosPtr,
                 .unlock_reader = unlockReader,
             },
         };
