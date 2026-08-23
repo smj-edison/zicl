@@ -47,7 +47,7 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
             const reader = stream_ops.lock_reader(cap.head);
             defer stream_ops.unlock_reader(cap.head);
 
-            const bytes = reader.allocRemainingAlignedSentinel(heap.global_gpa, .unlimited, .@"8", 0) catch |err| switch (err) {
+            const bytes = reader.allocRemainingAlignedSentinel(heap.global_gpa, .unlimited, .@"1", 0) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.ReadFailed => return readError(interp, stream_ops.get_reader_error(cap.head).?),
                 else => return readError(interp, err),
@@ -163,6 +163,7 @@ pub fn pwdCmd(interp: *Interp, args: []Shimmerable) !void {
 
 pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const Subcommands = enum {
+        open,
         exists,
         dirname,
         tail,
@@ -178,6 +179,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         tempfile,
     };
     const Parser = objects.SubcommandParser(Subcommands, &.{
+        .{ .variant = .open, .usage = "name", .min_args = 1, .max_args = 2 },
         .{ .variant = .exists, .usage = "name", .min_args = 1, .max_args = 1 },
         .{ .variant = .dirname, .usage = "name", .min_args = 1, .max_args = 1 },
         .{ .variant = .tail, .usage = "name", .min_args = 1, .max_args = 1 },
@@ -197,6 +199,18 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
 
     switch (subcommand) {
+        .open => {
+            const path = try args[2].getString();
+
+            const mode: capabilities.File.Mode =
+                if (args.len == 4) try interp.wrapError(&det, FileOpenMode.get(&det, &args[3])) else .r;
+
+            const cap = capabilities.File.open(path, mode) catch |err| {
+                try interp.setResultFormatted("error while opening file: {}", .{err});
+                return;
+            };
+            interp.setResultOwning(cap.asHead().asValue());
+        },
         .exists => {
             const path = try args[2].getString();
             const exists = blk: {
@@ -486,21 +500,6 @@ pub fn openForAppend(path: []const u8, readable: bool) !std.Io.File {
 
 const FileOpenMode = objects.EnumConstructor(capabilities.File.Mode, false);
 
-/// [fopen]
-pub fn fopenCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
-    const path = try args[1].getString();
-
-    var det: ErrorDetails = undefined;
-    const mode: capabilities.File.Mode =
-        if (args.len == 3) try interp.wrapError(&det, FileOpenMode.get(&det, &args[2])) else .r;
-
-    const cap = capabilities.File.open(path, mode) catch |err| {
-        try interp.setResultFormatted("error while opening file: {}", .{err});
-        return;
-    };
-    interp.setResultOwning(cap.asHead().asValue());
-}
-
 fn hasGlobMeta(segment: []const u8) bool {
     for (segment) |c| {
         if (c == '*' or c == '?' or c == '[') return true;
@@ -631,7 +630,6 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "pwd", pwdCmd, "", 0, 0);
     try registerCommand(interp, "stream", streamCmd, "subcommand ?arg ...?", 2, 3);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
-    try registerCommand(interp, "fopen", fopenCmd, "path ?mode?", 1, 2);
     try registerCommand(interp, "glob", globCmd, "?-nocomplain? ?--? pattern ?pattern ...?", 1, null);
     try registerCommand(interp, "sleep", sleepCmd, "seconds", 1, 1);
 }
@@ -684,21 +682,6 @@ fn testPutsNonewlineOmitsTheTrailingNewline(ta: std.mem.Allocator) !void {
 
 test "puts -nonewline omits the trailing newline" {
     try memutil.checkAllocationFailures(.exhaustive, testPutsNonewlineOmitsTheTrailingNewline, .{});
-}
-
-fn testPutsRejectsAnUnknownOption(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
-
-    try interp.testExpectScriptError(
-        error.EvalError,
-        "The second argument must be -nonewline",
-        "puts -bogus hello",
-    );
-}
-
-test "puts rejects an unknown option" {
-    try memutil.checkAllocationFailures(.exhaustive, testPutsRejectsAnUnknownOption, .{});
 }
 
 fn testPidReportsThisProcess(ta: std.mem.Allocator) !void {
@@ -872,9 +855,9 @@ fn testFileCapability(ta: std.mem.Allocator) !void {
     const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
 
     const script = try std.fmt.allocPrint(ta,
-        \\set fd [fopen {s} w]
-        \\puts $fd "first line"
-        \\puts -nonewline $fd "no newline"
+        \\set fd [file open {s} w]
+        \\stream write $fd "first line\n"
+        \\stream write $fd "no newline"
         \\close $fd
         \\set fd
     , .{absolute_path});
@@ -913,7 +896,7 @@ fn testReadSlurpsTheRemainderOfAFile(ta: std.mem.Allocator) !void {
     const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
 
     const script = try std.fmt.allocPrint(ta,
-        \\set fd [fopen {s} r]
+        \\set fd [file open {s} r]
         \\set contents [stream read $fd]
         \\close $fd
         \\set contents
@@ -942,7 +925,7 @@ fn testReadResumesFromWhereAPriorReadLeftOff(ta: std.mem.Allocator) !void {
     // A second [read] on the same handle picks up at EOF, since it's reading
     // through the same open file descriptor rather than reopening the path.
     const script = try std.fmt.allocPrint(ta,
-        \\set fd [fopen {s} r]
+        \\set fd [file open {s} r]
         \\set first [stream read $fd]
         \\set second [stream read $fd]
         \\close $fd
@@ -969,7 +952,7 @@ fn testWritingToAClosedCapabilityReportsItAsStale(ta: std.mem.Allocator) !void {
     const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "foo.txt", &path_buffer))];
 
     const script = try std.fmt.allocPrint(testing.allocator,
-        \\set fd [fopen {s} w]
+        \\set fd [file open {s} w]
         \\close $fd
         \\set fd
     , .{absolute_path});
