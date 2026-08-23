@@ -815,6 +815,9 @@ export fn Zicl_CallClosure(
     argv: [*]Shimmerable,
 ) callconv(.c) ReturnCode {
     const args = argv[0..@intCast(argc)];
+    // Usually the stack trace gets cleared with value evaluation,
+    // but we have to do it manually here.
+    interp.stack_trace.swapWithNone();
     // Use the higher level `invokeCommand` so tailcalls are handled.
     const command_variant: Interp.CommandVariant = .{ .closure = closure.* };
     return ReturnCode.fromErrorUnion(interp.invokeCommand(&command_variant, args));

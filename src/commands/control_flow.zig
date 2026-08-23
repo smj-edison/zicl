@@ -448,12 +448,12 @@ pub fn errorCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 /// [return ?-option value ...? ?result?]
 ///
-/// Supported options: -code, -level, -errorcode.
+/// Supported options: -code, -level, -errorcode, -errorstack.
 pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var code: Interp.ReturnCode = .@"return";
     var level: u32 = 1;
 
-    const Flags = objects.EnumConstructor(enum { @"-code", @"-level", @"-errorcode" }, false);
+    const Flags = objects.EnumConstructor(enum { @"-code", @"-level", @"-errorcode", @"-errorstack" }, false);
 
     var i: usize = 1;
     while (i + 1 < args.len) {
@@ -479,6 +479,10 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             },
             .@"-errorcode" => {
                 interp.pending_error_code.swap(value.current().takeReference());
+                i += 2;
+            },
+            .@"-errorstack" => {
+                interp.stack_trace.swap(value.current().takeReference());
                 i += 2;
             },
         } else {

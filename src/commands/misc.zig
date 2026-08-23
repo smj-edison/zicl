@@ -33,7 +33,6 @@ pub fn breakpointCmd(_: *Interp, _: []Shimmerable) Interp.Error!void {
     @breakpoint();
 }
 
-/// [errorinfo optsDict]
 pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const Subcommands = enum {
         exists,
@@ -205,7 +204,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "breakpoint", breakpointCmd, "", 0, 0);
     try registerCommand(interp, "close", closeCmd, "capability", 1, 1);
     try registerCommand(interp, "deref", derefCmd, "hash", 1, 1);
-    try registerCommand(interp, "errorinfo", errorinfoCmd, "optsDict", 1, 1);
+    try registerCommand(interp, "errorinfo", errorinfoCmd, "message ?stackTrace?", 1, 2);
     try registerCommand(interp, "identity", identityCmd, "anything", 1, 1);
     try registerCommand(interp, "info", infoCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "launder", launderCmd, "string", 1, 1);
