@@ -45,7 +45,7 @@ static int whoami_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
         Zicl_Value none_marker;
         if (Zicl_NewString(&none_marker, "(none)", -1) != ZICL_OK) return ZICL_OOM;
         Zicl_SetResult(interp, none_marker);
-        Zicl_Release(none_marker);
+        Zicl_DropRef(none_marker);
     } else {
         Zicl_SetResult(interp, Zicl_Unwrap(name));
     }
@@ -188,12 +188,12 @@ static Zicl_Object *wrapper_duplicate(const Zicl_Object *src) {
     const Wrapper *src_w = (const Wrapper *)Zicl_ObjectBodyConst(src);
     Wrapper *dst_w = (Wrapper *)body;
     dst_w->inner = src_w->inner;
-    dst_w->label = Zicl_Borrow(src_w->label);
+    dst_w->label = Zicl_Ref(src_w->label);
     return obj;
 }
 static void wrapper_free_internal_rep(Zicl_Object *obj) {
     Wrapper *w = (Wrapper *)Zicl_ObjectBody(obj);
-    Zicl_Release(w->label);
+    Zicl_DropRef(w->label);
 }
 static int wrapper_enumerate_struct(Zicl_StructWalker *ctx, const void *node) {
     /* Top-level: `node` is the Zicl_Object* itself (see Zicl_EnumerateStructFn's
@@ -216,12 +216,12 @@ int main(void) {
         Zicl_Value s;
         CHECK(Zicl_NewString(&s, "hello", 5) == ZICL_OK);
         CHECK(Zicl_RefCount(s) == 1);  /* heap String object */
-        Zicl_Value borrowed = Zicl_Borrow(s);
+        Zicl_Value borrowed = Zicl_Ref(s);
         CHECK(Zicl_RefCount(s) == 2);
-        Zicl_Release(borrowed);
+        Zicl_DropRef(borrowed);
         CHECK(Zicl_RefCount(s) == 1);
         CHECK(Zicl_GetString(s, NULL) != NULL);
-        Zicl_Release(s);
+        Zicl_DropRef(s);
     }
 
     /* Duplicate: a fresh owned copy. For a heap string it produces a distinct
@@ -235,15 +235,15 @@ int main(void) {
         CHECK(Zicl_RefCount(d) == 1);  /* independent copy */
         int eq = 0;
         CHECK(Zicl_Equals(d, s, &eq) == ZICL_OK && eq == 1);
-        Zicl_Release(d);
-        Zicl_Release(s);
+        Zicl_DropRef(d);
+        Zicl_DropRef(s);
 
         /* Primitives carry no object, so duplicate is infallible and identity. */
         Zicl_Value n = Zicl_NewLong(7);
         Zicl_Value nd;
         CHECK(Zicl_Duplicate(n, &nd) == ZICL_OK);
         CHECK(nd.raw.as.integer == 7);
-        Zicl_Release(nd);  /* no-op for a primitive */
+        Zicl_DropRef(nd);  /* no-op for a primitive */
     }
 
     /* ReleaseArrayItems: frees a mix of heap objects and inline values. */
@@ -252,7 +252,7 @@ int main(void) {
         CHECK(Zicl_NewString(&argv[0], "a", 1) == ZICL_OK);
         argv[1] = Zicl_NewLong(2);       /* inline, no object */
         CHECK(Zicl_NewString(&argv[2], "c", 1) == ZICL_OK);
-        Zicl_ReleaseArrayItems(argv, 3);
+        Zicl_DropRefArrayItems(argv, 3);
         /* No leak: Zicl_LeakCheckAll at the end of main catches anything
          * still alive. */
     }
@@ -270,7 +270,7 @@ int main(void) {
         CHECK(Zicl_NewString(&h, "world", 5) == ZICL_OK);
         int eq = 0;
         CHECK(Zicl_Equals(iv, h, &eq) == ZICL_OK && eq == 1);
-        Zicl_Release(h);
+        Zicl_DropRef(h);
         /* No DecrRefCount: interned carries no object reference. */
     }
 
@@ -283,7 +283,7 @@ int main(void) {
         Zicl_List *ml = NULL;
         CHECK(Zicl_AsListMut(interp, lv, &ml) == ZICL_OK);
         CHECK(ml == NULL);  /* cross-thread: cannot mutate in place */
-        Zicl_Release(lv);
+        Zicl_DropRef(lv);
     }
 
     /* Value equality (compares by string representation, across types). */
@@ -301,8 +301,8 @@ int main(void) {
         /* "5" (string) equals 5 (int): everything is a string. */
         CHECK(Zicl_Equals(s5, a, &eq) == ZICL_OK && eq == 1);
         CHECK(Zicl_Equals(shi, a, &eq) == ZICL_OK && eq == 0);
-        Zicl_Release(s5);
-        Zicl_Release(shi);
+        Zicl_DropRef(s5);
+        Zicl_DropRef(shi);
     }
 
     /* Numbers: inline constructors, plus a shimmerable coercion. */
@@ -332,7 +332,7 @@ int main(void) {
         CHECK(Zicl_ListAppend(ml, Zicl_NewLong(3)) == ZICL_OK);
         CHECK(Zicl_RefCount(lv) == rc_before);  /* same object */
         CHECK(Zicl_ListLength(ml) == 3);
-        Zicl_Release(lv);
+        Zicl_DropRef(lv);
     }
 
     /* List copy-on-write: dup branch (shared, copy once, batch, write back). */
@@ -341,7 +341,7 @@ int main(void) {
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(10)) == ZICL_OK);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(20)) == ZICL_OK);
         Zicl_Value lv = Zicl_BoxList(list);
-        Zicl_Value shared = Zicl_Borrow(lv);  /* refcount 2 */
+        Zicl_Value shared = Zicl_Ref(lv);  /* refcount 2 */
 
         Zicl_List *ml = NULL;
         CHECK(Zicl_AsListMut(interp, shared, &ml) == ZICL_OK);
@@ -359,8 +359,8 @@ int main(void) {
         /* Commit: release the old shared value, store the new list. */
         ZICL_SWAP(&shared, Zicl_BoxList(ml));
         CHECK(item_as_long(interp, &shared, 3) == 40);
-        Zicl_Release(shared);  /* the new copy */
-        Zicl_Release(lv);       /* the original, now refcount 1 */
+        Zicl_DropRef(shared);  /* the new copy */
+        Zicl_DropRef(lv);       /* the original, now refcount 1 */
     }
 
     /* List set/get and out-of-range handling. */
@@ -392,7 +392,7 @@ int main(void) {
         /* DiscardChanges rolls back any shimmered duplicate. */
         Zicl_ShimDiscardChanges(&shim);
 
-        Zicl_Release(lv);
+        Zicl_DropRef(lv);
     }
 
     /* NewList from an array borrows the inputs. */
@@ -403,7 +403,7 @@ int main(void) {
         CHECK(Zicl_ListLength(list) == 2);
         Zicl_Value lv = Zicl_BoxList(list);
         CHECK(item_as_long(interp, &lv, 0) == 7);
-        Zicl_Release(lv);
+        Zicl_DropRef(lv);
     }
 
     /* BorrowList: a list handle borrowed as a second handle to the same object,
@@ -413,14 +413,14 @@ int main(void) {
     {
         Zicl_List *list = Zicl_NewList(NULL, 0);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(1)) == ZICL_OK);
-        Zicl_List *bv = Zicl_BorrowList(list);  /* refcount 2 */
+        Zicl_List *bv = Zicl_RefList(list);  /* refcount 2 */
         CHECK(Zicl_RefCount(Zicl_BoxList(bv)) == 2);
         CHECK(Zicl_RefCount(Zicl_BoxList(list)) == 2);  /* same object */
         int eq = 0;
         CHECK(Zicl_Equals(Zicl_BoxList(bv), Zicl_BoxList(list), &eq) == ZICL_OK && eq == 1);
-        Zicl_ReleaseList(bv);
+        Zicl_DropRefList(bv);
         CHECK(Zicl_RefCount(Zicl_BoxList(list)) == 1);
-        Zicl_ReleaseList(list);
+        Zicl_DropRefList(list);
     }
 
     /* List shimmer writeback: replace an item in place with a shimmered form of
@@ -439,7 +439,7 @@ int main(void) {
         const char *s2 = Zicl_GetString(lv, &len2);
         CHECK(s2 == s1);  /* string rep not regenerated */
         CHECK(Zicl_ListShimmerWriteback(list, 5, Zicl_NewLong(5)) == ZICL_ERR);  /* out of range */
-        Zicl_Release(lv);
+        Zicl_DropRef(lv);
     }
 
     /* Dict copy-on-write: in-place branch (uniquely owned, no copy). */
@@ -462,8 +462,8 @@ int main(void) {
         CHECK(Zicl_ShimDictGet(interp, &dv_shim, k1, &got) == ZICL_OK);
         CHECK(!Zicl_IsNone(got));
         Zicl_ShimDiscardChanges(&dv_shim);
-        Zicl_Release(k1);
-        Zicl_Release(dv);
+        Zicl_DropRef(k1);
+        Zicl_DropRef(dv);
     }
 
     /* Dict copy-on-write: dup branch (shared, copy once, write back). */
@@ -471,7 +471,7 @@ int main(void) {
         Zicl_Value kv[2] = { Zicl_NewLong(10), Zicl_NewLong(100) };
         Zicl_Dict *dict = Zicl_NewDict(kv, 2);
         Zicl_Value dv = Zicl_BoxDict(dict);
-        Zicl_Value shared = Zicl_Borrow(dv);  /* refcount 2 */
+        Zicl_Value shared = Zicl_Ref(dv);  /* refcount 2 */
 
         Zicl_Dict *md = NULL;
         CHECK(Zicl_AsDictMut(interp, shared, &md) == ZICL_OK);
@@ -490,9 +490,9 @@ int main(void) {
         CHECK(Zicl_ShimDictGet(interp, &shared_shim, k20, &got) == ZICL_OK);
         CHECK(!Zicl_IsNone(got));  /* new key present in the copy */
         Zicl_ShimDiscardChanges(&shared_shim);
-        Zicl_Release(k20);
-        Zicl_Release(shared);  /* the new copy */
-        Zicl_Release(dv);       /* the original, now refcount 1 */
+        Zicl_DropRef(k20);
+        Zicl_DropRef(shared);  /* the new copy */
+        Zicl_DropRef(dv);       /* the original, now refcount 1 */
     }
 
     /* Dict remove. */
@@ -513,8 +513,8 @@ int main(void) {
         CHECK(Zicl_ShimDictGet(interp, &dv_shim, k1, &got) == ZICL_OK);
         CHECK(Zicl_IsNone(got));  /* gone */
         Zicl_ShimDiscardChanges(&dv_shim);
-        Zicl_Release(k1);
-        Zicl_Release(dv);
+        Zicl_DropRef(k1);
+        Zicl_DropRef(dv);
     }
 
     /* Dict shimmer writeback: replace a key's value in place with a shimmered
@@ -534,8 +534,8 @@ int main(void) {
         int len2 = -1;
         const char *s2 = Zicl_GetString(dv, &len2);
         CHECK(s2 == s1);  /* string rep not regenerated */
-        Zicl_Release(k1);
-        Zicl_Release(dv);
+        Zicl_DropRef(k1);
+        Zicl_DropRef(dv);
     }
 
     /* Dict link: build a fresh dict with a ~parent hash reference, leaving
@@ -568,9 +568,9 @@ int main(void) {
         const char *got = Zicl_GetString(Zicl_GetResult(interp), &rlen);
         CHECK(rlen == 4 && memcmp(got, "1000", 4) == 0);
 
-        Zicl_Release(lv);
-        Zicl_Release(pv);
-        Zicl_ReleaseDict(child);
+        Zicl_DropRef(lv);
+        Zicl_DropRef(pv);
+        Zicl_DropRefDict(child);
     }
 
     /* Source copy-on-write: in-place branch (uniquely owned, annotate line). */
@@ -584,7 +584,7 @@ int main(void) {
         CHECK(ms != NULL);  /* in place: no copy */
         ms->line_no = 20;   /* line_no is a plain uint32; safe to write directly */
         CHECK(Zicl_SourceGetLine(s) == 20);
-        Zicl_Release(s);
+        Zicl_DropRef(s);
     }
 
     /* Source shimmer-from-string: a plain string shimmers to a Source in place,
@@ -603,7 +603,7 @@ int main(void) {
         int len = -1;
         const char *got = Zicl_GetString(s, &len);
         CHECK(got != NULL && len == 10 && strcmp(got, "raw script") == 0);
-        Zicl_Release(s);
+        Zicl_DropRef(s);
     }
 
     /* Source copy-on-write: dup branch (shared, copy once, write back). */
@@ -611,7 +611,7 @@ int main(void) {
         Zicl_Value s;
         CHECK(Zicl_NewString(&s, "more script", 11) == ZICL_OK);
         CHECK(Zicl_AttachSource(&s, "other.tcl", 1) == ZICL_OK);
-        Zicl_Value shared = Zicl_Borrow(s);  /* refcount 2 */
+        Zicl_Value shared = Zicl_Ref(s);  /* refcount 2 */
 
         Zicl_Source *ms = Zicl_AsSourceMut(shared);
         CHECK(ms == NULL);  /* shared: must dup */
@@ -624,8 +624,8 @@ int main(void) {
          * path -- no specialized writeback is needed. */
         ZICL_SWAP(&shared, Zicl_BoxSource(ms));
         CHECK(Zicl_SourceGetLine(shared) == 99);
-        Zicl_Release(shared);  /* the new copy */
-        Zicl_Release(s);       /* the original, now refcount 1 */
+        Zicl_DropRef(shared);  /* the new copy */
+        Zicl_DropRef(s);       /* the original, now refcount 1 */
     }
 
     /* SetErrorString: reports the message as an error result. Returns ZICL_ERR
@@ -706,7 +706,7 @@ int main(void) {
         got = Zicl_GetString(Zicl_GetResult(interp), &len);
         CHECK(got != NULL && len == 1 && got[0] == '3');
 
-        Zicl_ReleaseClosure(closure);
+        Zicl_DropRefClosure(closure);
 
         /* A [method] closure is rejected by Zicl_GetClosure with ZICL_ERR,
          * matching plain command dispatch when a method is invoked as a
@@ -750,7 +750,7 @@ int main(void) {
         const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
         CHECK(got != NULL && len == 10 && memcmp(got, "tailcalled", 10) == 0);
 
-        Zicl_ReleaseClosure(closure);
+        Zicl_DropRefClosure(closure);
     }
 
     /* Local arena snapshot/rewind: rendering an inline integer's string rep
@@ -815,8 +815,8 @@ int main(void) {
         CHECK(dup_body != NULL && dup_body != body);
         CHECK(dup_body->x == 3.0 && dup_body->y == 4.0);
 
-        Zicl_Release(dup);
-        Zicl_Release(v);
+        Zicl_DropRef(dup);
+        Zicl_DropRef(v);
     }
 
     /* A struct too big to fit inline (BigStruct is 128 bytes, well over
@@ -838,8 +838,8 @@ int main(void) {
         CHECK(dup_body != NULL && *dup_body != *body);  /* independently malloc'd */
         CHECK(memcmp((*dup_body)->payload, (*body)->payload, sizeof((*body)->payload)) == 0);
 
-        Zicl_Release(dup);
-        Zicl_Release(v);  /* exercises bigstruct_free_internal_rep */
+        Zicl_DropRef(dup);
+        Zicl_DropRef(v);  /* exercises bigstruct_free_internal_rep */
     }
 
     /* enumerate_struct, exercised end to end via a deliberate, permanent

@@ -197,11 +197,11 @@ export fn Zicl_GetString(value: Value, len: ?*c_int) callconv(.c) ?[*:0]const u8
 // ===== Reference counting and object introspection =====
 // See the header docs for how these behave on primitives.
 
-export fn Zicl_Release(value: Value) callconv(.c) void {
+export fn Zicl_DropRef(value: Value) callconv(.c) void {
     value.dropReference();
 }
 
-export fn Zicl_Borrow(value: Value) callconv(.c) Value {
+export fn Zicl_Ref(value: Value) callconv(.c) Value {
     return value.takeReference();
 }
 
@@ -210,7 +210,7 @@ export fn Zicl_Duplicate(value: Value, out: *Value) callconv(.c) ReturnCode {
     return .ok;
 }
 
-export fn Zicl_ReleaseArrayItems(argv: [*]Value, argc: c_int) callconv(.c) void {
+export fn Zicl_DropRefArrayItems(argv: [*]Value, argc: c_int) callconv(.c) void {
     const count: usize = @intCast(argc);
     for (argv[0..count]) |v| v.dropReference();
 }
@@ -461,11 +461,11 @@ export fn Zicl_BoxList(list: *List) callconv(.c) Value {
     return list.asHead().asValue();
 }
 
-export fn Zicl_ReleaseList(list: *List) callconv(.c) void {
+export fn Zicl_DropRefList(list: *List) callconv(.c) void {
     list.asHead().dropReference();
 }
 
-export fn Zicl_BorrowList(list: *List) callconv(.c) *List {
+export fn Zicl_RefList(list: *List) callconv(.c) *List {
     list.asHead().incrRefCount();
     return list;
 }
@@ -570,11 +570,11 @@ export fn Zicl_BoxDict(dict: *Dictionary) callconv(.c) Value {
     return dict.asHead().asValue();
 }
 
-export fn Zicl_ReleaseDict(dict: *Dictionary) callconv(.c) void {
+export fn Zicl_DropRefDict(dict: *Dictionary) callconv(.c) void {
     dict.asHead().dropReference();
 }
 
-export fn Zicl_BorrowDict(dict: *Dictionary) callconv(.c) *Dictionary {
+export fn Zicl_RefDict(dict: *Dictionary) callconv(.c) *Dictionary {
     dict.asHead().incrRefCount();
     return dict;
 }
@@ -688,11 +688,11 @@ export fn Zicl_BoxSource(source: *objects.Source) callconv(.c) Value {
     return source.asHead().asValue();
 }
 
-export fn Zicl_ReleaseSource(source: *objects.Source) callconv(.c) void {
+export fn Zicl_DropRefSource(source: *objects.Source) callconv(.c) void {
     source.asHead().dropReference();
 }
 
-export fn Zicl_BorrowSource(source: *objects.Source) callconv(.c) *objects.Source {
+export fn Zicl_RefSource(source: *objects.Source) callconv(.c) *objects.Source {
     source.asHead().incrRefCount();
     return source;
 }
@@ -777,7 +777,7 @@ const ClosureHandle = Interp.ClosureAndCacheKey;
 /// not be a [method] closure: like ordinary command dispatch, that returns
 /// ZICL_ERR with "method cannot be invoked as function". Returns ZICL_OOM on
 /// allocation failure. The caller owns `*out` and must release it with
-/// Zicl_ReleaseClosure.
+/// Zicl_DropRefClosure.
 export fn Zicl_GetClosure(interp: *Interp, closure_value: Value, out: *?*ClosureHandle) callconv(.c) ReturnCode {
     out.* = null;
     // `getClosure` returns the closure already borrowed for us.
@@ -794,7 +794,7 @@ export fn Zicl_GetClosure(interp: *Interp, closure_value: Value, out: *?*Closure
 }
 
 /// Release a handle obtained from Zicl_GetClosure.
-export fn Zicl_ReleaseClosure(closure: *ClosureHandle) callconv(.c) void {
+export fn Zicl_DropRefClosure(closure: *ClosureHandle) callconv(.c) void {
     closure.closure.asHead().dropReference();
     heap.global_gpa.destroy(closure);
 }
@@ -1000,7 +1000,7 @@ export fn Zicl_ResolveCapability(
 }
 
 export fn Zicl_NewFileFromDescriptor(descriptor: i32, out: *Value) callconv(.c) ReturnCode {
-    const capability = capabilities.File.openDescriptor(descriptor) catch return .oom;
+    const capability = capabilities.File.openDescriptor(descriptor, false) catch return .oom;
     out.* = capability.asHead().asValue();
     return .ok;
 }

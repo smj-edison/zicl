@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #if defined(__cplusplus)
 #define ZICL_NORETURN [[noreturn]]
@@ -17,19 +18,12 @@
 #endif
 
 /* ===== Values, types, and conventions ===== */
-
-/* A ref-counted heap object. Forward-declared here because it and
- * Zicl_ObjectVTable are mutually recursive: the vtable's callbacks take
- * Zicl_Object*, and Zicl_Object holds a pointer to its own vtable. A pointer
- * to an incomplete type is fine in C, so this forward declaration is enough
- * to define Zicl_ObjectVTable below; the full field list follows right
- * after it, once Zicl_ObjectVTable is a complete type. */
+/* A heap allocated Zicl object. */
 typedef struct Zicl_Object Zicl_Object;
 
-/* The payload of `Zicl_Value` and `Zicl_OptionalValue`. Small primitives
- * (integers, floats, booleans, and interned strings) live inline, while
- * everything else is a pointer to a ref-counted heap object. Mirrors
- * `heap.ValueRep` on the Zig side, so the two must be kept in step. */
+/* The representation of values in Zicl. We use a 8 byte payload, along
+ * with a 1 byte tag and 2 byte "extra" value. Mirrors `heap.ValueRep` on
+ * the Zig side, so the two must be kept in step. */
 typedef enum : uint8_t {
     ZICL_TAG_NONE = 0,
     ZICL_TAG_POINTER,
@@ -70,9 +64,9 @@ static inline bool Zicl_IsSome(Zicl_OptionalValue value) {
     return value.raw.tag != ZICL_TAG_NONE;
 }
 
-/* Narrow an optional. Only valid once Zicl_IsNone has ruled out the empty
- * case; unwrapping an absent value and handing it back is undefined. */
+/* Narrow an optional. Asserts that `value` is not none. */
 static inline Zicl_Value Zicl_Unwrap(Zicl_OptionalValue value) {
+    assert(Zicl_IsSome(value));
     Zicl_Value narrowed;
     narrowed.raw = value.raw;
     return narrowed;
@@ -132,7 +126,7 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
  *     int rc = 0;
  *     Zicl_Value script;
  *     ZICL_TRY(Zicl_NewString(&script, "puts hi", -1), rc);
- *     defer { Zicl_Release(script); }
+ *     defer { Zicl_DropRef(script); }
  *     return Zicl_EvalValue(interp, script);
  *
  * `defer` here is whatever scope-exit mechanism the consumer has; nothing here
@@ -147,7 +141,7 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
  *     int rc = 0;
  *     Zicl_List *list = Zicl_NewList(NULL, 0);
  *     if (!list) return ZICL_OOM;
- *     defer { if (rc) Zicl_ReleaseList(list); }
+ *     defer { if (rc) Zicl_DropRefList(list); }
  *     ZICL_TRY(Zicl_ListAppend(list, item), rc);
  *     *out = Zicl_BoxList(list);
  *     return ZICL_OK;
@@ -166,7 +160,7 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
 /* Release the value held in `slot` and store `new_value` in its place. `slot`
  * is a pointer to a `Zicl_Value` or `Zicl_OptionalValue`; the macro works for
  * either because it copies through `.raw`, the common `ValueRep` they share.
- * `Zicl_Release` is a no-op for primitives and the `none` optional, so the
+ * `Zicl_DropRef` is a no-op for primitives and the `none` optional, so the
  * macro is safe to use on any slot. Use it to commit a copy-on-write duplicate
  * back into the slot it replaces:
  *
@@ -184,7 +178,7 @@ static inline Zicl_Shimmerable Zicl_NewShimmerable(Zicl_Value value) {
         Zicl_ValueRep zicl_swap_old = (slot)->raw;              \
         (slot)->raw = (new_value).raw;                          \
         if (zicl_swap_old.tag != ZICL_TAG_NONE) {               \
-            Zicl_Release((Zicl_Value){ zicl_swap_old });   \
+            Zicl_DropRef((Zicl_Value){ zicl_swap_old });   \
         }                                                       \
     } while (0)
 
@@ -311,8 +305,8 @@ const char *Zicl_GetString(Zicl_Value object, int *len);
  * The primitives (`integer`, `float`, `boolean`, `interned`) carry no object,
  * so `Zicl_AsPtr` returns NULL and the refcount accessors report zero. */
 
-void Zicl_Release(Zicl_Value value);
-Zicl_Value Zicl_Borrow(Zicl_Value value);
+void Zicl_DropRef(Zicl_Value value);
+Zicl_Value Zicl_Ref(Zicl_Value value);
 /* A shallow copy of `value` as a fresh owned value with its own refcount. For a
  * pointer value this duplicates the underlying object (deep for the string rep;
  * collection items are borrowed) and can OOM; primitives (integer, float,
@@ -322,10 +316,10 @@ Zicl_Value Zicl_Borrow(Zicl_Value value);
 int Zicl_Duplicate(Zicl_Value value, Zicl_Value *out);
 /* Release every value in `argv[0..argc]`. A convenience for cleaning up an
  * array of values (such as an argv built for a command call): it loops and
- * calls Zicl_Release on each, which is a no-op for primitives, so the
+ * calls Zicl_DropRef on each, which is a no-op for primitives, so the
  * array can hold a mix of heap objects and inline values. `argc` must not be
  * negative. */
-void Zicl_ReleaseArrayItems(Zicl_Value *argv, int argc);
+void Zicl_DropRefArrayItems(Zicl_Value *argv, int argc);
 /* The heap object a pointer-tagged value refers to, or NULL for primitives. */
 Zicl_Object *Zicl_AsPtr(Zicl_Value value);
 /* Wrap a heap object as a pointer-tagged value. The inverse of Zicl_AsPtr: no
@@ -603,17 +597,17 @@ Zicl_List *Zicl_NewListFromShimmerables(const Zicl_Shimmerable *shims, int n_shi
  * `list` afterwards. */
 Zicl_Value Zicl_BoxList(Zicl_List *list);
 /* Release an owned list handle. */
-void Zicl_ReleaseList(Zicl_List *list);
+void Zicl_DropRefList(Zicl_List *list);
 /* Borrow a list handle: the same handle with its refcount incremented. The
- * caller owns the returned handle and must release it with Zicl_ReleaseList. */
-Zicl_List *Zicl_BorrowList(Zicl_List *list);
+ * caller owns the returned handle and must release it with Zicl_DropRefList. */
+Zicl_List *Zicl_RefList(Zicl_List *list);
 
 /* Copy-on-write entry points. If `value` is uniquely owned, `*out` is a
  * borrowed mutable view of the same object (no copy). If it is shared,
  * cross-thread, or a primitive, `*out` is NULL and the caller must
  * Zicl_DupAsList. Returns ZICL_OOM if shimmering allocates and fails, ZICL_ERR
  * for a malformed list string. A borrowed view is not owned: do not pass it to
- * Zicl_ReleaseList. Commit a duplicate back to its slot with
+ * Zicl_DropRefList. Commit a duplicate back to its slot with
  * ZICL_SWAP(&slot, Zicl_BoxList(*out)). */
 int Zicl_AsListMut(Zicl_Interp *interp, Zicl_Value value, Zicl_List **out);
 /* An owned mutable copy of `value` shimmered to a list. Returns ZICL_OOM on OOM
@@ -669,17 +663,17 @@ Zicl_Dict *Zicl_NewDict(const Zicl_Value *values, int n_values);
  * `dict` afterwards. */
 Zicl_Value Zicl_BoxDict(Zicl_Dict *dict);
 /* Release an owned dict handle. */
-void Zicl_ReleaseDict(Zicl_Dict *dict);
+void Zicl_DropRefDict(Zicl_Dict *dict);
 /* Borrow a dict handle: the same handle with its refcount incremented. The
- * caller owns the returned handle and must release it with Zicl_ReleaseDict. */
-Zicl_Dict *Zicl_BorrowDict(Zicl_Dict *dict);
+ * caller owns the returned handle and must release it with Zicl_DropRefDict. */
+Zicl_Dict *Zicl_RefDict(Zicl_Dict *dict);
 
 /* Copy-on-write entry points. If `value` is uniquely owned, `*out` is a
  * borrowed mutable view of the same object (no copy). If it is shared,
  * cross-thread, or a primitive, `*out` is NULL and the caller must
  * Zicl_DupAsDict. Returns ZICL_OOM if shimmering allocates and fails, ZICL_ERR
  * for a malformed dict string (odd item count). A borrowed view is not owned:
- * do not pass it to Zicl_ReleaseDict. Commit a duplicate back to its slot with
+ * do not pass it to Zicl_DropRefDict. Commit a duplicate back to its slot with
  * ZICL_SWAP(&slot, Zicl_BoxDict(*out)). */
 int Zicl_AsDictMut(Zicl_Interp *interp, Zicl_Value value, Zicl_Dict **out);
 /* An owned mutable copy of `value` shimmered to a dict. Returns ZICL_OOM on OOM
@@ -761,7 +755,7 @@ const Zicl_Source *Zicl_AsSource(Zicl_Value value);
  * change it, release the old Zicl_OptionalValue and store a borrowed one (the
  * caller owns the bookkeeping, as with any refcounted field). `_hash` is
  * internal and must not be touched. A borrowed view is not owned: do not pass it
- * to Zicl_ReleaseSource. */
+ * to Zicl_DropRefSource. */
 Zicl_Source *Zicl_AsSourceMut(Zicl_Value value);
 /* An owned mutable copy of `value` shimmered to a Source, or NULL on OOM.
  * Commit it back to the slot with ZICL_SWAP(&slot, Zicl_BoxSource(out)). A
@@ -772,10 +766,10 @@ Zicl_Source *Zicl_DupAsSource(Zicl_Value value);
  * `source` afterwards. */
 Zicl_Value Zicl_BoxSource(Zicl_Source *source);
 /* Release an owned Source handle. */
-void Zicl_ReleaseSource(Zicl_Source *source);
+void Zicl_DropRefSource(Zicl_Source *source);
 /* Borrow a Source handle: the same handle with its refcount incremented. The
- * caller owns the returned handle and must release it with Zicl_ReleaseSource. */
-Zicl_Source *Zicl_BorrowSource(Zicl_Source *source);
+ * caller owns the returned handle and must release it with Zicl_DropRefSource. */
+Zicl_Source *Zicl_RefSource(Zicl_Source *source);
 
 const char *Zicl_SourceGetFilename(Zicl_Value source);
 int Zicl_SourceGetLine(Zicl_Value source);
@@ -817,7 +811,7 @@ int Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
 /* ===== Closures =====
  * A resolved closure plus the cache key its body evaluates under, opaque to
  * the C side. Get one with Zicl_GetClosure, invoke it (possibly more than
- * once) with Zicl_CallClosure, and release it with Zicl_ReleaseClosure. */
+ * once) with Zicl_CallClosure, and release it with Zicl_DropRefClosure. */
 typedef struct Zicl_Closure Zicl_Closure;
 
 /* Resolve closure_value into a handle: parses it as a closure literal first
@@ -825,10 +819,10 @@ typedef struct Zicl_Closure Zicl_Closure;
  * so closure_value need not survive the call. closure_value must not be a
  * [method] closure: like ordinary command dispatch, that returns ZICL_ERR
  * with "method cannot be invoked as function". Returns ZICL_OOM on allocation
- * failure. The caller owns *out and must release it with Zicl_ReleaseClosure. */
+ * failure. The caller owns *out and must release it with Zicl_DropRefClosure. */
 int Zicl_GetClosure(Zicl_Interp *interp, Zicl_Value closure_value, Zicl_Closure **out);
 /* Release a handle obtained from Zicl_GetClosure. */
-void Zicl_ReleaseClosure(Zicl_Closure *closure);
+void Zicl_DropRefClosure(Zicl_Closure *closure);
 /* Call closure the same way the interpreter calls a closure it resolved from
  * a command name: argv[0] fills the command-name slot, argv[1..argc] are its
  * arguments. Letrec-bound closures are not reachable through this entry point
