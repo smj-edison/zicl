@@ -314,6 +314,14 @@ Zicl_Value Zicl_Ref(Zicl_Value value);
  * stores the owned result in *out; the caller must release it or commit it via
  * ZICL_SWAP. Returns ZICL_OOM if the duplicate cannot be allocated. */
 int Zicl_Duplicate(Zicl_Value value, Zicl_Value *out);
+/* Zicl_Duplicate, except the result is always a heap object rather than a
+ * possibly-inline value: a pointer value duplicates its object, and a
+ * primitive is copied into a fresh object (integer into an Integer, float
+ * into a Float, boolean or interned string into a String). Returns NULL on
+ * OOM; otherwise an owned Zicl_Object* with a single reference. Hold it as a
+ * value with Zicl_BoxObject (no refcount change), or release it with
+ * Zicl_DropRef(Zicl_BoxObject(obj)). */
+Zicl_Object *Zicl_DuplicateAsBoxed(Zicl_Value value);
 /* Release every value in `argv[0..argc]`. A convenience for cleaning up an
  * array of values (such as an argv built for a command call): it loops and
  * calls Zicl_DropRef on each, which is a no-op for primitives, so the

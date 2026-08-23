@@ -246,6 +246,35 @@ int main(void) {
         Zicl_DropRef(nd);  /* no-op for a primitive */
     }
 
+    /* DuplicateAsBoxed: same copy semantics as Zicl_Duplicate, but the result
+     * is always a heap object -- primitives come back boxed. */
+    {
+        Zicl_Value s;
+        CHECK(Zicl_NewString(&s, "hello", 5) == ZICL_OK);
+        Zicl_Object *sd = Zicl_DuplicateAsBoxed(s);
+        CHECK(sd != NULL);
+        CHECK(sd != Zicl_AsPtr(s));  /* independent copy, not the same object */
+        Zicl_Value sdv = Zicl_BoxObject(sd);
+        CHECK(Zicl_RefCount(sdv) == 1);
+        int eq = 0;
+        CHECK(Zicl_Equals(sdv, s, &eq) == ZICL_OK && eq == 1);
+        Zicl_DropRef(sdv);
+        Zicl_DropRef(s);
+
+        /* An inline integer boxes into a fresh Integer object; the original
+         * stays inline. Everything is a string, so they compare equal. */
+        Zicl_Value n = Zicl_NewLong(7);
+        Zicl_Object *nb = Zicl_DuplicateAsBoxed(n);
+        CHECK(nb != NULL);
+        Zicl_Value nbv = Zicl_BoxObject(nb);
+        CHECK(Zicl_RefCount(nbv) == 1);
+        CHECK(Zicl_AsPtr(n) == NULL);
+        eq = 0;
+        CHECK(Zicl_Equals(nbv, n, &eq) == ZICL_OK && eq == 1);
+        CHECK(strcmp(Zicl_GetString(nbv, NULL), "7") == 0);
+        Zicl_DropRef(nbv);
+    }
+
     /* ReleaseArrayItems: frees a mix of heap objects and inline values. */
     {
         Zicl_Value argv[3];

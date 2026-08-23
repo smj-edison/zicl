@@ -210,6 +210,10 @@ export fn Zicl_Duplicate(value: Value, out: *Value) callconv(.c) ReturnCode {
     return .ok;
 }
 
+export fn Zicl_DuplicateAsBoxed(value: Value) callconv(.c) ?*heap.Object {
+    return value.duplicateAsBoxed() catch null;
+}
+
 export fn Zicl_DropRefArrayItems(argv: [*]Value, argc: c_int) callconv(.c) void {
     const count: usize = @intCast(argc);
     for (argv[0..count]) |v| v.dropReference();
