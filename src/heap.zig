@@ -1551,7 +1551,14 @@ pub const Object = extern struct {
                     .len = math.maxInt(u16),
                 });
             },
-            .none => {},
+            .none => {
+                dest.string = .init(null);
+                dest.string_metadata = .init(.{
+                    .has_value = false,
+                    .is_special = false,
+                    .len = 0,
+                });
+            },
         }
 
         dest.ref_count = 1;
