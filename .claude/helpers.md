@@ -114,7 +114,7 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Object.takeReference(obj)` -- Increment and return the same `*Object`.
 - `Object.dropReference(obj)` -- Decrement and free at zero; unregisters from the hash registry when a representative or registered object reaches the threshold.
 - `Object.swap(ref, new)` -- Set `ref.* = new` and drop the old object.
-- `Object.invalidateString(obj)` -- Free the string rep (asserts `canShimmer`).
+- `Object.commitMutation(obj)` -- Free the string rep (asserts `canShimmer`).
 - `Object.invalidateInternalRep(obj)` -- Dispatch to the vtable's `free_internal_rep`.
 - `Object.getHashNoRegister(obj)` -- Return the `u256` hash from the cached string/special/source hash, computing if needed.
 - `Object.getHashRegistering(obj)` -- `getHashNoRegister` plus idempotent `HashRegistry.register`.

@@ -1453,6 +1453,12 @@ pub const Object = extern struct {
         obj.freeStringInner();
     }
 
+    /// This is separate from `invalidateString`, as I plan to have richer
+    /// in-place mutation semantics in the future.
+    pub fn commitMutation(obj: *Object) void {
+        obj.invalidateString();
+    }
+
     pub fn invalidateInternalRep(obj: *Object) void {
         leak_check.globalTrace(obj, .invalidate_rep);
         if (obj.vtable.is_c_vtable) {

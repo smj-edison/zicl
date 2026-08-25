@@ -101,17 +101,17 @@ point: it returns a `*T` you can write to when the value can be shimmered to `T`
 mutated in place, and null when it cannot, leaving copying logic to you.
 
 ```zig
-if (try interp.asMutableInPlace(Dictionary, dict)) |dict_mut| {
-    try dict_mut.put(key, value);
-    // Mutated in place, so the owner's string rep is now stale.
-    dict_owner.asHead().invalidateString();
+if (try interp.asMutableInPlace(List, list_raw)) |list_mut| {
+    try list_mut.ensureUnusedCapacity(items.len);
+    errdefer comptime unreachable; // Start of transaction.
+    for (items) |*value_shim| list_mut.appendAssumeCapacity(value_shim.current());
+    dict_mut.asHead().commitMutation();
+    return; // End of transaction.
 } else {
-    // Copy-on-write. The duplicate is exclusively ours, so the second
-    // `asMutableInPlace` always succeeds.
-    const duped = try interp.duplicateAsType(Dictionary, dict);
-    defer duped.dropReference();
-    try duped.put(key, value);
-    try interp.setVariable(var_name, duped.asHead().asValue()); // Store the copy back.
+    const list_mut = try interp.duplicateAsType(List, existing);
+    defer list_mut.asHead().dropReference();
+    for (items) |*value_shim| try list_mut.append(value_shim.current());
+    try dict_mut.put(key, list_mut.asHead().asValue());
 }
 ```
 
@@ -242,7 +242,7 @@ copy-on-write `if` from above -- both branches, always.
 ```zig
 if (try dict_raw.asMutableInPlace(Dictionary, &det)) |dict| {
     try dict.put(key, value);
-    owner.asHead().invalidateString();
+    owner.asHead().commitMutation();
 } else {
     const duped = try dict_raw.duplicateAsBoxed();
     defer duped.dropReference();

@@ -1434,9 +1434,48 @@ pub const List = struct {
         return self.items.ptr[0..self.capacity];
     }
 
+    /// Called when memory growth is necessary. Returns a capacity larger than
+    /// minimum that grows super-linearly.
+    pub fn growCapacity(minimum: usize) usize {
+        const init_capacity: comptime_int = @max(1, std.atomic.cache_line / @sizeOf(Value));
+        return minimum +| (minimum / 2 + init_capacity);
+    }
+
+    /// If the current capacity is less than `new_capacity`, this function will
+    /// modify the array so that it can hold exactly `new_capacity` items.
+    /// Invalidates element pointers if additional memory is needed.
+    ///
+    /// `list` must be mutable.
+    fn ensureTotalCapacityPrecise(list: *List, new_capacity: usize) !void {
+        assert(list.asHead().canMutate());
+        if (new_capacity > list.capacity) {
+            const new_backing = try heap.global_gpa.realloc(list.backingSlice(), new_capacity);
+            list.items = new_backing[0..list.items.len];
+            list.capacity = new_capacity;
+        }
+    }
+
+    /// If the current capacity is less than `new_capacity`, this function will
+    /// modify the array so that it can hold at least `new_capacity` items.
+    /// Invalidates element pointers if additional memory is needed.
+    ///
+    /// `list` must be mutable.
+    pub fn ensureTotalCapacity(self: *List, new_capacity: usize) !void {
+        if (self.capacity >= new_capacity) return;
+        return self.ensureTotalCapacityPrecise(growCapacity(new_capacity));
+    }
+
+    pub fn ensureUnusedCapacity(list: *List, additional_count: usize) !void {
+        const total_needed_capacity = list.items.len + additional_count;
+        try list.ensureTotalCapacity(total_needed_capacity);
+    }
+
+    /// Extend the list by 1 element. Allocates more memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    ///
     /// `list` must be mutable.
     pub fn append(list: *List, value: Value) !void {
-        if (list.capacity < list.items.len + 1) try list.ensureCapacity(@max(4, list.capacity * 2));
+        if (list.capacity < list.items.len + 1) try list.ensureTotalCapacityPrecise(growCapacity(list.capacity));
         list.appendAssumeCapacity(value);
     }
 
@@ -1450,14 +1489,14 @@ pub const List = struct {
         const old_len = list.items.len;
         list.items = list.backingSlice()[0..(old_len + 1)];
         list.items[old_len] = value;
-        list.asHead().invalidateString();
+        list.asHead().commitMutation();
     }
 
     /// `list` must be mutable.
     pub fn set(list: *List, index: usize, value: Value) void {
         assert(list.asHead().canMutate());
         list.items[index].swap(value.takeReference());
-        list.asHead().invalidateString();
+        list.asHead().commitMutation();
     }
 
     pub fn resolveIndex(list: *const List, index: Index) ?usize {
@@ -1514,25 +1553,16 @@ pub const List = struct {
         defer child_shim.discardChanges();
 
         if (child_shim.shimmered.isNone() and list.items[index].canMutate()) {
-            // Mutate in place.
+            errdefer comptime unreachable; // Start transaction.
             const as_list = list.items[index].asType(List).?;
             try as_list.setRecursively(det, indexes[1..], value);
-            list.asHead().invalidateString();
+            list.asHead().commitMutation();
+            return; // End transaction.
         } else {
             const child_mut = try child_shim.getMutable(List, det);
             defer child_mut.asHead().dropReference();
             try child_mut.setRecursively(det, indexes[1..], value);
             list.set(index, child_mut.asHead().asValue());
-        }
-    }
-
-    /// `list` must be mutable.
-    fn ensureCapacity(list: *List, new_capacity: usize) !void {
-        assert(list.asHead().canMutate());
-        if (new_capacity > list.capacity) {
-            const new_backing = try heap.global_gpa.realloc(list.backingSlice(), new_capacity);
-            list.items = new_backing[0..list.items.len];
-            list.capacity = new_capacity;
         }
     }
 
@@ -1911,10 +1941,24 @@ pub const Dictionary = struct {
         // this is a completely transparent operation as far as the user is concerned.
     }
 
+    // Transaction safe.
     pub fn put(dict: *Dictionary, key: Value, value: Value) error{OutOfMemory}!void {
         _ = try dict.putInner(key, value);
     }
 
+    /// What is a "good" key in this context? A key that 1. has its hash cached and
+    /// 2. exists in the dictionary. This is safe to use in a transaction.
+    pub fn putKnownGoodKey(dict: *Dictionary, key: Value, value: Value) usize {
+        assert(dict.asHead().canMutate());
+        const existing_value_index = dict.table.get(key).?;
+
+        dict.items[existing_value_index].swap(value.takeReference());
+        const shifted_index = removeDuplicates(dict, existing_value_index).?;
+        dict.asHead().commitMutation();
+        return shifted_index; // End of transaction.
+    }
+
+    // Starts a transaction on success.
     pub fn putInner(dict: *Dictionary, key: Value, value: Value) error{OutOfMemory}!usize {
         assert(dict.asHead().canMutate());
         if (dict.capacity < dict.items.len + 2) try dict.ensureCapacity(@max(4, dict.capacity * 2));
@@ -1924,12 +1968,15 @@ pub const Dictionary = struct {
         try heap.hashutil.cacheQuickHash(key);
         if (dict.table.get(key)) |existing_value_index| {
             // Key exists, so replace the value in place.
-            dict.items[existing_value_index].swap(value.takeReference());
 
-            dict.asHead().invalidateString();
+            errdefer comptime unreachable; // Start of transaction.
+            dict.items[existing_value_index].swap(value.takeReference());
             const shifted_index = removeDuplicates(dict, existing_value_index).?;
-            return shifted_index;
+            dict.asHead().commitMutation();
+            return shifted_index; // End of transaction.
         } else {
+            errdefer comptime unreachable; // Start of transaction.
+
             // New item, so we need to expand the dict.
             assert(dict.capacity >= dict.items.len + 2);
 
@@ -1937,7 +1984,7 @@ pub const Dictionary = struct {
             const new_key_index = old_len;
             const new_value_index = old_len + 1;
 
-            // `Dictionary.ensureCapacity` also ensures enough room for the table.
+            // The previous `Dictionary.ensureCapacity` also ensured enough room for the table.
             dict.table.putAssumeCapacity(key, new_value_index);
 
             // Expand the items slice to include the new items we made room for.
@@ -1945,9 +1992,9 @@ pub const Dictionary = struct {
             dict.items[new_key_index] = key.takeReference();
             dict.items[new_value_index] = value.takeReference();
 
-            dict.asHead().invalidateString();
             const shifted_index = removeDuplicates(dict, new_value_index);
-            return shifted_index.?;
+            dict.asHead().commitMutation();
+            return shifted_index.?; // End of transaction.
         }
     }
 
@@ -1971,6 +2018,8 @@ pub const Dictionary = struct {
 
     /// Remove all pairs with key `key`. Returns true if any were removed, and
     /// keeps the table live (clearing and re-putting into the same allocation).
+    ///
+    /// Transaction safe.
     pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) error{ OutOfMemory, LookupFailed }!bool {
         assert(dict.asHead().canMutate());
         try heap.hashutil.cacheQuickHash(key);
@@ -2006,6 +2055,9 @@ pub const Dictionary = struct {
                 error.BadDict, error.NotHashReference, error.HashLookupFailed => return error.LookupFailed,
             };
 
+            // `dict` has now mutated in place, so we can't fail after this.
+            errdefer comptime unreachable;
+
             // Flattening may change indicies, so we need to rescan for the first key.
             first_key_index = 0;
             while (first_key_index < dict.items.len) : (first_key_index += 2) {
@@ -2014,6 +2066,9 @@ pub const Dictionary = struct {
                 return false; // No matching key.
             }
         }
+        // `dict` may have mutated in place in the above `if`, so this is sorta "begin transaction",
+        // but really the transaction may have already started.
+        errdefer comptime unreachable;
 
         // Remove the key from the table before shifting everything around.
         _ = dict.table.remove(key);
@@ -2046,14 +2101,17 @@ pub const Dictionary = struct {
             dict.table.putAssumeCapacity(dict.items[item_index], item_index + 1);
         }
 
-        // Match Tcl behavior by removing duplicates in other parts of the dictionary.
+        // Match Tcl behavior by removing duplicates in other parts of the dictionary on mutation.
         _ = dict.removeDuplicates(null);
-        dict.asHead().invalidateString();
-        return true;
+
+        dict.asHead().commitMutation();
+        return true; // End transaction.
     }
 
     /// Remove earlier duplicate pairs, keeping the last value for each key. If
     /// `to_track` is given, returns its new index (or null if it was removed).
+    ///
+    /// Transaction safe.
     fn removeDuplicates(dict: *Dictionary, to_track: ?usize) ?usize {
         assert(dict.asHead().canMutate());
 
@@ -2119,24 +2177,32 @@ pub const Dictionary = struct {
     /// pairs for nothing and, more importantly, break the sharing that makes the
     /// deeper scopes cheap, since those are the ones most likely to be
     /// hash-registered and reachable from other threads.
+    ///
+    /// Transaction safe.
     pub fn flattenForKey(dict: *Dictionary, det: ?*ErrorDetails, key: Value) !void {
         assert(dict.asHead().canMutate());
         if (try dict.flattenForKeyInner(det, key)) |new_dict| {
+            errdefer comptime unreachable; // Begin transaction.
+
             // Steal the values from `new_dict` directly.
-            freeInternalRep(dict.asHead());
+            dict.asHead().invalidateInternalRep();
             dict.* = .{
                 .items = new_dict.items,
                 .capacity = new_dict.capacity,
                 .table = new_dict.table,
             };
             new_dict.asHead().freeBacking();
-            dict.asHead().invalidateString();
+
+            dict.asHead().commitMutation();
+            return; // End transaction.
         }
     }
 
     /// Remove all links from a dict and combine them into one dict.
     /// Returns null when no ancestor of `dict` holds `key`, meaning
     /// the chain already only shadows it here and nothing needs collapsing.
+    ///
+    /// Transaction safe.
     pub fn flattenForKeyInner(dict: *const Dictionary, det: ?*ErrorDetails, key: Value) !?*Dictionary {
         const parent_hash_ref = (try dict.getNoFollow(interned_tilde_parent)).asValue() orelse {
             return null; // We've reached the end, so no need to flatten.
@@ -2189,6 +2255,8 @@ pub const Dictionary = struct {
                 defer hash_ref_shim.discardChanges();
                 const parent_dict = try HashReference.resolveAsDictionary(det, &hash_ref_shim);
                 if (hash_ref_shim.shimmered.asValue()) |new_hash_ref| {
+                    // `shim.ensureShimmerable()` May duplicate `dict`, so we have to
+                    // reload the dictionary.
                     try shim.ensureShimmerable();
                     const as_shimmerable_dict = shim.current().asType(Dictionary).?;
                     try as_shimmerable_dict.shimmerWriteback(tilde_parent, new_hash_ref);
@@ -2215,22 +2283,41 @@ pub const Dictionary = struct {
     }
 
     pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !OptionalValue {
-        if (context.len() == 0) return shim.current().asOptional();
-        if (context.len() == 1) return try getFollowingLinks(det, shim, context.get(0));
+        const result = try getRecursivelyInner(det, shim, context);
+        return result.looked_up;
+    }
+
+    pub const GetRecursivelyResult = struct { looked_up: OptionalValue, can_mutate: bool };
+    pub fn getRecursivelyInner(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !GetRecursivelyResult {
+        if (context.len() == 0) return .{
+            .looked_up = shim.current().asOptional(),
+            .can_mutate = shim.current().canMutate(),
+        };
+        if (context.len() == 1) {
+            const lookup = try getFollowingLinks(det, shim, context.get(0));
+            const lookup_can_mutate = if (lookup.asValue()) |val| val.canMutate() else false;
+            return .{
+                .looked_up = lookup,
+                .can_mutate = lookup_can_mutate and shim.current().canMutate(),
+            };
+        }
 
         if ((try getFollowingLinks(det, shim, context.get(0))).asValue()) |child_dict| {
             var child_shim: Shimmerable = .{ .original = child_dict };
             defer child_shim.discardChanges();
-            const child_result = try getRecursively(det, &child_shim, context.sliceAfter(1));
+            const lookup = try getRecursivelyInner(det, &child_shim, context.sliceAfter(1));
             if (child_shim.shimmered.asValue()) |new_child| {
                 try shim.ensureShimmerable();
                 // The child dict changed, propagate back up.
                 const as_dict = shim.current().asType(Dictionary).?;
                 try as_dict.shimmerWriteback(context.get(0), new_child);
             }
-            return child_result;
+            return .{
+                .looked_up = lookup,
+                .can_mutate = child_shim.current().canMutate() and lookup.can_mutate,
+            };
         } else {
-            return .none;
+            return .{ .looked_up = .none, .can_mutate = false };
         }
     }
 
@@ -2264,7 +2351,9 @@ pub const Dictionary = struct {
             // Mutate in place.
             const as_dict = child_dict.asType(Dictionary).?;
             try as_dict.putRecursively(det, context.sliceAfter(1), value);
-            dict.asHead().invalidateString();
+            errdefer comptime unreachable; // Continue from above transaction.
+            dict.asHead().commitMutation();
+            return; // End transaction.
         } else {
             const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
             defer child_dict_mut.asHead().dropReference();
@@ -2278,28 +2367,30 @@ pub const Dictionary = struct {
         assert(context.len() > 0);
         if (context.len() == 1) return try dict.remove(det, context.get(0));
 
-        if ((try dict.getNoFollow(context.get(0))).asValue()) |child_dict| {
+        const child_dict_key: Value = context.get(0);
+        if ((try dict.getNoFollow(child_dict_key)).asValue()) |child_dict| {
             var child_dict_shim: Shimmerable = .{ .original = child_dict };
             defer child_dict_shim.discardChanges();
             _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
 
-            const did_remove = blk: {
-                if (child_dict_shim.shimmered.isNone() and child_dict.canMutate()) {
-                    // Mutate in place, if possible.
-                    const as_dict = child_dict.asType(Dictionary).?;
-                    break :blk try as_dict.removeRecursively(det, context.sliceAfter(1));
-                } else {
-                    const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
-                    defer child_dict_mut.asHead().dropReference();
-                    const did_remove = try child_dict_mut.removeRecursively(det, context.sliceAfter(1));
-                    try dict.put(context.get(0), child_dict_mut.asHead().asValue());
-                    break :blk did_remove;
-                }
-            };
+            if (child_dict_shim.shimmered.isNone() and child_dict.canMutate()) {
+                // Mutate in place, if possible.
+                const as_dict = child_dict.asType(Dictionary).?;
+                const did_remove = try as_dict.removeRecursively(det, context.sliceAfter(1));
+                errdefer comptime unreachable; // Continue from above transaction.
+                dict.asHead().commitMutation();
+                return did_remove; // Finish transaction.
+            } else {
+                const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
+                defer child_dict_mut.asHead().dropReference();
+                try heap.hashutil.cacheQuickHash(child_dict_key);
 
-            dict.asHead().invalidateString();
-
-            return did_remove;
+                const did_remove = try child_dict_mut.removeRecursively(det, context.sliceAfter(1));
+                errdefer comptime unreachable; // Continue from above transaction.
+                _ = dict.putKnownGoodKey(child_dict_key, child_dict_mut.asHead().asValue());
+                dict.asHead().commitMutation();
+                return did_remove; // Finish transaction.
+            }
         } else {
             if (det) |details| details.* = .{ .message = try allocPrintZ(
                 "key \"{s}\" not known in dictionary \"{s}\"",

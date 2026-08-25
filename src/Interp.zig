@@ -348,8 +348,8 @@ pub fn callClosure(
     if (is_method) {
         var self_var_name: Shimmerable = .{ .original = arg_names[0] };
         defer self_var_name.discardChanges(); // TODO PERF don't discard, write back.
-        if (vartypes.getVariableOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
-            args[1].shimmered.swap(updated_self.takeReference());
+        if (vartypes.getVariableTakingReferenceOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
+            args[1].shimmered.swap(updated_self);
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadVariableName => {
@@ -764,8 +764,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !
         .variable_subst => {
             var name_shim: Shimmerable = .{ .original = value };
             defer name_shim.discardChanges();
-            const var_target: Value = try interp.getVariableOrError(&name_shim);
-            return var_target.takeReference();
+            return try interp.getVariableTakingReferenceOrError(&name_shim);
         },
         .expression_sugar => {
             return try interp.evalExpression(value);
@@ -985,13 +984,12 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
 
 /// If variant is `closure`, then the closure is returned referenced.
 pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
-    var det: ErrorDetails = undefined;
-
-    const var_val_raw: ?Value = try interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame_idx, name));
-    const var_val = var_val_raw orelse {
+    const var_val_raw = try interp.getVariableTakingReferenceInFrame(call_frame_idx, name);
+    const var_val = var_val_raw.asValue() orelse {
         try interp.setResultFormatted("invalid command name \"{s}\"", .{try name.current().getString()});
         return error.CommandNotFound;
     };
+    defer var_val.dropReference();
 
     var var_val_shim: Shimmerable = .{ .original = var_val };
     defer var_val_shim.discardChanges();
@@ -1268,7 +1266,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         // foo::bar would have foo as `self`, or foo::bar::baz would have foo::bar as `self`.
         var dict_name_shim: Shimmerable = .{ .original = dict_sugar.dict_name };
         defer dict_name_shim.discardChanges();
-        const dict_resolved = vartypes.getVariable(
+        const dict_resolved = vartypes.getVariableTakingReference(
             interp,
             null,
             interp.callFrameIdx(),
@@ -1279,6 +1277,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
             // it ensured that the dict sugar resolved to something.
             else => unreachable,
         };
+        defer if (dict_resolved) |val| val.dropReference();
 
         // We modify the dictionary at the end of the path.
         const all_but_last = dict_sugar.dict_path.items[0..(dict_sugar.dict_path.items.len - 1)];
@@ -1909,9 +1908,18 @@ pub fn setVariableUpvar(
     ));
 }
 
-pub fn getVariable(interp: *Interp, name: *Shimmerable) !OptionalValue {
+pub fn getVariableTakingReference(interp: *Interp, name: *Shimmerable) !OptionalValue {
+    return interp.getVariableTakingReferenceInFrame(interp.callFrameIdx(), name);
+}
+
+pub fn getVariableTakingReferenceInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !OptionalValue {
     var det: ErrorDetails = undefined;
-    const value = interp.wrapError(&det, vartypes.getVariable(interp, &det, interp.callFrameIdx(), name)) catch |err| switch (err) {
+    const value = interp.wrapError(&det, vartypes.getVariableTakingReference(
+        interp,
+        &det,
+        call_frame_idx,
+        name,
+    )) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try interp.setResultStringOwning(det.message);
@@ -1921,22 +1929,10 @@ pub fn getVariable(interp: *Interp, name: *Shimmerable) !OptionalValue {
     return OptionalValue.fromValue(value);
 }
 
-pub fn getVariableInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !OptionalValue {
-    var det: ErrorDetails = undefined;
-    const value = interp.wrapError(&det, vartypes.getVariable(interp, &det, call_frame_idx, name)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try interp.setResultStringOwning(det.message);
-            return error.EvalError;
-        },
-    };
-    return OptionalValue.fromValue(value);
-}
-
-pub fn getVariableOrError(interp: *Interp, name: *Shimmerable) !Value {
+pub fn getVariableTakingReferenceOrError(interp: *Interp, name: *Shimmerable) !Value {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, vartypes.getVariableOrError(interp, &det, interp.callFrameIdx(), name));
+    return try interp.wrapError(&det, vartypes.getVariableTakingReferenceOrError(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn unsetVariable(interp: *Interp, name: *Shimmerable) !void {

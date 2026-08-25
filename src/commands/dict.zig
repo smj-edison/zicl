@@ -33,19 +33,22 @@ fn dictAppendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: [
 }
 
 /// Equivalent to [lappend], but for a dict key.
-fn dictLappendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: []Shimmerable) !void {
+fn dictLappendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, items: []Shimmerable) !void {
     if (try interp.getMutDictValue(dict_mut, key)) |existing| {
         if (try interp.asMutableInPlace(List, existing)) |list_mut| {
-            for (pieces) |*value_shim| try list_mut.append(value_shim.current());
-            dict_mut.asHead().invalidateString();
+            try list_mut.ensureUnusedCapacity(items.len);
+            errdefer comptime unreachable; // Start of transaction.
+            for (items) |*value_shim| list_mut.appendAssumeCapacity(value_shim.current());
+            dict_mut.asHead().commitMutation();
+            return; // End of transaction.
         } else {
             const list_mut = try interp.duplicateAsType(List, existing);
             defer list_mut.asHead().dropReference();
-            for (pieces) |*value_shim| try list_mut.append(value_shim.current());
+            for (items) |*value_shim| try list_mut.append(value_shim.current());
             try dict_mut.put(key, list_mut.asHead().asValue());
         }
     } else {
-        const list_mut = try List.newFromShimmerables(pieces);
+        const list_mut = try List.newFromShimmerables(items);
         defer list_mut.asHead().dropReference();
         try dict_mut.put(key, list_mut.asHead().asValue());
     }

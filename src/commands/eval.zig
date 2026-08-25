@@ -523,6 +523,43 @@ test "letrec new" {
     try memutil.checkAllocationFailures(.exhaustive, testLetrecNew, .{});
 }
 
+// Writing through a dict-sugar path must copy-on-write exactly like the plain
+// nested form does. `set b $a` leaves both names on the same dict, so mutating
+// through `b` may not be visible through `a`.
+fn testDictSugarWriteDoesNotAlias(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("1 2",
+        \\ set a [dict create inner [dict create k 1]]
+        \\ set b $a
+        \\ dict set b::inner k 2
+        \\ list [dict get $a::inner k] [dict get $b::inner k]
+    );
+}
+
+test "dict sugar write does not alias" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictSugarWriteDoesNotAlias, .{});
+}
+
+// The plain-nested control for the test above: same two dicts, same mutation,
+// reached without the `::` path. This one passes today.
+fn testPlainNestedWriteDoesNotAlias(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("1 2",
+        \\ set a [dict create inner [dict create k 1]]
+        \\ set b $a
+        \\ dict set b inner k 2
+        \\ list [dict get $a::inner k] [dict get $b::inner k]
+    );
+}
+
+test "plain nested write does not alias" {
+    try memutil.checkAllocationFailures(.exhaustive, testPlainNestedWriteDoesNotAlias, .{});
+}
+
 fn testLetrecSelfDictSugar(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);

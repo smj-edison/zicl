@@ -242,11 +242,11 @@ const list = try objects.List.shimmerFrom(&det, &shim);
 ```
 
 **Mutating a value (copy-on-write)**:
-
-```zig
 if (try dict_raw.asMutableInPlace(objects.Dictionary, &det)) |dict| {
     try dict.put(key, value);
-    owner.asHead().invalidateString(); // Mutated in place; owner's string is stale.
+    errdefer comptime unreachable; // Continue from above transaction.
+    owner.asHead().commitMutation(); // Mutated in place; owner's string is stale.
+    return; // End of transaction.
 } else {
     const duped = try dict_raw.duplicateAsBoxed();
     defer duped.dropReference();

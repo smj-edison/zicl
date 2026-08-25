@@ -22,7 +22,8 @@ pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     const var_name = &args[1];
 
-    if ((try interp.getVariable(var_name)).asValue()) |val| {
+    if ((try interp.getVariableTakingReference(var_name)).asValue()) |val| {
+        defer val.dropReference();
         var val_shim: Shimmerable = .{ .original = val };
         defer val_shim.discardChanges();
         var det: ErrorDetails = undefined;
@@ -31,7 +32,7 @@ pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             return interp.wrapError(&det, objects.Integer.overflowError(i65, &det, @as(i65, contents) + @as(i65, increment_by)));
         };
 
-        const new_int = objects.Integer.new(new_contents);
+        const new_int = Value.newInt(new_contents);
         try interp.setVariable(var_name, new_int);
         interp.setResult(new_int);
     } else {
