@@ -17,46 +17,9 @@ const memutil = common.memutil;
 const Dictionary = objects.Dictionary;
 const List = objects.List;
 
-/// Equivalent to [append], but for a dict key.
-fn dictAppendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, pieces: []Shimmerable) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(heap.global_gpa);
-    if (try interp.getMutDictValue(dict_mut, key)) |existing| {
-        try buf.appendSlice(heap.global_gpa, try existing.getString());
-    }
-    for (pieces) |*value_shim| {
-        try buf.appendSlice(heap.global_gpa, try value_shim.current().getString());
-    }
-    const new_str = try String.newOwning(try buf.toOwnedSliceSentinel(heap.global_gpa, 0));
-    defer new_str.asHead().dropReference();
-    try dict_mut.put(key, new_str.asHead().asValue());
-}
-
-/// Equivalent to [lappend], but for a dict key.
-fn dictLappendValue(interp: *Interp, dict_mut: *Dictionary, key: Value, items: []Shimmerable) !void {
-    if (try interp.getMutDictValue(dict_mut, key)) |existing| {
-        if (try interp.asMutableInPlace(List, existing)) |list_mut| {
-            try list_mut.ensureUnusedCapacity(items.len);
-            errdefer comptime unreachable; // Start of transaction.
-            for (items) |*value_shim| list_mut.appendAssumeCapacity(value_shim.current());
-            dict_mut.asHead().commitMutation();
-            return; // End of transaction.
-        } else {
-            const list_mut = try interp.duplicateAsType(List, existing);
-            defer list_mut.asHead().dropReference();
-            for (items) |*value_shim| try list_mut.append(value_shim.current());
-            try dict_mut.put(key, list_mut.asHead().asValue());
-        }
-    } else {
-        const list_mut = try List.newFromShimmerables(items);
-        defer list_mut.asHead().dropReference();
-        try dict_mut.put(key, list_mut.asHead().asValue());
-    }
-}
-
 /// Equivalent to [incr], but for a dict key.
 fn dictIncrValue(interp: *Interp, dict_mut: *Dictionary, key: Value, increment: i64) !void {
-    const base: i64 = if (try interp.getMutDictValue(dict_mut, key)) |val| blk: {
+    const base: i64 = if (try interp.getDictValue(dict_mut, key)) |val| blk: {
         var val_shim: Shimmerable = .{ .original = val };
         defer val_shim.discardChanges();
         break :blk try interp.getInteger(&val_shim);
@@ -66,6 +29,20 @@ fn dictIncrValue(interp: *Interp, dict_mut: *Dictionary, key: Value, increment: 
         return interp.integerOverflowError(i65, @as(i65, base) + @as(i65, increment));
     };
     try dict_mut.put(key, Value.newInt(new_contents));
+}
+
+fn getMutableDict(interp: *Interp, var_name: *Shimmerable) !struct { dict: *Dictionary, needs_commit_and_drop: bool } {
+    if (try interp.getVariableForMutation(var_name)) |dict_raw| {
+        if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
+            return .{ .dict = dict_mut, .needs_commit_and_drop = false };
+        } else {
+            const duped = try interp.duplicateAsType(Dictionary, dict_raw);
+            return .{ .dict = duped, .needs_commit_and_drop = true };
+        }
+    } else {
+        const new_dict = try objects.Dictionary.newWithCapacity(&.{}, 4);
+        return .{ .dict = new_dict, .needs_commit_and_drop = true };
+    }
 }
 
 /// [dict]
@@ -133,7 +110,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         },
         .getdef => {
             const getdef_ctx = objects.ShimmerableSliceContext{ .items = args[3..(args.len - 1)] };
-            if ((try interp.getDictValueRecursively(&args[2], getdef_ctx)).asValue()) |val| {
+            if (try interp.getDictValueRecursively(&args[2], getdef_ctx)) |val| {
                 interp.setResult(val);
             } else {
                 interp.setResult(args[args.len - 1].current());
@@ -144,21 +121,11 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const key_context: objects.ShimmerableSliceContext = .{ .items = args[3..(args.len - 1)] };
             const value = args[args.len - 1].current();
 
-            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
-                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
-                    try interp.putDictValueRecursively(dict_mut, key_context, value);
-                } else {
-                    const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
-                    defer duped.asHead().dropReference();
-                    try interp.putDictValueRecursively(duped, key_context, value);
-                    try interp.setVariable(var_name, duped.asHead().asValue());
-                }
-            } else {
-                const new_dict = try objects.Dictionary.newWithCapacity(&.{}, 4);
-                defer new_dict.asHead().dropReference();
-                try interp.putDictValueRecursively(new_dict, key_context, value);
-                try interp.setVariable(var_name, new_dict.asHead().asValue());
-            }
+            const lookup = try getMutableDict(interp, var_name);
+            defer if (lookup.needs_commit_and_drop) lookup.dict.asHead().dropReference();
+            try interp.putDictValueRecursively(lookup.dict, key_context, value); // Transaction.
+            // Okay if this fails, since this only applies when `lookup.dict` is duplicated.
+            if (lookup.needs_commit_and_drop) try interp.setVariable(var_name, lookup.dict.asHead().asValue());
         },
         .unset => {
             const var_name = &args[2];
@@ -166,25 +133,15 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             const unset_ctx: objects.ShimmerableSliceContext = .{ .items = args[3..args.len] };
 
-            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
-                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
-                    _ = try interp.removeDictValueRecursively(dict_mut, unset_ctx);
-                } else {
-                    const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
-                    defer duped.asHead().dropReference();
-                    _ = try interp.removeDictValueRecursively(duped, unset_ctx);
-                    try interp.setVariable(var_name, duped.asHead().asValue());
-                }
-            } else {
-                const new_dict = try objects.Dictionary.new(&.{});
-                defer new_dict.asHead().dropReference();
-                try interp.setVariable(var_name, new_dict.asHead().asValue());
-            }
+            const lookup = try getMutableDict(interp, var_name);
+            defer if (lookup.needs_commit_and_drop) lookup.dict.asHead().dropReference();
+            _ = try interp.removeDictValueRecursively(lookup.dict, unset_ctx); // Transaction.
+            if (lookup.needs_commit_and_drop) try interp.setVariable(var_name, lookup.dict.asHead().asValue());
         },
         .exists => {
             const dict = &args[2];
             const exists_ctx: objects.ShimmerableSliceContext = .{ .items = args[3..] };
-            interp.setResultBoolean((try interp.getDictValueRecursively(dict, exists_ctx)).isSome());
+            interp.setResultBoolean(try interp.getDictValueRecursively(dict, exists_ctx) != null);
         },
         .keys, .values => {
             var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[2]));
@@ -248,16 +205,14 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const dict = &args[2];
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
-                const key = args[i].current();
-                const found = try interp.wrapError(&det, Dictionary.getFollowingLinks(&det, dict, key));
-                const value = found.asValue() orelse return interp.wrapError(&det, Dictionary.keyNotFoundError(&det, key));
-                try interp.setVariable(&args[i], value);
+                const found = try interp.getDictValueOrError(dict, args[i].current());
+                try interp.setVariable(&args[i], found);
             }
             interp.setResult(dict.current());
         },
         .size => {
             var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[2]));
-            defer kv_result.deinit(heap.local_arena); // Still need to drop the values.
+            defer kv_result.deinit(heap.local_arena); // Still need to drop the value references.
             interp.setResultInteger(@intCast(kv_result.mapping.count()));
         },
         .remove => {
@@ -291,73 +246,79 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const key = args[3].current();
             const pieces = args[4..];
 
-            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
-                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
-                    try dictAppendValue(interp, dict_mut, key, pieces);
-                    // Mutated in place, so no `setVariable` needed.
-                    interp.setResult(dict_mut.asHead().asValue());
-                } else {
-                    const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
-                    defer dict_mut.asHead().dropReference();
-                    try dictAppendValue(interp, dict_mut, key, pieces);
-                    try interp.setVariable(var_name, dict_mut.asHead().asValue());
-                    interp.setResult(dict_mut.asHead().asValue());
+            const lookup = try getMutableDict(interp, var_name);
+            defer if (lookup.needs_commit_and_drop) lookup.dict.asHead().dropReference();
+
+            {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(heap.global_gpa);
+                if (try interp.getDictValue(lookup.dict, key)) |existing| {
+                    try buf.appendSlice(heap.global_gpa, try existing.getString());
                 }
-            } else {
-                const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
-                defer dict_mut.asHead().dropReference();
-                try dictAppendValue(interp, dict_mut, key, pieces);
-                try interp.setVariable(var_name, dict_mut.asHead().asValue());
-                interp.setResult(dict_mut.asHead().asValue());
+                for (pieces) |*value_shim| {
+                    try buf.appendSlice(heap.global_gpa, try value_shim.current().getString());
+                }
+                const new_str = try String.newOwning(try buf.toOwnedSliceSentinel(heap.global_gpa, 0));
+                defer new_str.asHead().dropReference();
+                try lookup.dict.put(key, new_str.asHead().asValue()); // Transaction.
             }
+
+            if (lookup.needs_commit_and_drop) try interp.setVariable(var_name, lookup.dict.asHead().asValue());
+            interp.setResult(lookup.dict.asHead().asValue());
         },
         .lappend => {
             const var_name = &args[2];
             const key = args[3].current();
-            const pieces = args[4..];
+            const items = args[4..];
 
-            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
-                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
-                    try dictLappendValue(interp, dict_mut, key, pieces);
-                    interp.setResult(dict_mut.asHead().asValue());
+            const lookup = try getMutableDict(interp, var_name);
+            defer if (lookup.needs_commit_and_drop) lookup.dict.asHead().dropReference();
+
+            {
+                if (try interp.getDictValue(lookup.dict, key)) |existing| {
+                    if (try interp.asMutableInPlace(List, existing)) |list_mut| {
+                        try list_mut.ensureUnusedCapacity(items.len);
+                        errdefer comptime unreachable; // Start of transaction.
+                        for (items) |*value_shim| list_mut.appendAssumeCapacity(value_shim.current());
+                        lookup.dict.asHead().commitMutation();
+                        // End of transaction.
+                    } else {
+                        const list_mut = try interp.duplicateAsType(List, existing);
+                        defer list_mut.asHead().dropReference();
+                        for (items) |*value_shim| try list_mut.append(value_shim.current());
+                        try lookup.dict.put(key, list_mut.asHead().asValue()); // Transaction.
+                    }
                 } else {
-                    const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
-                    defer dict_mut.asHead().dropReference();
-                    try dictLappendValue(interp, dict_mut, key, pieces);
-                    try interp.setVariable(var_name, dict_mut.asHead().asValue());
-                    interp.setResult(dict_mut.asHead().asValue());
+                    const list_mut = try List.newFromShimmerables(items);
+                    defer list_mut.asHead().dropReference();
+                    try lookup.dict.put(key, list_mut.asHead().asValue()); // Transaction.
                 }
-            } else {
-                const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
-                defer dict_mut.asHead().dropReference();
-                try dictLappendValue(interp, dict_mut, key, pieces);
-                try interp.setVariable(var_name, dict_mut.asHead().asValue());
-                interp.setResult(dict_mut.asHead().asValue());
             }
+
+            if (lookup.needs_commit_and_drop) try interp.setVariable(var_name, lookup.dict.asHead().asValue());
+            interp.setResult(lookup.dict.asHead().asValue());
         },
         .incr => {
             const var_name = &args[2];
             const key = args[3].current();
             const increment: i64 = if (args.len == 5) (try interp.getInteger(&args[4])) else 1;
 
-            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
-                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
-                    try dictIncrValue(interp, dict_mut, key, increment);
-                    interp.setResult(dict_mut.asHead().asValue());
-                } else {
-                    const dict_mut = try interp.duplicateAsType(Dictionary, dict_raw);
-                    defer dict_mut.asHead().dropReference();
-                    try dictIncrValue(interp, dict_mut, key, increment);
-                    try interp.setVariable(var_name, dict_mut.asHead().asValue());
-                    interp.setResult(dict_mut.asHead().asValue());
-                }
-            } else {
-                const dict_mut = try Dictionary.newWithCapacity(&.{}, 4);
-                defer dict_mut.asHead().dropReference();
-                try dictIncrValue(interp, dict_mut, key, increment);
-                try interp.setVariable(var_name, dict_mut.asHead().asValue());
-                interp.setResult(dict_mut.asHead().asValue());
+            const lookup = try getMutableDict(interp, var_name);
+            defer if (lookup.needs_commit_and_drop) lookup.dict.asHead().dropReference();
+
+            {
+                const base: i64 = if (try interp.getDictValue(lookup.dict, key)) |val| blk: {
+                    break :blk try interp.wrapError(&det, objects.Integer.fromValue(&det, val));
+                } else 0;
+
+                const new_contents = std.math.add(i64, base, increment) catch {
+                    return interp.integerOverflowError(i65, @as(i65, base) + @as(i65, increment));
+                };
+                try lookup.dict.put(key, Value.newInt(new_contents)); // Transaction.
             }
+
+            if (lookup.needs_commit_and_drop) try interp.setVariable(var_name, lookup.dict.asHead().asValue());
+            interp.setResult(lookup.dict.asHead().asValue());
         },
         .@"for" => {
             const var_list = try interp.getList(&args[2]);
@@ -628,17 +589,17 @@ fn testPartialFlatten(ta: std.mem.Allocator) !void {
     try std.testing.expect(try child.remove(&det, a));
 
     // `a` is gone even though a parent held it.
-    try std.testing.expect((try child.getNoFollow(a)).isNone());
+    try std.testing.expect(try child.getNoFollow(a) == null);
     var child_shim: Shimmerable = .{ .original = child.asHead().asValue() };
     defer child_shim.discardChanges();
-    try std.testing.expect((try Dictionary.getFollowingLinks(&det, &child_shim, a)).isNone());
+    try std.testing.expect(try Dictionary.shimGetFollowingLinks(&det, &child_shim, a) == null);
 
     // The grandparent was not absorbed: the link survives and its key is still
     // reachable through it. A full flatten would have copied `c` in and dropped
     // `~parent` entirely.
-    try std.testing.expect((try child.getNoFollow(objects.interned_tilde_parent)).isSome());
-    try std.testing.expect((try child.getNoFollow(c)).isNone());
-    try std.testing.expect((try Dictionary.getFollowingLinks(&det, &child_shim, c)).isSome());
+    try std.testing.expect(try child.getNoFollow(objects.interned_tilde_parent) != null);
+    try std.testing.expect(try child.getNoFollow(c) == null);
+    try std.testing.expect(try Dictionary.shimGetFollowingLinks(&det, &child_shim, c) != null);
 }
 
 test "dict remove flattens only as far as the key reaches" {

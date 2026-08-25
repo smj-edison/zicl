@@ -29,7 +29,7 @@ pub fn llengthCmd(interp: *Interp, args: []Shimmerable) !void {
 }
 
 pub fn lappendCmd(interp: *Interp, args: []Shimmerable) !void {
-    if ((try interp.getVariableMut(&args[1])).asValue()) |var_value| {
+    if (try interp.getVariableForMutation(&args[1])) |var_value| {
         if (try interp.asMutableInPlace(List, var_value)) |list_mut| {
             try list_mut.ensureUnusedCapacity(args[2..].len);
             errdefer comptime unreachable; // Start transaction.
@@ -323,7 +323,7 @@ pub fn lsetCmd(interp: *Interp, args: []Shimmerable) !void {
         return;
     }
 
-    const list_raw = try interp.getVariableMutOrError(var_name);
+    const list_raw = try interp.getVariableForMutationOrError(var_name);
     if (try interp.asMutableInPlace(List, list_raw)) |list_mut| {
         try interp.setListValueRecursively(list_mut, args[2..(args.len - 1)], new_value);
         interp.setResult(list_mut.asHead().asValue());

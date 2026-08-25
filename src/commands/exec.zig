@@ -625,7 +625,7 @@ const interned_env = heap.InternedString.newValue("env");
 fn buildEnviron(interp: *Interp) Interp.Error!?process.Environ.Map {
     var name_shim: Shimmerable = .{ .original = interned_env };
     defer name_shim.discardChanges();
-    const env_value = (try interp.getVariableTakingReference(&name_shim)).asValue() orelse return null;
+    const env_value = try interp.getVariableTakingRef(&name_shim) orelse return null;
     defer env_value.dropReference();
 
     var det: ErrorDetails = undefined;

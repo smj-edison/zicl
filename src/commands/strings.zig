@@ -20,17 +20,14 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
     // Get the variable's value if it exists, or else use an empty string.
     const var_name = &args[1];
 
-    const var_value: []const u8 = blk: {
-        if (try interp.getVariableInner(interp.callFrameIdx(), var_name, false)) |val| {
-            break :blk try val.getString();
-        } else {
-            break :blk "";
-        }
-    };
+    const lookup = try interp.getVariableTakingRef(var_name);
+    const var_value: Value = if (lookup) |val| val else heap.interned_empty_string;
+    defer var_value.dropReference();
+    const bytes = try var_value.getString();
 
     // Fast path: no values to append, just ensure the variable exists and return it.
     if (args.len == 2) {
-        if ((try interp.getVariableTakingReference(var_name)).asValue()) |val| {
+        if (try interp.getVariableTakingRef(var_name)) |val| {
             interp.setResultOwning(val);
         } else {
             try interp.setVariable(var_name, heap.interned_empty_string);
@@ -39,28 +36,28 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
         return;
     }
 
-    // Compute total length so we can allocate a single string.
-    var total_len: usize = var_value.len;
+    // Precompute needed length.
+    var total_len: usize = bytes.len;
     for (args[2..]) |arg| {
         total_len += (try arg.current().getString()).len;
     }
 
     const combined_str = blk: {
-        var new_bytes = try heap.global_gpa.allocSentinel(u8, total_len, 0);
-        errdefer heap.global_gpa.free(new_bytes);
+        var result_bytes = try heap.global_gpa.allocSentinel(u8, total_len, 0);
+        errdefer heap.global_gpa.free(result_bytes);
 
         if (total_len > 0) {
             var pos: usize = 0;
-            @memcpy(new_bytes[pos..(pos + var_value.len)], var_value);
-            pos += var_value.len;
+            @memcpy(result_bytes[pos..(pos + bytes.len)], bytes);
+            pos += bytes.len;
             for (args[2..]) |arg| {
-                const bytes = try arg.current().getString();
-                @memcpy(new_bytes[pos..(pos + bytes.len)], bytes);
+                const item_bytes = try arg.current().getString();
+                @memcpy(result_bytes[pos..(pos + bytes.len)], item_bytes);
                 pos += bytes.len;
             }
         }
 
-        break :blk try String.newOwningNoFree(new_bytes);
+        break :blk try String.newOwningNoFree(result_bytes);
     };
     defer combined_str.asHead().dropReference();
 

@@ -936,6 +936,11 @@ pub const Integer = struct {
         }
     }
 
+    pub fn fromValue(det: ?*ErrorDetails, value: Value) !i64 {
+        if (asInt(value)) |int| return int;
+        return parse(det, try value.getString());
+    }
+
     pub fn shimmerFrom(det: ?*ErrorDetails, shim: *Shimmerable) !i64 {
         if (asInt(shim.current())) |int| return int;
         if (Float.asFloat(shim.current())) |_| {
@@ -1897,18 +1902,18 @@ pub const Dictionary = struct {
         return error.KeyNotFound;
     }
 
-    pub fn getNoFollow(self: *const Dictionary, key: Value) !OptionalValue {
+    pub fn getNoFollow(self: *const Dictionary, key: Value) !?Value {
         try heap.hashutil.cacheQuickHash(key);
-        if (self.table.get(key)) |idx| return self.items[idx].asOptional();
-        return .none;
+        if (self.table.get(key)) |idx| return self.items[idx];
+        return null;
     }
 
-    pub fn getFollowingLinksMut(self: *Dictionary, det: *ErrorDetails, key: Value) !OptionalValue {
+    pub fn getFollowingLinks(self: *Dictionary, det: ?*ErrorDetails, key: Value) !?Value {
         assert(self.asHead().canMutate());
         try heap.hashutil.cacheQuickHash(key);
 
         var dict_shim: Shimmerable = .{ .original = self.asHead().asValue() };
-        const result = try getFollowingLinks(det, &dict_shim, key);
+        const result = try shimGetFollowingLinks(det, &dict_shim, key);
         // `getFollowingLinks` currently only ever uses the `dict_shim`
         // when calling `shim.ensureShimmerable()` for shimmer writeback.
         // Because `shim.ensureShimmerable()` only sets `shimmered` if
@@ -2046,10 +2051,10 @@ pub const Dictionary = struct {
         // we have to flatten the linked dictionaries into a singular dictionary
         // so we can remove "a" without resolving to a parent.
         var dict_shim: Shimmerable = .{ .original = dict.asHead().asValue() };
-        const in_parent_dict = try getFollowingLinks(det, &dict_shim, key);
+        const in_parent_dict = try shimGetFollowingLinks(det, &dict_shim, key);
         assert(dict_shim.shimmered.isNone()); // We already checked that `dict` is mutable.
 
-        if (in_parent_dict.isSome()) {
+        if (in_parent_dict) |_| {
             // Key was found in the parent, so we do need to flatten.
             dict.flattenForKey(det, key) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -2205,7 +2210,7 @@ pub const Dictionary = struct {
     ///
     /// Transaction safe.
     pub fn flattenForKeyInner(dict: *const Dictionary, det: ?*ErrorDetails, key: Value) !?*Dictionary {
-        const parent_hash_ref = (try dict.getNoFollow(interned_tilde_parent)).asValue() orelse {
+        const parent_hash_ref = try dict.getNoFollow(interned_tilde_parent) orelse {
             return null; // We've reached the end, so no need to flatten.
         };
 
@@ -2217,7 +2222,7 @@ pub const Dictionary = struct {
         const parent_as_dict = try shimmerFrom(det, &parent_shim);
 
         const deeper = try parent_as_dict.flattenForKeyInner(det, key);
-        if (deeper == null and (try parent_as_dict.getNoFollow(key)).isNone()) {
+        if (deeper == null and try parent_as_dict.getNoFollow(key) == null) {
             // Neither this parent nor anything past it holds `key`, so the link
             // from here on can stay as it is.
             return null;
@@ -2237,7 +2242,7 @@ pub const Dictionary = struct {
         return to_add_to;
     }
 
-    pub fn getFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LookupFailed }!OptionalValue {
+    pub fn shimGetFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LookupFailed }!?Value {
         try heap.hashutil.cacheQuickHash(key);
 
         var dict = shimmerFrom(det, shim) catch |err| switch (err) {
@@ -2246,12 +2251,12 @@ pub const Dictionary = struct {
         };
 
         // See if it's immediately in this dictionary.
-        if ((try dict.getNoFollow(key)).asValue()) |val| return val.asOptional();
+        if (try dict.getNoFollow(key)) |val| return val;
 
         // Wasn't in this dictionary, so check if it's in a parent dict.
         const tilde_parent = interned_tilde_parent;
         const parent_dict: ?*const Dictionary = blk: {
-            if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {
+            if (try dict.getNoFollow(tilde_parent)) |hash_ref| {
                 var hash_ref_shim: Shimmerable = .{ .original = hash_ref };
                 defer hash_ref_shim.discardChanges();
                 const parent_dict = try HashReference.resolveAsDictionary(det, &hash_ref_shim);
@@ -2270,7 +2275,7 @@ pub const Dictionary = struct {
         if (parent_dict) |parent| {
             var parent_shim: Shimmerable = .{ .original = @constCast(parent).asHead().asValue() };
             defer parent_shim.discardChanges();
-            const looked_up = try getFollowingLinks(det, &parent_shim, key);
+            const looked_up = try shimGetFollowingLinks(det, &parent_shim, key);
             if (parent_shim.shimmered.asValue()) |value| {
                 try shim.ensureShimmerable();
                 const as_shimmerable_dict = shim.current().asType(Dictionary).?;
@@ -2280,45 +2285,67 @@ pub const Dictionary = struct {
         }
 
         // Nothing found, even after checking parent links.
-        return .none;
+        return null;
     }
 
-    pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !OptionalValue {
-        const result = try getRecursivelyInner(det, shim, context);
-        return result.looked_up;
-    }
+    /// Makes all intermediate dictionaries as well as the final result mutable.
+    pub fn getRecursivelyAllMutable(dict: *Dictionary, det: ?*ErrorDetails, context: anytype) !?Value {
+        assert(dict.asHead().canMutate());
 
-    pub const GetRecursivelyResult = struct { looked_up: OptionalValue, can_mutate: bool };
-    pub fn getRecursivelyInner(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !GetRecursivelyResult {
-        if (context.len() == 0) return .{
-            .looked_up = shim.current().asOptional(),
-            .can_mutate = shim.current().canMutate(),
-        };
+        assert(context.len() > 0);
         if (context.len() == 1) {
-            const lookup = try getFollowingLinks(det, shim, context.get(0));
-            const lookup_can_mutate = if (lookup.asValue()) |val| val.canMutate() else false;
-            return .{
-                .looked_up = lookup,
-                .can_mutate = lookup_can_mutate and shim.current().canMutate(),
-            };
+            const looked_up = try dict.getFollowingLinks(det, context.get(0)) orelse return null;
+            if (!looked_up.canMutate()) {
+                const duped = (try looked_up.duplicateAsBoxed()).asValue();
+                defer duped.dropReference();
+                try dict.put(context.get(0), duped);
+                return duped;
+            } else {
+                // We still have to invalidate the string here, since we're preparing
+                // for mutation in place.
+                dict.asHead().commitMutation();
+                return looked_up;
+            }
         }
 
-        if ((try getFollowingLinks(det, shim, context.get(0))).asValue()) |child_dict| {
+        if (try dict.getFollowingLinks(det, context.get(0))) |child_dict| {
             var child_shim: Shimmerable = .{ .original = child_dict };
             defer child_shim.discardChanges();
-            const lookup = try getRecursivelyInner(det, &child_shim, context.sliceAfter(1));
+            _ = try Dictionary.shimmerFrom(det, &child_shim);
+            if (child_shim.shimmered.isNone() and child_dict.canMutate()) {
+                const dict_mut = child_dict.asType(Dictionary).?;
+                const result = try dict_mut.getRecursivelyAllMutable(det, context.sliceAfter(1));
+                dict.asHead().commitMutation();
+                return result;
+            } else {
+                const dict_mut = try child_shim.getMutable(Dictionary, det);
+                defer dict_mut.asHead().dropReference();
+                const result = try dict_mut.getRecursivelyAllMutable(det, context.sliceAfter(1));
+                try dict.put(context.get(0), dict_mut.asHead().asValue()); // Commits mutation.
+                return result;
+            }
+        } else {
+            return null;
+        }
+    }
+
+    pub fn getRecursively(det: ?*ErrorDetails, shim: *Shimmerable, context: anytype) !?Value {
+        if (context.len() == 0) return shim.current();
+        if (context.len() == 1) return try shimGetFollowingLinks(det, shim, context.get(0));
+
+        if (try shimGetFollowingLinks(det, shim, context.get(0))) |child_dict| {
+            var child_shim: Shimmerable = .{ .original = child_dict };
+            defer child_shim.discardChanges();
+            const child_result = try getRecursively(det, &child_shim, context.sliceAfter(1));
             if (child_shim.shimmered.asValue()) |new_child| {
                 try shim.ensureShimmerable();
                 // The child dict changed, propagate back up.
                 const as_dict = shim.current().asType(Dictionary).?;
                 try as_dict.shimmerWriteback(context.get(0), new_child);
             }
-            return .{
-                .looked_up = lookup.looked_up,
-                .can_mutate = child_shim.current().canMutate() and lookup.can_mutate,
-            };
+            return child_result;
         } else {
-            return .{ .looked_up = .none, .can_mutate = false };
+            return null;
         }
     }
 
@@ -2333,7 +2360,7 @@ pub const Dictionary = struct {
 
         // Find/create the child dict.
         const child_dict = blk: {
-            if ((try dict.getNoFollow(context.get(0))).asValue()) |existing_dict| {
+            if (try dict.getNoFollow(context.get(0))) |existing_dict| {
                 break :blk existing_dict;
             } else {
                 // Create a new child dictionary.
@@ -2369,7 +2396,7 @@ pub const Dictionary = struct {
         if (context.len() == 1) return try dict.remove(det, context.get(0));
 
         const child_dict_key: Value = context.get(0);
-        if ((try dict.getNoFollow(child_dict_key)).asValue()) |child_dict| {
+        if (try dict.getNoFollow(child_dict_key)) |child_dict| {
             var child_dict_shim: Shimmerable = .{ .original = child_dict };
             defer child_dict_shim.discardChanges();
             _ = try Dictionary.shimmerFrom(det, &child_dict_shim);
@@ -2430,7 +2457,7 @@ pub const Dictionary = struct {
 
     fn dictGetKvPairsInner(det: ?*ErrorDetails, arena: std.mem.Allocator, shim: *Shimmerable, result: *KvResult) !void {
         const as_dict = try shimmerFrom(det, shim);
-        if ((try as_dict.getNoFollow(interned_tilde_parent)).asValue()) |parent_link| {
+        if (try as_dict.getNoFollow(interned_tilde_parent)) |parent_link| {
             var parent_link_shim: Shimmerable = .{ .original = parent_link };
             defer parent_link_shim.discardChanges();
 
@@ -2555,8 +2582,8 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const bad_key = try String.newValue("bogus");
     defer bad_key.dropReference();
 
-    try testing.expectEqualStrings("1", try (try dict1.getNoFollow(good_key)).asValue().?.getString());
-    try testing.expectEqual(.none, (try dict1.getNoFollow(bad_key)).raw.tag);
+    try testing.expectEqualStrings("1", try (try dict1.getNoFollow(good_key)).?.getString());
+    try testing.expect(try dict1.getNoFollow(bad_key) == null);
 
     // Dict with duplicate entries.
     var dup_shim: Shimmerable = .{ .original = try String.newValue("foo 5 bar 10 foo 15") };
@@ -2564,7 +2591,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     const dup_dict = try Dictionary.shimmerFrom(&det, &dup_shim);
     try testing.expectEqual(3, dup_dict.items.len / 2);
     // A duplicate key maps to its last value.
-    try testing.expectEqualStrings("15", try (try dup_dict.getNoFollow(key_foo)).asValue().?.getString());
+    try testing.expectEqualStrings("15", try (try dup_dict.getNoFollow(key_foo)).?.getString());
 
     const as_dict_mut = dup_shim.current().asType(Dictionary).?;
     _ = as_dict_mut.removeDuplicates(null);
@@ -2588,7 +2615,7 @@ fn testDicts(ta: std.mem.Allocator) !void {
     // Add a new key; pair count grows.
     try dict_for_put.put(key3, value3);
     try testing.expectEqual(@as(usize, 3), dict_for_put.items.len / 2);
-    try testing.expectEqualStrings("3", try (try dict_for_put.getNoFollow(key3)).asValue().?.getString());
+    try testing.expectEqualStrings("3", try (try dict_for_put.getNoFollow(key3)).?.getString());
 
     // Dict remove. Tcl removes all matching keys, so both "foo" pairs go.
     const dict_for_remove = try Dictionary.new(&.{ key_foo, value1, key_bar, value2, key_foo, value3 });
@@ -2602,15 +2629,15 @@ fn testDicts(ta: std.mem.Allocator) !void {
 
     // Use a value as a key, and a key as the value.
     try dict_edge_cases.put(dict_edge_cases.items[1], dict_edge_cases.items[2]);
-    try testing.expectEqualStrings("bar", try (try dict_edge_cases.getNoFollow(value1)).asValue().?.getString());
+    try testing.expectEqualStrings("bar", try (try dict_edge_cases.getNoFollow(value1)).?.getString());
 
     // Alias a key by using it as both key and value.
     try dict_edge_cases.put(dict_edge_cases.items[0], dict_edge_cases.items[0]);
-    try testing.expectEqualStrings("foo", try (try dict_edge_cases.getNoFollow(key_foo)).asValue().?.getString());
+    try testing.expectEqualStrings("foo", try (try dict_edge_cases.getNoFollow(key_foo)).?.getString());
 
     // Alias a value by using it as both key and value.
     try dict_edge_cases.put(dict_edge_cases.items[3], dict_edge_cases.items[3]);
-    try testing.expectEqualStrings("2", try (try dict_edge_cases.getNoFollow(value2)).asValue().?.getString());
+    try testing.expectEqualStrings("2", try (try dict_edge_cases.getNoFollow(value2)).?.getString());
 }
 
 test "dicts" {
@@ -2648,30 +2675,30 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
     const path_foo_bar = ValueSliceContext{ .items = &.{ key_foo, key_bar } };
     try testing.expectEqualStrings(
         "2",
-        try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).asValue().?.getString(),
+        try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).?.getString(),
     );
 
     // A missing leaf, and a missing top-level key, both yield none.
     const path_foo_bogus = ValueSliceContext{ .items = &.{ key_foo, bad_key } };
-    try testing.expectEqual(.none, (try Dictionary.getRecursively(null, &outer_shim, path_foo_bogus)).raw.tag);
+    try testing.expect((try Dictionary.getRecursively(null, &outer_shim, path_foo_bogus)) == null);
     const path_bogus = ValueSliceContext{ .items = &.{bad_key} };
-    try testing.expectEqual(.none, (try Dictionary.getRecursively(null, &outer_shim, path_bogus)).raw.tag);
+    try testing.expect((try Dictionary.getRecursively(null, &outer_shim, path_bogus)) == null);
 
     // putRecursively into an existing nested key creates a new leaf beside the old one.
     const path_foo_baz = ValueSliceContext{ .items = &.{ key_foo, key_baz } };
     try outer_dict.putRecursively(null, path_foo_baz, value3);
-    try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_baz)).asValue().?.getString());
+    try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_baz)).?.getString());
     // The pre-existing sibling is untouched.
-    try testing.expectEqualStrings("2", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).asValue().?.getString());
+    try testing.expectEqualStrings("2", try (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).?.getString());
 
     // putRecursively creating a wholly new child dict at a fresh top-level key.
     const path_qux_baz = ValueSliceContext{ .items = &.{ key_qux, key_baz } };
     try outer_dict.putRecursively(null, path_qux_baz, value3);
-    try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_qux_baz)).asValue().?.getString());
+    try testing.expectEqualStrings("3", try (try Dictionary.getRecursively(null, &outer_shim, path_qux_baz)).?.getString());
 
     // removeRecursively drops the nested leaf.
     try testing.expect(try outer_dict.removeRecursively(null, path_foo_bar));
-    try testing.expectEqual(.none, (try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)).raw.tag);
+    try testing.expect((try Dictionary.getRecursively(null, &outer_shim, path_foo_bar)) == null);
 
     // removeRecursively on a missing intermediate key errors.
     const path_bogus_baz = ValueSliceContext{ .items = &.{ bad_key, key_baz } };
@@ -2680,4 +2707,58 @@ fn testRecursiveDicts(ta: std.mem.Allocator) !void {
 
 test "dict recursive" {
     try testing.checkAllAllocationFailures(testing.allocator, testRecursiveDicts, .{});
+}
+
+fn testGetRecursivelyAllMutable(ta: std.mem.Allocator) !void {
+    try heap.testStart(ta, testing.io);
+    defer heap.testFinish();
+
+    const key_foo = try String.newValue("foo");
+    defer key_foo.dropReference();
+    const key_bar = try String.newValue("bar");
+    defer key_bar.dropReference();
+    const value2 = try String.newValue("2");
+    defer value2.dropReference();
+    const value9 = try String.newValue("9");
+    defer value9.dropReference();
+
+    // Case 1: leaf is shared, so it must be duplicated and written back.
+    {
+        const inner = try Dictionary.new(&.{ key_bar, value2 });
+        defer inner.asHead().dropReference();
+        const outer = try Dictionary.new(&.{ key_foo, inner.asHead().asValue() });
+        defer outer.asHead().dropReference();
+
+        _ = try outer.asHead().asValue().getString(); // Force the ancestor's string rep.
+
+        const path_foo = ValueSliceContext{ .items = &.{key_foo} };
+        const leaf = (try outer.getRecursivelyAllMutable(null, path_foo)).?;
+        try testing.expect(leaf.canMutate());
+        try leaf.asType(Dictionary).?.put(key_bar, value9);
+
+        try testing.expectEqualStrings("foo {bar 9}", try outer.asHead().asValue().getString());
+        // The original must not have been aliased.
+        try testing.expectEqualStrings("bar 2", try inner.asHead().asValue().getString());
+    }
+
+    // Case 2: leaf is already unshared, so it takes the pass-through branch.
+    {
+        const inner = try Dictionary.new(&.{ key_bar, value2 });
+        const outer = try Dictionary.new(&.{ key_foo, inner.asHead().asValue() });
+        defer outer.asHead().dropReference();
+        inner.asHead().dropReference(); // `outer` is now the sole owner.
+
+        _ = try outer.asHead().asValue().getString(); // Force the ancestor's string rep.
+
+        const path_foo = ValueSliceContext{ .items = &.{key_foo} };
+        const leaf = (try outer.getRecursivelyAllMutable(null, path_foo)).?;
+        try testing.expect(leaf.canMutate());
+        try leaf.asType(Dictionary).?.put(key_bar, value9);
+
+        try testing.expectEqualStrings("foo {bar 9}", try outer.asHead().asValue().getString());
+    }
+}
+
+test "dict getRecursivelyAllMutable" {
+    try testing.checkAllAllocationFailures(testing.allocator, testGetRecursivelyAllMutable, .{});
 }

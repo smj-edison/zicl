@@ -22,7 +22,7 @@ pub fn incrCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     const var_name = &args[1];
 
-    if ((try interp.getVariableTakingReference(var_name)).asValue()) |val| {
+    if (try interp.getVariableTakingRef(var_name)) |val| {
         defer val.dropReference();
         var val_shim: Shimmerable = .{ .original = val };
         defer val_shim.discardChanges();
@@ -48,11 +48,11 @@ pub fn setCmd(interp: *Interp, args: []Shimmerable) !void {
 
     if (args.len == 2) {
         // Return the value.
-        interp.setResultOwning(try interp.getVariableTakingReferenceOrError(var_name));
+        interp.setResultOwning(try interp.getVariableTakingRefOrError(var_name));
     } else {
         try interp.setVariable(var_name, args[2].current());
         // Return the stored value (may differ from args[2] after upvar follow).
-        interp.setResultOwning(try interp.getVariableTakingReferenceOrError(var_name));
+        interp.setResultOwning(try interp.getVariableTakingRefOrError(var_name));
     }
 }
 

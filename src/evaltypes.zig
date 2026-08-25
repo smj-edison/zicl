@@ -889,8 +889,7 @@ pub const Expression = struct {
                 // `CachedLocalVar`/`DictSugar` in place.
                 var name_shim: Shimmerable = .{ .original = node.data.value };
                 defer name_shim.discardChanges();
-                const var_value = try interp.getVariableOrError(&name_shim);
-                return var_value.takeReference();
+                return try interp.getVariableTakingRefOrError(&name_shim);
             },
             .bool_and => {
                 const children = node.data.binary;
@@ -1258,7 +1257,7 @@ pub const Closure = struct {
         const maybe_scope = try as_dict.getNoFollow(interned_scope);
 
         const args, const body = blk: {
-            if (maybe_impl.asValue()) |impl| {
+            if (maybe_impl) |impl| {
                 var impl_wb: Shimmerable = .{ .original = impl };
                 defer impl_wb.discardChanges();
                 const as_list = objects.List.shimmerFrom(null, &impl_wb) catch |err| switch (err) {
@@ -1306,7 +1305,7 @@ pub const Closure = struct {
 
         // Scope must always be a dictionary.
         var scope: ?*objects.Dictionary = null;
-        if (maybe_scope.asValue()) |scope_hash_ref| {
+        if (maybe_scope) |scope_hash_ref| {
             var scope_hash_ref_shim: Shimmerable = .{ .original = scope_hash_ref };
             defer scope_hash_ref_shim.discardChanges();
             // We know we're the only ones who own it, so const cast won't violate any assumptions.
@@ -1343,7 +1342,7 @@ pub const Closure = struct {
             .required_arity = parsed_args.required_arity,
             .optional_arity = parsed_args.optional_values.len,
             .body = body,
-            .name = maybe_name.takeReference(),
+            .name = if (maybe_name) |name| name.takeReference().asOptional() else .none,
             .scope = scope,
             .has_args_parameter = parsed_args.has_args_parameter,
             .is_method = is_method,
@@ -1642,8 +1641,8 @@ pub const Letrec = struct {
             else => return badLetrec(det, bytes),
         };
 
-        const scope = (try as_dict.getNoFollow(Closure.interned_scope)).asValue() orelse return badLetrec(det, bytes);
-        const selected = (try as_dict.getNoFollow(interned_select)).asValue() orelse return badLetrec(det, bytes);
+        const scope = try as_dict.getNoFollow(Closure.interned_scope) orelse return badLetrec(det, bytes);
+        const selected = try as_dict.getNoFollow(interned_select) orelse return badLetrec(det, bytes);
         if (try selected.equals(objects.interned_tilde_parent)) return vartypes.badVariableNameError(det, "~parent");
 
         var scope_hash_ref_shim: Shimmerable = .{ .original = scope };

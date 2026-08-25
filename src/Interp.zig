@@ -348,7 +348,7 @@ pub fn callClosure(
     if (is_method) {
         var self_var_name: Shimmerable = .{ .original = arg_names[0] };
         defer self_var_name.discardChanges(); // TODO PERF don't discard, write back.
-        if (vartypes.getVariableTakingReferenceOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
+        if (vartypes.getVariableTakingRefOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
             args[1].shimmered.swap(updated_self);
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -632,7 +632,7 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
             .upvar => |link| {
                 var name_shim: Shimmerable = .{ .original = link.linked_name };
                 defer name_shim.discardChanges();
-                if ((try interp.getVariableTakingReferenceInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
+                if (try interp.getVariableTakingRefInFrame(link.call_frame, &name_shim)) |linked_value| {
                     defer linked_value.dropReference();
                     try new_scope.put(name, linked_value);
                 } else {
@@ -765,7 +765,7 @@ fn substituteOneToken(interp: *Interp, tag: Tokenizer.Token.Tag, value: Value) !
         .variable_subst => {
             var name_shim: Shimmerable = .{ .original = value };
             defer name_shim.discardChanges();
-            return try interp.getVariableTakingReferenceOrError(&name_shim);
+            return try interp.getVariableTakingRefOrError(&name_shim);
         },
         .expression_sugar => {
             return try interp.evalExpression(value);
@@ -924,7 +924,7 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
             .cache_key = @as(u256, closure.content.cache_id),
         } };
     } else if (shim.current().asType(Letrec)) |letrec| {
-        const closure_value = (try letrec.scope.getNoFollow(letrec.selected)).asValue() orelse {
+        const closure_value = try letrec.scope.getNoFollow(letrec.selected) orelse {
             try interp.setResultFormatted("\"{s}\" does not exist in letrec scope", .{try letrec.selected.getString()});
             return error.CommandNotFound;
         };
@@ -966,7 +966,7 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
         return error.CommandNotFound;
     } else if (bytes.len > Letrec.prefix.len and std.mem.eql(u8, bytes[0..Letrec.prefix.len], Letrec.prefix)) {
         const letrec: *const Letrec = try interp.wrapError(&det, Letrec.shimmerFrom(&det, shim));
-        const closure_value = (try letrec.scope.getNoFollow(letrec.selected)).asValue() orelse {
+        const closure_value = try letrec.scope.getNoFollow(letrec.selected) orelse {
             try interp.setResultFormatted("\"{s}\" does not exist in letrec scope", .{try letrec.selected.getString()});
             return error.CommandNotFound;
         };
@@ -985,8 +985,7 @@ pub fn getCommandFromValue(interp: *Interp, shim: *Shimmerable, can_be_method: b
 
 /// If variant is `closure`, then the closure is returned referenced.
 pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_be_method: bool) !CommandVariant {
-    const var_val_raw = try interp.getVariableTakingReferenceInFrame(call_frame_idx, name);
-    const var_val = var_val_raw.asValue() orelse {
+    const var_val = try interp.getVariableTakingRefInFrame(call_frame_idx, name) orelse {
         try interp.setResultFormatted("invalid command name \"{s}\"", .{try name.current().getString()});
         return error.CommandNotFound;
     };
@@ -1267,7 +1266,7 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         // foo::bar would have foo as `self`, or foo::bar::baz would have foo::bar as `self`.
         var dict_name_shim: Shimmerable = .{ .original = dict_sugar.dict_name };
         defer dict_name_shim.discardChanges();
-        const dict_resolved = vartypes.getVariableTakingReference(
+        const dict_resolved = vartypes.getVariableTakingRef(
             interp,
             null,
             interp.callFrameIdx(),
@@ -1287,14 +1286,14 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
         var dict_shim: Shimmerable = .{ .original = dict_resolved.? };
         defer dict_shim.discardChanges();
         var det: ErrorDetails = undefined;
-        const maybe_self: OptionalValue = try interp.wrapError(&det, Dictionary.getRecursively(&det, &dict_shim, method_ctx));
+        const maybe_self: ?Value = try interp.wrapError(&det, Dictionary.getRecursively(&det, &dict_shim, method_ctx));
         if (dict_shim.shimmered.asValue()) |new_dict| {
             var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
             defer dict_name.discardChanges();
             try interp.wrapError(&det, vartypes.setVariable(interp, &det, interp.callFrameIdx(), &dict_name, new_dict));
         }
 
-        if (maybe_self.asValue()) |self| {
+        if (maybe_self) |self| {
             return .{ .command = command, .self = self.takeReference().asOptional() };
         } else {
             const var_name = try method_dict_path.current().getString();
@@ -1351,35 +1350,24 @@ pub fn invokeCommandMaybeMethod(
         var det: ErrorDetails = undefined;
         try method_dict_path.ensureShimmerable();
 
-        const ensure_result = try interp.wrapError(
-            &det,
-            vartypes.ensureValidVariableType(interp, &det, call_frame, method_dict_path),
-        );
-        const as_dict_sugar = blk: {
-            switch (ensure_result) {
-                .not_found => {
-                    const args_list = command.closure.closure.content.arg_names;
-                    const self_name = try args_list.items[0].getString();
-                    try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
-                    return error.EvalError;
-                },
-                .normal => unreachable,
-                .dict_sugar => {
-                    // What we want.
-                    break :blk try vartypes.DictSugar.shimmerAssumeValid(method_dict_path);
-                },
-            }
+        const ensure_result = try interp.wrapError(&det, vartypes.ensureValidVariableType(interp, &det, call_frame, method_dict_path));
+        const as_dict_sugar = blk: switch (ensure_result) {
+            .not_found => unreachable, // .dict_sugar will always be returned.
+            .normal => unreachable,
+            .dict_sugar => {
+                // What we want.
+                break :blk method_dict_path.current().asType(vartypes.DictSugar).?;
+            },
         };
+
         var dict_name: Shimmerable = .{ .original = as_dict_sugar.dict_name };
         defer dict_name.discardChanges();
-
-        const dict_resolved = try interp.wrapError(&det, vartypes.getVariableInnerOrError(
-            interp,
-            &det,
-            call_frame,
-            &dict_name,
-            true,
-        ));
+        const dict_resolved = try interp.getVariableForMutationInFrame(call_frame, &dict_name) orelse {
+            const args_list = command.closure.closure.content.arg_names;
+            const self_name = try args_list.items[0].getString();
+            try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
+            return error.EvalError;
+        };
 
         if (as_dict_sugar.dict_path.items.len == 1) {
             try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()));
@@ -1917,48 +1905,35 @@ pub fn setVariableUpvar(
     ));
 }
 
-pub fn getVariableTakingReference(interp: *Interp, name: *Shimmerable) !OptionalValue {
-    return interp.getVariableTakingReferenceInFrame(interp.callFrameIdx(), name);
+pub fn getVariableTakingRef(interp: *Interp, name: *Shimmerable) !?Value {
+    return try interp.getVariableTakingRefInFrame(interp.callFrameIdx(), name);
 }
 
-pub fn getVariableInner(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, get_for_mutation: bool) !?Value {
+pub fn getVariableTakingRefInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !?Value {
     var det: ErrorDetails = undefined;
-    return interp.wrapError(&det, vartypes.getVariableInner(interp, &det, call_frame_idx, name, get_for_mutation));
+    return interp.wrapError(&det, vartypes.getVariableTakingRef(interp, &det, call_frame_idx, name));
 }
 
-pub fn getVariableTakingReferenceInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !OptionalValue {
+pub fn getVariableForMutation(interp: *Interp, name: *Shimmerable) !?Value {
+    return try interp.getVariableForMutation(name);
+}
+
+pub fn getVariableForMutationInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !?Value {
     var det: ErrorDetails = undefined;
-    const value = interp.wrapError(&det, vartypes.getVariableTakingReference(
-        interp,
-        &det,
-        call_frame_idx,
-        name,
-    )) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try interp.setResultStringOwning(det.message);
-            return error.EvalError;
-        },
-    };
-    return OptionalValue.fromValue(value);
+    return try interp.wrapError(&det, vartypes.getVariableForMutation(interp, &det, call_frame_idx, name));
 }
 
-pub fn getVariableMut(interp: *Interp, name: *Shimmerable) !OptionalValue {
-    var det: ErrorDetails = undefined;
-    const looked_up = try interp.wrapError(&det, vartypes.getVariableInner(interp, &det, interp.callFrameIdx(), name, true));
-    return OptionalValue.fromValue(looked_up);
-}
-
-pub fn getVariableMutOrError(interp: *Interp, name: *Shimmerable) !Value {
-    var det: ErrorDetails = undefined;
-    const looked_up = try interp.wrapError(&det, vartypes.getVariableInnerOrError(interp, &det, interp.callFrameIdx(), name, true));
-    return looked_up;
-}
-
-pub fn getVariableTakingReferenceOrError(interp: *Interp, name: *Shimmerable) !Value {
+pub fn getVariableForMutationOrError(interp: *Interp, name: *Shimmerable) !Value {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    const looked_up = try interp.wrapError(&det, vartypes.getVariableInnerOrError(interp, &det, interp.callFrameIdx(), name, false));
+    const looked_up = try interp.wrapError(&det, vartypes.getVariableForMutationOrError(interp, &det, interp.callFrameIdx(), name));
+    return looked_up.takeReference();
+}
+
+pub fn getVariableTakingRefOrError(interp: *Interp, name: *Shimmerable) !Value {
+    try name.ensureShimmerable();
+    var det: ErrorDetails = undefined;
+    const looked_up = try interp.wrapError(&det, vartypes.getVariableTakingRefOrError(interp, &det, interp.callFrameIdx(), name));
     return looked_up.takeReference();
 }
 
@@ -1973,42 +1948,40 @@ pub fn unsetVariableSilent(interp: *Interp, name: *Shimmerable) !void {
     try vartypes.unsetVariable(interp, null, interp.callFrameIdx(), name);
 }
 
-pub fn getDictValue(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!?Value {
+pub fn shimGetDictValue(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!?Value {
     var det: ErrorDetails = undefined;
-    const opt = try interp.wrapError(&det, objects.Dictionary.getFollowingLinks(&det, dict, key));
-    return opt.asValue();
+    return try interp.wrapError(&det, objects.Dictionary.shimGetFollowingLinks(&det, dict, key));
 }
 
-pub fn getMutDictValue(interp: *Interp, dict: *Dictionary, key: Value) heap.Error!?Value {
+pub fn getDictValue(interp: *Interp, dict: *Dictionary, key: Value) heap.Error!?Value {
     var det: ErrorDetails = undefined;
-    const opt = try interp.wrapError(&det, dict.getFollowingLinksMut(&det, key));
-    return opt.asValue();
+    return try interp.wrapError(&det, dict.getFollowingLinks(&det, key));
 }
 
 pub fn getDictValueOrError(interp: *Interp, dict: *Shimmerable, key: Value) heap.Error!Value {
-    const result = try interp.getDictValue(dict, key);
+    const result = try interp.shimGetDictValue(dict, key);
     if (result) |val| return val;
 
-    try interp.setResultFormatted("could not find value for key \"{s}\"", .{try key.getString()});
-    return error.EvalError;
+    var det: ErrorDetails = undefined;
+    return interp.wrapError(&det, Dictionary.keyNotFoundError(&det, key));
 }
 
 pub fn getDictValueInPlace(interp: *Interp, dict: *Value, key: Value) !?Value {
     var dict_shim: Shimmerable = .{ .original = dict.* };
     errdefer dict_shim.discardChanges();
-    const result = try interp.getDictValue(&dict_shim, key);
+    const result = try interp.shimGetDictValue(&dict_shim, key);
     dict.* = dict_shim.consume();
     return result;
 }
 
-pub fn getDictValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!OptionalValue {
+pub fn getDictValueRecursively(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!?Value {
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, objects.Dictionary.getRecursively(&det, shim, context));
 }
 
 pub fn getDictValueRecursivelyOrError(interp: *Interp, shim: *Shimmerable, context: anytype) heap.Error!Value {
     const result = try interp.getDictValueRecursively(shim, context);
-    if (result.asValue()) |val| return val;
+    if (result) |val| return val;
 
     // Else, create a useful error message.
     if (context.len() == 1) {
@@ -2085,7 +2058,7 @@ test "recursive dict keys" {
     const to_take = (try interp.getDictValueRecursively(
         &dict_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).asValue().?;
+    )).?;
 
     // See if setting still works correctly.
     try interp.putDictValueRecursively(
@@ -2102,7 +2075,7 @@ test "recursive dict keys" {
     const value_result = (try interp.getDictValueRecursively(
         &dict_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).asValue().?;
+    )).?;
     try testing.expectEqualStrings("foo", try value_result.getString());
 }
 
@@ -2202,7 +2175,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     const intermediate = (try interp.getDictValueRecursively(
         &interm_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).asValue().?;
+    )).?;
     intermediate.asPtr().?.incrRefCount();
     defer intermediate.dropReference();
 
@@ -2222,7 +2195,7 @@ fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
     const foo_bar_result = (try interp.getDictValueRecursively(
         &interm_shim,
         objects.ValueSliceContext{ .items = &.{ key_foo, key_bar } },
-    )).asValue().?;
+    )).?;
     try testing.expectEqualStrings("foo qux", try foo_bar_result.getString());
     // Reference count should drop by 1 since the parent no longer references it.
     try testing.expectEqual(initial_refcount - 1, intermediate.asPtr().?.getRefCount());

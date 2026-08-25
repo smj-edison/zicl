@@ -637,7 +637,7 @@ export fn Zicl_ShimDictGet(
     key: Value,
     out: *OptionalValue,
 ) callconv(.c) ReturnCode {
-    const result = interp.getDictValue(shim, key) catch |err| {
+    const result = interp.shimGetDictValue(shim, key) catch |err| {
         out.* = .none;
         return ReturnCode.fromError(err);
     };

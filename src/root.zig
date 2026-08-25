@@ -30,25 +30,27 @@ pub fn main(init: std.process.Init) !void {
         try stdout.writeAll("> ");
         try stdout.flush();
 
-        // Read the next line.
+        // Read the next line. Check what is already buffered before reading
+        // more, or piped input past the first line is dropped at EOF.
         while (true) {
+            if (std.mem.indexOfScalarPos(u8, stdin.buffer[0..stdin.end], stdin.seek, '\n')) |end| {
+                try line_read.appendSlice(init.gpa, stdin.buffer[stdin.seek..end]);
+                stdin.toss(end - stdin.seek + 1);
+                break;
+            }
+
+            try line_read.appendSlice(init.gpa, stdin.buffered());
+            stdin.tossBuffered();
+
             stdin.fillMore() catch |err| switch (err) {
                 error.ReadFailed => return error.ReadFailed,
                 error.EndOfStream => {
+                    if (line_read.items.len > 0) break;
                     try stdout.writeAll("\nGoodbye!\n");
                     try stdout.flush();
                     return;
                 },
             };
-
-            if (std.mem.indexOfScalarPos(u8, stdin.buffer[0..stdin.end], stdin.seek, '\n')) |end| {
-                try line_read.appendSlice(init.gpa, stdin.buffer[stdin.seek..end]);
-                stdin.toss(end - stdin.seek + 1);
-                break;
-            } else {
-                try line_read.appendSlice(init.gpa, stdin.buffered());
-                stdin.tossBuffered();
-            }
         }
 
         const str_handle = try objects.String.newValue(line_read.items);
