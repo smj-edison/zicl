@@ -560,6 +560,40 @@ test "plain nested write does not alias" {
     try memutil.checkAllocationFailures(.exhaustive, testPlainNestedWriteDoesNotAlias, .{});
 }
 
+// A nested write must invalidate the cached string rep of every dict on the path.
+fn testDictSugarWriteInvalidatesParentString(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("inner {k 2}",
+        \\ set a [dict create inner [dict create k 1]]
+        \\ set forceStringRep "$a"
+        \\ dict set a::inner k 2
+        \\ set a
+    );
+}
+
+test "dict sugar write invalidates parent string" {
+    try memutil.checkAllocationFailures(.exhaustive, testDictSugarWriteInvalidatesParentString, .{});
+}
+
+// The plain-nested control for the test above.
+fn testPlainNestedWriteInvalidatesParentString(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    try interp.testExpectScriptResult("inner {k 2}",
+        \\ set a [dict create inner [dict create k 1]]
+        \\ set forceStringRep "$a"
+        \\ dict set a inner k 2
+        \\ set a
+    );
+}
+
+test "plain nested write invalidates parent string" {
+    try memutil.checkAllocationFailures(.exhaustive, testPlainNestedWriteInvalidatesParentString, .{});
+}
+
 fn testLetrecSelfDictSugar(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);

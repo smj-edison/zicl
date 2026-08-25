@@ -1551,11 +1551,12 @@ pub const List = struct {
 
         var child_shim: Shimmerable = .{ .original = list.items[index] };
         defer child_shim.discardChanges();
+        _ = try shimmerFrom(det, &child_shim);
 
         if (child_shim.shimmered.isNone() and list.items[index].canMutate()) {
-            errdefer comptime unreachable; // Start transaction.
-            const as_list = list.items[index].asType(List).?;
-            try as_list.setRecursively(det, indexes[1..], value);
+            const child_as_list = list.items[index].asType(List).?;
+            try child_as_list.setRecursively(det, indexes[1..], value);
+            errdefer comptime unreachable; // Continue from above transaction.
             list.asHead().commitMutation();
             return; // End transaction.
         } else {
@@ -2313,7 +2314,7 @@ pub const Dictionary = struct {
                 try as_dict.shimmerWriteback(context.get(0), new_child);
             }
             return .{
-                .looked_up = lookup,
+                .looked_up = lookup.looked_up,
                 .can_mutate = child_shim.current().canMutate() and lookup.can_mutate,
             };
         } else {

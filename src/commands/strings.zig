@@ -21,7 +21,7 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
     const var_name = &args[1];
 
     const var_value: []const u8 = blk: {
-        if ((try interp.getVariable(var_name)).asValue()) |val| {
+        if (try interp.getVariableInner(interp.callFrameIdx(), var_name, false)) |val| {
             break :blk try val.getString();
         } else {
             break :blk "";
@@ -30,8 +30,8 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
 
     // Fast path: no values to append, just ensure the variable exists and return it.
     if (args.len == 2) {
-        if ((try interp.getVariable(var_name)).asValue()) |val| {
-            interp.setResult(val);
+        if ((try interp.getVariableTakingReference(var_name)).asValue()) |val| {
+            interp.setResultOwning(val);
         } else {
             try interp.setVariable(var_name, heap.interned_empty_string);
             interp.setEmptyResult();

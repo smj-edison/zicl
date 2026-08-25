@@ -48,11 +48,11 @@ pub fn setCmd(interp: *Interp, args: []Shimmerable) !void {
 
     if (args.len == 2) {
         // Return the value.
-        interp.setResult(try interp.getVariableOrError(var_name));
+        interp.setResultOwning(try interp.getVariableTakingReferenceOrError(var_name));
     } else {
         try interp.setVariable(var_name, args[2].current());
         // Return the stored value (may differ from args[2] after upvar follow).
-        interp.setResult(try interp.getVariableOrError(var_name));
+        interp.setResultOwning(try interp.getVariableTakingReferenceOrError(var_name));
     }
 }
 

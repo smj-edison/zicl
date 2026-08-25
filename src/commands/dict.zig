@@ -144,8 +144,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const key_context: objects.ShimmerableSliceContext = .{ .items = args[3..(args.len - 1)] };
             const value = args[args.len - 1].current();
 
-            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
-                if (try interp.wrapError(&det, dict_raw.asMutableInPlace(Dictionary, &det))) |dict_mut| {
+            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
+                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
                     try interp.putDictValueRecursively(dict_mut, key_context, value);
                 } else {
                     const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
@@ -166,8 +166,8 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             const unset_ctx: objects.ShimmerableSliceContext = .{ .items = args[3..args.len] };
 
-            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
-                if (try interp.wrapError(&det, dict_raw.asMutableInPlace(Dictionary, &det))) |dict_mut| {
+            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
+                if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
                     _ = try interp.removeDictValueRecursively(dict_mut, unset_ctx);
                 } else {
                     const duped = try interp.wrapError(&det, dict_raw.duplicateAsType(Dictionary, &det));
@@ -291,7 +291,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const key = args[3].current();
             const pieces = args[4..];
 
-            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
                 if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
                     try dictAppendValue(interp, dict_mut, key, pieces);
                     // Mutated in place, so no `setVariable` needed.
@@ -316,7 +316,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const key = args[3].current();
             const pieces = args[4..];
 
-            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
                 if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
                     try dictLappendValue(interp, dict_mut, key, pieces);
                     interp.setResult(dict_mut.asHead().asValue());
@@ -340,7 +340,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const key = args[3].current();
             const increment: i64 = if (args.len == 5) (try interp.getInteger(&args[4])) else 1;
 
-            if ((try interp.getVariable(var_name)).asValue()) |dict_raw| {
+            if ((try interp.getVariableMut(var_name)).asValue()) |dict_raw| {
                 if (try interp.asMutableInPlace(Dictionary, dict_raw)) |dict_mut| {
                     try dictIncrValue(interp, dict_mut, key, increment);
                     interp.setResult(dict_mut.asHead().asValue());

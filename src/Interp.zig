@@ -632,7 +632,8 @@ pub fn captureScope(interp: *Interp, call_frame_idx: u32) !*Dictionary {
             .upvar => |link| {
                 var name_shim: Shimmerable = .{ .original = link.linked_name };
                 defer name_shim.discardChanges();
-                if ((try interp.getVariableInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
+                if ((try interp.getVariableTakingReferenceInFrame(link.call_frame, &name_shim)).asValue()) |linked_value| {
+                    defer linked_value.dropReference();
                     try new_scope.put(name, linked_value);
                 } else {
                     try interp.setResultFormatted(
@@ -1372,7 +1373,13 @@ pub fn invokeCommandMaybeMethod(
         var dict_name: Shimmerable = .{ .original = as_dict_sugar.dict_name };
         defer dict_name.discardChanges();
 
-        const dict_resolved = try interp.wrapError(&det, vartypes.getVariableOrError(interp, &det, call_frame, &dict_name));
+        const dict_resolved = try interp.wrapError(&det, vartypes.getVariableInnerOrError(
+            interp,
+            &det,
+            call_frame,
+            &dict_name,
+            true,
+        ));
 
         if (as_dict_sugar.dict_path.items.len == 1) {
             try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()));
@@ -1380,18 +1387,20 @@ pub fn invokeCommandMaybeMethod(
             const all_but_last = as_dict_sugar.dict_path.items[0..(as_dict_sugar.dict_path.items.len - 1)];
             const put_ctx = objects.ValueSliceContext{ .items = all_but_last };
 
-            const duplicate = if (dict_resolved.canMutate()) null else try dict_resolved.duplicate();
-            defer if (duplicate) |dup| dup.dropReference();
-            const to_use = duplicate orelse dict_resolved;
-
-            var dict_resolved_shim: Shimmerable = .{ .original = to_use };
+            var dict_resolved_shim: Shimmerable = .{ .original = dict_resolved };
+            defer dict_resolved_shim.discardChanges();
             _ = try interp.wrapError(&det, Dictionary.shimmerFrom(&det, &dict_resolved_shim));
-            assert(dict_resolved_shim.shimmered.isNone());
-            const as_mutable = dict_resolved_shim.current().asType(Dictionary).?;
-            try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
 
-            if (duplicate) |dup| {
-                try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, dup));
+            if (dict_resolved_shim.shimmered.isNone() and dict_resolved.canMutate()) {
+                const as_mutable = dict_resolved.asType(Dictionary).?;
+                try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
+                return; // End transaction.
+            } else {
+                const duped = try dict_resolved_shim.current().duplicate();
+                defer duped.dropReference();
+                const as_mutable = duped.asType(Dictionary).?;
+                try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
+                try interp.setVariableInFrame(call_frame, &dict_name, duped);
             }
         }
     }
@@ -1912,6 +1921,11 @@ pub fn getVariableTakingReference(interp: *Interp, name: *Shimmerable) !Optional
     return interp.getVariableTakingReferenceInFrame(interp.callFrameIdx(), name);
 }
 
+pub fn getVariableInner(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, get_for_mutation: bool) !?Value {
+    var det: ErrorDetails = undefined;
+    return interp.wrapError(&det, vartypes.getVariableInner(interp, &det, call_frame_idx, name, get_for_mutation));
+}
+
 pub fn getVariableTakingReferenceInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !OptionalValue {
     var det: ErrorDetails = undefined;
     const value = interp.wrapError(&det, vartypes.getVariableTakingReference(
@@ -1929,10 +1943,23 @@ pub fn getVariableTakingReferenceInFrame(interp: *Interp, call_frame_idx: u32, n
     return OptionalValue.fromValue(value);
 }
 
+pub fn getVariableMut(interp: *Interp, name: *Shimmerable) !OptionalValue {
+    var det: ErrorDetails = undefined;
+    const looked_up = try interp.wrapError(&det, vartypes.getVariableInner(interp, &det, interp.callFrameIdx(), name, true));
+    return OptionalValue.fromValue(looked_up);
+}
+
+pub fn getVariableMutOrError(interp: *Interp, name: *Shimmerable) !Value {
+    var det: ErrorDetails = undefined;
+    const looked_up = try interp.wrapError(&det, vartypes.getVariableInnerOrError(interp, &det, interp.callFrameIdx(), name, true));
+    return looked_up;
+}
+
 pub fn getVariableTakingReferenceOrError(interp: *Interp, name: *Shimmerable) !Value {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    return try interp.wrapError(&det, vartypes.getVariableTakingReferenceOrError(interp, &det, interp.callFrameIdx(), name));
+    const looked_up = try interp.wrapError(&det, vartypes.getVariableInnerOrError(interp, &det, interp.callFrameIdx(), name, false));
+    return looked_up.takeReference();
 }
 
 pub fn unsetVariable(interp: *Interp, name: *Shimmerable) !void {

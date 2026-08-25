@@ -29,16 +29,19 @@ pub fn llengthCmd(interp: *Interp, args: []Shimmerable) !void {
 }
 
 pub fn lappendCmd(interp: *Interp, args: []Shimmerable) !void {
-    if ((try interp.getVariable(&args[1])).asValue()) |var_value| {
-        var det: ErrorDetails = undefined;
-        if (try interp.wrapError(&det, var_value.asMutableInPlace(List, &det))) |list_mut| {
-            for (args[2..]) |item| try list_mut.append(item.current());
+    if ((try interp.getVariableMut(&args[1])).asValue()) |var_value| {
+        if (try interp.asMutableInPlace(List, var_value)) |list_mut| {
+            try list_mut.ensureUnusedCapacity(args[2..].len);
+            errdefer comptime unreachable; // Start transaction.
+            for (args[2..]) |item| list_mut.appendAssumeCapacity(item.current());
             // Mutated in place, so no writeback needed.
             interp.setResult(list_mut.asHead().asValue());
+            return; // End transaction.
         } else {
-            const list_mut: *List = try interp.wrapError(&det, var_value.duplicateAsType(List, &det));
+            const list_mut = try interp.duplicateAsType(List, var_value);
             defer list_mut.asHead().dropReference();
-            for (args[2..]) |item| try list_mut.append(item.current());
+            try list_mut.ensureUnusedCapacity(args[2..].len);
+            for (args[2..]) |item| list_mut.appendAssumeCapacity(item.current());
             try interp.setVariable(&args[1], list_mut.asHead().asValue());
             interp.setResult(list_mut.asHead().asValue());
         }
@@ -320,14 +323,12 @@ pub fn lsetCmd(interp: *Interp, args: []Shimmerable) !void {
         return;
     }
 
-    var det: ErrorDetails = undefined;
-    const current = try interp.getVariableOrError(var_name);
-
-    if (try interp.wrapError(&det, current.asMutableInPlace(List, &det))) |list_mut| {
+    const list_raw = try interp.getVariableMutOrError(var_name);
+    if (try interp.asMutableInPlace(List, list_raw)) |list_mut| {
         try interp.setListValueRecursively(list_mut, args[2..(args.len - 1)], new_value);
         interp.setResult(list_mut.asHead().asValue());
     } else {
-        const duped = try interp.wrapError(&det, current.duplicateAsType(List, &det));
+        const duped = try interp.duplicateAsType(List, list_raw);
         defer duped.asHead().dropReference();
         try interp.setListValueRecursively(duped, args[2..(args.len - 1)], new_value);
         try interp.setVariable(var_name, duped.asHead().asValue());

@@ -755,6 +755,13 @@ pub fn unsetVariable(
     } else unreachable;
 }
 
+fn badDictSugar(det: ?*ErrorDetails, variable_name: []const u8) error{ OutOfMemory, LookupFailed } {
+    if (det) |details| details.* = .{
+        .message = try allocPrintZ("variable \"{s}\" is not a valid dictionary", .{variable_name}),
+    };
+    return error.LookupFailed;
+}
+
 pub fn getVariableInner(
     interp: *Interp,
     det: ?*ErrorDetails,
@@ -777,36 +784,36 @@ pub fn getVariableInner(
             const lookup_ctx = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
             const lookup_result = Dictionary.getRecursivelyInner(null, &resolved_dict_shim, lookup_ctx) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    if (det) |details| details.* = .{ .message = try allocPrintZ(
-                        "variable \"{s}\" is not a valid dictionary",
-                        .{try dict_sugar.dict_name.getString()},
-                    ) };
-                    return error.LookupFailed;
-                },
+                else => return badDictSugar(det, try dict_sugar.dict_name.getString()),
             };
             const looked_up = lookup_result.looked_up.asValue() orelse return null;
 
             if (get_as_mutable and !lookup_result.can_mutate) {
-                const looked_up_duped = try looked_up.duplicate();
+                const looked_up_duped = (try looked_up.duplicateAsBoxed()).asValue();
                 defer looked_up_duped.dropReference();
 
                 // There was a shared dictionary somewhere along the path, so we
                 // need to make sure the path is clear of mutable dictionaries.
                 if (resolved_dict_shim.shimmered.isNone() and resolved_dict.canMutate()) {
                     const as_dict = resolved_dict_shim.current().asType(Dictionary).?;
-                    try as_dict.putRecursively(det, lookup_ctx, looked_up_duped);
+                    as_dict.putRecursively(det, lookup_ctx, looked_up_duped) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return badDictSugar(det, try dict_sugar.dict_name.getString()),
+                    };
                 } else {
                     const resolved_dict_duped = try resolved_dict_shim.current().duplicate();
                     defer resolved_dict_duped.dropReference();
                     const as_dict = resolved_dict_duped.asType(Dictionary).?;
-                    try as_dict.putRecursively(det, lookup_ctx, looked_up_duped);
-                    try setVariable(interp, det, call_frame_idx, dict_name, resolved_dict_duped);
+                    as_dict.putRecursively(det, lookup_ctx, looked_up_duped) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return badDictSugar(det, try dict_sugar.dict_name.getString()),
+                    };
+                    try setVariable(interp, det, call_frame_idx, &dict_name, resolved_dict_duped);
                 }
 
                 return looked_up_duped;
             } else if (dict_name.shimmered.asValue()) |new_dict_name| {
-                dict_sugar.dict_name.swap(new_dict_name);
+                name.current().asType(DictSugar).?.dict_name.swap(new_dict_name);
             }
 
             return looked_up;
@@ -818,17 +825,52 @@ pub fn getVariableInner(
 
     if (name.current().asType(CachedLocalVar)) |local_var| {
         switch (local_var.getCurrentSlot().*) {
-            .upvar => |link| {
+            .upvar => |*link| {
                 // Recursively follow upvar.
                 var name_in_other_scope: Shimmerable = .{ .original = link.linked_name };
                 defer name_in_other_scope.discardChanges();
-                return try getVariableInner(interp, det, link.call_frame, &name_in_other_scope, get_as_mutable);
+                const lookup_result = try getVariableInner(interp, det, link.call_frame, &name_in_other_scope, get_as_mutable);
+                if (name_in_other_scope.shimmered.asValue()) |shimmered| link.linked_name.swap(shimmered);
+                return lookup_result;
             },
-            .normal => |value| return value,
+            .normal => |value| {
+                if (get_as_mutable and !value.canMutate()) {
+                    const duped = (try value.duplicateAsBoxed()).asValue();
+                    defer duped.dropReference();
+                    try setVariable(interp, det, call_frame_idx, name, duped);
+                    return duped;
+                } else {
+                    return value;
+                }
+            },
         }
     } else if (name.current().asType(CachedLexicalVar)) |lexical_var| {
-        return lexical_var;
+        if (get_as_mutable) {
+            // Lexical variables are immutable, so we always duplicate
+            // in this case.
+            const duped = (try lexical_var.ref.duplicateAsBoxed()).asValue();
+            defer duped.dropReference();
+            try setVariable(interp, det, call_frame_idx, name, duped);
+            return duped;
+        } else {
+            return lexical_var.ref;
+        }
     } else unreachable;
+}
+
+pub fn getVariableInnerOrError(
+    interp: *Interp,
+    det: ?*ErrorDetails,
+    call_frame_idx: u32,
+    name: *Shimmerable,
+    get_for_mutation: bool,
+) error{ VariableNotFound, OutOfMemory, LookupFailed, BadVariableName }!Value {
+    return try getVariableInner(interp, det, call_frame_idx, name, get_for_mutation) orelse {
+        if (det) |details| details.* = .{
+            .message = try allocPrintZ("can't read \"{s}\": no such variable", .{try name.current().getString()}),
+        };
+        return error.VariableNotFound;
+    };
 }
 
 pub fn getVariableMut(

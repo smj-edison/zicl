@@ -58,7 +58,8 @@ pub fn infoCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     switch (subcommand) {
         .exists => {
-            const val = try interp.getVariable(&args[2]);
+            const val = try interp.getVariableTakingReference(&args[2]);
+            defer val.dropReference();
             interp.setResultBoolean(val.isSome());
         },
         .source => {
