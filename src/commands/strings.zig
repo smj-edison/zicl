@@ -52,8 +52,8 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
             pos += bytes.len;
             for (args[2..]) |arg| {
                 const item_bytes = try arg.current().getString();
-                @memcpy(result_bytes[pos..(pos + bytes.len)], item_bytes);
-                pos += bytes.len;
+                @memcpy(result_bytes[pos..(pos + item_bytes.len)], item_bytes);
+                pos += item_bytes.len;
             }
         }
 

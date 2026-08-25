@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
         // Read the next line. Check what is already buffered before reading
         // more, or piped input past the first line is dropped at EOF.
         while (true) {
-            if (std.mem.indexOfScalarPos(u8, stdin.buffer[0..stdin.end], stdin.seek, '\n')) |end| {
+            if (std.mem.findScalarPos(u8, stdin.buffer[0..stdin.end], stdin.seek, '\n')) |end| {
                 try line_read.appendSlice(init.gpa, stdin.buffer[stdin.seek..end]);
                 stdin.toss(end - stdin.seek + 1);
                 break;

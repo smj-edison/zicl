@@ -200,7 +200,7 @@ pub const DictSugar = struct {
     dict_path: *objects.List,
 
     fn isValidDictSugar(var_name: [:0]const u8) bool {
-        const double_colons = std.mem.indexOf(u8, var_name, "::");
+        const double_colons = std.mem.find(u8, var_name, "::");
         // Must have at least one set of double colons.
         const start_at = if (double_colons) |val| val else return false;
 
@@ -276,17 +276,6 @@ pub const DictSugar = struct {
         .enumerate_struct = enumerateStruct,
     });
 };
-
-/// Dict sugar reports a malformed dictionary as a failed lookup, since from the
-/// script's side the path simply did not resolve. Spelled out rather than using
-/// an `else`, so that a new error in the dictionary operations has to be
-/// considered here rather than being silently folded into `LookupFailed`.
-fn asLookupFailure(err: error{ OutOfMemory, BadDict }) error{ OutOfMemory, LookupFailed } {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.BadDict => error.LookupFailed,
-    };
-}
 
 const VariableLookupResult = enum { not_found, dict_sugar, normal };
 pub const VariableValue = union(enum) {
@@ -449,6 +438,9 @@ pub fn ensureValidVariableType(
     // We don't know whether this is a normal variable or dict sugar yet.
     const var_name = try name.current().getString();
     if (try DictSugar.parseDictSugar(det, var_name)) |parsed| {
+        errdefer parsed.dict_name.dropReference();
+        errdefer parsed.dict_path.asHead().dropReference();
+
         const as_dict_sugar = try name.prepareToShimmer(DictSugar);
         as_dict_sugar.* = .{
             .dict_name = parsed.dict_name,
@@ -482,41 +474,29 @@ fn createVariable(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, slot
     };
 }
 
-fn dictSugarRead(
+fn dictSugarReadInner(
     interp: *Interp,
     det: ?*ErrorDetails,
     call_frame_idx: u32,
     dict_sugar: *DictSugar,
     get_for_mutation: bool,
-) error{ OutOfMemory, LookupFailed, BadVariableName }!?Value {
+) !?Value {
     var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
     defer dict_name.discardChanges();
     const resolved_dict = try getVariableInner(interp, det, call_frame_idx, &dict_name, false) orelse return null;
 
     var resolved_dict_shim: Shimmerable = .{ .original = resolved_dict };
     defer resolved_dict_shim.discardChanges();
-    _ = Dictionary.shimmerFrom(det, &resolved_dict_shim) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadDict => return error.LookupFailed,
-    };
+    _ = try Dictionary.shimmerFrom(det, &resolved_dict_shim);
 
     const lookup_ctx = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
     if (get_for_mutation) {
         if (resolved_dict_shim.shimmered.isNone() and resolved_dict.canMutate()) {
-            return resolved_dict.asType(Dictionary).?.getRecursivelyAllMutable(det, lookup_ctx) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict, error.LookupFailed => return error.LookupFailed,
-            };
+            return try resolved_dict.asType(Dictionary).?.getRecursivelyAllMutable(det, lookup_ctx);
         } else {
-            const dict_mut = resolved_dict_shim.getMutable(Dictionary, det) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict => return error.LookupFailed,
-            };
+            const dict_mut = try resolved_dict_shim.getMutable(Dictionary, det);
             defer dict_mut.asHead().dropReference();
-            const looked_up = dict_mut.getRecursivelyAllMutable(det, lookup_ctx) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BadDict, error.LookupFailed => return error.LookupFailed,
-            };
+            const looked_up = try dict_mut.getRecursivelyAllMutable(det, lookup_ctx);
             try setVariable(interp, det, call_frame_idx, &dict_name, dict_mut.asHead().asValue());
             return looked_up;
         }
@@ -525,12 +505,30 @@ fn dictSugarRead(
             error.OutOfMemory => return error.OutOfMemory,
             else => return badDictSugar(det, try dict_sugar.dict_name.getString()),
         };
-        if (dict_name.shimmered.asValue()) |new_dict_name| {
-            dict_sugar.dict_name.swap(new_dict_name);
-        }
+        if (resolved_dict_shim.shimmered.asValue()) |new_dict|
+            try setVariable(interp, det, call_frame_idx, &dict_name, new_dict);
+        if (dict_name.shimmered.asValue()) |new_dict_name| dict_sugar.dict_name.swap(new_dict_name);
 
         return looked_up;
     }
+}
+
+fn dictSugarRead(
+    interp: *Interp,
+    det: ?*ErrorDetails,
+    call_frame_idx: u32,
+    dict_sugar: *DictSugar,
+    get_for_mutation: bool,
+) error{ OutOfMemory, LookupFailed, BadVariableName }!?Value {
+    return dictSugarReadInner(interp, det, call_frame_idx, dict_sugar, get_for_mutation) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadDict => {
+            if (det) |details| heap.global_gpa.free(details.message);
+            return badDictSugar(det, try dict_sugar.dict_name.getString());
+        },
+        error.LookupFailed => return error.LookupFailed,
+        error.BadVariableName => return error.BadVariableName,
+    };
 }
 
 fn dictSugarWriteInner(
@@ -579,7 +577,11 @@ fn dictSugarWrite(
 ) error{ OutOfMemory, LookupFailed, BadVariableName }!void {
     dictSugarWriteInner(interp, det, call_frame_idx, dict_sugar, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.BadDict, error.LookupFailed => return error.LookupFailed,
+        error.BadDict => {
+            if (det) |details| heap.global_gpa.free(details.message);
+            return badDictSugar(det, try dict_sugar.dict_name.getString());
+        },
+        error.LookupFailed => return error.LookupFailed,
         error.BadVariableName => return error.BadVariableName,
     };
 }

@@ -1140,7 +1140,7 @@ pub fn nextNumberToken(self: *Tokenizer) !Token {
         };
 
         self.advance(2);
-        while (!self.atEnd() and std.mem.indexOfScalar(u8, radix_digits, self.current()) != null) self.advance(1);
+        while (!self.atEnd() and std.mem.findScalar(u8, radix_digits, self.current()) != null) self.advance(1);
 
         if (strutil.parseInt(self.buffer[token.loc.start..self.index])) |_| {
             token.loc.end = self.index;

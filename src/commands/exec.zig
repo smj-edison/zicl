@@ -1314,7 +1314,7 @@ test "exec runs in the background" {
 
     // The capability stands in for the output, which nobody is there to read.
     const cap = try interp.testRunScript("set p [exec " ++ true_path ++ " &]");
-    try testing.expect(std.mem.indexOf(u8, try cap.getString(), "/process/") != null);
+    try testing.expect(std.mem.find(u8, try cap.getString(), "/process/") != null);
 
     // Asking twice reports the same thing rather than failing on a child that
     // has already been collected.

@@ -634,5 +634,5 @@ test "leak" {
 
     const needle = try std.fmt.allocPrint(heap.global_gpa, "\"{x}\"", .{@intFromPtr(obj)});
     defer heap.global_gpa.free(needle);
-    try testing.expect(std.mem.indexOf(u8, rendered, needle) != null);
+    try testing.expect(std.mem.find(u8, rendered, needle) != null);
 }

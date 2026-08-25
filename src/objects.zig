@@ -2743,10 +2743,12 @@ fn testGetRecursivelyAllMutable(ta: std.mem.Allocator) !void {
 
     // Case 2: leaf is already unshared, so it takes the pass-through branch.
     {
-        const inner = try Dictionary.new(&.{ key_bar, value2 });
-        const outer = try Dictionary.new(&.{ key_foo, inner.asHead().asValue() });
+        const outer = blk: {
+            const inner = try Dictionary.new(&.{ key_bar, value2 });
+            defer inner.asHead().dropReference(); // Leaves `outer` as the sole owner.
+            break :blk try Dictionary.new(&.{ key_foo, inner.asHead().asValue() });
+        };
         defer outer.asHead().dropReference();
-        inner.asHead().dropReference(); // `outer` is now the sole owner.
 
         _ = try outer.asHead().asValue().getString(); // Force the ancestor's string rep.
 

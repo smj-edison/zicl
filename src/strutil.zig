@@ -29,7 +29,7 @@ pub fn isGraph(c: u8) bool {
 }
 
 pub fn isPunct(c: u8) bool {
-    _ = std.mem.indexOfScalar(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c) orelse return false;
+    _ = std.mem.findScalar(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c) orelse return false;
     return true;
 }
 

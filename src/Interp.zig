@@ -504,7 +504,7 @@ pub fn makeErrorMessage(error_mesage: Value, stack_trace: *const List) !Value {
         }
 
         if (args.len > 0) {
-            if (std.mem.indexOfScalar(u8, args, '\n')) |args_newline| {
+            if (std.mem.findScalar(u8, args, '\n')) |args_newline| {
                 const shortened = args[0..args_newline];
                 try buf.print(heap.global_gpa, "    {s}...\n", .{shortened});
             } else {
@@ -1915,7 +1915,7 @@ pub fn getVariableTakingRefInFrame(interp: *Interp, call_frame_idx: u32, name: *
 }
 
 pub fn getVariableForMutation(interp: *Interp, name: *Shimmerable) !?Value {
-    return try interp.getVariableForMutation(name);
+    return try interp.getVariableForMutationInFrame(interp.callFrameIdx(), name);
 }
 
 pub fn getVariableForMutationInFrame(interp: *Interp, call_frame_idx: u32, name: *Shimmerable) !?Value {
@@ -1926,15 +1926,13 @@ pub fn getVariableForMutationInFrame(interp: *Interp, call_frame_idx: u32, name:
 pub fn getVariableForMutationOrError(interp: *Interp, name: *Shimmerable) !Value {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    const looked_up = try interp.wrapError(&det, vartypes.getVariableForMutationOrError(interp, &det, interp.callFrameIdx(), name));
-    return looked_up.takeReference();
+    return try interp.wrapError(&det, vartypes.getVariableForMutationOrError(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn getVariableTakingRefOrError(interp: *Interp, name: *Shimmerable) !Value {
     try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
-    const looked_up = try interp.wrapError(&det, vartypes.getVariableTakingRefOrError(interp, &det, interp.callFrameIdx(), name));
-    return looked_up.takeReference();
+    return try interp.wrapError(&det, vartypes.getVariableTakingRefOrError(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn unsetVariable(interp: *Interp, name: *Shimmerable) !void {

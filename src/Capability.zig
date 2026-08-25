@@ -396,7 +396,7 @@ pub fn parseName(det: ?*ErrorDetails, bytes: []const u8) !ParsedName {
     if (path.len == 0 or path[0] != '/') return parseError(det, bytes);
     const after_slash = path[1..];
 
-    const type_end = std.mem.indexOfScalar(u8, after_slash, '/') orelse return parseError(det, bytes);
+    const type_end = std.mem.findScalar(u8, after_slash, '/') orelse return parseError(det, bytes);
     const encoded = after_slash[(type_end + 1)..];
     if (encoded.len != encoded_id_len) return parseError(det, bytes);
 
@@ -467,7 +467,7 @@ fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
         const string_rep = try cap.asHead().getString();
         try testing.expect(std.mem.startsWith(u8, string_rep, "<" ++ scheme));
         try testing.expect(std.mem.endsWith(u8, string_rep, ">"));
-        try testing.expect(std.mem.indexOf(u8, string_rep, "/test-handle/") != null);
+        try testing.expect(std.mem.find(u8, string_rep, "/test-handle/") != null);
 
         // Check that we can get the capability back from its string.
         var shim: objects.Shimmerable = .{ .original = try objects.String.newValue(string_rep) };

@@ -770,7 +770,7 @@ fn testFileTempfileCreatesAFileAndReturnsItsPath(ta: std.mem.Allocator) !void {
     defer std.Io.Dir.deleteFileAbsolute(heap.global_io, path) catch {};
 
     try testing.expect(path.len > 0);
-    try testing.expect(std.mem.indexOf(u8, path, "tcl.tmp.") != null);
+    try testing.expect(std.mem.find(u8, path, "tcl.tmp.") != null);
 
     // The file it names really is there.
     try interp.testExpectScriptResult("true", "file exists $path");
@@ -885,7 +885,7 @@ fn testFileCapability(ta: std.mem.Allocator) !void {
     // The capability renders as a delimited URL naming this machine.
     const name = try handle.getString();
     try testing.expect(std.mem.startsWith(u8, name, "<" ++ Capability.scheme));
-    try testing.expect(std.mem.indexOf(u8, name, "/file-handle/") != null);
+    try testing.expect(std.mem.find(u8, name, "/file-handle/") != null);
 
     const written = try std.Io.Dir.cwd().readFileAlloc(heap.global_io, absolute_path, ta, .limited(1024));
     defer ta.free(written);
