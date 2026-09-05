@@ -6,7 +6,7 @@ const is_windows = native_os == .windows;
 const is_darwin = native_os.isDarwin();
 const is_debug = builtin.mode == .Debug;
 
-const std = @import("../std.zig");
+const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const File = std.Io.File;
@@ -34,8 +34,6 @@ cond: Io.Condition = .init,
 run_queue: std.SinglyLinkedList = .{},
 join_requested: bool = false,
 stack_size: usize,
-/// All threads are spawned detached; this is how we wait until they all exit.
-wait_group: WaitGroup = .init,
 async_limit: Io.Limit,
 concurrent_limit: Io.Limit = .unlimited,
 /// Error from calling `std.Thread.getCpuCount` in `init`.
@@ -44,7 +42,6 @@ cpu_count_error: ?std.Thread.CpuCountError,
 /// available count, subtract this from either `async_limit` or
 /// `concurrent_limit`.
 busy_count: usize = 0,
-worker_threads: std.atomic.Value(?*Thread),
 pid: Pid = .unknown,
 
 have_signal_handler: bool,
@@ -452,344 +449,6 @@ const Runnable = struct {
     startFn: *const fn (*Runnable, *Thread, *Threaded) void,
 };
 
-const Group = struct {
-    ptr: *Io.Group,
-
-    /// Returns a correctly-typed pointer to the `Io.Group.token` field.
-    ///
-    /// The status indicates how many pending tasks are in the group, whether the group has been
-    /// canceled, and whether the group has been awaited.
-    ///
-    /// Note that the zero value of `Status` intentionally represents the initial group state (empty
-    /// with no awaiters). This is a requirement of `Io.Group`.
-    fn status(g: Group) *std.atomic.Value(Status) {
-        return @ptrCast(&g.ptr.token);
-    }
-    /// Returns a correctly-typed pointer to the `Io.Group.state` field. The double-pointer here is
-    /// intentional, because the `state` field itself stores a pointer, and this function returns a
-    /// pointer to that field.
-    ///
-    /// On completion of the whole group, if `status` indicates that there is an awaiter, the last
-    /// task must increment this `u32` and do a futex wake on it to signal that awaiter.
-    fn awaiter(g: Group) **std.atomic.Value(u32) {
-        return @ptrCast(&g.ptr.state);
-    }
-
-    const Status = packed struct(usize) {
-        num_running: @Int(.unsigned, @bitSizeOf(usize) - 2),
-        have_awaiter: bool,
-        canceled: bool,
-    };
-
-    const Task = struct {
-        runnable: Runnable,
-        group: *Io.Group,
-        func: *const fn (context: *const anyopaque) void,
-        context_alignment: Alignment,
-        alloc_len: usize,
-
-        /// `Task.runnable.node` is `undefined` in the created `Task`.
-        fn create(
-            gpa: Allocator,
-            group: Group,
-            context: []const u8,
-            context_alignment: Alignment,
-            func: *const fn (context: *const anyopaque) void,
-        ) Allocator.Error!*Task {
-            const max_context_misalignment = context_alignment.toByteUnits() -| @alignOf(Task);
-            const worst_case_context_offset = context_alignment.forward(@sizeOf(Task) + max_context_misalignment);
-            const alloc_len = worst_case_context_offset + context.len;
-
-            const task: *Task = @ptrCast(@alignCast(try gpa.alignedAlloc(u8, .of(Task), alloc_len)));
-            errdefer comptime unreachable;
-
-            task.* = .{
-                .runnable = .{
-                    .node = undefined,
-                    .startFn = &start,
-                },
-                .group = group.ptr,
-                .func = func,
-                .context_alignment = context_alignment,
-                .alloc_len = alloc_len,
-            };
-            @memcpy(task.contextPointer()[0..context.len], context);
-            return task;
-        }
-
-        fn destroy(task: *Task, gpa: Allocator) void {
-            const base: [*]align(@alignOf(Task)) u8 = @ptrCast(task);
-            gpa.free(base[0..task.alloc_len]);
-        }
-
-        fn contextPointer(task: *Task) [*]u8 {
-            const base: [*]u8 = @ptrCast(task);
-            const offset = task.context_alignment.forward(@intFromPtr(base) + @sizeOf(Task)) - @intFromPtr(base);
-            return base + offset;
-        }
-
-        fn start(r: *Runnable, thread: *Thread, t: *Threaded) void {
-            const task: *Task = @fieldParentPtr("runnable", r);
-            const group: Group = .{ .ptr = task.group };
-
-            // This would be a simple store, but it's upgraded to an RMW so we can use `.acquire` to
-            // enforce the ordering between this and the `group.status().load` below. Paired with
-            // the `.release` rmw on `Thread.status` in `cancelThreads`, this creates a StoreLoad
-            // barrier which guarantees that when a group is canceled, either we see the cancelation
-            // in the group status, or the canceler sees our thread status so can directly notify us
-            // of the cancelation.
-            _ = thread.status.swap(.{
-                .cancelation = .none,
-                .awaitable = .fromGroup(group.ptr),
-            }, .acquire);
-            if (group.status().load(.monotonic).canceled) {
-                thread.status.store(.{
-                    .cancelation = .canceling,
-                    .awaitable = .fromGroup(group.ptr),
-                }, .monotonic);
-            }
-
-            task.func(task.contextPointer());
-
-            thread.status.store(.{ .cancelation = .none, .awaitable = .null }, .monotonic);
-            const old_status = group.status().fetchSub(.{
-                .num_running = 1,
-                .have_awaiter = false,
-                .canceled = false,
-            }, .acq_rel); // acquire `group.awaiter()`, release task results
-            assert(old_status.num_running > 0);
-            if (old_status.have_awaiter and old_status.num_running == 1) {
-                const to_signal = group.awaiter().*;
-                // `awaiter` should only be modified by us. For another thread to see `num_running`
-                // drop to 0 after this point would indicate that another task started up, meaning
-                // `async`/`cancel` was racing with awaited group completion.
-                group.awaiter().* = undefined;
-                _ = to_signal.fetchAdd(1, .release); // release results
-                Thread.futexWake(&to_signal.raw, 1);
-            }
-
-            // Task completed. Self-destruct sequence initiated.
-            task.destroy(t.allocator);
-        }
-    };
-
-    /// Assumes the caller has already atomically updated the group status to indicate cancelation,
-    /// and notifies any already-running threads of this cancelation.
-    fn cancelThreads(g: Group, t: *Threaded) bool {
-        var any_blocked = false;
-        var it = t.worker_threads.load(.acquire); // acquire `Thread` values
-        while (it) |thread| : (it = thread.next) {
-            // This non-mutating RMW exists for ordering reasons: see comment in `Group.Task.start` for reasons.
-            _ = thread.status.fetchOr(.{ .cancelation = @enumFromInt(0), .awaitable = .null }, .release);
-            if (thread.cancelAwaitable(.fromGroup(g.ptr))) any_blocked = true;
-        }
-        return any_blocked;
-    }
-
-    /// Uses `Thread.signalCanceledSyscall` to signal any threads which are still blocked in a
-    /// syscall for this group and have not observed a cancelation request yet. Returns `true` if
-    /// more signals may be necessary, in which case the caller must call this again after a delay.
-    fn signalAllCanceledSyscalls(g: Group, t: *Threaded) bool {
-        var any_signaled = false;
-        var it = t.worker_threads.load(.acquire); // acquire `Thread` values
-        while (it) |thread| : (it = thread.next) {
-            if (thread.signalCanceledSyscall(t, .fromGroup(g.ptr))) any_signaled = true;
-        }
-        return any_signaled;
-    }
-
-    /// The caller has canceled `g`. Inform any threads working on that group of the cancelation if
-    /// necessary, and wait for `g` to finish (indicated by `num_completed` being incremented from 0
-    /// to 1), while sending regular signals to threads if necessary for them to unblock from any
-    /// cancelable syscalls.
-    ///
-    /// `skip_signals` means it is already known that no threads are currently working on the group
-    /// so no notifications or signals are necessary.
-    fn waitForCancelWithSignaling(
-        g: Group,
-        t: *Threaded,
-        num_completed: *std.atomic.Value(u32),
-        skip_signals: bool,
-    ) void {
-        var need_signal: bool = !skip_signals and g.cancelThreads(t);
-        var timeout_ns: u64 = 1 << 10;
-        while (true) {
-            need_signal = need_signal and g.signalAllCanceledSyscalls(t);
-            Thread.futexWaitUncancelable(&num_completed.raw, 0, if (need_signal) timeout_ns else null);
-            switch (num_completed.load(.acquire)) { // acquire task results
-                0 => {},
-                1 => break,
-                else => unreachable,
-            }
-            timeout_ns <<|= 1;
-        }
-    }
-};
-
-/// Trailing data:
-/// 1. context
-/// 2. result
-const Future = struct {
-    runnable: Runnable,
-    func: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    status: std.atomic.Value(Status),
-    /// On completion, increment this `u32` and do a futex wake on it.
-    awaiter: *std.atomic.Value(u32),
-    context_alignment: Alignment,
-    result_offset: usize,
-    alloc_len: usize,
-
-    const Status = packed struct(usize) {
-        /// The values of this enum are chosen so that await/cancel can just OR with 0b01 and 0b11
-        /// respectively. That *does* clobber `.done`, but that's actually fine, because if the tag
-        /// is `.done` then only the awaiter is referencing this `Future` anyway.
-        tag: enum(u2) {
-            /// The future is queued or running (depending on whether `thread` is set).
-            pending = 0b00,
-            /// Like `pending`, but the future is being awaited. `Future.awaiter` is populated.
-            pending_awaited = 0b01,
-            /// Like `pending`, but the future is being canceled. `Future.awaiter` is populated.
-            pending_canceled = 0b11,
-            /// The future has already completed. `thread` is `.null`, unless the future terminated
-            /// with an acknowledged cancel request, in which case `thread` is `.all_ones`.
-            done = 0b10,
-        },
-        /// When the future begins execution, this is atomically updated from `null` to the thread running the
-        /// `Future`, so that cancelation knows which thread to cancel.
-        thread: Thread.PackedPtr,
-    };
-
-    /// `Future.runnable.node` is `undefined` in the created `Future`.
-    fn create(
-        gpa: Allocator,
-        result_len: usize,
-        result_alignment: Alignment,
-        context: []const u8,
-        context_alignment: Alignment,
-        func: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    ) Allocator.Error!*Future {
-        const max_context_misalignment = context_alignment.toByteUnits() -| @alignOf(Future);
-        const worst_case_context_offset = context_alignment.forward(@sizeOf(Future) + max_context_misalignment);
-        const worst_case_result_offset = result_alignment.forward(worst_case_context_offset + context.len);
-        const alloc_len = worst_case_result_offset + result_len;
-
-        const future: *Future = @ptrCast(@alignCast(try gpa.alignedAlloc(u8, .of(Future), alloc_len)));
-        errdefer comptime unreachable;
-
-        const actual_context_addr = context_alignment.forward(@intFromPtr(future) + @sizeOf(Future));
-        const actual_result_addr = result_alignment.forward(actual_context_addr + context.len);
-        const actual_result_offset = actual_result_addr - @intFromPtr(future);
-        future.* = .{
-            .runnable = .{
-                .node = undefined,
-                .startFn = &start,
-            },
-            .func = func,
-            .status = .init(.{
-                .tag = .pending,
-                .thread = .null,
-            }),
-            .awaiter = undefined,
-            .context_alignment = context_alignment,
-            .result_offset = actual_result_offset,
-            .alloc_len = alloc_len,
-        };
-        @memcpy(future.contextPointer()[0..context.len], context);
-        return future;
-    }
-
-    fn destroy(future: *Future, gpa: Allocator) void {
-        const base: [*]align(@alignOf(Future)) u8 = @ptrCast(future);
-        gpa.free(base[0..future.alloc_len]);
-    }
-
-    fn resultPointer(future: *Future) [*]u8 {
-        const base: [*]u8 = @ptrCast(future);
-        return base + future.result_offset;
-    }
-
-    fn contextPointer(future: *Future) [*]u8 {
-        const base: [*]u8 = @ptrCast(future);
-        const context_offset = future.context_alignment.forward(@intFromPtr(future) + @sizeOf(Future)) - @intFromPtr(future);
-        return base + context_offset;
-    }
-
-    fn start(r: *Runnable, thread: *Thread, t: *Threaded) void {
-        _ = t;
-        const future: *Future = @fieldParentPtr("runnable", r);
-
-        thread.status.store(.{
-            .cancelation = .none,
-            .awaitable = .fromFuture(future),
-        }, .monotonic);
-        {
-            const old_status = future.status.fetchOr(.{
-                .tag = .pending,
-                .thread = .pack(thread),
-            }, .release);
-            assert(old_status.thread == .null);
-            switch (old_status.tag) {
-                .pending, .pending_awaited => {},
-                .pending_canceled => thread.status.store(.{
-                    .cancelation = .canceling,
-                    .awaitable = .fromFuture(future),
-                }, .monotonic),
-                .done => unreachable,
-            }
-        }
-
-        future.func(future.contextPointer(), future.resultPointer());
-
-        const had_acknowledged_cancel = switch (thread.status.load(.monotonic).cancelation) {
-            .none, .canceling => false,
-            .canceled => true,
-            .parked => unreachable,
-            .blocked => unreachable,
-            .blocked_alertable => unreachable,
-            .blocked_alertable_canceling => unreachable,
-            .blocked_canceling => unreachable,
-        };
-        thread.status.store(.{ .cancelation = .none, .awaitable = .null }, .monotonic);
-        const old_status = future.status.swap(.{
-            .tag = .done,
-            .thread = if (had_acknowledged_cancel) .all_ones else .null,
-        }, .acq_rel); // acquire `future.awaiter`, release results
-        switch (old_status.tag) {
-            .pending => {},
-            .pending_awaited, .pending_canceled => {
-                const to_signal = future.awaiter;
-                _ = to_signal.fetchAdd(1, .release); // release results
-                Thread.futexWake(&to_signal.raw, 1);
-            },
-            .done => unreachable,
-        }
-    }
-
-    /// The caller has canceled `future`. `thread` is the thread currently running that future.
-    /// Inform `thread` of the cancelation if necessary, and wait for `future` to finish (indicated
-    /// by `num_completed` being incremented from 0 to 1), while sending regular signals to `thread`
-    /// if necessary for it to unblock from a cancelable syscall.
-    fn waitForCancelWithSignaling(
-        future: *Future,
-        t: *Threaded,
-        num_completed: *std.atomic.Value(u32),
-        thread: ?*Thread,
-    ) void {
-        var need_signal: bool = if (thread) |th| th.cancelAwaitable(.fromFuture(future)) else false;
-        var timeout_ns: u64 = 1 << 10;
-        while (true) {
-            need_signal = need_signal and thread.?.signalCanceledSyscall(t, .fromFuture(future));
-            Thread.futexWaitUncancelable(&num_completed.raw, 0, if (need_signal) timeout_ns else null);
-            switch (num_completed.load(.acquire)) { // acquire task results
-                0 => {},
-                1 => break,
-                else => unreachable,
-            }
-            timeout_ns <<|= 1;
-        }
-    }
-};
-
 /// A sequence of (ptr_bit_width - 3) bits which uniquely identifies a group or future. The bits are
 /// the MSBs of the `*Io.Group` or `*Future`. These things do not necessarily have 3 zero bits at
 /// the end (they are pointer-aligned, so on 32-bit targets only have 2), but because they both have
@@ -798,25 +457,16 @@ const Future = struct {
 /// or future must be at least 8 bytes later, so its address will have a different value for one of
 /// the top (ptr_bit_width - 3) bits.
 const AwaitableId = enum(@Int(.unsigned, @bitSizeOf(usize) - 3)) {
-    comptime {
-        assert(@sizeOf(Future) >= 8);
-        assert(@sizeOf(Io.Group) >= 8);
-    }
     null = 0,
     all_ones = std.math.maxInt(@Int(.unsigned, @bitSizeOf(usize) - 3)),
     _,
-    const Split = packed struct(usize) { low: u3, high: AwaitableId };
-    fn fromGroup(g: *Io.Group) AwaitableId {
-        const split: Split = @bitCast(@intFromPtr(g));
-        return split.high;
-    }
-    fn fromFuture(f: *Future) AwaitableId {
-        const split: Split = @bitCast(@intFromPtr(f));
-        return split.high;
+
+    pub fn fromInt(int: u32) AwaitableId {
+        return @enumFromInt(int + 1); // +1 so we can still use null.
     }
 };
 
-const Thread = struct {
+pub const Thread = struct {
     next: ?*Thread,
 
     id: std.Thread.Id,
@@ -1627,7 +1277,6 @@ pub fn init(
         .argv0 = options.argv0,
         .environ_initialized = options.environ.block.isEmpty(),
         .environ = .{ .process_environ = options.environ },
-        .worker_threads = init_single_threaded.worker_threads,
         .disable_memory_mapping = options.disable_memory_mapping,
     };
 
@@ -1645,7 +1294,6 @@ pub fn init(
         .argv0 = options.argv0,
         .environ_initialized = options.environ.block.isEmpty(),
         .environ = .{ .process_environ = options.environ },
-        .worker_threads = .init(null),
         .disable_memory_mapping = options.disable_memory_mapping,
     };
 
@@ -1685,7 +1333,6 @@ pub const init_single_threaded: Threaded = init: {
         .argv0 = .empty,
         .environ_initialized = env_block.isEmpty(),
         .environ = .{ .process_environ = .{ .block = env_block } },
-        .worker_threads = .init(null),
         .disable_memory_mapping = false,
     };
 };
@@ -1730,11 +1377,12 @@ fn join(t: *Threaded) void {
         t.join_requested = true;
     }
     condBroadcast(&t.cond);
-    t.wait_group.wait();
 }
 
-fn worker(t: *Threaded) void {
-    var thread: Thread = .{
+threadlocal var thread_contents: Thread = undefined;
+/// Call from the thread you're initializing.
+pub fn initThread() *Thread {
+    thread_contents = .{
         .next = undefined,
         .id = std.Thread.getCurrentId(),
         .handle = handle: {
@@ -1750,11 +1398,11 @@ fn worker(t: *Threaded) void {
         .unpark_flag = unpark_flag_init,
         .csprng = .uninitialized,
     };
-    Thread.current = &thread;
+    Thread.current = &thread_contents;
 
     if (is_windows) {
         assert(windows.ntdll.NtOpenThread(
-            &thread.handle,
+            &thread_contents.handle,
             .{
                 .SPECIFIC = .{
                     .THREAD = .{
@@ -1767,39 +1415,29 @@ fn worker(t: *Threaded) void {
             &windows.teb().ClientId,
         ) == .SUCCESS);
     }
-    defer if (is_windows) {
-        windows.CloseHandle(thread.handle);
-    };
 
-    {
-        var head = t.worker_threads.load(.monotonic);
-        while (true) {
-            thread.next = head;
-            head = t.worker_threads.cmpxchgWeak(
-                head,
-                &thread,
-                .release,
-                .monotonic,
-            ) orelse break;
-        }
-    }
+    return &thread_contents;
+}
 
-    defer t.wait_group.finish();
+pub fn deinitThread() void {
+    if (is_windows) windows.CloseHandle(thread_contents.handle);
+}
 
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
+/// Call from the thread you're starting the task on before you start it.
+pub fn startTask(id: AwaitableId) void {
+    Thread.current.?.status.store(.{
+        .cancelation = .none,
+        .awaitable = id,
+    }, .monotonic);
+}
 
-    while (true) {
-        while (t.run_queue.popFirst()) |runnable_node| {
-            mutexUnlock(&t.mutex);
-            thread.cancel_protection = .unblocked;
-            const runnable: *Runnable = @fieldParentPtr("node", runnable_node);
-            runnable.startFn(runnable, &thread, t);
-            mutexLock(&t.mutex);
-            t.busy_count -= 1;
-        }
-        if (t.join_requested) break;
-        condWait(&t.cond, &t.mutex);
+/// Provide `id` to make sure you don't accidentally cancel the wrong task.
+/// Threadsafe. FIXME need to figure out some way to keep sending the signal
+/// until the thread runner acknowledges it, similar to the actual `Threaded`
+/// implementation.
+pub fn cancelId(t: *Threaded, thread: *Thread, id: AwaitableId) void {
+    if (thread.cancelAwaitable(id)) {
+        thread.signalCanceledSyscall(t, id);
     }
 }
 
@@ -2072,331 +1710,66 @@ fn crashHandler(userdata: ?*anyopaque) void {
 }
 
 fn async(
-    userdata: ?*anyopaque,
-    result: []u8,
-    result_alignment: Alignment,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    _: ?*anyopaque,
+    _: []u8,
+    _: Alignment,
+    _: []const u8,
+    _: Alignment,
+    _: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*Io.AnyFuture {
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    if (builtin.single_threaded) {
-        start(context.ptr, result.ptr);
-        return null;
-    }
-
-    const gpa = t.allocator;
-    const future = Future.create(gpa, result.len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
-        error.OutOfMemory => {
-            start(context.ptr, result.ptr);
-            return null;
-        },
-    };
-
-    mutexLock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @intFromEnum(t.async_limit)) {
-        mutexUnlock(&t.mutex);
-        future.destroy(gpa);
-        start(context.ptr, result.ptr);
-        return null;
-    }
-
-    t.busy_count = busy_count + 1;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch {
-            t.wait_group.finish();
-            t.busy_count = busy_count;
-            mutexUnlock(&t.mutex);
-            future.destroy(gpa);
-            start(context.ptr, result.ptr);
-            return null;
-        };
-        thread.detach();
-    }
-
-    t.run_queue.prepend(&future.runnable.node);
-
-    mutexUnlock(&t.mutex);
-    condSignal(&t.cond);
-    return @ptrCast(future);
+    unreachable;
 }
 
 fn concurrent(
-    userdata: ?*anyopaque,
-    result_len: usize,
-    result_alignment: Alignment,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    _: ?*anyopaque,
+    _: usize,
+    _: Alignment,
+    _: []const u8,
+    _: Alignment,
+    _: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
-    if (builtin.single_threaded) return error.ConcurrencyUnavailable;
-
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-
-    const gpa = t.allocator;
-    const future = Future.create(gpa, result_len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
-        error.OutOfMemory => return error.ConcurrencyUnavailable,
-    };
-    errdefer future.destroy(gpa);
-
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @intFromEnum(t.concurrent_limit))
-        return error.ConcurrencyUnavailable;
-
-    t.busy_count = busy_count + 1;
-    errdefer t.busy_count = busy_count;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        errdefer t.wait_group.finish();
-
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch
-            return error.ConcurrencyUnavailable;
-
-        thread.detach();
-    }
-
-    t.run_queue.prepend(&future.runnable.node);
-
-    condSignal(&t.cond);
-    return @ptrCast(future);
+    unreachable;
 }
 
 fn groupAsync(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque) void,
+    _: ?*anyopaque,
+    _: *Io.Group,
+    _: []const u8,
+    _: Alignment,
+    _: *const fn (context: *const anyopaque) void,
 ) void {
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    const g: Group = .{ .ptr = type_erased };
-
-    if (builtin.single_threaded) return groupAsyncEager(start, context.ptr);
-
-    const gpa = t.allocator;
-    const task = Group.Task.create(gpa, g, context, context_alignment, start) catch |err| switch (err) {
-        error.OutOfMemory => return groupAsyncEager(start, context.ptr),
-    };
-
-    mutexLock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @intFromEnum(t.async_limit)) {
-        mutexUnlock(&t.mutex);
-        task.destroy(gpa);
-        return groupAsyncEager(start, context.ptr);
-    }
-
-    t.busy_count = busy_count + 1;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch {
-            t.wait_group.finish();
-            t.busy_count = busy_count;
-            mutexUnlock(&t.mutex);
-            task.destroy(gpa);
-            return groupAsyncEager(start, context.ptr);
-        };
-        thread.detach();
-    }
-
-    // TODO: if this logic is changed to be lock-free, this `fetchAdd` must be released by the queue
-    // prepend so that the task doesn't finish without observing this and try to decrement the count
-    // below zero.
-    _ = g.status().fetchAdd(.{
-        .num_running = 1,
-        .have_awaiter = false,
-        .canceled = false,
-    }, .monotonic);
-    t.run_queue.prepend(&task.runnable.node);
-
-    mutexUnlock(&t.mutex);
-    condSignal(&t.cond);
+    unreachable;
 }
 fn groupAsyncEager(
-    start: *const fn (context: *const anyopaque) void,
-    context: *const anyopaque,
+    _: *const fn (context: *const anyopaque) void,
+    _: *const anyopaque,
 ) void {
-    start(context);
+    unreachable;
 }
 
 fn groupConcurrent(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque) void,
+    _: ?*anyopaque,
+    _: *Io.Group,
+    _: []const u8,
+    _: Alignment,
+    _: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
-    if (builtin.single_threaded) return error.ConcurrencyUnavailable;
-
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    const g: Group = .{ .ptr = type_erased };
-
-    const gpa = t.allocator;
-    const task = Group.Task.create(gpa, g, context, context_alignment, start) catch |err| switch (err) {
-        error.OutOfMemory => return error.ConcurrencyUnavailable,
-    };
-    errdefer task.destroy(gpa);
-
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @intFromEnum(t.concurrent_limit))
-        return error.ConcurrencyUnavailable;
-
-    t.busy_count = busy_count + 1;
-    errdefer t.busy_count = busy_count;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        errdefer t.wait_group.finish();
-
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch
-            return error.ConcurrencyUnavailable;
-
-        thread.detach();
-    }
-
-    // TODO: if this logic is changed to be lock-free, this `fetchAdd` must be released by the queue
-    // prepend so that the task doesn't finish without observing this and try to decrement the count
-    // below zero.
-    _ = g.status().fetchAdd(.{
-        .num_running = 1,
-        .have_awaiter = false,
-        .canceled = false,
-    }, .monotonic);
-    t.run_queue.prepend(&task.runnable.node);
-
-    condSignal(&t.cond);
+    unreachable;
 }
 
-fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
-    _ = initial_token; // we need to load `token` *after* the group finishes
-    if (builtin.single_threaded) unreachable; // nothing to await
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    const g: Group = .{ .ptr = type_erased };
-
-    var num_completed: std.atomic.Value(u32) = .init(0);
-    g.awaiter().* = &num_completed;
-
-    const pre_await_status = g.status().fetchOr(.{
-        .num_running = 0,
-        .have_awaiter = true,
-        .canceled = false,
-    }, .acq_rel); // acquire results if complete; release `g.awaiter()`
-
-    assert(!pre_await_status.have_awaiter);
-    assert(!pre_await_status.canceled);
-    if (pre_await_status.num_running == 0) {
-        // Already done. Since the group is finished, it's illegal to spawn more tasks in it
-        // until we return, so we can access `g.status()` non-atomically.
-        g.status().raw.have_awaiter = false;
-        return;
-    }
-
-    while (Thread.futexWait(&num_completed.raw, 0, null)) {
-        switch (num_completed.load(.acquire)) { // acquire task results
-            0 => continue,
-            1 => break,
-            else => unreachable, // group was reused before `await` returned
-        }
-    } else |err| switch (err) {
-        error.Canceled => {
-            const pre_cancel_status = g.status().fetchOr(.{
-                .num_running = 0,
-                .have_awaiter = false,
-                .canceled = true,
-            }, .acq_rel); // acquire results if complete; release `g.awaiter()`
-            assert(pre_cancel_status.have_awaiter);
-            assert(!pre_cancel_status.canceled);
-
-            // Even if `pre_cancel_status.num_running == 0`, we still need to wait for the signal,
-            // because in that case the last member of the group is already trying to modify it.
-            // However, if we know everything is done, we *can* skip signaling blocked threads.
-            const skip_signals = pre_cancel_status.num_running == 0;
-            g.waitForCancelWithSignaling(t, &num_completed, skip_signals);
-
-            // The group is finished, so it's illegal to spawn more tasks in it until we return, so
-            // we can access `g.status()` non-atomically.
-            g.status().raw.canceled = false;
-            g.status().raw.have_awaiter = false;
-            return error.Canceled;
-        },
-    }
-
-    // The group is finished, so it's illegal to spawn more tasks in it until we return, so
-    // we can access `g.status()` non-atomically.
-    g.status().raw.have_awaiter = false;
+fn groupAwait(_: ?*anyopaque, _: *Io.Group, _: *anyopaque) Io.Cancelable!void {
+    unreachable;
 }
 
-fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
-    _ = initial_token;
-    if (builtin.single_threaded) unreachable; // nothing to cancel
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    const g: Group = .{ .ptr = type_erased };
-
-    var num_completed: std.atomic.Value(u32) = .init(0);
-    g.awaiter().* = &num_completed;
-
-    const pre_cancel_status = g.status().fetchOr(.{
-        .num_running = 0,
-        .have_awaiter = true,
-        .canceled = true,
-    }, .acq_rel); // acquire results if complete; release `g.awaiter()`
-
-    assert(!pre_cancel_status.have_awaiter);
-    assert(!pre_cancel_status.canceled);
-    if (pre_cancel_status.num_running == 0) {
-        // Already done. Since the group is finished, it's illegal to spawn more tasks in it
-        // until we return, so we can access `g.status()` non-atomically.
-        g.status().raw.have_awaiter = false;
-        g.status().raw.canceled = false;
-        return;
-    }
-
-    g.waitForCancelWithSignaling(t, &num_completed, false);
-
-    g.status().raw = .{ .num_running = 0, .have_awaiter = false, .canceled = false };
+fn groupCancel(_: ?*anyopaque, _: *Io.Group, _: *anyopaque) void {
+    unreachable;
 }
 
-fn recancel(userdata: ?*anyopaque) void {
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    _ = t;
-    recancelInner();
+fn recancel(_: ?*anyopaque) void {
+    unreachable;
 }
 fn recancelInner() void {
-    const thread = Thread.current.?; // called `recancel` but was not canceled
-    switch (thread.status.fetchXor(.{
-        .cancelation = @enumFromInt(0b001),
-        .awaitable = .null,
-    }, .monotonic).cancelation) {
-        .canceled => {},
-        .none => unreachable, // called `recancel` but was not canceled
-        .canceling => unreachable, // called `recancel` but cancelation was already pending
-        .parked => unreachable,
-        .blocked => unreachable,
-        .blocked_alertable => unreachable,
-        .blocked_alertable_canceling => unreachable,
-        .blocked_canceling => unreachable,
-    }
+    unreachable;
 }
 
 fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
@@ -2415,101 +1788,21 @@ fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
 }
 
 fn await(
-    userdata: ?*anyopaque,
-    any_future: *Io.AnyFuture,
-    result: []u8,
-    result_alignment: Alignment,
+    _: ?*anyopaque,
+    _: *Io.AnyFuture,
+    _: []u8,
+    _: Alignment,
 ) void {
-    _ = result_alignment;
-    if (builtin.single_threaded) unreachable; // nothing to await
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    const future: *Future = @ptrCast(@alignCast(any_future));
-
-    var num_completed: std.atomic.Value(u32) = .init(0);
-    future.awaiter = &num_completed;
-
-    const pre_await_status = future.status.fetchOr(.{
-        .tag = .pending_awaited,
-        .thread = .null,
-    }, .acq_rel); // acquire results if complete; release `future.awaiter`
-    switch (pre_await_status.tag) {
-        .pending => while (Thread.futexWait(&num_completed.raw, 0, null)) {
-            switch (num_completed.load(.acquire)) { // acquire task results
-                0 => continue,
-                1 => break,
-                else => unreachable, // group was reused before `await` returned
-            }
-        } else |err| switch (err) {
-            error.Canceled => {
-                const pre_cancel_status = future.status.fetchOr(.{
-                    .tag = .pending_canceled,
-                    .thread = .null,
-                }, .acq_rel); // acquire results if complete; release `future.awaiter`
-                const done_status = switch (pre_cancel_status.tag) {
-                    .pending => unreachable, // invalid state: we already awaited
-                    .pending_awaited => done_status: {
-                        const working_thread = pre_cancel_status.thread.unpack();
-                        future.waitForCancelWithSignaling(t, &num_completed, @alignCast(working_thread));
-                        break :done_status future.status.load(.monotonic);
-                    },
-                    .pending_canceled => unreachable, // `await` raced with `cancel`
-                    .done => done_status: {
-                        // The task just finished, but we still need to wait for the signal, because the
-                        // task thread already figured out that they need to update `future.awaiter`.
-                        future.waitForCancelWithSignaling(t, &num_completed, null);
-                        // Also, we have clobbered `future.status.tag` to `.pending_canceled`, but that's
-                        // not actually a problem for the logic below.
-                        break :done_status pre_cancel_status;
-                    },
-                };
-                // If the future did not acknowledge the cancelation, we need to mark it outstanding
-                // for us. Because `done_status.tag == .done`, the information about whether there
-                // was an acknowledged cancelation is encoded in `done_status.thread`.
-                assert(done_status.tag == .done);
-                switch (done_status.thread) {
-                    .null => recancelInner(), // cancelation was not acknowledged, so it's ours
-                    .all_ones => {}, // cancelation was acknowledged, so it was this task's job to propagate it
-                    _ => unreachable,
-                }
-            },
-        },
-        .pending_awaited => unreachable, // `await` raced with `await`
-        .pending_canceled => unreachable, // `await` raced with `cancel`
-        .done => {},
-    }
-    @memcpy(result, future.resultPointer());
-    future.destroy(t.allocator);
+    unreachable;
 }
 
 fn cancel(
-    userdata: ?*anyopaque,
-    any_future: *Io.AnyFuture,
-    result: []u8,
-    result_alignment: Alignment,
+    _: ?*anyopaque,
+    _: *Io.AnyFuture,
+    _: []u8,
+    _: Alignment,
 ) void {
-    _ = result_alignment;
-    if (builtin.single_threaded) unreachable; // nothing to cancel
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    const future: *Future = @ptrCast(@alignCast(any_future));
-
-    var num_completed: std.atomic.Value(u32) = .init(0);
-    future.awaiter = &num_completed;
-
-    const pre_cancel_status = future.status.fetchOr(.{
-        .tag = .pending_canceled,
-        .thread = .null,
-    }, .acq_rel); // acquire results if complete; release `future.awaiter`
-    switch (pre_cancel_status.tag) {
-        .pending => {
-            const working_thread = pre_cancel_status.thread.unpack();
-            future.waitForCancelWithSignaling(t, &num_completed, @alignCast(working_thread));
-        },
-        .pending_awaited => unreachable, // `await` raced with `await`
-        .pending_canceled => unreachable, // `await` raced with `cancel`
-        .done => {},
-    }
-    @memcpy(result, future.resultPointer());
-    future.destroy(t.allocator);
+    unreachable;
 }
 
 fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
@@ -2569,323 +1862,12 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
     }
 }
 
-fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    if (is_windows) {
-        batchDrainSubmittedWindows(t, b, false) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
-            else => |e| return e,
-        };
-        const alertable_syscall = try AlertableSyscall.start();
-        while (b.pending.head != .none and b.completed.head == .none) waitForApcOrAlert();
-        alertable_syscall.finish();
-        return;
-    }
-    if (have_poll) {
-        var poll_buffer: [poll_buffer_len]posix.pollfd = undefined;
-        var poll_len: u32 = 0;
-        {
-            var index = b.submitted.head;
-            while (index != .none and poll_len < poll_buffer_len) {
-                const submission = &b.storage[index.toIndex()].submission;
-                switch (submission.operation) {
-                    .file_read_streaming => |o| {
-                        poll_buffer[poll_len] = .{
-                            .fd = o.file.handle,
-                            .events = posix.POLL.IN | posix.POLL.ERR,
-                            .revents = 0,
-                        };
-                        poll_len += 1;
-                    },
-                    .file_write_streaming => |o| {
-                        poll_buffer[poll_len] = .{
-                            .fd = o.file.handle,
-                            .events = posix.POLL.OUT | posix.POLL.ERR,
-                            .revents = 0,
-                        };
-                        poll_len += 1;
-                    },
-                    .device_io_control => |o| {
-                        poll_buffer[poll_len] = .{
-                            .fd = o.file.handle,
-                            .events = posix.POLL.OUT | posix.POLL.IN | posix.POLL.ERR,
-                            .revents = 0,
-                        };
-                        poll_len += 1;
-                    },
-                    .net_receive => |*o| {
-                        poll_buffer[poll_len] = .{
-                            .fd = o.socket_handle,
-                            .events = posix.POLL.IN | posix.POLL.ERR,
-                            .revents = 0,
-                        };
-                        poll_len += 1;
-                    },
-                }
-                index = submission.node.next;
-            }
-        }
-        switch (poll_len) {
-            0 => return,
-            1 => {},
-            else => while (true) {
-                const timeout_ms: i32 = t: {
-                    if (b.completed.head != .none) {
-                        // It is legal to call batchWait with already completed
-                        // operations in the ring. In such case, we need to avoid
-                        // blocking in the poll syscall, but we can still take this
-                        // opportunity to find additional ready operations.
-                        break :t 0;
-                    }
-                    break :t std.math.maxInt(i32);
-                };
-                const syscall = try Syscall.start();
-                const rc = posix.system.poll(&poll_buffer, poll_len, timeout_ms);
-                syscall.finish();
-                switch (posix.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc == 0) {
-                            if (b.completed.head != .none) {
-                                // Since there are already completions available in the
-                                // queue, this is neither a timeout nor a case for
-                                // retrying.
-                                return;
-                            }
-                            continue;
-                        }
-                        var prev_index: Io.Operation.OptionalIndex = .none;
-                        var index = b.submitted.head;
-                        for (poll_buffer[0..poll_len]) |poll_entry| {
-                            const storage = &b.storage[index.toIndex()];
-                            const submission = &storage.submission;
-                            const next_index = submission.node.next;
-                            if (poll_entry.revents != 0) {
-                                const result = try operate(t, submission.operation);
-
-                                switch (prev_index) {
-                                    .none => b.submitted.head = next_index,
-                                    else => b.storage[prev_index.toIndex()].submission.node.next = next_index,
-                                }
-                                if (next_index == .none) b.submitted.tail = prev_index;
-
-                                switch (b.completed.tail) {
-                                    .none => b.completed.head = index,
-                                    else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
-                                }
-                                storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-                                b.completed.tail = index;
-                            } else prev_index = index;
-                            index = next_index;
-                        }
-                        assert(index == .none);
-                        return;
-                    },
-                    .INTR => continue,
-                    else => break,
-                }
-            },
-        }
-    }
-
-    var tail_index = b.completed.tail;
-    defer b.completed.tail = tail_index;
-    var index = b.submitted.head;
-    errdefer b.submitted.head = index;
-    while (index != .none) {
-        const storage = &b.storage[index.toIndex()];
-        const submission = &storage.submission;
-        const next_index = submission.node.next;
-        const result = try operate(t, submission.operation);
-
-        switch (tail_index) {
-            .none => b.completed.head = index,
-            else => b.storage[tail_index.toIndex()].completion.node.next = index,
-        }
-        storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-        tail_index = index;
-        index = next_index;
-    }
-    b.submitted = .{ .head = .none, .tail = .none };
+fn batchAwaitAsync(_: ?*anyopaque, _: *Io.Batch) Io.Cancelable!void {
+    unreachable;
 }
 
-fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    if (is_windows) {
-        const deadline: ?Io.Clock.Timestamp = timeout.toTimestamp(io(t));
-        try batchDrainSubmittedWindows(t, b, true);
-        while (b.pending.head != .none and b.completed.head == .none) {
-            var delay_interval: windows.LARGE_INTEGER = interval: {
-                const d = deadline orelse break :interval std.math.minInt(windows.LARGE_INTEGER);
-                break :interval timeoutToWindowsInterval(.{ .deadline = d }).?;
-            };
-            const alertable_syscall = try AlertableSyscall.start();
-            const delay_rc = windows.ntdll.NtDelayExecution(.TRUE, &delay_interval);
-            alertable_syscall.finish();
-            switch (delay_rc) {
-                .SUCCESS, .TIMEOUT => {
-                    // The thread woke due to the timeout. Although spurious
-                    // timeouts are OK, when no deadline is passed we must not
-                    // return `error.Timeout`.
-                    if (timeout != .none and b.completed.head == .none) return error.Timeout;
-                },
-                else => {},
-            }
-        }
-        return;
-    }
-    if (native_os == .wasi) {
-        // TODO call poll_oneoff
-        return error.ConcurrencyUnavailable;
-    }
-    if (!have_poll) return error.ConcurrencyUnavailable;
-    var poll_buffer: [poll_buffer_len]posix.pollfd = undefined;
-    var poll_storage: struct {
-        gpa: Allocator,
-        batch: *Io.Batch,
-        slice: []posix.pollfd,
-        len: u32,
-
-        fn add(storage: *@This(), fd: File.Handle, events: @FieldType(posix.pollfd, "events")) Io.ConcurrentError!void {
-            const len = storage.len;
-            if (len == poll_buffer_len) {
-                const slice: []posix.pollfd = if (storage.batch.userdata) |batch_userdata|
-                    @as([*]posix.pollfd, @ptrCast(@alignCast(batch_userdata)))[0..storage.batch.storage.len]
-                else allocation: {
-                    const allocation = storage.gpa.alloc(posix.pollfd, storage.batch.storage.len) catch
-                        return error.ConcurrencyUnavailable;
-                    storage.batch.userdata = allocation.ptr;
-                    break :allocation allocation;
-                };
-                @memcpy(slice[0..poll_buffer_len], storage.slice);
-                storage.slice = slice;
-            }
-            storage.slice[len] = .{
-                .fd = fd,
-                .events = events,
-                .revents = 0,
-            };
-            storage.len = len + 1;
-        }
-    } = .{ .gpa = t.allocator, .batch = b, .slice = &poll_buffer, .len = 0 };
-    {
-        var index = b.submitted.head;
-        while (index != .none) {
-            const storage = &b.storage[index.toIndex()];
-            const submission = storage.submission;
-            switch (submission.operation) {
-                .file_read_streaming => |o| try poll_storage.add(o.file.handle, posix.POLL.IN | posix.POLL.ERR),
-                .file_write_streaming => |o| try poll_storage.add(o.file.handle, posix.POLL.OUT | posix.POLL.ERR),
-                .device_io_control => |o| try poll_storage.add(o.file.handle, posix.POLL.IN | posix.POLL.OUT | posix.POLL.ERR),
-                .net_receive => |*o| nb: {
-                    var data_i: usize = 0;
-                    const result: Io.Operation.Result = .{ .net_receive = for (o.message_buffer, 0..) |*msg, msg_i| {
-                        const remaining_data_buffer = o.data_buffer[data_i..];
-                        netReceivePosix(o.socket_handle, msg, remaining_data_buffer, o.flags, true) catch |err| switch (err) {
-                            error.Canceled => |e| return e,
-                            error.WouldBlock => {
-                                if (msg_i != 0) break .{ null, msg_i };
-                                try poll_storage.add(o.socket_handle, posix.POLL.IN | posix.POLL.ERR);
-                                break :nb;
-                            },
-                            else => |e| break .{ e, 0 },
-                        };
-                        data_i += msg.data.len;
-                    } else .{ null, o.message_buffer.len } };
-                    switch (b.completed.tail) {
-                        .none => b.completed.head = index,
-                        else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
-                    }
-                    storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-                    b.completed.tail = index;
-                },
-            }
-            index = submission.node.next;
-        }
-    }
-    switch (poll_storage.len) {
-        0 => return,
-        1 => if (timeout == .none and b.completed.head == .none) {
-            const index = b.submitted.head;
-            const storage = &b.storage[index.toIndex()];
-            const result = try operate(t, storage.submission.operation);
-
-            b.submitted = .{ .head = .none, .tail = .none };
-
-            switch (b.completed.tail) {
-                .none => b.completed.head = index,
-                else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
-            }
-            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-            b.completed.tail = index;
-            return;
-        },
-        else => {},
-    }
-    const t_io = io(t);
-    const deadline = timeout.toTimestamp(t_io);
-    while (true) {
-        const timeout_ms: i32 = t: {
-            if (b.completed.head != .none) {
-                // It is legal to call batchWait with already completed
-                // operations in the ring. In such case, we need to avoid
-                // blocking in the poll syscall, but we can still take this
-                // opportunity to find additional ready operations.
-                break :t 0;
-            }
-            const d = deadline orelse break :t -1;
-            const duration = d.durationFromNow(t_io);
-            break :t @min(@max(0, duration.raw.toMilliseconds()), std.math.maxInt(i32));
-        };
-        const syscall = try Syscall.start();
-        const rc = posix.system.poll(poll_storage.slice.ptr, poll_storage.len, timeout_ms);
-        syscall.finish();
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) {
-                    if (b.completed.head != .none) {
-                        // Since there are already completions available in the
-                        // queue, this is neither a timeout nor a case for
-                        // retrying.
-                        return;
-                    }
-                    // Although spurious timeouts are OK, when no deadline is
-                    // passed we must not return `error.Timeout`.
-                    if (deadline == null) continue;
-                    return error.Timeout;
-                }
-                var prev_index: Io.Operation.OptionalIndex = .none;
-                var index = b.submitted.head;
-                for (poll_storage.slice[0..poll_storage.len]) |poll_entry| {
-                    const submission = &b.storage[index.toIndex()].submission;
-                    const next_index = submission.node.next;
-                    if (poll_entry.revents != 0) {
-                        const result = try operate(t, submission.operation);
-
-                        switch (prev_index) {
-                            .none => b.submitted.head = next_index,
-                            else => b.storage[prev_index.toIndex()].submission.node.next = next_index,
-                        }
-                        if (next_index == .none) b.submitted.tail = prev_index;
-
-                        switch (b.completed.tail) {
-                            .none => b.completed.head = index,
-                            else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
-                        }
-                        b.completed.tail = index;
-                        b.storage[index.toIndex()] = .{ .completion = .{
-                            .node = .{ .next = .none },
-                            .result = result,
-                        } };
-                    } else prev_index = index;
-                    index = next_index;
-                }
-                assert(index == .none);
-                return;
-            },
-            .INTR => continue,
-            else => return error.ConcurrencyUnavailable,
-        }
-    }
+fn batchAwaitConcurrent(_: ?*anyopaque, _: *Io.Batch, _: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+    unreachable;
 }
 
 const WindowsBatchOperationUserdata = extern struct {
@@ -2907,304 +1889,8 @@ const WindowsBatchOperationUserdata = extern struct {
     }
 };
 
-fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    if (is_windows) {
-        if (b.pending.head == .none) return;
-        waitForApcOrAlert();
-        var index = b.pending.head;
-        while (index != .none) {
-            const pending = &b.storage[index.toIndex()].pending;
-            const operation_userdata: *WindowsBatchOperationUserdata = .fromErased(&pending.userdata);
-            var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
-            _ = windows.ntdll.NtCancelIoFileEx(operation_userdata.file, &operation_userdata.iosb, &cancel_iosb);
-            index = pending.node.next;
-        }
-        while (b.pending.head != .none) waitForApcOrAlert();
-    } else if (b.userdata) |batch_userdata| {
-        const poll_storage: [*]posix.pollfd = @ptrCast(@alignCast(batch_userdata));
-        t.allocator.free(poll_storage[0..b.storage.len]);
-        b.userdata = null;
-    }
-}
-
-fn batchCompleteBlockingWindows(
-    b: *Io.Batch,
-    operation_userdata: *WindowsBatchOperationUserdata,
-    result: Io.Operation.Result,
-) void {
-    const erased_userdata = operation_userdata.toErased();
-    const pending: *Io.Operation.Storage.Pending = @fieldParentPtr("userdata", erased_userdata);
-    switch (pending.node.prev) {
-        .none => b.pending.head = pending.node.next,
-        else => |prev_index| b.storage[prev_index.toIndex()].pending.node.next = pending.node.next,
-    }
-    switch (pending.node.next) {
-        .none => b.pending.tail = pending.node.prev,
-        else => |next_index| b.storage[next_index.toIndex()].pending.node.prev = pending.node.prev,
-    }
-    const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
-    const index: Io.Operation.OptionalIndex = .fromIndex(storage - b.storage.ptr);
-    switch (b.completed.tail) {
-        .none => b.completed.head = index,
-        else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
-    }
-    b.completed.tail = index;
-    storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-}
-
-fn batchApc(
-    apc_context: ?*anyopaque,
-    iosb: *windows.IO_STATUS_BLOCK,
-    _: windows.ULONG,
-) align(apc_align) callconv(.winapi) void {
-    const b: *Io.Batch = @ptrCast(@alignCast(apc_context));
-    const operation_userdata: *WindowsBatchOperationUserdata = @fieldParentPtr("iosb", iosb);
-    const erased_userdata = operation_userdata.toErased();
-    const pending: *Io.Operation.Storage.Pending = @fieldParentPtr("userdata", erased_userdata);
-    switch (pending.node.prev) {
-        .none => b.pending.head = pending.node.next,
-        else => |prev_index| b.storage[prev_index.toIndex()].pending.node.next = pending.node.next,
-    }
-    switch (pending.node.next) {
-        .none => b.pending.tail = pending.node.prev,
-        else => |next_index| b.storage[next_index.toIndex()].pending.node.prev = pending.node.prev,
-    }
-    const storage: *Io.Operation.Storage = @fieldParentPtr("pending", pending);
-    const index: Io.Operation.OptionalIndex = .fromIndex(storage - b.storage.ptr);
-    switch (iosb.u.Status) {
-        .CANCELLED => {
-            const tail_index = b.unused.tail;
-            switch (tail_index) {
-                .none => b.unused.head = index,
-                else => b.storage[tail_index.toIndex()].unused.next = index,
-            }
-            storage.* = .{ .unused = .{ .prev = tail_index, .next = .none } };
-            b.unused.tail = index;
-        },
-        else => {
-            switch (b.completed.tail) {
-                .none => b.completed.head = index,
-                else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
-            }
-            b.completed.tail = index;
-            const result: Io.Operation.Result = switch (pending.tag) {
-                .file_read_streaming => .{ .file_read_streaming = ntReadFileResult(iosb) },
-                .file_write_streaming => .{ .file_write_streaming = ntWriteFileResult(iosb) },
-                .device_io_control => .{ .device_io_control = iosb.* },
-                .net_receive => unreachable,
-            };
-            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
-        },
-    }
-}
-
-/// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
-fn batchDrainSubmittedWindows(t: *Threaded, b: *Io.Batch, concurrency: bool) (Io.ConcurrentError || Io.Cancelable)!void {
-    var index = b.submitted.head;
-    errdefer b.submitted.head = index;
-    while (index != .none) {
-        const storage = &b.storage[index.toIndex()];
-        const submission = storage.submission;
-        storage.* = .{ .pending = .{
-            .node = .{ .prev = b.pending.tail, .next = .none },
-            .tag = submission.operation,
-            .userdata = undefined,
-        } };
-        switch (b.pending.tail) {
-            .none => b.pending.head = index,
-            else => |tail_index| b.storage[tail_index.toIndex()].pending.node.next = index,
-        }
-        b.pending.tail = index;
-        const operation_userdata: *WindowsBatchOperationUserdata = .fromErased(&storage.pending.userdata);
-        errdefer {
-            operation_userdata.iosb = .{ .u = .{ .Status = .CANCELLED }, .Information = undefined };
-            batchApc(b, &operation_userdata.iosb, 0);
-        }
-        switch (submission.operation) {
-            .file_read_streaming => |o| o: {
-                var data_index: usize = 0;
-                while (o.data.len - data_index != 0 and o.data[data_index].len == 0) data_index += 1;
-                if (o.data.len - data_index == 0) {
-                    operation_userdata.iosb = .{ .u = .{ .Status = .SUCCESS }, .Information = 0 };
-                    batchApc(b, &operation_userdata.iosb, 0);
-                    break :o;
-                }
-                const buffer = o.data[data_index];
-                const short_buffer_len = std.math.lossyCast(u32, buffer.len);
-
-                if (o.file.flags.nonblocking) {
-                    operation_userdata.file = o.file.handle;
-                    switch (windows.ntdll.NtReadFile(
-                        o.file.handle,
-                        null, // event
-                        &batchApc,
-                        b,
-                        &operation_userdata.iosb,
-                        buffer.ptr,
-                        short_buffer_len,
-                        null, // byte offset
-                        null, // key
-                    )) {
-                        .PENDING, .SUCCESS => {},
-                        .CANCELLED => unreachable,
-                        else => |status| {
-                            operation_userdata.iosb.u.Status = status;
-                            batchApc(b, &operation_userdata.iosb, 0);
-                        },
-                    }
-                } else {
-                    if (concurrency) return error.ConcurrencyUnavailable;
-
-                    const syscall: Syscall = try .start();
-                    while (true) switch (windows.ntdll.NtReadFile(
-                        o.file.handle,
-                        null, // event
-                        null, // APC routine
-                        null, // APC context
-                        &operation_userdata.iosb,
-                        buffer.ptr,
-                        short_buffer_len,
-                        null, // byte offset
-                        null, // key
-                    )) {
-                        .PENDING => unreachable, // unrecoverable: wrong File nonblocking flag
-                        .CANCELLED => {
-                            try syscall.checkCancel();
-                            continue;
-                        },
-                        else => |status| {
-                            syscall.finish();
-                            operation_userdata.iosb.u.Status = status;
-                            batchApc(b, &operation_userdata.iosb, 0);
-                            break;
-                        },
-                    };
-                }
-            },
-            .file_write_streaming => |o| o: {
-                const buffer = windowsWriteBuffer(o.header, o.data, o.splat);
-                if (buffer.len == 0) {
-                    operation_userdata.iosb = .{ .u = .{ .Status = .SUCCESS }, .Information = 0 };
-                    batchApc(b, &operation_userdata.iosb, 0);
-                    break :o;
-                }
-                if (o.file.flags.nonblocking) {
-                    operation_userdata.file = o.file.handle;
-                    switch (windows.ntdll.NtWriteFile(
-                        o.file.handle,
-                        null, // event
-                        &batchApc,
-                        b,
-                        &operation_userdata.iosb,
-                        buffer.ptr,
-                        @intCast(buffer.len),
-                        null, // byte offset
-                        null, // key
-                    )) {
-                        .PENDING, .SUCCESS => {},
-                        .CANCELLED => unreachable,
-                        else => |status| {
-                            operation_userdata.iosb.u.Status = status;
-                            batchApc(b, &operation_userdata.iosb, 0);
-                        },
-                    }
-                } else {
-                    if (concurrency) return error.ConcurrencyUnavailable;
-
-                    const syscall: Syscall = try .start();
-                    while (true) switch (windows.ntdll.NtWriteFile(
-                        o.file.handle,
-                        null, // event
-                        null, // APC routine
-                        null, // APC context
-                        &operation_userdata.iosb,
-                        buffer.ptr,
-                        @intCast(buffer.len),
-                        null, // byte offset
-                        null, // key
-                    )) {
-                        .PENDING => unreachable, // unrecoverable: wrong File nonblocking flag
-                        .CANCELLED => {
-                            try syscall.checkCancel();
-                            continue;
-                        },
-                        else => |status| {
-                            syscall.finish();
-                            operation_userdata.iosb.u.Status = status;
-                            batchApc(b, &operation_userdata.iosb, 0);
-                            break;
-                        },
-                    };
-                }
-            },
-            .device_io_control => |o| {
-                const NtControlFile = switch (o.code.DeviceType) {
-                    .FILE_SYSTEM, .NAMED_PIPE => &windows.ntdll.NtFsControlFile,
-                    else => &windows.ntdll.NtDeviceIoControlFile,
-                };
-                if (o.file.flags.nonblocking) {
-                    operation_userdata.file = o.file.handle;
-                    switch (NtControlFile(
-                        o.file.handle,
-                        null, // event
-                        &batchApc,
-                        b,
-                        &operation_userdata.iosb,
-                        o.code,
-                        if (o.in.len > 0) o.in.ptr else null,
-                        @intCast(o.in.len),
-                        if (o.out.len > 0) o.out.ptr else null,
-                        @intCast(o.out.len),
-                    )) {
-                        .PENDING, .SUCCESS => {},
-                        .CANCELLED => unreachable,
-                        else => |status| {
-                            operation_userdata.iosb.u.Status = status;
-                            batchApc(b, &operation_userdata.iosb, 0);
-                        },
-                    }
-                } else {
-                    if (concurrency) return error.ConcurrencyUnavailable;
-
-                    const syscall: Syscall = try .start();
-                    while (true) switch (NtControlFile(
-                        o.file.handle,
-                        null, // event
-                        null, // APC routine
-                        null, // APC context
-                        &operation_userdata.iosb,
-                        o.code,
-                        if (o.in.len > 0) o.in.ptr else null,
-                        @intCast(o.in.len),
-                        if (o.out.len > 0) o.out.ptr else null,
-                        @intCast(o.out.len),
-                    )) {
-                        .PENDING => unreachable, // unrecoverable: wrong File nonblocking flag
-                        .CANCELLED => {
-                            try syscall.checkCancel();
-                            continue;
-                        },
-                        else => |status| {
-                            syscall.finish();
-                            operation_userdata.iosb.u.Status = status;
-                            batchApc(b, &operation_userdata.iosb, 0);
-                            break;
-                        },
-                    };
-                }
-            },
-            .net_receive => |*o| {
-                // TODO integrate with overlapped I/O or equivalent to avoid this error
-                if (concurrency) return error.ConcurrencyUnavailable;
-                batchCompleteBlockingWindows(b, operation_userdata, .{
-                    .net_receive = netReceiveWindows(t, o.socket_handle, o.message_buffer, o.data_buffer, o.flags),
-                });
-            },
-        }
-        index = submission.node.next;
-    }
-    b.submitted = .{ .head = .none, .tail = .none };
+fn batchCancel(_: ?*anyopaque, _: *Io.Batch) void {
+    unreachable;
 }
 
 /// Since Windows only supports writing one contiguous buffer, returns the
@@ -17226,10 +15912,6 @@ fn getRandomFd(t: *Threaded) Io.RandomSecureError!posix.fd_t {
             }
         },
     }
-}
-
-test {
-    _ = @import("Threaded/test.zig");
 }
 
 const use_parking_futex = switch (native_os) {
