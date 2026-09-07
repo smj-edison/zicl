@@ -38,7 +38,7 @@ pub fn asHead(self: *Capability) *Object {
     return Object.from(Capability, self);
 }
 
-/// `head` should have `id` uninitialized, as this function will assign
+/// `head` should have `id` set to null, as this function will assign
 /// the head its identifier. `head` should set the vtable, however.
 pub fn new(head: *Head) !*Capability {
     try registry.register(head); // Sets `head.id` while registering.
@@ -103,7 +103,7 @@ fn updateString(obj: *Object) !void {
     const self = obj.asType(Capability).?;
 
     var id_bytes: [@sizeOf(Id)]u8 = undefined;
-    std.mem.writeInt(Id, &id_bytes, self.head.id, .big);
+    std.mem.writeInt(Id, &id_bytes, self.head.id.?, .big);
     var encoded: [encoded_id_len]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &id_bytes);
 
@@ -156,7 +156,11 @@ pub const Head = extern struct {
     };
 
     vtable: *const VTable,
-    id: Id,
+    /// If the capability never becomes public, its `id` never needs to
+    /// be set. Note though that a capability can't upgrade partway
+    /// through to be public though, since I haven't figured out how
+    /// all the synchronization would work for that.
+    id: ?Id,
     state: std.atomic.Value(State) = .init(.{}),
     ref_count: std.atomic.Value(u32) = .init(1),
 
@@ -222,7 +226,12 @@ pub const Head = extern struct {
 
         // We were the ones who marked it as closed, so we'll remove it
         // from the registry.
-        registry.deregister(head);
+        if (head.id != null) registry.deregister(head);
+    }
+
+    pub fn closeAndDropReference(head: *Head) void {
+        head.close();
+        head.dropReference();
     }
 
     pub fn hasCloseBeenInitiated(head: *const Head) bool {
@@ -249,6 +258,7 @@ pub const Head = extern struct {
         destroy_backing: *const fn (head: *Head) callconv(.c) void,
 
         stream_ops: ?*const capabilities.StreamOps = null,
+        socket_ops: ?*const capabilities.SocketOps = null,
     };
 };
 
@@ -264,6 +274,8 @@ pub const Registry = struct {
     /// `id` is not synchronized by itself, so only call `register` with
     /// a newly created, non-crossthread Head.
     pub fn register(self: *Registry, head: *Head) !void {
+        assert(head.id == null);
+
         self.mutex.lockUncancelable(heap.global_io);
         defer self.mutex.unlock(heap.global_io);
 
@@ -272,12 +284,13 @@ pub const Registry = struct {
 
         // Generated while the mutex is locked because the generator is shared state.
         head.id = self.csprng.random().int(Id);
-        self.heads.putAssumeCapacity(head.id, head.takeReference());
+        self.heads.putAssumeCapacity(head.id.?, head.takeReference());
     }
 
+    /// Asserts that `head` has an identifier.
     pub fn deregister(self: *Registry, head: *Head) void {
         self.mutex.lockUncancelable(heap.global_io);
-        const removed = self.heads.fetchRemove(head.id);
+        const removed = self.heads.fetchRemove(head.id.?);
         self.mutex.unlock(heap.global_io);
 
         // Note that we assert that there was a value with `.?`,
@@ -418,7 +431,7 @@ const TestCapability = struct {
         const cap_backing = try heap.global_gpa.create(Backing);
         errdefer heap.global_gpa.destroy(cap_backing);
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .head = .{ .vtable = &Backing.vtable, .id = null },
             .body = .{ .deinited_ptr = deinited_ptr, .payload = payload },
         };
 

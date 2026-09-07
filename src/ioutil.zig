@@ -201,7 +201,7 @@ test "self-deleting temp file has no name" {
     if (native_os == .windows) return error.SkipZigTest;
 
     const io = std.testing.io;
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    var env: std.process.Environ.Map = std.testing.environ.createMap(std.testing.allocator);
     defer env.deinit();
 
     var tmpdir = std.testing.tmpDir(.{ .iterate = true });

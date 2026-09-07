@@ -326,7 +326,7 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const path = try args[2].getString();
             const readable = blk: {
                 std.Io.Dir.cwd().access(heap.global_io, path, .{ .read = true }) catch |err| switch (err) {
-                    error.FileNotFound => break :blk false,
+                    error.FileNotFound, error.AccessDenied => break :blk false,
                     else => {
                         return interp.setErrorFormatted("could not access file: {s}", .{@errorName(err)});
                     },
@@ -430,26 +430,16 @@ pub fn createTempFile(template: ?[]const u8) !TempFile {
         try path_buf.appendSlice(heap.global_gpa, "tcl.tmp.");
     }
 
-    const base_len = path_buf.items.len;
-    const has_template = if (template) |val| std.mem.endsWith(u8, val, "XXXXXX") else false;
-    const suffix_start = if (has_template) base_len - 6 else base_len;
-    const suffix_len: usize = if (has_template) 6 else 8;
-
-    if (!has_template) {
-        try path_buf.resize(heap.global_gpa, base_len + suffix_len);
-    }
-
-    const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    var random_bytes: [8]u8 = undefined;
+    const template_start = path_buf.items.len;
+    try path_buf.resize(heap.global_gpa, template_start + 16);
+    const template_slice = path_buf.items[template_start..];
 
     var retries: u32 = 0;
     const max_retries = 100;
     while (retries < max_retries) : (retries += 1) {
+        var random_bytes: [8]u8 = undefined;
         heap.global_io.random(&random_bytes);
-
-        for (0..suffix_len) |i| {
-            path_buf.items[suffix_start + i] = alnum[random_bytes[i] % alnum.len];
-        }
+        _ = std.fmt.bufPrint(template_slice, "{x}", .{}) catch unreachable;
 
         const file = std.Io.Dir.createFileAbsolute(heap.global_io, path_buf.items, .{
             .read = true,

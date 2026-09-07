@@ -26,8 +26,12 @@ pub const StreamOps = struct {
     unlock_reader: *const fn (head: *Capability.Head) void,
 };
 
+pub const SocketOps = struct {
+    accept: *const fn (head: *Capability.Head) (std.Io.net.Server.AcceptError || error{OutOfMemory})!*Capability,
+};
+
 pub const File = struct {
-    pub const Mode = enum { r, @"r+", w, @"w+" };
+    pub const Mode = enum { r, @"r+", w, @"w+", a, @"a+" };
 
     file: std.Io.File,
     close_when_done: bool,
@@ -40,7 +44,7 @@ pub const File = struct {
     eos_hit: bool = false,
     reader: std.Io.File.Reader,
 
-    pub fn open(path: []const u8, mode: Mode) !*Capability {
+    pub fn open(path: []const u8, mode: Mode) !*Backing {
         const cwd = std.Io.Dir.cwd();
 
         const read_buffer = try heap.global_gpa.alloc(u8, 4096);
@@ -51,56 +55,67 @@ pub const File = struct {
         const cap_backing = try heap.global_gpa.create(Backing);
         errdefer heap.global_gpa.destroy(cap_backing);
 
-        cap_backing.head = .{ .vtable = &Backing.vtable, .id = undefined };
-        const cap = try Capability.new(&cap_backing.head);
-        errdefer cap.asHead().dropReference();
-
         const file = switch (mode) {
             .r, .@"r+" => try cwd.openFile(heap.global_io, path, .{
                 .mode = if (mode == .@"r+") .read_write else .read_only,
                 .allow_directory = false,
             }),
-            .w, .@"w+" => try cwd.createFile(heap.global_io, path, .{
-                .read = mode == .@"w+",
+            .w, .@"w+", .a, .@"a+" => try cwd.createFile(heap.global_io, path, .{
+                .read = mode == .@"w+" or mode == .@"a+",
+                .truncate = mode == .w or mode == .@"w+",
             }),
         };
-        errdefer comptime unreachable;
+        errdefer file.close(heap.global_io);
 
-        cap_backing.body = .{
-            .file = file,
-            .close_when_done = true,
-            .write_mutex = .init,
-            .writer = .init(file, heap.global_io, write_buffer),
-            .read_mutex = .init,
-            .reader = .init(file, heap.global_io, read_buffer),
+        var reader: std.Io.File.Reader = .init(file, heap.global_io, read_buffer);
+        if (mode == .a or mode == .@"a+") try reader.seekTo(try file.length(heap.global_io));
+        const writer: std.Io.File.Writer = .init(file, heap.global_io, write_buffer);
+
+        // Take ownership of everything.
+        cap_backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .body = .{
+                .file = file,
+                .close_when_done = true,
+                .write_mutex = .init,
+                .writer = writer,
+                .read_mutex = .init,
+                .reader = reader,
+            },
         };
-
-        return cap;
+        return cap_backing;
     }
 
-    pub fn openDescriptor(handle: std.Io.File.Handle, nonblocking: bool) !*Capability {
-        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = nonblocking } };
-
+    pub fn createFromFile(file: std.Io.File, close_when_done: bool) !*Backing {
         const read_buffer = try heap.global_gpa.alloc(u8, 4096);
         errdefer heap.global_gpa.free(read_buffer);
         const write_buffer = try heap.global_gpa.alloc(u8, 4096);
         errdefer heap.global_gpa.free(write_buffer);
 
         const cap_backing = try heap.global_gpa.create(Backing);
-        errdefer heap.global_gpa.destroy(cap_backing);
+
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .head = .{ .vtable = &Backing.vtable, .id = null },
             .body = .{
                 .file = file,
-                .close_when_done = false,
+                .close_when_done = close_when_done,
                 .write_mutex = .init,
                 .writer = .initStreaming(file, heap.global_io, write_buffer),
                 .read_mutex = .init,
                 .reader = .initStreaming(file, heap.global_io, read_buffer),
             },
         };
+        return cap_backing;
+    }
 
-        return try Capability.new(&cap_backing.head);
+    pub fn createFromDescriptor(handle: std.Io.File.Handle, nonblocking: bool, close_when_done: bool) !*Backing {
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = nonblocking } };
+        return try createFromFile(file, close_when_done);
+    }
+
+    pub fn asHead(file: *File) *Capability.Head {
+        const backing: *Backing = @fieldParentPtr("body", file);
+        return &backing.head;
     }
 
     fn lockWriter(head: *Capability.Head) *std.Io.Writer {
@@ -175,6 +190,173 @@ pub const File = struct {
                 .get_reader_error = getReaderError,
                 .get_eos_ptr = getEosPtr,
                 .unlock_reader = unlockReader,
+            },
+        };
+    };
+};
+
+pub const IpConnection = struct {
+    stream: std.Io.net.Stream,
+
+    write_mutex: std.Io.Mutex,
+    writer: std.Io.net.Stream.Writer,
+
+    read_mutex: std.Io.Mutex,
+    /// Set to true when end of stream is hit. Only read/written
+    /// behind `read_mutex`.
+    eos_hit: bool = false,
+    reader: std.Io.net.Stream.Reader,
+
+    /// Only takes ownership of `stream` on success.
+    pub fn init(stream: std.Io.net.Stream) error{OutOfMemory}!*Backing {
+        const read_buffer = try heap.global_gpa.alloc(u8, 4096);
+        errdefer heap.global_gpa.free(read_buffer);
+        const write_buffer = try heap.global_gpa.alloc(u8, 4096);
+        errdefer heap.global_gpa.free(write_buffer);
+
+        const cap_backing = try heap.global_gpa.create(Backing);
+        errdefer heap.global_gpa.destroy(cap_backing);
+
+        cap_backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .body = .{
+                .stream = stream,
+                .write_mutex = .init,
+                .writer = stream.writer(heap.global_io, write_buffer),
+                .read_mutex = .init,
+                .reader = stream.reader(heap.global_io, read_buffer),
+            },
+        };
+        return cap_backing;
+    }
+
+    fn lockWriter(head: *Capability.Head) *std.Io.Writer {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        backing.body.write_mutex.lockUncancelable(heap.global_io);
+        return &backing.body.writer.interface;
+    }
+
+    fn getWriterError(head: *Capability.Head) ?anyerror {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        return backing.body.writer.err;
+    }
+
+    fn unlockWriter(head: *Capability.Head) void {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        backing.body.write_mutex.unlock(heap.global_io);
+    }
+
+    fn lockReader(head: *Capability.Head) *std.Io.Reader {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        backing.body.read_mutex.lockUncancelable(heap.global_io);
+        return &backing.body.reader.interface;
+    }
+
+    fn getReaderError(head: *Capability.Head) ?anyerror {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        return backing.body.reader.err;
+    }
+
+    fn getEosPtr(head: *Capability.Head) *bool {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        return &backing.body.eos_hit;
+    }
+
+    fn unlockReader(head: *Capability.Head) void {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        backing.body.read_mutex.unlock(heap.global_io);
+    }
+
+    pub const Backing = struct {
+        head: Capability.Head,
+        body: IpConnection,
+
+        fn deinitBody(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            backing.body.stream.close(heap.global_io);
+
+            // We lock to make sure `.buffer` happens-after it was set.
+            backing.body.read_mutex.lockUncancelable(heap.global_io);
+            heap.global_gpa.free(backing.body.reader.interface.buffer);
+            backing.body.read_mutex.unlock(heap.global_io);
+
+            backing.body.write_mutex.lockUncancelable(heap.global_io);
+            heap.global_gpa.free(backing.body.writer.interface.buffer);
+            backing.body.write_mutex.unlock(heap.global_io);
+        }
+
+        fn destroyBacking(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            heap.global_gpa.destroy(backing);
+        }
+
+        pub const vtable: Capability.Head.VTable = .{
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
+            .name = "ip-connection",
+            .stream_ops = &.{
+                .lock_writer = lockWriter,
+                .get_writer_error = getWriterError,
+                .unlock_writer = unlockWriter,
+                .lock_reader = lockReader,
+                .get_reader_error = getReaderError,
+                .get_eos_ptr = getEosPtr,
+                .unlock_reader = unlockReader,
+            },
+        };
+    };
+};
+
+pub const IpSocket = struct {
+    server: std.Io.net.Server,
+
+    pub fn listen(address: std.Io.net.IpAddress) !*Backing {
+        const server = try address.listen(heap.global_io, .{ .mode = .stream });
+        errdefer server.deinit(heap.global_io);
+
+        const cap_backing = try heap.global_gpa.create(Backing);
+        errdefer heap.global_gpa.destroy(cap_backing);
+
+        cap_backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .body = .{ .server = server },
+        };
+        return cap_backing;
+    }
+
+    fn accept(head: *Capability.Head) !*Backing {
+        const backing: *Backing = @fieldParentPtr("head", head);
+        const stream: std.Io.net.Stream = blk: while (true) {
+            const conn = backing.body.server.accept(heap.global_io) catch |err| switch (err) {
+                error.ConnectionAborted => continue, // Connection died before we could use it.
+                else => return err,
+            };
+            break :blk conn;
+        };
+        errdefer stream.close(heap.global_io);
+        return try IpConnection.init(stream);
+    }
+
+    pub const Backing = struct {
+        head: Capability.Head,
+        body: IpSocket,
+
+        fn deinitBody(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            backing.body.server.deinit(heap.global_io);
+        }
+
+        fn destroyBacking(head: *Capability.Head) callconv(.c) void {
+            const backing: *Backing = @fieldParentPtr("head", head);
+            heap.global_gpa.destroy(backing);
+        }
+
+        pub const vtable: Capability.Head.VTable = .{
+            .deinit_body = deinitBody,
+            .destroy_backing = destroyBacking,
+            .name = "ip-socket",
+            .socket_ops = &.{
+                .accept = accept,
             },
         };
     };

@@ -436,6 +436,11 @@ pub fn setErrorString(interp: *Interp, bytes: []const u8) error{ OutOfMemory, Ev
     return error.EvalError;
 }
 
+/// Bytes must live for the duration of the program.
+pub fn setErrorInterned(interp: *Interp, bytes: []const u8) error{EvalError} {
+    interp.setResult(heap.InternedString.newValue(bytes));
+}
+
 pub fn setErrorFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) error{ OutOfMemory, EvalError } {
     try interp.setResultFormatted(fmt, args);
     return error.EvalError;
@@ -2256,7 +2261,7 @@ pub fn testExpectScriptError(interp: *Interp, expected_error: anyerror, expected
 pub fn nextRandomFloat(interp: *Interp) f64 {
     // https://stackoverflow.com/questions/46901022/how-to-convert-a-uint64-t-to-a-double-float-between-0-and-1-with-maximum-accurac
     const two63: u64 = 0x8000000000000000;
-    const two64f = @as(f64, @bitCast(two63)) * 2.0;
-    const as_float = @as(f64, @bitCast(interp.prng.next())) / two64f;
+    const two64f = @as(f64, @floatFromInt(two63)) * 2.0;
+    const as_float = @as(f64, @floatFromInt(interp.prng.next())) / two64f;
     return as_float;
 }

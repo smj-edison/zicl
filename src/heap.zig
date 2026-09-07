@@ -33,6 +33,7 @@ pub var global_gpa: mem.Allocator = undefined;
 pub threadlocal var local_arena_instance: memutil.ScopedArena = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
+pub var environ: std.process.Environ.Map = undefined;
 pub var lazy_fn_registry: LazyFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
 
@@ -116,7 +117,7 @@ pub const ReturnCode = enum(c_int) {
 };
 
 /// Initialize global heap state. Must be called once per process (or test).
-pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
+pub fn initGlobals(gpa: Allocator, io: std.Io, env: std.process.Environ.Map, config: Config) !void {
     init_mutex.lockUncancelable(io);
     defer init_mutex.unlock(io);
 
@@ -124,6 +125,7 @@ pub fn initGlobals(gpa: Allocator, io: std.Io, config: Config) !void {
 
     global_gpa = gpa;
     global_io = io;
+    environ = env;
 
     lazy_fn_registry = .{};
     registered_hashes = .{};

@@ -124,6 +124,10 @@ pub const Shimmerable = extern struct {
         return duped_shim.current().takeReference().asType(T).?;
     }
 
+    pub fn equalsString(self: *Shimmerable, bytes: []const u8) !bool {
+        return try self.current().equalsString(bytes);
+    }
+
     pub fn getString(self: *const Shimmerable) ![:0]const u8 {
         return try self.current().getString();
     }
@@ -2478,7 +2482,7 @@ pub const Dictionary = struct {
 
             if (parent_shim.shimmered.asValue()) |new_parent| {
                 const new_hash_ref = try HashReference.newFromValue(new_parent);
-                errdefer new_hash_ref.asHead().dropReference();
+                defer new_hash_ref.asHead().dropReference();
                 try shim.ensureShimmerable();
                 const as_shimmerable = shim.current().asType(Dictionary).?;
                 try as_shimmerable.shimmerWriteback(interned_tilde_parent, new_hash_ref.asHead().asValue());
