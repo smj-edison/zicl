@@ -449,21 +449,83 @@ const Runnable = struct {
     startFn: *const fn (*Runnable, *Thread, *Threaded) void,
 };
 
-/// A sequence of (ptr_bit_width - 3) bits which uniquely identifies a group or future. The bits are
-/// the MSBs of the `*Io.Group` or `*Future`. These things do not necessarily have 3 zero bits at
-/// the end (they are pointer-aligned, so on 32-bit targets only have 2), but because they both have
-/// a *size* of at least 8 bytes, no two groups/futures in memory at the same time will have the
-/// same value for all of these bits. In other words, given a group/future pointer, the next group
-/// or future must be at least 8 bytes later, so its address will have a different value for one of
-/// the top (ptr_bit_width - 3) bits.
-const AwaitableId = enum(@Int(.unsigned, @bitSizeOf(usize) - 3)) {
+/// `AwaitableId` identifies a currently running task on a specific thread. It's
+/// needed for sequencing tasks, to avoid accidentally canceling an old task right
+/// after a new task has taken its place. Currently generated in `startTask`.
+///
+/// .null is currently used to mark "no task running", and .all_ones is currently
+/// only used for bit tricks.
+pub const AwaitableId = enum(@Int(.unsigned, @bitSizeOf(usize) - 3)) {
     null = 0,
     all_ones = std.math.maxInt(@Int(.unsigned, @bitSizeOf(usize) - 3)),
     _,
 
-    pub fn fromInt(int: u32) AwaitableId {
-        return @enumFromInt(int + 1); // +1 so we can still use null.
+    pub const Int = @typeInfo(AwaitableId).@"enum".tag_type;
+
+    /// Converts an integer back into the id `toInt` produced. Used
+    /// for C FFI.
+    pub fn fromInt(int: usize) AwaitableId {
+        const converted: AwaitableId = @enumFromInt(@as(u29, @intCast(int)));
+        assert(converted != .null);
+        return converted;
     }
+
+    pub fn toInt(id: AwaitableId) usize {
+        return @intFromEnum(id);
+    }
+
+    /// Since this is vendored from std.Io.Threaded, we still need
+    /// `AwaitableId` to be (usize bits - 3) wide for backwards
+    /// compatibility. But a `CancelableTask.Id` is 29 bits, so
+    /// this function converts to a CancelableTask.Id. This is
+    /// valid, because `AwaitableId`s are only derived from
+    /// `CancelableTask.Id`.
+    pub fn cancelableTaskId(id: AwaitableId) CancelableTask.Id {
+        return @enumFromInt(@as(u29, @intCast(@intFromEnum(id))));
+    }
+};
+
+/// This structure is used to safely cancel a thread, by making sure that
+/// said thread doesn't start another task until we stop sending it signals.
+/// We also carry an id, to avoid canceling a task that no longer exists.
+///
+/// Backed by a `u32` because that is what the futex primitives operate on, so
+/// `CancelableTask` can be waited on directly.
+pub const CancelableTask = packed struct(u32) {
+    cancel: CancelState,
+    /// The task this thread is running, or .null between tasks. `startTask` sets it
+    /// to a fresh task id, and `finishTask` sets it back to .null once the task has
+    /// finished, so a cancelation request arriving afterwards has no id to match.
+    id: Id,
+
+    pub const Id = enum(u29) {
+        null = 0,
+        _,
+
+        /// Wraps on overflow.
+        pub fn next(current: Id) Id {
+            var as_int: u29 = @intFromEnum(current);
+            as_int +%= 1;
+            if (@as(Id, @enumFromInt(as_int)) == .null) as_int +%= 1;
+            return @enumFromInt(as_int);
+        }
+
+        pub fn toAwaitableId(id: Id) AwaitableId {
+            return @enumFromInt(@as(AwaitableId.Int, @intFromEnum(id)));
+        }
+    };
+
+    /// Prefixed with `task_` to avoid mixing it up with `Thread.Status`.
+    pub const CancelState = enum(u3) {
+        /// No cancelation is in flight, so `cancelId` may start one.
+        task_cancelable,
+        /// A canceler is inside `cancelId` for this task and may
+        /// continuously signal it.
+        task_being_canceled,
+        /// The canceler has finished, so no further signal can arrive, but
+        /// the task thread has not called/finished calling `finishTask` yet.
+        task_canceling_done,
+    };
 };
 
 pub const Thread = struct {
@@ -473,6 +535,9 @@ pub const Thread = struct {
     handle: Handle,
 
     status: std.atomic.Value(Status),
+    cancelable_task: std.atomic.Value(CancelableTask),
+    /// Source of this thread's `AwaitableId`s. Not threadsafe.
+    task_counter: CancelableTask.Id,
 
     cancel_protection: Io.CancelProtection,
     /// Always released when `Status.cancelation` is set to `.parked`.
@@ -1393,6 +1458,8 @@ pub fn initThread() *Thread {
             .cancelation = .none,
             .awaitable = .null,
         }),
+        .cancelable_task = .init(.{ .cancel = .task_cancelable, .id = .null }),
+        .task_counter = .null,
         .cancel_protection = .unblocked,
         .futex_waiter = undefined,
         .unpark_flag = unpark_flag_init,
@@ -1424,21 +1491,170 @@ pub fn deinitThread() void {
 }
 
 /// Call from the thread you're starting the task on before you start it.
-pub fn startTask(id: AwaitableId) void {
-    Thread.current.?.status.store(.{
+/// Returns an id that you can cancel the task from any thread with `cancelId`.
+/// After calling this and running your task, be sure to call `finishTask`.
+pub fn startTask() AwaitableId {
+    const thread = Thread.current.?;
+    // Make sure no task is running (could happen if the user forgot to call
+    // `finishTask` for the previous task).
+    assert(thread.status.load(.monotonic).awaitable == .null);
+    assert(thread.cancelable_task.load(.monotonic) == CancelableTask{ .cancel = .task_cancelable, .id = .null });
+
+    thread.task_counter = thread.task_counter.next();
+    const id = thread.task_counter;
+
+    thread.status.store(.{ .cancelation = .none, .awaitable = id.toAwaitableId() }, .monotonic);
+
+    // We set the task id after setting the thread status, to avoid cancelation
+    // happening before the thread status has been updated. Cancelation can't
+    // happen when `cancelable_task` id is still .null, which it was at the top
+    // of this call, so after this is stored cancelation can start.
+    thread.cancelable_task.store(
+        .{ .cancel = .task_cancelable, .id = id },
+        .release,
+    );
+    return id.toAwaitableId();
+}
+
+/// Call from the thread running the task once it has completed. May block
+/// if a cancelation was requested, while it coordinates winding down that
+/// cancelation.
+pub fn finishTask() void {
+    const thread = Thread.current.?;
+
+    const status = thread.status.load(.monotonic);
+    assert(status.awaitable != .null);
+    const as_task_id = status.awaitable.cancelableTaskId();
+
+    // Assert that we're in a valid state.
+    switch (status.cancelation) {
+        .canceling => {
+            // The task ran to completion without ever reaching a cancelable
+            // point, so it never observed the cancel request.
+        },
+        .none, .canceled => {},
+        .parked, .blocked, .blocked_alertable, .blocked_canceling, .blocked_alertable_canceling => {
+            // All of these states are impossible, since these are states only
+            // reachable while running a task. Since `finishTask` is called only
+            // after a task has finished, these states should have already been
+            // cleared.
+            unreachable;
+        },
+    }
+
+    var observed = thread.cancelable_task.load(.acquire);
+    while (true) {
+        // The id should never change, since only we can set the id to .null or
+        // start the next task.
+        assert(observed.id == as_task_id);
+
+        switch (observed.cancel) {
+            .task_cancelable => {
+                // No cancelation is in flight, so we can set the id to null.
+                // Needs to be CAS since a late cancel could still swoop in.
+                observed = thread.cancelable_task.cmpxchgWeak(
+                    observed,
+                    .{ .cancel = .task_cancelable, .id = .null },
+                    .release,
+                    .acquire,
+                ) orelse break;
+                continue; // Lost, so retry.
+            },
+            .task_being_canceled => {
+                // A canceler may still signal us, so there is nothing to do but wait
+                // below for it to finish.
+                //
+                // We also wake the futex, because chances are the thread canceling us
+                // is waiting for the futex to timeout, and so this will end it sooner.
+                Thread.futexWake(@ptrCast(&thread.cancelable_task.raw), 1);
+            },
+            .task_canceling_done => {
+                // The canceler has finished, so we're the only ones who can
+                // advance the state machine.
+                thread.cancelable_task.store(
+                    .{ .cancel = .task_cancelable, .id = .null },
+                    .release,
+                );
+                break;
+            },
+        }
+
+        // Wait on the state we observed, so we sleep until the value changes to
+        // something new.
+        Thread.futexWaitUncancelable(
+            @ptrCast(&thread.cancelable_task.raw),
+            @bitCast(observed),
+            null,
+        );
+        observed = thread.cancelable_task.load(.acquire);
+    }
+
+    // The task is over and no canceler is left, so change the thread status
+    // back to no running task.
+    thread.status.store(.{
         .cancelation = .none,
-        .awaitable = id,
+        .awaitable = .null,
     }, .monotonic);
 }
 
-/// Provide `id` to make sure you don't accidentally cancel the wrong task.
-/// Threadsafe. FIXME need to figure out some way to keep sending the signal
-/// until the thread runner acknowledges it, similar to the actual `Threaded`
-/// implementation.
+/// Idempotently cancel task `id` on `thread`. If `thread` is no longer running
+/// task `id`, this will silently return. This also handles the case where `thread`
+/// is blocking, and will send signals until the thread leaves its blocking section.
+/// Threadsafe, as long as the caller can guarantee `thread` won't terminate before
+/// the cancelation request goes through.
 pub fn cancelId(t: *Threaded, thread: *Thread, id: AwaitableId) void {
+    const as_task_id = id.cancelableTaskId();
+
+    // This exchange simultaneously checks that `thread` is running `id`, that no
+    // cancelation is already in flight for it, and initiates the cancelation.
+    if (thread.cancelable_task.cmpxchgStrong(
+        .{ .cancel = .task_cancelable, .id = as_task_id },
+        .{ .cancel = .task_being_canceled, .id = as_task_id },
+        .acquire,
+        .monotonic,
+    ) != null) return;
+
+    // `cancelAwaitable` updates `thread.status` to some form of canceling, and
+    // reports whether we need to send signals to get the thread to exit a
+    // blocking section.
     if (thread.cancelAwaitable(id)) {
-        thread.signalCanceledSyscall(t, id);
+        // A signal can be missed between marking the thread as blocking and it
+        // actually entering the syscall, which is why we retry here. We keep
+        // sending until `signalCanceledSyscall` reports the thread has left
+        // .blocked_canceling. We wait on the futex with a timeout, because
+        // 1. The thread being canceled could wake us early after terminating,
+        // and 2. The timeout acts as a sleep for the exponential backoff.
+        var timeout_ns: u64 = 1 << 10;
+        const held: CancelableTask = .{ .cancel = .task_being_canceled, .id = as_task_id };
+        while (thread.signalCanceledSyscall(t, id)) {
+            Thread.futexWaitUncancelable(
+                @ptrCast(&thread.cancelable_task.raw),
+                @bitCast(held),
+                timeout_ns,
+            );
+            timeout_ns <<|= 1;
+        }
     }
+
+    // We're done signalling, so we'll advance the state machine to
+    // .task_canceling_done. We can do this as a normal store, since
+    // we are the only ones who can advance.
+    thread.cancelable_task.store(
+        .{ .cancel = .task_canceling_done, .id = as_task_id },
+        .release,
+    );
+    Thread.futexWake(@ptrCast(&thread.cancelable_task.raw), 1);
+}
+
+/// The id of the task this thread is running, or null if it is between tasks or was never
+/// initialized with `initThread`. Never returns .null wrapped in a non-null optional, so a
+/// caller only has to check one thing.
+pub fn getCurrentId() ?AwaitableId {
+    const current = Thread.current orelse return null;
+    return switch (current.status.load(.monotonic).awaitable) {
+        .null => null,
+        else => |id| id,
+    };
 }
 
 pub fn io(t: *Threaded) Io {
