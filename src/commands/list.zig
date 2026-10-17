@@ -256,6 +256,7 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
     const Mode = enum { exact, glob, regexp };
     var mode: Mode = .glob; // Tcl's default.
     var opt_nocase = false;
+    var opt_all = false;
 
     var i: usize = 1;
     while (i < args.len - 2) : (i += 1) {
@@ -267,6 +268,8 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
             mode = .regexp;
         } else if (try args[i].current().equalsString("-nocase")) {
             opt_nocase = true;
+        } else if (try args[i].current().equalsString("-all")) {
+            opt_all = true;
         } else if (try args[i].current().equalsString("--")) {
             i += 1;
             break;
@@ -289,6 +292,9 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
         compiled_regexp = try interp.wrapError(&det, regex.Regexp.shimmerFrom(&det, pattern_shim, compile_opts));
     }
 
+    const all_matches = if (opt_all) try List.new(&.{}) else null;
+    errdefer if (all_matches) |list| list.asHead().dropReference();
+
     for (as_list.items, 0..) |item, idx| {
         const item_bytes = try item.getString();
 
@@ -299,12 +305,20 @@ pub fn lsearchCmd(interp: *Interp, args: []Shimmerable) !void {
         };
 
         if (matched) {
-            interp.setResultInteger(@intCast(idx));
-            return;
+            if (all_matches) |list| {
+                try list.append(objects.Integer.new(@intCast(idx)));
+            } else {
+                interp.setResultInteger(@intCast(idx));
+                return;
+            }
         }
     }
 
-    interp.setResultInteger(-1);
+    if (all_matches) |list| {
+        interp.setResultOwning(list.asHead().asValue());
+    } else {
+        interp.setResultInteger(-1);
+    }
 }
 
 /// [lset]
@@ -480,6 +494,45 @@ pub fn joinCmd(interp: *Interp, args: []Shimmerable) !void {
     try interp.setResultStringOwning(try buf.toOwnedSliceSentinel(heap.global_gpa, 0));
 }
 
+/// [split]
+pub fn splitCmd(interp: *Interp, args: []Shimmerable) !void {
+    const str = try args[1].getString();
+    const split_chars = if (args.len > 2) try args[2].getString() else " \t\n\r";
+
+    const result = try List.new(&.{});
+    errdefer result.asHead().dropReference();
+
+    if (split_chars.len == 0) {
+        // `split_chars` was empty, so we split on every character.
+        var char_iter = strutil.Iterator.init(str);
+        while (true) {
+            const start = char_iter.i;
+            if (char_iter.next() == null) break;
+            const item = try String.newValue(str[start..char_iter.i]);
+            defer item.dropReference();
+            try result.append(item);
+        }
+    } else {
+        var char_iter = strutil.Iterator.init(str);
+        var start: usize = 0;
+        while (true) {
+            const cp_start = char_iter.i;
+            const cp = char_iter.next() orelse break;
+            if (strutil.findCodepoint(split_chars, cp) != null) {
+                const item = try String.newValue(str[start..cp_start]);
+                defer item.dropReference();
+                try result.append(item);
+                start = char_iter.i;
+            }
+        }
+        const item = try String.newValue(str[start..]);
+        defer item.dropReference();
+        try result.append(item);
+    }
+
+    interp.setResultOwning(result.asHead().asValue());
+}
+
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "list", listCmd, "?arg ...?", 0, null);
     try registerCommand(interp, "llength", llengthCmd, "list", 1, 1);
@@ -488,6 +541,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "lmap", lmapCmd, "varList list ?varList list ...? body", 3, null);
     try registerCommand(interp, "concat", concatCmd, "?arg ...?", 0, null);
     try registerCommand(interp, "join", joinCmd, "list ?joinString?", 1, 2);
+    try registerCommand(interp, "split", splitCmd, "string ?splitChars?", 1, 2);
     try registerCommand(interp, "lindex", lindexCmd, "list ?index ...?", 1, null);
     try registerCommand(interp, "lrange", lrangeCmd, "list first last", 3, 3);
     try registerCommand(interp, "lreplace", lreplaceCmd, "list first last ?element ...?", 3, null);
@@ -651,6 +705,43 @@ fn testJoinBasic(ta: std.mem.Allocator) !void {
 
 test "join basic" {
     try memutil.checkAllocationFailures(.exhaustive, testJoinBasic, .{});
+}
+
+fn testSplitBasic(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Default splitChars is whitespace.
+    try interp.testExpectScriptResult("a b c", "split {a b c}");
+
+    // Explicit splitChars.
+    try interp.testExpectScriptResult("a b c", "split a,b,c ,");
+
+    // Adjacent delimiters produce an empty element, not collapsing.
+    try interp.testExpectScriptResult("a {} b", "split a,,b ,");
+
+    // Empty splitChars splits into individual characters.
+    try interp.testExpectScriptResult("a b c", "split abc {}");
+
+    // Empty string still produces one (empty-string) element, not an empty list.
+    try interp.testExpectScriptResult("{}", "split {} ,");
+
+    // No delimiter present: whole string comes back as the one element.
+    try interp.testExpectScriptResult("abc", "split abc ,");
+
+    // split/join round-trip.
+    try interp.testExpectScriptResult("a b c", "join [split a,b,c ,]");
+
+    // A multi-byte delimiter is one codepoint, not a run of matchable bytes.
+    try interp.testExpectScriptResult("a b c", "split a\xc3\xa9b\xc3\xa9c \xc3\xa9");
+
+    // "\xc3\xa9" and "\xc3\xa3" share a lead byte but are different
+    // codepoints, so neither delimits the other.
+    try interp.testExpectScriptResult("a\xc3\xa3b", "split a\xc3\xa3b \xc3\xa9");
+}
+
+test "split basic" {
+    try memutil.checkAllocationFailures(.exhaustive, testSplitBasic, .{});
 }
 
 fn testLappendAppendsToAVariable(ta: std.mem.Allocator) !void {
@@ -834,6 +925,11 @@ fn testLsearchBasic(ta: std.mem.Allocator) !void {
 
     try interp.testExpectScriptResult("1", "lsearch -exact {foo bar baz} bar");
     try interp.testExpectScriptResult("2", "lsearch -regexp {foo bar baz} {z$}");
+
+    // -all collects every match, and answers an empty list rather than -1.
+    try interp.testExpectScriptResult("0 2", "lsearch -all -exact {bar foo bar} bar");
+    try interp.testExpectScriptResult("", "lsearch -all -exact {foo baz} bar");
+    try interp.testExpectScriptResult("1 2", "lsearch -all {foo bar baz} b*");
 }
 
 test "lsearch basic" {
