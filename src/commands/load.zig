@@ -60,7 +60,7 @@ pub fn loadLibrary(interp: *Interp, path: [:0]const u8) Interp.Error!void {
     errdefer lib.close();
 
     const basename = std.Io.Dir.path.basename(path);
-    const pkgname = if (std.mem.indexOfScalar(u8, basename, '.')) |dot| basename[0..dot] else basename;
+    const pkgname = if (std.mem.findScalar(u8, basename, '.')) |dot| basename[0..dot] else basename;
 
     const symbol = try std.fmt.allocPrintSentinel(heap.local_arena, "Zicl_{s}Init", .{pkgname}, 0);
     const init_fn = lib.lookup(InitFn, symbol) orelse {

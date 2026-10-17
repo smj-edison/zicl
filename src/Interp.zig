@@ -437,12 +437,26 @@ pub fn setErrorString(interp: *Interp, bytes: []const u8) error{ OutOfMemory, Ev
 }
 
 /// Bytes must live for the duration of the program.
-pub fn setErrorInterned(interp: *Interp, bytes: []const u8) error{EvalError} {
+pub fn setErrorInterned(interp: *Interp, comptime bytes: [:0]const u8) error{EvalError} {
     interp.setResult(heap.InternedString.newValue(bytes));
+    return error.EvalError;
 }
 
 pub fn setErrorFormatted(interp: *Interp, comptime fmt: []const u8, args: anytype) error{ OutOfMemory, EvalError } {
     try interp.setResultFormatted(fmt, args);
+    return error.EvalError;
+}
+
+/// Like `setErrorFormatted`, but also sets the error code that [catch] and
+/// [try] report, as a list of `code`.
+pub fn setErrorWithCode(interp: *Interp, code: []const Value, comptime fmt: []const u8, args: anytype) error{ OutOfMemory, EvalError } {
+    const code_list = blk: {
+        const code_list = try List.new(code);
+        errdefer code_list.asHead().dropReference();
+        try interp.setResultFormatted(fmt, args);
+        break :blk code_list;
+    };
+    interp.pending_error_code.swap(code_list.asHead().asValue());
     return error.EvalError;
 }
 
@@ -1157,7 +1171,7 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
 }
 
 test "eval expression" {
-    try heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
@@ -2028,7 +2042,7 @@ pub fn setListValueRecursively(interp: *Interp, list: *List, indexes: []Shimmera
 }
 
 test "recursive dict keys" {
-    try heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
@@ -2083,7 +2097,7 @@ test "recursive dict keys" {
 }
 
 fn testRecursiveDictRemoval(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();

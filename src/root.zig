@@ -86,6 +86,7 @@ test {
     _ = @import("Interp.zig");
     _ = @import("expr_parse.zig");
     _ = @import("regex.zig");
+    _ = @import("vendor/Threaded_test.zig");
 
     _ = @import("commands/common.zig");
 }

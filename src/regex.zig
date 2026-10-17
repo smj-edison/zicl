@@ -132,7 +132,7 @@ pub fn doesStringMatch(det: ?*ErrorDetails, re: *pcre2.struct_pcre2_real_code_8,
 }
 
 fn regexMemStressTest(ta: std.mem.Allocator) !void {
-    _ = try heap.testStart(ta, testing.io);
+    _ = try heap.testStart(ta, null);
     defer heap.testFinish();
 
     const pattern = "hello, (\\w+)";

@@ -794,7 +794,6 @@ pub const Parsed = struct {
             .abs,
             .to_double,
             .round,
-            .rand,
             .srand,
             .sin,
             .cos,
@@ -815,6 +814,7 @@ pub const Parsed = struct {
                 try parsed.renderInner(writer, data.unary);
                 try writer.print(")", .{});
             },
+            .rand => try writer.print("({})", .{tag}),
         }
     }
 
@@ -829,7 +829,7 @@ pub const Parsed = struct {
 
 test "expr parsing" {
     const ta = testing.allocator;
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     // Left associativity.
@@ -838,6 +838,11 @@ test "expr parsing" {
     try testExprParse(ta, "1 ** 2 ** 3 ** 4", "(1 .pow (2 .pow (3 .pow 4)))");
     // No associativity.
     try testExprParseError(ta, "1 < 2 < 3", .chained_comparison_operators, null);
+
+    // `rand` is the only nullary function, so it renders without an operand.
+    try testExprParse(ta, "rand()", "(.rand)");
+    try testExprParse(ta, "int(rand() * 2)", "(.to_int ((.rand) .mul 2))");
+    try testExprParse(ta, "srand(4)", "(.srand 4)");
 
     // Various stress tests.
     try testExprParse(ta, "1 + 2 * 3 + 4", "((1 .add (2 .mul 3)) .add 4)");

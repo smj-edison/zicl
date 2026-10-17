@@ -53,7 +53,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
-    _ = try heap.testStart(ta, std.testing.io);
+    _ = try heap.testStart(ta, null);
     errdefer heap.testFinish();
     var interp = try Interp.init(.{});
     errdefer interp.deinit();
@@ -72,7 +72,7 @@ test {
     _ = @import("math.zig");
     _ = @import("eval.zig");
     _ = @import("dict.zig");
-    _ = @import("exec.zig");
+    _ = @import("exec-2.zig");
     _ = @import("misc.zig");
     _ = @import("variables.zig");
     _ = @import("io.zig");

@@ -13921,6 +13921,22 @@ fn spawnPosix(t: *Threaded, options: process.SpawnOptions) process.SpawnError!Sp
             }
         }
 
+        // We don't want the child process to inherit the parent's signal
+        // configuration, as that may cause the child process to inherit
+        // ignoring SIGPIPE.
+        if (posix.Sigaction != void) {
+            if (have_sig_pipe) {
+                const act: posix.Sigaction = .{
+                    .handler = .{ .handler = posix.SIG.DFL },
+                    .mask = posix.sigemptyset(),
+                    .flags = 0,
+                };
+                posix.sigaction(.PIPE, &act, null);
+            }
+            const empty_mask = posix.sigemptyset();
+            posix.sigprocmask(posix.SIG.SETMASK, &empty_mask, null);
+        }
+
         const err = posixExecv(options.expand_arg0, argv_buf.ptr[0].?, argv_buf.ptr, env_block, PATH);
         forkBail(ep1, err);
     }
@@ -14141,8 +14157,6 @@ fn childCleanupWindows(child: *process.Child) void {
 }
 
 fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.Term {
-    defer childCleanupPosix(child);
-
     const pid = child.id.?;
 
     var ru: posix.rusage = undefined;
@@ -14155,6 +14169,8 @@ fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.T
             .SUCCESS => {
                 syscall.finish();
                 if (ru_ptr) |p| child.resource_usage_statistics.rusage = p.*;
+
+                childCleanupPosix(child);
                 return statusToTerm(@bitCast(status));
             },
             .INTR => {
@@ -14176,6 +14192,8 @@ fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.T
                 if (ru_ptr) |p| child.resource_usage_statistics.rusage = p.*;
                 const status: u32 = @bitCast(info.fields.common.second.sigchld.status);
                 const code: linux.CLD = @enumFromInt(info.code);
+
+                childCleanupPosix(child);
                 return switch (code) {
                     .EXITED => .{ .exited = @truncate(status) },
                     .KILLED, .DUMPED => .{ .signal = @enumFromInt(status) },
@@ -14197,6 +14215,7 @@ fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.T
     while (true) switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
         .SUCCESS => {
             syscall.finish();
+            childCleanupPosix(child);
             return statusToTerm(@bitCast(status));
         },
         .INTR => {

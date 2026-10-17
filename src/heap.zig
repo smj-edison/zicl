@@ -19,6 +19,7 @@ const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
 const Capability = @import("Capability.zig");
 const Interp = @import("Interp.zig");
+const Threaded = @import("vendor/Threaded.zig");
 
 pub var initialized: bool = false;
 /// Use to lock `custom_types` or `script_metadata` when adding or removing
@@ -33,7 +34,45 @@ pub var global_gpa: mem.Allocator = undefined;
 pub threadlocal var local_arena_instance: memutil.ScopedArena = undefined;
 pub threadlocal var local_arena: mem.Allocator = undefined;
 pub var global_io: std.Io = undefined;
-pub var environ: std.process.Environ.Map = undefined;
+
+pub const EnvironAndOwnership = union(enum) {
+    owned: std.process.Environ.Map,
+    shared: *const std.process.Environ.Map,
+
+    pub fn get(self: *EnvironAndOwnership) *const std.process.Environ.Map {
+        switch (self.*) {
+            .owned => |*owned| return owned,
+            .shared => |shared| return shared,
+        }
+    }
+
+    pub fn deinit(self: *EnvironAndOwnership) void {
+        switch (self.*) {
+            .owned => |*owned| owned.deinit(),
+            .shared => {},
+        }
+    }
+};
+pub var environ: EnvironAndOwnership = .{ .shared = undefined };
+
+/// Used across multiple tests to avoid the overhead of duplicating the
+/// environ per test.
+var test_environ: ?struct {
+    arena: std.heap.ArenaAllocator,
+    map: std.process.Environ.Map,
+} = if (builtin.is_test) null else @compileError("not testing");
+/// Get the test environment, which is lazily generated.
+fn getTestEnviron() *const std.process.Environ.Map {
+    if (!builtin.is_test) @compileError("not testing");
+
+    if (test_environ) |*val| return &val.map;
+    // Use the heap allocator as it will outlive the provided gpa.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const map = std.testing.environ.createMap(arena.allocator()) catch @panic("oom");
+    test_environ = .{ .arena = arena, .map = map };
+
+    return &test_environ.?.map;
+}
 pub var lazy_fn_registry: LazyFnRegistry = .{};
 pub var registered_hashes: HashRegistry = .{};
 
@@ -117,15 +156,26 @@ pub const ReturnCode = enum(c_int) {
 };
 
 /// Initialize global heap state. Must be called once per process (or test).
-pub fn initGlobals(gpa: Allocator, io: std.Io, env: std.process.Environ.Map, config: Config) !void {
+pub fn initGlobals(
+    gpa: Allocator,
+    io: std.Io,
+    env: EnvironAndOwnership,
+    config: Config,
+) !void {
+    var env_mut = env;
+    errdefer env_mut.deinit();
+
     init_mutex.lockUncancelable(io);
     defer init_mutex.unlock(io);
 
-    if (initialized) return;
+    if (initialized) return error.AlreadyInitialized;
 
     global_gpa = gpa;
+    errdefer global_gpa = undefined;
     global_io = io;
-    environ = env;
+    errdefer global_io = undefined;
+    environ = env_mut;
+    errdefer environ = undefined;
 
     lazy_fn_registry = .{};
     registered_hashes = .{};
@@ -177,6 +227,7 @@ pub fn deinitGlobals() void {
 
     lazy_fn_registry.deinit(global_gpa);
     registered_hashes.entries.deinit(global_gpa);
+    environ.deinit();
 
     initialized = false;
 }
@@ -193,8 +244,21 @@ pub fn deinitThread() void {
     local_arena = undefined;
 }
 
-pub fn testStart(gpa: Allocator, io: std.Io) !void {
-    try initGlobals(gpa, io, .{});
+/// Tests run on the vendored `Threaded`, the same `Io` that libzicl uses,
+/// rather than the test runner's `std.Io.Threaded`.
+var test_threaded: if (builtin.is_test) Threaded else void = undefined;
+
+/// If `env` is provided, caller is responsible for cleanup.
+pub fn testStart(gpa: Allocator, env: ?EnvironAndOwnership) !void {
+    // Not `gpa`, since that fails on purpose during allocation-failure sweeps,
+    // and `Threaded` only allocates for async tasks, which aren't under test.
+    test_threaded = .init(std.testing.allocator, .{ .environ = std.testing.environ });
+    errdefer test_threaded.deinit();
+    _ = Threaded.initThread();
+    errdefer Threaded.deinitThread();
+
+    try initGlobals(gpa, test_threaded.io(), env orelse .{ .shared = getTestEnviron() }, .{});
+    errdefer deinitGlobals();
     try initThread();
 }
 
@@ -205,6 +269,8 @@ pub fn testFinish() void {
     if (options.trace_mem) leak_check.dumpLeaks() catch {};
     deinitThread();
     deinitGlobals();
+    Threaded.deinitThread();
+    test_threaded.deinit();
 }
 
 pub export fn dumpLastTouchedTrace(fd: i32) void {
@@ -432,16 +498,21 @@ pub const InternedString = extern struct {
     ptr: [*:0]const u8,
     len: u16,
 
-    pub fn new(comptime bytes: [:0]const u8) InternedString {
+    /// `bytes` is never copied or freed, so it must live for the rest of the
+    /// program, such as a string literal or `@errorName`.
+    pub fn new(bytes: [:0]const u8) InternedString {
+        assert(bytes.len <= std.math.maxInt(u16));
         return .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) };
     }
 
-    pub fn newValue(comptime bytes: [:0]const u8) Value {
-        const interned = new(bytes);
+    /// `bytes` is never copied or freed, so it must live for the rest of the
+    /// program, such as a string literal or `@errorName`.
+    pub fn newValue(bytes: [:0]const u8) Value {
+        assert(bytes.len <= std.math.maxInt(u16));
         return .fromRep(.{
             .tag = .interned,
-            .as = .{ .interned = interned.ptr },
-            .interned_string_len = @intCast(interned.len),
+            .as = .{ .interned = bytes.ptr },
+            .interned_string_len = @intCast(bytes.len),
         });
     }
 
@@ -1714,7 +1785,7 @@ pub fn decrRefCountOf(comptime T: type, ref: *T, is_atomic: bool) T {
 }
 
 fn testBoxInteger(ta: std.mem.Allocator) !void {
-    try testStart(ta, testing.io);
+    try testStart(ta, null);
     defer testFinish();
 
     const obj = try Value.newInt(42).raw.box();
@@ -1727,7 +1798,7 @@ test "value box int" {
 }
 
 fn testBoxFloat(ta: std.mem.Allocator) !void {
-    try testStart(ta, testing.io);
+    try testStart(ta, null);
     defer testFinish();
 
     const obj = try Value.newFloat(3.14).raw.box();
@@ -1740,7 +1811,7 @@ test "value box float" {
 }
 
 fn testBoxBool(ta: std.mem.Allocator) !void {
-    try testStart(ta, testing.io);
+    try testStart(ta, null);
     defer testFinish();
 
     const true_obj = try Value.newBool(true).raw.box();
@@ -1757,7 +1828,7 @@ test "value box bool" {
 }
 
 fn testReferenceCounting(ta: std.mem.Allocator) !void {
-    try testStart(ta, testing.io);
+    try testStart(ta, null);
     defer testFinish();
 
     const obj = (try objects.String.new("foo")).asHead();
@@ -1774,7 +1845,7 @@ test "object ref count" {
 }
 
 fn testDuplicateObject(ta: std.mem.Allocator) !void {
-    try testStart(ta, testing.io);
+    try testStart(ta, null);
     defer testFinish();
 
     const original = (try objects.String.new("to duplicate")).asHead();
@@ -1789,7 +1860,7 @@ test "object duplicate" {
 }
 
 fn testSpecialSourceHash(ta: std.mem.Allocator) !void {
-    try testStart(ta, testing.io);
+    try testStart(ta, null);
     defer testFinish();
 
     // Over 1024 bytes, so the string rep is stored as a `SpecialString` and both

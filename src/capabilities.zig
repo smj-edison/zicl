@@ -44,6 +44,19 @@ pub const File = struct {
     eos_hit: bool = false,
     reader: std.Io.File.Reader,
 
+    pub fn openFileMode(dir: std.Io.Dir, path: []const u8, mode: Mode) !std.Io.File {
+        return switch (mode) {
+            .r, .@"r+" => try dir.openFile(heap.global_io, path, .{
+                .mode = if (mode == .@"r+") .read_write else .read_only,
+                .allow_directory = false,
+            }),
+            .w, .@"w+", .a, .@"a+" => try dir.createFile(heap.global_io, path, .{
+                .read = mode == .@"w+" or mode == .@"a+",
+                .truncate = mode == .w or mode == .@"w+",
+            }),
+        };
+    }
+
     pub fn open(path: []const u8, mode: Mode) !*Backing {
         const cwd = std.Io.Dir.cwd();
 
@@ -55,16 +68,7 @@ pub const File = struct {
         const cap_backing = try heap.global_gpa.create(Backing);
         errdefer heap.global_gpa.destroy(cap_backing);
 
-        const file = switch (mode) {
-            .r, .@"r+" => try cwd.openFile(heap.global_io, path, .{
-                .mode = if (mode == .@"r+") .read_write else .read_only,
-                .allow_directory = false,
-            }),
-            .w, .@"w+", .a, .@"a+" => try cwd.createFile(heap.global_io, path, .{
-                .read = mode == .@"w+" or mode == .@"a+",
-                .truncate = mode == .w or mode == .@"w+",
-            }),
-        };
+        const file = try openFileMode(cwd, path, mode);
         errdefer file.close(heap.global_io);
 
         var reader: std.Io.File.Reader = .init(file, heap.global_io, read_buffer);
@@ -73,7 +77,7 @@ pub const File = struct {
 
         // Take ownership of everything.
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{
                 .file = file,
                 .close_when_done = true,
@@ -95,7 +99,7 @@ pub const File = struct {
         const cap_backing = try heap.global_gpa.create(Backing);
 
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{
                 .file = file,
                 .close_when_done = close_when_done,
@@ -218,7 +222,7 @@ pub const IpConnection = struct {
         errdefer heap.global_gpa.destroy(cap_backing);
 
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{
                 .stream = stream,
                 .write_mutex = .init,
@@ -318,7 +322,7 @@ pub const IpSocket = struct {
         errdefer heap.global_gpa.destroy(cap_backing);
 
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{ .server = server },
         };
         return cap_backing;
@@ -412,18 +416,19 @@ pub const Process = struct {
         }
     };
 
-    /// Takes ownership of `stages` on success, which must have been allocated
-    /// with `heap.global_gpa` and hold already-spawned children. On failure the
-    /// slice is still the caller's, along with the children in it.
+    /// Takes ownership of `stages`, which must have been allocated with
+    /// `heap.global_gpa` and hold already-spawned children -- on failure to
+    /// publish, the capability kills and frees them itself.
     pub fn new(stages: []Stage) !*Capability {
         const cap_backing = try heap.global_gpa.create(Backing);
-        errdefer heap.global_gpa.destroy(cap_backing);
+        // `newTakingOwnership` tears the backing down if publication fails, so
+        // from here on no caller-side cleanup is needed.
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{ .stages = stages },
         };
 
-        return try Capability.new(&cap_backing.head);
+        return try Capability.newTakingOwnership(&cap_backing.head);
     }
 
     /// Blocks until every stage has exited and reports how the pipeline ended, a
@@ -546,17 +551,20 @@ pub const Pointer = struct {
     destructor: ?*const fn (ptr: *anyopaque) callconv(.c) void,
 
     pub fn new(ptr: ?*anyopaque, type_name: []const u8, destructor: ?*const fn (ptr: *anyopaque) callconv(.c) void) !*Capability {
-        const owned_type_name = try heap.global_gpa.dupeSentinel(u8, type_name, 0);
-        errdefer heap.global_gpa.free(owned_type_name);
-
-        const cap_backing = try heap.global_gpa.create(Backing);
-        errdefer heap.global_gpa.destroy(cap_backing);
-        cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = undefined },
-            .body = .{ .ptr = ptr, .type_name = owned_type_name, .destructor = destructor },
+        const cap_backing = backing_and_name: {
+            const created = try heap.global_gpa.create(Backing);
+            errdefer heap.global_gpa.destroy(created);
+            const owned_type_name = try heap.global_gpa.dupeSentinel(u8, type_name, 0);
+            break :backing_and_name .{ .backing = created, .type_name = owned_type_name };
+        };
+        // `newTakingOwnership` tears the backing down if publication fails, so
+        // from here on no caller-side cleanup is needed.
+        cap_backing.backing.* = .{
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
+            .body = .{ .ptr = ptr, .type_name = cap_backing.type_name, .destructor = destructor },
         };
 
-        return try Capability.new(&cap_backing.head);
+        return try Capability.newTakingOwnership(&cap_backing.backing.head);
     }
 
     /// Like `Capability.getBacking`, but also requires the capability's
@@ -610,14 +618,15 @@ pub const DynLib = struct {
     /// Takes ownership of `handle` and `fns`.
     pub fn new(handle: std.DynLib, fns: heap.Value) !*Capability {
         const cap_backing = try heap.global_gpa.create(Backing);
-        errdefer heap.global_gpa.destroy(cap_backing);
+        // `newTakingOwnership` tears the backing down if publication fails, so
+        // from here on no caller-side cleanup is needed.
         fns.makeCrossthread();
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = undefined },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{ .handle = handle, .fns = fns },
         };
 
-        return try Capability.new(&cap_backing.head);
+        return try Capability.newTakingOwnership(&cap_backing.head);
     }
 
     /// The address of `symbol_name` in this library, or null if it isn't
@@ -650,7 +659,7 @@ pub const DynLib = struct {
 };
 
 fn testPointerDestructorRunsOnClose(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     const Impl = struct {
@@ -693,7 +702,7 @@ test "pointer capability destructor runs on close" {
 }
 
 fn testPointerNullDestructorIsNoop(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     var payload: u64 = 7;
@@ -716,7 +725,7 @@ test "pointer capability with null destructor is a no-op close" {
 }
 
 fn testPointerGetTypedChecksTypeName(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     var payload: u64 = 99;
@@ -738,7 +747,7 @@ test "pointer capability getTyped checks type_name" {
 }
 
 fn testPointerNullPtrClosesWithoutRunningDestructor(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     const Impl = struct {
@@ -768,7 +777,7 @@ test "pointer capability with null ptr closes without running destructor" {
 }
 
 test "file" {
-    try heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
 
     // Written into a temporary directory rather than the working one, so a test
@@ -781,13 +790,14 @@ test "file" {
     defer testing.allocator.free(path);
 
     {
-        const cap = try File.open(path, .w);
+        const backing = try File.open(path, .w);
+        const cap = try Capability.newTakingOwnership(&backing.head);
         defer cap.asHead().dropReference();
         defer cap.close();
-        const backing = try cap.getBacking(File.Backing, null);
-        defer backing.head.dropInFlight();
-        const writer = backing.head.vtable.stream_ops.?.lock_writer(&backing.head);
-        defer backing.head.vtable.stream_ops.?.unlock_writer(&backing.head);
+        const got = try cap.getBacking(File.Backing, null);
+        defer got.head.dropInFlight();
+        const writer = got.head.vtable.stream_ops.?.lock_writer(&got.head);
+        defer got.head.vtable.stream_ops.?.unlock_writer(&got.head);
         try writer.writeAll("hello ");
         try writer.writeAll("world");
         try writer.flush();

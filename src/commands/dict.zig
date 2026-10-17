@@ -87,7 +87,7 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .replace, .usage = "dictionary ?key value ...?", .min_args = 1 },
         .{ .variant = .update, .usage = "varName ?arg ...? script", .min_args = 2 },
         .{ .variant = .link, .usage = "linkTo dict", .min_args = 2, .max_args = 2 },
-        .{ .variant = .assign, .usage = "dictionary varName ?varName ...?", .min_args = 2 },
+        .{ .variant = .assign, .usage = "?-all? dictionary ?varName ...?", .min_args = 1 },
     });
 
     var det: ErrorDetails = undefined;
@@ -202,13 +202,30 @@ pub fn dictCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             interp.setResultOwning(dict_mut.asHead().asValue());
         },
         .assign => {
-            const dict = &args[2];
-            var i: usize = 3;
-            while (i < args.len) : (i += 1) {
-                const found = try interp.getDictValueOrError(dict, args[i].current());
-                try interp.setVariable(&args[i], found);
+            if (try args[2].current().equalsString("-all")) {
+                if (args.len != 4) return error.WrongUsage;
+                const dict = &args[3];
+
+                var kv_result: Dictionary.KvResult =
+                    try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, dict));
+                defer kv_result.deinit(heap.local_arena);
+
+                for (kv_result.mapping.keys(), kv_result.mapping.values()) |key, value| {
+                    var name: Shimmerable = .{ .original = key };
+                    defer name.discardChanges();
+                    try interp.setVariable(&name, value);
+                }
+
+                interp.setResult(dict.current());
+            } else {
+                const dict = &args[2];
+                var i: usize = 3;
+                while (i < args.len) : (i += 1) {
+                    const found = try interp.getDictValueOrError(dict, args[i].current());
+                    try interp.setVariable(&args[i], found);
+                }
+                interp.setResult(dict.current());
             }
-            interp.setResult(dict.current());
         },
         .size => {
             var kv_result: Dictionary.KvResult = try interp.wrapError(&det, Dictionary.getKvPairs(&det, heap.local_arena, &args[2]));
@@ -411,6 +428,31 @@ fn testDictAssign(ta: std.mem.Allocator) !void {
         \\could not find value for key "missing"
     ,
         \\ dict assign {a 1} missing
+    );
+
+    // Naming no keys binds nothing, so `{*}$names` on an empty list is a no-op
+    // rather than an error.
+    try interp.testExpectScriptResult("a 1", "dict assign {a 1}");
+
+    try interp.testExpectScriptResult("1 2 3",
+        \\ dict assign -all {a 1 b 2 c 3}
+        \\ list $a $b $c
+    );
+
+    // -all binds only what the dict holds, which is what makes it a stand-in
+    // for Tcl's [dict with]: an absent key stays absent rather than erroring.
+    try interp.testExpectScriptResult("no",
+        \\ dict assign -all {a 1}
+        \\ expr {[info exists notInTheDict] ? "yes" : "no"}
+    );
+
+    // Reaches inherited keys, and binds the link itself as a variable no more
+    // than [dict keys] reports it as a key.
+    try interp.testExpectScriptResult("1 2",
+        \\ set parent {a 1}
+        \\ set child [dict link $parent {b 2}]
+        \\ dict assign -all $child
+        \\ list $a $b
     );
 }
 

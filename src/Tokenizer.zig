@@ -378,6 +378,7 @@ pub fn nextStringToken(self: *Tokenizer) !Token {
                     self.advance(1);
                     return token;
                 }
+                self.advance(1);
             },
             else => self.advance(1),
         }
@@ -641,11 +642,10 @@ pub fn nextCommandToken(self: *Tokenizer) Error!Token {
                 start_of_word = false; // have to set because of the continue
                 continue;
             },
-            else => {
-                start_of_word = isWhitespace(self.current());
-            },
+            else => {},
         }
 
+        start_of_word = isWhitespace(self.current());
         self.advance(1);
     }
 
@@ -1363,6 +1363,23 @@ fn testNextToken(parser: *Tokenizer, expected_type: Token.Tag, expected_value: [
 
     try expectEqual(expected_type, next.tag);
     try expectEqualSlices(u8, expected_value, parser.buffer[next.loc.start..next.loc.end]);
+}
+
+test "a quote only opens a word at the start of one" {
+    var parser = Tokenizer.init("set a \\\\\" x\\\\\"y", 1);
+
+    try testNextToken(&parser, .simple_string, "set");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .simple_string, "a");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .escaped_string, "\\\\\"");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .escaped_string, "x\\\\\"y");
+}
+
+test "an escape inside a command substitution ends the word start" {
+    var parser = Tokenizer.init("[list \\\\\\\\ \\\" \\\\\\\"]", 1);
+    try testNextToken(&parser, .command_subst, "list \\\\\\\\ \\\" \\\\\\\"");
 }
 
 test "quoted string parsing" {

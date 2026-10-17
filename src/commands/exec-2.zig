@@ -27,8 +27,8 @@ const FileAndCleanup = union(enum) {
 
     pub fn get(self: FileAndCleanup) Io.File {
         switch (self) {
-            .file_cap_close => |cap| return cap.body,
-            .file_cap_no_close => |cap| return cap.body,
+            .file_cap_close => |cap| return cap.body.file,
+            .file_cap_no_close => |cap| return cap.body.file,
             .file_close => |file| return file,
             .file_no_close => |file| return file,
         }
@@ -39,9 +39,11 @@ const FileAndCleanup = union(enum) {
             .file_cap_close => |cap| {
                 cap.head.dropInFlight();
                 cap.head.close();
+                cap.head.dropReference();
             },
             .file_cap_no_close => |cap| {
                 cap.head.dropInFlight();
+                cap.head.dropReference();
             },
             .file_close => |file| {
                 file.close(heap.global_io);
@@ -58,13 +60,11 @@ const Source = union(enum) {
     consume,
     /// Referenced and marked in-flight when the Source is created.
     file: FileAndCleanup,
-    /// Global fd, such as stdin. Don't close when done.
-    global_file: Io.File,
 
     pub fn deinit(source: *Source) void {
         switch (source.*) {
             .file => |*cap| cap.deinit(),
-            .consume, .global_file => {},
+            .consume => {},
         }
     }
 };
@@ -74,18 +74,16 @@ const Sink = union(enum) {
     capture,
     /// Forward to the next stage of the pipeline.
     forward,
-    /// Used with stderr only. This redirects stderr into whatever
-    /// stdout was specified as.
+    /// This redirects stderr into whatever stdout was specified as.
+    /// Only set on stderr sinks.
     use_stdout,
     /// Referenced and marked in-flight when the Sink is created.
-    capability: FileCapAndCleanup,
-    /// Global fd, such as stdout. Don't close when done.
-    global_file: Io.File,
+    file: FileAndCleanup,
 
     pub fn deinit(sink: *Sink) void {
         switch (sink.*) {
-            .capability => |*cap| cap.deinit(),
-            .capture, .forward, .use_stdout, .global_file => {},
+            .file => |*file| file.deinit(),
+            .capture, .forward, .use_stdout => {},
         }
     }
 };
@@ -93,7 +91,7 @@ const Sink = union(enum) {
 /// A stage represents one command in the pipeline, alongside
 /// metadata with how that command should handle its IO.
 const Stage = struct {
-    /// Arguments to call the command with.
+    /// Arguments to call the command with, in the format that spawn expects.
     args: [][]u8,
     stdin: Source,
     stdout: Sink,
@@ -105,13 +103,14 @@ const Stage = struct {
         stage.stderr.deinit();
         for (stage.args) |arg| heap.global_gpa.free(arg);
         heap.global_gpa.free(stage.args);
+
+        stage.* = undefined;
     }
 };
 
 const Pipeline = struct {
     stages: []Stage,
     is_background_process: bool,
-    split_stdout_and_stderr: bool,
     environ: heap.EnvironAndOwnership,
 
     pub fn deinit(pipeline: *Pipeline) void {
@@ -123,7 +122,7 @@ const Pipeline = struct {
     }
 };
 
-/// Used in the `redirection_tokens` table.
+/// Used in the `unsorted_redirection_tokens` table.
 const RedirectionFlags = struct {
     direction: union(enum) {
         stdin,
@@ -158,7 +157,7 @@ const unsorted_redirection_tokens = [_]RedirectionTokenEntry{
 };
 
 /// These need to be sorted by length, since we try the longest string first,
-/// so we don't accidentally match on a shorter token when a longer one matched.
+/// so we don't accidentally match on a shorter token when a longer one matches.
 const sorted_redirection_tokens = blk: {
     var mapping = unsorted_redirection_tokens;
     @setEvalBranchQuota(100_000);
@@ -193,29 +192,15 @@ fn parseRedirectionPayload(
     environ: *const process.Environ.Map,
     flags: RedirectionFlags,
     payload: *Shimmerable,
-) !FileCapAndCleanup {
+) !FileAndCleanup {
     switch (flags.payload_type) {
         .handle => {
             if (try payload.equalsString("stdout")) {
-                const file = try capabilities.File.createFromFile(ioutil.getStdout(), false);
-                // Non-escaped capability, so this could only error if someone was iterating through
-                // registered capabilities, and then somehow closed that capability.
-                file.head.markInFlight() catch unreachable;
-                return .{
-                    .file = file,
-                    // This is closing the capability, not the file (`openDescriptor` makes
-                    // sure to create the capability with `capabilities.File.close_when_done`
-                    // set to false).
-                    .close_when_done = true,
-                };
+                return .{ .file_no_close = ioutil.getStdout() };
             } else if (try payload.equalsString("stderr")) {
-                const file = try capabilities.File.createFromFile(ioutil.getStderr(), false);
-                file.head.markInFlight() catch unreachable;
-                return .{ .file = file, .close_when_done = true };
+                return .{ .file_no_close = ioutil.getStderr() };
             } else if (try payload.equalsString("stdin")) {
-                const file = try capabilities.File.createFromFile(Io.File.stdin(), false);
-                file.head.markInFlight() catch unreachable;
-                return .{ .file = file, .close_when_done = true };
+                return .{ .file_no_close = Io.File.stdin() };
             } else {
                 // Parse it as a capability.
                 const cap = try interp.getCapability(payload);
@@ -225,21 +210,23 @@ fn parseRedirectionPayload(
                 // shimmered value. Note we don't need to mark it as in-flight, as
                 // `getBacking` did that.
                 _ = backing.head.takeReference();
-                return .{
-                    .file = backing,
-                    // Lifetime of this capability is managed by the caller.
-                    .close_when_done = false,
-                };
+
+                // Closing this capability is managed by the caller, so we shouldn't close
+                // when we no are longer using it.
+                return .{ .file_cap_no_close = backing };
             }
         },
         .filename => {
             const filename = try payload.getString();
-            const file = try capabilities.File.open(filename, switch (flags.direction) {
-                .stdin => .r,
-                .stdout, .stderr => if (flags.append) .a else .w,
-            });
-            file.head.markInFlight() catch unreachable;
-            return .{ .file = file, .close_when_done = true };
+            const file = try capabilities.File.openFileMode(
+                std.Io.Dir.cwd(),
+                filename,
+                switch (flags.direction) {
+                    .stdin => .r,
+                    .stdout, .stderr => if (flags.append) .a else .w,
+                },
+            );
+            return .{ .file_close = file };
         },
         .bytes => {
             // We put this into a temp file instead of in a pipe, since we
@@ -247,11 +234,10 @@ fn parseRedirectionPayload(
             // also reading the output from the command, causing a deadlock.
             const tempfile = try createTempInDefaultDir(environ);
             errdefer tempfile.close(heap.global_io);
+            // Write positionally to avoid seeking.
             try tempfile.writePositionalAll(heap.global_io, try payload.getString(), 0);
 
-            const file = try capabilities.File.createFromFile(tempfile, true);
-            file.head.markInFlight() catch unreachable;
-            return .{ .file = file, .close_when_done = true };
+            return .{ .file_close = tempfile };
         },
     }
 }
@@ -272,11 +258,7 @@ fn parseStages(interp: *Interp, environ: *const std.process.Environ.Map, args: [
         for (stage_args.items) |arg| heap.global_gpa.free(arg);
         stage_args.deinit(heap.global_gpa);
     }
-    var stage_stdin: Source = blk: {
-        const stdin_file = try capabilities.File.createFromFile(Io.File.stdin(), false);
-        stdin_file.head.markInFlight() catch unreachable;
-        break :blk .{ .file = .{ .file = stdin_file, .close_when_done = true } };
-    };
+    var stage_stdin: Source = .{ .file = .{ .file_no_close = Io.File.stdin() } };
     defer stage_stdin.deinit();
     var stage_stdout: Sink = .forward;
     defer stage_stdout.deinit();
@@ -357,18 +339,23 @@ fn parseStages(interp: *Interp, environ: *const std.process.Environ.Map, args: [
                 redirection.flags.direction == .stderr and
                 try redirection_payload.equalsString("1"))
             {
+                // We hit `2>1`.
                 stage_stderr.deinit();
                 stage_stderr = .use_stdout;
             } else {
                 const redirection_file = try parseRedirectionPayload(interp, environ, redirection.flags, redirection_payload);
                 switch (redirection.flags.direction) {
                     .stdin => {
+                        // Note that this may change `stage_stdin` from .consume to .file,
+                        // even while the previous stage has its stdout set to .forward.
+                        // This situation will be handled by the process spawning loop,
+                        // so see it for details.
                         stage_stdin.deinit();
                         stage_stdin = .{ .file = redirection_file };
                     },
                     .stdout => |details| {
                         stage_stdout.deinit();
-                        stage_stdout = .{ .capability = redirection_file };
+                        stage_stdout = .{ .file = redirection_file };
                         if (details.stderr_uses_stdout) {
                             stage_stderr.deinit();
                             stage_stderr = .use_stdout;
@@ -376,7 +363,7 @@ fn parseStages(interp: *Interp, environ: *const std.process.Environ.Map, args: [
                     },
                     .stderr => {
                         stage_stderr.deinit();
-                        stage_stderr = .{ .capability = redirection_file };
+                        stage_stderr = .{ .file = redirection_file };
                     },
                 }
             }
@@ -394,7 +381,9 @@ fn parseStages(interp: *Interp, environ: *const std.process.Environ.Map, args: [
     }
 
     if (stage_args.items.len == 0) return interp.setErrorInterned("didn't specify command to execute");
-    try stages.append(heap.global_gpa, .{
+    try stages.ensureUnusedCapacity(heap.global_gpa, 1);
+
+    stages.appendAssumeCapacity(.{
         .args = try stage_args.toOwnedSlice(heap.global_gpa),
         .stdin = stage_stdin,
         .stdout = stage_stdout,
@@ -418,21 +407,25 @@ fn parseStages(interp: *Interp, environ: *const std.process.Environ.Map, args: [
             .use_stdout => unreachable,
             .capture => stage.stderr = .capture,
             .forward => stage.stderr = .forward,
-            .capability => |cap| {
-                var det: ErrorDetails = undefined;
-                // Capability may have closed here since the user can provide us with an externally
-                // managed capability. TODO don't just use "<unknown>".
-                cap.file.head.markInFlight() catch return interp.wrapError(&det, Capability.staleError(&det, "<unknown>"));
-                _ = cap.file.head.takeReference();
+            .file => |file| {
+                switch (file) {
+                    .file_cap_close, .file_cap_no_close => |cap| {
+                        // Capability may have closed here since the user can provide us with an externally
+                        // managed capability. TODO don't just use "<unknown>".
+                        var det: ErrorDetails = undefined;
+                        cap.head.markInFlight() catch return interp.wrapError(&det, Capability.staleError(&det, "<unknown>"));
+                        _ = cap.head.takeReference();
 
-                stage.stderr.deinit();
-                stage.stderr = .{
-                    .capability = .{
-                        .file = cap.file,
+                        stage.stderr.deinit();
                         // Never close when done, since the other one will close it if applicable.
-                        .close_when_done = false,
+                        stage.stderr = .{ .file = .{ .file_cap_no_close = cap } };
                     },
-                };
+                    .file_close, .file_no_close => |io_file| {
+                        stage.stderr.deinit();
+                        // Never close when done, since the other one will close it if applicable.
+                        stage.stderr = .{ .file = .{ .file_no_close = io_file } };
+                    },
+                }
             },
         }
     };
@@ -472,9 +465,15 @@ const Process = struct {
     /// where stderr wasn't captured.
     stderr_captures: []?Io.File = &.{},
 
-    pub const Stage = union(enum) {
-        child_process: process.Child,
-        terminated: process.Child.Term,
+    pub const Stage = struct {
+        /// The error code names the stage that decided the pipeline's
+        /// outcome, but reaping a child clears `process.Child.id` (and
+        /// `state` drops the `process.Child` for its `Term` anyway).
+        pid: process.Child.Id,
+        state: union(enum) {
+            child_process: process.Child,
+            terminated: process.Child.Term,
+        },
     };
     pub const WaitError = error{AlreadyWaited} || process.Child.WaitError;
 
@@ -483,31 +482,31 @@ const Process = struct {
     /// (since error.AlreadyWaited means that the process was already
     /// destroyed).
     pub fn wait(self: *Process) WaitError!process.Child.Term {
-        if (!self.wait_mutex.tryLock(heap.global_io)) return error.AlreadyWaited;
+        if (!self.wait_mutex.tryLock()) return error.AlreadyWaited;
         defer self.wait_mutex.unlock(heap.global_io);
 
         // Have all the stages terminated? If so, it means this pipeline
         // has already run.
         for (self.stages) |stage| {
-            if (std.meta.activeTag(stage) == .alive) break;
+            if (stage.state == .child_process) break;
         } else return error.AlreadyWaited;
 
-        for (0.., self.stages) |i, *stage| switch (stage.*) {
+        for (0.., self.stages) |i, *stage| switch (stage.state) {
             .child_process => |*stage_process| {
                 const termination = stage_process.wait(heap.global_io) catch |err| {
                     // Kill the remaining stages (no need to kill the
                     // previous stages, since they already were waited on).
-                    for (self.stages[i..]) |*to_kill| switch (to_kill.*) {
+                    for (self.stages[i..]) |*to_kill| switch (to_kill.state) {
                         .child_process => |*to_kill_process| {
                             to_kill_process.kill(heap.global_io);
-                            to_kill.* = .{ .terminated = .{ .signal = .TERM } };
+                            to_kill.state = .{ .terminated = .{ .signal = .TERM } };
                         },
                         .terminated => continue,
                     };
                     return err;
                 };
 
-                stage.* = .{ .terminated = termination };
+                stage.state = .{ .terminated = termination };
             },
             .terminated => continue,
         };
@@ -517,12 +516,12 @@ const Process = struct {
 
     pub fn deinit(self: *Process) void {
         // Kill all running tasks if the process hasn't been waited on yet.
-        if (self.wait_mutex.tryLock(heap.global_io)) {
+        if (self.wait_mutex.tryLock()) {
             defer self.wait_mutex.unlock(heap.global_io);
-            for (self.stages) |*stage| switch (stage.*) {
+            for (self.stages) |*stage| switch (stage.state) {
                 .child_process => |*stage_process| {
                     stage_process.kill(heap.global_io);
-                    stage.* = .{ .terminated = .{ .signal = .TERM } };
+                    stage.state = .{ .terminated = .{ .signal = .TERM } };
                 },
                 .terminated => continue,
             };
@@ -536,23 +535,29 @@ const Process = struct {
         self.* = undefined;
     }
 
+    pub const Outcome = struct {
+        termination: process.Child.Term,
+        /// Index of the stage that `termination` came from.
+        stage: usize,
+    };
+
     /// Get the termination of the whole pipeline, following bash semantics:
     /// If no stages failed, then return the last stage's termination.
     /// Else a stage failed, so return the failed stage's termination instead.
-    pub fn getPipelineTermination(stages: []const Process.Stage) struct { termination: process.Child.Term, stage: usize } {
+    pub fn getPipelineTermination(stages: []const Process.Stage) Outcome {
         var index = stages.len;
         while (index > 0) {
             index -= 1;
-            const termination = stages[index].termination.?;
+            const termination = stages[index].state.terminated;
             switch (termination) {
                 .exited => |code| if (code != 0) {
-                    return .{ .termination = termination, .index = index };
+                    return .{ .termination = termination, .stage = index };
                 },
-                else => return .{ .termination = termination, .index = index },
+                else => return .{ .termination = termination, .stage = index },
             }
         }
 
-        return .{ .termination = stages[stages.len - 1].termination.?, .stage = stages.len - 1 };
+        return .{ .termination = stages[stages.len - 1].state.terminated, .stage = stages.len - 1 };
     }
 
     pub const Backing = struct {
@@ -577,26 +582,137 @@ const Process = struct {
     };
 };
 
-const interned_childstatus = heap.InternedString.newValue("CHILDSTATUS");
-const interned_childkilled = heap.InternedString.newValue("CHILDKILLED");
-const interned_childsusp = heap.InternedString.newValue("CHILDSUSPENDED");
-const interned_childunknown = heap.InternedString.newValue("CHILDUNKNOWN");
+const interned_childstatus = heap.InternedString.newValue("ChildStatus");
+const interned_childkilled = heap.InternedString.newValue("ChildKilled");
+const interned_childsusp = heap.InternedString.newValue("ChildSuspended");
+const interned_childunknown = heap.InternedString.newValue("ChildUnknown");
 const interned_out = heap.InternedString.newValue("out");
 const interned_err = heap.InternedString.newValue("err");
 const interned_code = heap.InternedString.newValue("code");
+const interned_zicl = heap.InternedString.newValue("Zicl");
+const interned_io = heap.InternedString.newValue("Io");
 
-/// Error message from process termination, or null if the process terminated
-/// normally.
-fn errorMessageFromTerm(term: process.Child.Term) !?[:0]u8 {
-    switch (term) {
-        .exited => |code| if (code == 0) return null,
-        .signal => |sig| return objects.allocPrintZ("child killed by signal {d}", .{@intFromEnum(sig)}),
-        .stopped => |sig| return objects.allocPrintZ("child suspended by signal {d}", .{@intFromEnum(sig)}),
-        .unknown => {},
+/// Reports a failed system call. The result becomes `what` followed by the
+/// error's name, and the error code becomes `{Zicl Io <name>}`.
+/// error.OutOfMemory is propagated rather than reported.
+fn osError(interp: *Interp, err: anyerror, comptime what: []const u8, args: anytype) Interp.Error {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    const name = heap.InternedString.newValue(@errorName(err));
+    return interp.setErrorWithCode(&.{ interned_zicl, interned_io, name }, what ++ ": {t}", args ++ .{err});
+}
+
+/// Writes a finished pipeline's captured output to `stdout` and `stderr`,
+/// with every stage's stderr in stage order. Every stage must have exited,
+/// or the captures may be incomplete. Returns error.WriteFailed when either
+/// writer fails, for the caller to interpret.
+fn readCaptures(
+    interp: *Interp,
+    body: *const Process,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) (Interp.Error || error{WriteFailed})!void {
+    // `File.reader` reads positionally from offset 0, since the child shares
+    // the file's offset.
+    if (body.stdout_capture) |file| {
+        var file_reader = file.reader(heap.global_io, &.{});
+        _ = file_reader.interface.streamRemaining(stdout) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            error.ReadFailed => return osError(interp, file_reader.err.?, "error reading from child", .{}),
+        };
     }
 
-    return try heap.global_gpa.dupeSentinel(u8, "child process exited abnormally", 0);
+    for (body.stderr_captures) |slot| {
+        const file = slot orelse continue;
+        var file_reader = file.reader(heap.global_io, &.{});
+        _ = file_reader.interface.streamRemaining(stderr) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            error.ReadFailed => return osError(interp, file_reader.err.?, "error reading from child", .{}),
+        };
+    }
 }
+
+/// Sets the result of a finished pipeline: the `{out err code}` dict when
+/// `split`, and otherwise its output, raising when any stage ended
+/// abnormally. Both [exec] and [wait] report this way.
+fn reportResult(interp: *Interp, body: *const Process, split: bool) Interp.Error!void {
+    var stdout_bytes: Io.Writer.Allocating = .init(heap.global_gpa);
+    defer stdout_bytes.deinit();
+    var stderr_bytes: Io.Writer.Allocating = .init(heap.global_gpa);
+    defer stderr_bytes.deinit();
+    readCaptures(interp, body, &stdout_bytes.writer, &stderr_bytes.writer) catch |err| switch (err) {
+        // An `Io.Writer.Allocating` only fails to write when it fails to grow.
+        error.WriteFailed => return error.OutOfMemory,
+        else => |e| return e,
+    };
+    const stdout = stdout_bytes.written();
+    const stderr = stderr_bytes.written();
+
+    const outcome = Process.getPipelineTermination(body.stages);
+    if (split) return setSplitResult(interp, outcome.termination, stdout, stderr);
+
+    const succeeded = switch (outcome.termination) {
+        .exited => |exit_code| exit_code == 0,
+        else => false,
+    };
+    if (succeeded) return interp.setResultFormatted("{s}{s}", .{ stdout, stderr });
+
+    const code = childStatus(body.stages, outcome);
+    // Like Tcl, say how the child ended only when it explained nothing itself,
+    // since its own diagnostic is the better message.
+    if (stderr.len == 0) {
+        return interp.setErrorWithCode(&code, "{s}{f}", .{ stdout, TermMessage{ .term = outcome.termination } });
+    }
+    return interp.setErrorWithCode(&code, "{s}{s}", .{ stdout, stderr });
+}
+
+/// Sets the result to the `{out err code}` dict reported by `-split`.
+fn setSplitResult(interp: *Interp, termination: process.Child.Term, stdout: []const u8, stderr: []const u8) Interp.Error!void {
+    // The parts are reported apart; nothing raises, since a caller asking
+    // for them is asking to inspect the outcome. `code` renders a killed
+    // stage as 128 plus its signal, the way a shell does.
+    const code: i64 = switch (termination) {
+        .exited => |exit_code| exit_code,
+        .signal, .stopped => |sig| 128 + @as(i64, @intFromEnum(sig)),
+        .unknown => 1,
+    };
+    const out_value = try objects.String.newValue(stdout);
+    defer out_value.dropReference();
+    const err_value = try objects.String.newValue(stderr);
+    defer err_value.dropReference();
+    const dict = try objects.Dictionary.new(&.{
+        interned_out,  out_value,
+        interned_err,  err_value,
+        interned_code, objects.Integer.new(code),
+    });
+    interp.setResultOwning(dict.asHead().asValue());
+}
+
+/// The `{ChildStatus pid code}`-style triple naming the stage that decided
+/// the pipeline's outcome, modeled on Jim's, for [catch]/[try] to dispatch on.
+fn childStatus(stages: []const Process.Stage, outcome: Process.Outcome) [3]Value {
+    const kind: Value, const detail: i64 = switch (outcome.termination) {
+        .exited => |exit_code| .{ interned_childstatus, exit_code },
+        .signal => |sig| .{ interned_childkilled, @intFromEnum(sig) },
+        .stopped => |sig| .{ interned_childsusp, @intFromEnum(sig) },
+        // Its own word, so a pipeline whose outcome was lost is not mistaken
+        // for one that exited with whatever is in the raw wait status.
+        .unknown => |raw| .{ interned_childunknown, raw },
+    };
+    return .{ kind, objects.Integer.new(stages[outcome.stage].pid), objects.Integer.new(detail) };
+}
+
+/// Formats, with `{f}`, how a child that ended abnormally ended.
+const TermMessage = struct {
+    term: process.Child.Term,
+
+    pub fn format(message: TermMessage, writer: *Io.Writer) Io.Writer.Error!void {
+        switch (message.term) {
+            .signal => |sig| try writer.print("child killed by signal {d}", .{@intFromEnum(sig)}),
+            .stopped => |sig| try writer.print("child suspended by signal {d}", .{@intFromEnum(sig)}),
+            .exited, .unknown => try writer.writeAll("child process exited abnormally"),
+        }
+    }
+};
 
 pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var split_stdout_and_stderr = false;
@@ -632,8 +748,11 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             .head = .{ .vtable = &Process.Backing.vtable, .id = .not_set },
             .body = .{ .stages = &.{}, .stdout_capture = null },
         };
-        var process_cap = try Capability.newTakingOwnership(&cap_backing.head);
-        errdefer process_cap.head.closeAndDropReference();
+        const process_cap = try Capability.newTakingOwnership(&cap_backing.head);
+        errdefer {
+            process_cap.close();
+            process_cap.asHead().dropReference();
+        }
 
         var pipeline: Pipeline = pipeline: {
             var environ: heap.EnvironAndOwnership = if (env_dict) |val|
@@ -646,13 +765,12 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.EvalError => return error.EvalError,
                 // Anything else is an IO error during setup.
-                else => return interp.setErrorFormatted("couldn't set up redirections: {t}", .{err}),
+                else => return osError(interp, err, "couldn't set up redirections", .{}),
             };
             // Take ownership of everything.
             break :pipeline .{
                 .stages = stages,
                 .is_background_process = is_background_process,
-                .split_stdout_and_stderr = split_stdout_and_stderr,
                 .environ = environ,
             };
         };
@@ -664,9 +782,8 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         defer for (stderr_captures.items) |item| if (item) |capture| capture.close(heap.global_io);
         for (pipeline.stages) |stage| {
             if (stage.stderr == .capture) {
-                const capture = createTempInDefaultDir(pipeline.environ.get()) catch |err| {
-                    return interp.setErrorFormatted("couldn't create a temporary file: {}", .{err});
-                };
+                const capture = createTempInDefaultDir(pipeline.environ.get()) catch |err|
+                    return osError(interp, err, "couldn't create a temporary file", .{});
                 stderr_captures.appendAssumeCapacity(capture);
             } else {
                 stderr_captures.appendAssumeCapacity(null);
@@ -677,9 +794,8 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         // process's stdin and reading from the process's stdout.
         const stdout_capture: ?Io.File = blk: {
             if (pipeline.stages[pipeline.stages.len - 1].stdout == .capture) {
-                break :blk createTempInDefaultDir(pipeline.environ.get()) catch |err| {
-                    return interp.setErrorFormatted("couldn't create a temporary file: {}", .{err});
-                };
+                break :blk createTempInDefaultDir(pipeline.environ.get()) catch |err|
+                    return osError(interp, err, "couldn't create a temporary file", .{});
             } else break :blk null;
         };
         errdefer if (stdout_capture) |file| file.close(heap.global_io);
@@ -687,20 +803,25 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         // This will contain all the spawned stages.
         var proc_stages = try std.ArrayList(Process.Stage).initCapacity(heap.global_gpa, pipeline.stages.len);
         defer proc_stages.deinit(heap.global_gpa);
-        defer for (proc_stages.items) |*stage| {
-            stage.child_process.kill(heap.global_io);
-            stage = .{ .terminated = .{ .signal = .TERM } };
-        };
+        defer for (proc_stages.items) |*stage| stage.state.child_process.kill(heap.global_io);
 
         var read_end_from_previous: ?Io.File = null;
         defer if (read_end_from_previous) |val| val.close(heap.global_io);
         for (pipeline.stages, 0..) |stage, i| {
             const pipe_files: ?[2]Io.File = blk: {
-                // We only create a pipe pair if the next stage uses it.
-                if (i == pipeline.stages.len - 1) break :blk null;
-                if (pipeline.stages[i + 1].stdin == .consume) {
+                // Create a pipe whenever either side of the pipe is used. If
+                // this stage forwards but the next stage doesn't consume, the
+                // read end is closed one the next stage spawns, so this stage
+                // will die from SIGPIPE if it writes. Conversely, if the next
+                // stage consumes but this stage doesn't forward, the write end
+                // is closed right after this stage spawns, so the next stage
+                // will read EOF. This matches how bash handles piping.
+
+                const forwards = stage.stdout == .forward or stage.stderr == .forward;
+                const next_consumes = i < pipeline.stages.len - 1 and pipeline.stages[i + 1].stdin == .consume;
+                if (forwards or next_consumes) {
                     const pipe_fds = Threaded.pipe2(.{ .CLOEXEC = true }) catch |err|
-                        return interp.setErrorFormatted("couldn't create pipe: {t}", .{err});
+                        return osError(interp, err, "couldn't create pipe", .{});
                     break :blk .{
                         Io.File{ .handle = pipe_fds[0], .flags = .{ .nonblocking = false } },
                         Io.File{ .handle = pipe_fds[1], .flags = .{ .nonblocking = false } },
@@ -715,14 +836,14 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
             const stdin_io: process.SpawnOptions.StdIo = switch (stage.stdin) {
                 .consume => .{ .file = read_end_from_previous.? },
-                .file => |cap| .{ .file = cap.file.body.file },
+                .file => |file| .{ .file = file.get() },
             };
 
             const stdout_io: process.SpawnOptions.StdIo = switch (stage.stdout) {
                 // Never used in `stage.stdout`.
                 .use_stdout => unreachable,
                 .forward => .{ .file = write_end.? },
-                .capability => |cap| .{ .file = cap.file.body.file },
+                .file => |file| .{ .file = file.get() },
                 .capture => .{ .file = stdout_capture.? },
             };
 
@@ -731,7 +852,7 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 // intermetiate state.
                 .use_stdout => unreachable,
                 .forward => .{ .file = write_end.? },
-                .capability => |cap| .{ .file = cap.file.body.file },
+                .file => |file| .{ .file = file.get() },
                 .capture => .{ .file = stderr_captures.items[i].? },
             };
 
@@ -741,14 +862,11 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 .stdout = stdout_io,
                 .stderr = stderr_io,
                 .environ_map = pipeline.environ.get(),
-            }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return interp.setErrorFormatted("couldn't exec \"{s}\": {}", .{ stage.args[0], err }),
-            };
-            proc_stages.appendAssumeCapacity(child);
+            }) catch |err| return osError(interp, err, "couldn't exec \"{s}\"", .{stage.args[0]});
+            proc_stages.appendAssumeCapacity(.{ .pid = child.id.?, .state = .{ .child_process = child } });
 
-            // The child holds its own copy now, so we can close the
-            // read end on our side.
+            // The child holds its own copy now, so we can close the read end in
+            // our process.
             if (read_end_from_previous) |file| file.close(heap.global_io);
             read_end_from_previous = read_end;
             read_end = null;
@@ -758,7 +876,7 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         try stderr_captures.shrinkAndFreePrecise(heap.global_gpa, stderr_captures.items.len);
 
         errdefer comptime unreachable;
-        cap_backing.body.* = .{
+        cap_backing.body = .{
             .stages = proc_stages.toOwnedSliceAssert(),
             .stdout_capture = stdout_capture,
             .stderr_captures = stderr_captures.toOwnedSliceAssert(),
@@ -768,111 +886,27 @@ pub fn execCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     if (is_background_process) {
         interp.setResultOwning(process_capability.asHead().asValue());
-    } else {
-        defer process_capability.head.closeAndDropReference();
+        return;
+    }
+    // The capability never escapes a foreground [exec], so closing it here
+    // kills anything still running and closes the capture files.
+    defer {
+        process_capability.close();
+        process_capability.asHead().dropReference();
     }
 
-    // -- Collecting output. Nothing was a pipe, so there is no drain-before-
-    // wait ordering to preserve: every child is reaped first, then each
-    // capture file is read back from the start, in report order. --
+    var det: ErrorDetails = undefined;
+    const backing = try interp.wrapError(&det, process_capability.getBacking(Process.Backing, &det));
+    defer backing.head.dropInFlight();
+    const body = &backing.body;
 
-    for (proc_stages) |*stage| {
-        stage.termination = stage.child.wait(heap.global_io) catch |err|
-            return interp.setErrorFormatted("error waiting for child: {t}", .{err});
-    }
-
-    var stdout_bytes: []u8 = &.{};
-    errdefer if (stdout_bytes.len != 0) heap.global_gpa.free(stdout_bytes);
-    if (stdout_capture) |file| {
-        const len: usize = @intCast(file.length(heap.global_io) catch |err|
-            return interp.setErrorFormatted("error reading from child: {t}", .{err}));
-        stdout_bytes = heap.global_gpa.alloc(u8, len) catch return error.OutOfMemory;
-        _ = file.readPositionalAll(heap.global_io, stdout_bytes, 0) catch |err|
-            return interp.setErrorFormatted("error reading from child: {t}", .{err});
-        file.close(heap.global_io);
-        stdout_capture = null;
-    }
-
-    var stderr_parts: std.ArrayList(u8) = .empty;
-    defer stderr_parts.deinit(heap.global_gpa);
-    for (stderr_captures) |*slot| {
-        const file = slot.* orelse continue;
-        const len: usize = @intCast(file.length(heap.global_io) catch |err|
-            return interp.setErrorFormatted("error reading from child: {t}", .{err}));
-        const buffer = heap.global_gpa.alloc(u8, len) catch return error.OutOfMemory;
-        defer heap.global_gpa.free(buffer);
-        const got = file.readPositionalAll(heap.global_io, buffer, 0) catch |err|
-            return interp.setErrorFormatted("error reading from child: {t}", .{err});
-        stderr_parts.appendSlice(heap.global_gpa, buffer[0..got]) catch return error.OutOfMemory;
-        slot.* = null;
-        file.close(heap.global_io);
-    }
-    const stderr_bytes = try stderr_parts.toOwnedSlice(heap.global_gpa);
-    errdefer heap.global_gpa.free(stderr_bytes);
-
-    const outcome = Process.getPipelineTermination(proc_stages);
-
-    if (pipeline.split_stdout_and_stderr) {
-        // The parts are reported apart; nothing raises, since a caller asking
-        // for them is asking to inspect the outcome. `code` renders a killed
-        // stage as 128 plus its signal, the way a shell does.
-        const code: i64 = switch (outcome.termination) {
-            .exited => |exit_code| exit_code,
-            .signal, .stopped => |sig| 128 + @as(i64, @intFromEnum(sig)),
-            .unknown => 1,
-        };
-        const out_value = try objects.String.newValue(stdout_bytes);
-        defer out_value.dropReference();
-        const err_value = try objects.String.newValue(stderr_bytes);
-        defer err_value.dropReference();
-        const dict = try objects.Dictionary.new(&.{
-            interned_out,  out_value,
-            interned_err,  err_value,
-            interned_code, objects.Integer.new(code),
-        });
-        interp.setResultOwning(dict.asHead().asValue());
-    } else {
-        var result: std.ArrayList(u8) = .empty;
-        defer result.deinit(heap.global_gpa);
-        result.appendSlice(heap.global_gpa, stdout_bytes) catch return error.OutOfMemory;
-        result.appendSlice(heap.global_gpa, stderr_bytes) catch return error.OutOfMemory;
-
-        var message_buffer: [64]u8 = undefined;
-        const abnormal = errorMessageFromTerm(outcome.termination, &message_buffer);
-        // Dropped when the child said something itself, since its own
-        // diagnostic is the better message.
-        if (abnormal) |text| {
-            if (stderr_bytes.len == 0) result.appendSlice(heap.global_gpa, text) catch return error.OutOfMemory;
-        }
-
-        try interp.setResultString(result.items);
-        if (abnormal != null) {
-            // Jim parity: the error code names the deciding child and how it
-            // ended, for [catch]/[try] to dispatch on.
-            const status: struct { heap.Value, i64 } = switch (outcome.termination) {
-                .exited => |exit_code| .{ interned_childstatus, exit_code },
-                .signal => |sig| .{ interned_childkilled, @intFromEnum(sig) },
-                .stopped => |sig| .{ interned_childsusp, @intFromEnum(sig) },
-                .unknown => |raw| .{ interned_childunknown, @intCast(raw) },
-            };
-            const pid_value = objects.Integer.new(@intCast(proc_stages[outcome.stage].pid));
-            const list = try objects.List.new(&.{ status[0], objects.Integer.new(status[1]), pid_value });
-            interp.pending_error_code.swap(list.asHead().asValue().takeReference());
-            return error.EvalError;
-        }
-    }
-
-    heap.global_gpa.free(proc_stages);
-    heap.global_gpa.free(stderr_captures);
-    if (stdout_bytes.len != 0) heap.global_gpa.free(stdout_bytes);
-    heap.global_gpa.free(stderr_bytes);
+    _ = body.wait() catch |err| return osError(interp, err, "error waiting for child", .{});
+    return reportResult(interp, body, split_stdout_and_stderr);
 }
 
-/// [wait]: reports how a background pipeline ended, as a `{CHILDSTATUS pid
-/// code}`-style list naming the stage that decided the outcome. With
-/// `-split`, reports instead the `{out err code}` dict the pipeline was
-/// started with `exec -split ... &` in order to stage. Either way, a
-/// pipeline can only be waited on once.
+/// [wait]: reports a background pipeline's result exactly as a foreground
+/// [exec] would have, with `-split` choosing the `{out err code}` dict.
+/// Waiting closes the process, so a pipeline can only be waited on once.
 pub fn waitCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     var split = false;
     var rest = args[1..];
@@ -886,94 +920,19 @@ pub fn waitCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &rest[0]));
     const backing = try interp.wrapError(&det, cap.getBacking(Process.Backing, &det));
     defer backing.head.dropInFlight();
-
-    if (split) {
-        // Checked before waiting: a plain background pipeline inherited its
-        // output, so there is nothing to read no matter when we look.
-        var any_capture = backing.body.stdout_capture != null;
-        for (backing.body.stderr_captures) |slot| {
-            if (slot != null) any_capture = true;
-        }
-        if (!any_capture) return interp.setErrorInterned("process was not started with -split");
-    }
+    // A pipeline can only be waited on once, so the process is closed however
+    // this ends. Our in-flight mark keeps the capture files open until we're
+    // done reading them, after which closing cleans them up.
+    defer @constCast(cap).close();
 
     _ = backing.body.wait() catch |err| switch (err) {
         error.AlreadyWaited => return interp.setErrorInterned("process has already been waited on"),
-        else => return interp.setErrorFormatted("error waiting for child: {t}", .{err}),
+        else => return osError(interp, err, "error waiting for child", .{}),
     };
-    const outcome = Process.getPipelineTermination(backing.body.stages);
-
-    const status: struct { heap.Value, i64 } = switch (outcome.termination) {
-        .exited => |exit_code| .{ interned_childstatus, exit_code },
-        .signal => |sig| .{ interned_childkilled, @intFromEnum(sig) },
-        .stopped => |sig| .{ interned_childsusp, @intFromEnum(sig) },
-        // Its own word, so a pipeline whose outcome was lost is not mistaken
-        // for one that exited with whatever is in the raw wait status.
-        .unknown => |raw| .{ interned_childunknown, @intCast(raw) },
-    };
-    const pid_value = objects.Integer.new(@intCast(backing.body.stages[outcome.stage].pid));
-
-    if (split) {
-        // Every child has been reaped, so the staged files are complete and
-        // can be read from the start.
-        var err_parts: std.ArrayList(u8) = .empty;
-        defer err_parts.deinit(heap.global_gpa);
-        var out_bytes: []u8 = &.{};
-        defer heap.global_gpa.free(out_bytes);
-        if (backing.body.stdout_capture) |file| {
-            const len: usize = @intCast(file.length(heap.global_io) catch |err|
-                return interp.setErrorFormatted("error reading from child: {t}", .{err}));
-            out_bytes = heap.global_gpa.alloc(u8, len) catch return error.OutOfMemory;
-            _ = file.readPositionalAll(heap.global_io, out_bytes, 0) catch |err|
-                return interp.setErrorFormatted("error reading from child: {t}", .{err});
-        }
-        for (backing.body.stderr_captures) |slot| {
-            const file = slot orelse continue;
-            const len: usize = @intCast(file.length(heap.global_io) catch |err|
-                return interp.setErrorFormatted("error reading from child: {t}", .{err}));
-            const buffer = heap.global_gpa.alloc(u8, len) catch return error.OutOfMemory;
-            defer heap.global_gpa.free(buffer);
-            const got = file.readPositionalAll(heap.global_io, buffer, 0) catch |err|
-                return interp.setErrorFormatted("error reading from child: {t}", .{err});
-            err_parts.appendSlice(heap.global_gpa, buffer[0..got]) catch return error.OutOfMemory;
-        }
-
-        const code: i64 = switch (outcome.termination) {
-            .exited => |exit_code| exit_code,
-            .signal, .stopped => |sig| 128 + @as(i64, @intFromEnum(sig)),
-            .unknown => 1,
-        };
-        const out_value = try objects.String.newValue(out_bytes);
-        defer out_value.dropReference();
-        const err_value = try objects.String.newValue(err_parts.items);
-        defer err_value.dropReference();
-        const dict = try objects.Dictionary.new(&.{
-            interned_out,  out_value,
-            interned_err,  err_value,
-            interned_code, objects.Integer.new(code),
-        });
-        interp.setResultOwning(dict.asHead().asValue());
-        backing.body.discardCaptures();
-        return;
-    }
-
-    const list = try objects.List.new(&.{ status[0], objects.Integer.new(status[1]), pid_value });
-    interp.setResultOwning(list.asHead().asValue());
-    // A plain [wait] asked only how it ended, so anything staged goes.
-    backing.body.discardCaptures();
+    return reportResult(interp, &backing.body, split);
 }
 
 const testing = std.testing;
-
-/// Absolute paths throughout, so the tests exercise [exec2] rather than
-/// whatever PATH the embedder happened to install.
-const true_path = "/usr/bin/true";
-const false_path = "/usr/bin/false";
-const echo_path = "/usr/bin/echo";
-const cat_path = "/bin/cat";
-const sh_path = "/bin/sh";
-const sort_path = "/usr/bin/sort";
-const tr_path = "/usr/bin/tr";
 
 fn testStartExec2(ta: std.mem.Allocator) !Interp {
     var interp = try common.testStart(ta);
@@ -989,19 +948,19 @@ fn testExec2Basics(ta: std.mem.Allocator) !void {
     defer common.testFinish(&interp);
 
     // Raw results: exactly what the child wrote, newlines included.
-    try interp.testExpectScriptResult("hello\n", "exec2 " ++ echo_path ++ " hello");
-    try interp.testExpectScriptResult("a\nb\n", "exec2 " ++ echo_path ++ " a\\nb");
+    try interp.testExpectScriptResult("hello\n", "exec2 echo hello");
+    try interp.testExpectScriptResult("a\nb\n", "exec2 echo a\\nb");
 
     // Pipelines, and a mid stage's stderr folded in stage order.
-    try interp.testExpectScriptResult("hi\n", "exec2 " ++ echo_path ++ " hi | " ++ sort_path);
-    try interp.testExpectScriptResult("from-first\n", "exec2 " ++ sh_path ++ " -c {echo from-first >&2} | " ++ cat_path);
+    try interp.testExpectScriptResult("hi\n", "exec2 echo hi | sort");
+    try interp.testExpectScriptResult("from-first\n", "exec2 sh -c {echo from-first >&2} | cat");
 
     // `|&` and `2>@1` both send stderr wherever this stage's stdout goes.
-    try interp.testExpectScriptResult("TO-PIPE\n", "exec2 " ++ sh_path ++ " -c {echo to-pipe >&2} |& " ++ tr_path ++ " a-z A-Z");
-    try interp.testExpectScriptResult("merge\n", "exec2 " ++ sh_path ++ " -c {echo merge >&2} 2>@1 | " ++ cat_path);
+    try interp.testExpectScriptResult("TO-PIPE\n", "exec2 sh -c {echo to-pipe >&2} |& tr a-z A-Z");
+    try interp.testExpectScriptResult("merge\n", "exec2 sh -c {echo merge >&2} 2>@1 | cat");
 
     // The `<<` document is fed exactly: no trailing newline is added.
-    try interp.testExpectScriptResult("inline", "exec2 " ++ cat_path ++ " << inline");
+    try interp.testExpectScriptResult("inline", "exec2 cat << inline");
 }
 
 fn testExec2Files(ta: std.mem.Allocator) !void {
@@ -1015,12 +974,12 @@ fn testExec2Files(ta: std.mem.Allocator) !void {
     const out_path = try std.fmt.allocPrint(ta, "{s}/out.txt", .{dir_path});
     defer ta.free(out_path);
 
-    const write_script = try std.fmt.allocPrint(ta, "exec2 " ++ echo_path ++ " out > {s}", .{out_path});
+    const write_script = try std.fmt.allocPrint(ta, "exec2 echo out > {s}", .{out_path});
     defer ta.free(write_script);
     // Output went to the file, so the command itself reports nothing.
     try interp.testExpectScriptResult("", write_script);
 
-    const read_script = try std.fmt.allocPrint(ta, "exec2 " ++ cat_path ++ " {s}", .{out_path});
+    const read_script = try std.fmt.allocPrint(ta, "exec2 cat {s}", .{out_path});
     defer ta.free(read_script);
     try interp.testExpectScriptResult("out\n", read_script);
 }
@@ -1030,16 +989,17 @@ fn testExec2Abnormal(ta: std.mem.Allocator) !void {
     defer common.testFinish(&interp);
 
     // The generic message only when the child said nothing itself.
-    try interp.testExpectScriptError(error.EvalError, "child process exited abnormally", "exec2 " ++ false_path);
+    try interp.testExpectScriptError(error.EvalError, "child process exited abnormally", "exec2 false");
     // The child's own diagnostic wins, and the error code names it for
-    // [catch]/[try]: `{CHILDSTATUS pid code}`.
-    try interp.testExpectScriptError(error.EvalError, "no good\n", "exec2 " ++ sh_path ++ " -c {echo no good >&2; exit 3}");
-    try interp.testExpectScriptResult("1", "catch {exec2 " ++ false_path ++ "} m o; string match {CHILDSTATUS * 1} [dict get $o -errorcode]");
-    try interp.testExpectScriptResult("1", "catch {exec2 " ++ sh_path ++ " -c {exit 3}} m o; string match {CHILDSTATUS * 3} [dict get $o -errorcode]");
+    // [catch]/[try]: `{ChildStatus pid code}`.
+    try interp.testExpectScriptError(error.EvalError, "no good\n", "exec2 sh -c {echo no good >&2; exit 3}");
+    try interp.testExpectScriptResult("true", "catch {exec2 false} m o; string match {ChildStatus * 1} [dict get $o -errorcode]");
+    try interp.testExpectScriptResult("true", "catch {exec2 sh -c {exit 3}} m o; string match {ChildStatus * 3} [dict get $o -errorcode]");
     // An earlier failure is not swallowed by a successful tail.
-    try interp.testExpectScriptError(error.EvalError, "child process exited abnormally", "exec2 " ++ false_path ++ " | " ++ true_path);
+    try interp.testExpectScriptError(error.EvalError, "child process exited abnormally", "exec2 false | true");
     // A missing binary reports at exec time.
     try interp.testExpectScriptError(error.EvalError, "couldn't exec \"/nonexistent\": FileNotFound", "exec2 /nonexistent");
+    try interp.testExpectScriptResult("Zicl Io FileNotFound", "catch {exec2 /nonexistent} m o; dict get $o -errorcode");
 }
 
 fn testExec2Split(ta: std.mem.Allocator) !void {
@@ -1048,28 +1008,53 @@ fn testExec2Split(ta: std.mem.Allocator) !void {
 
     // `-split` never raises; `code` carries the outcome instead, and the
     // parts are raw.
-    try interp.testExpectScriptResult("out\n", "dict get [exec2 -split " ++ sh_path ++ " -c {echo out; echo err >&2}] out");
-    try interp.testExpectScriptResult("err\n", "dict get [exec2 -split " ++ sh_path ++ " -c {echo out; echo err >&2}] err");
-    try interp.testExpectScriptResult("0", "dict get [exec2 -split " ++ true_path ++ "] code");
-    try interp.testExpectScriptResult("3", "dict get [exec2 -split " ++ sh_path ++ " -c {exit 3}] code");
+    try interp.testExpectScriptResult("out\n", "dict get [exec2 -split sh -c {echo out; echo err >&2}] out");
+    try interp.testExpectScriptResult("err\n", "dict get [exec2 -split sh -c {echo out; echo err >&2}] err");
+    try interp.testExpectScriptResult("0", "dict get [exec2 -split true] code");
+    try interp.testExpectScriptResult("3", "dict get [exec2 -split sh -c {exit 3}] code");
 }
 
 fn testExec2Background(ta: std.mem.Allocator) !void {
     var interp = try testStartExec2(ta);
     defer common.testFinish(&interp);
 
-    // Plain background: [wait] reports how it ended, once. The child is quiet
-    // on purpose -- it inherits the redirect cell, which under the test runner
-    // carries the protocol stream.
-    try interp.testExpectScriptResult("1", "set p [exec2 " ++ true_path ++ " &]; string match {CHILDSTATUS * 0} [wait2 $p]");
-    try interp.testExpectScriptError(error.EvalError, "process has already been waited on", "wait2 $p");
+    // [wait] reports what a foreground [exec] would have. Output is captured
+    // to files either way, so these children may be as loud as they like.
+    try interp.testExpectScriptResult("out\n", "set p [exec2 sh -c {echo out} &]; wait2 $p");
+    // Waiting closed it.
+    try interp.testExpectScriptResult("true", "catch {wait2 $p} m; string match {*is stale} $m");
 
-    // The split is opted into at [exec] and read at [wait]; captures go to
-    // files, so these children may be as loud as they like.
-    try interp.testExpectScriptResult("out\n", "set q [exec2 -split " ++ sh_path ++ " -c {echo out; echo err >&2} &]; dict get [wait2 -split $q] out");
-    try interp.testExpectScriptResult("err\n", "set q [exec2 -split " ++ sh_path ++ " -c {echo out; echo err >&2} &]; dict get [wait2 -split $q] err");
-    try interp.testExpectScriptResult("0", "set q [exec2 -split " ++ echo_path ++ " bg &]; dict get [wait2 -split $q] code");
-    try interp.testExpectScriptError(error.EvalError, "process was not started with -split", "set r [exec2 " ++ true_path ++ " &]; wait2 -split $r");
+    // A failure raises from [wait], and still closes the process.
+    try interp.testExpectScriptResult("true", "set f [exec2 false &]; catch {wait2 $f} m o; string match {ChildStatus * 1} [dict get $o -errorcode]");
+    try interp.testExpectScriptResult("true", "catch {wait2 $f} m; string match {*is stale} $m");
+
+    // A background pipeline chooses `-split` at [wait].
+    try interp.testExpectScriptResult("out\n", "set q [exec2 sh -c {echo out; echo err >&2} &]; set split [wait2 -split $q]; dict get $split out");
+    try interp.testExpectScriptResult("err\n", "dict get $split err");
+    try interp.testExpectScriptResult("3", "set q [exec2 sh -c {exit 3} &]; set split [wait2 -split $q]; dict get $split code");
+}
+
+fn testExec2Sigpipe(ta: std.mem.Allocator) !void {
+    var interp = try testStartExec2(ta);
+    defer common.testFinish(&interp);
+
+    // Ignoring SIGPIPE in the parent checks that children start with it reset
+    // to the default. Otherwise [yes] gets EPIPE, and may never exit. This
+    // comes after `testStartExec2`, since that installs `Threaded`'s own
+    // SIGPIPE handler.
+    const posix = std.posix;
+    const ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(.PIPE, &ignore, &old);
+    defer posix.sigaction(.PIPE, &old, null);
+
+    // Tcl parity: a writer killed by SIGPIPE is a failure, even when the
+    // reader stopped on purpose.
+    try interp.testExpectScriptResult("true", "catch {exec2 yes | head -n 1} m o; string match {ChildKilled * 13} [dict get $o -errorcode]");
 }
 
 test "exec2 basics" {
@@ -1090,4 +1075,8 @@ test "exec2 split" {
 
 test "exec2 background" {
     try memutil.checkAllocationFailures(.exhaustive, testExec2Background, .{});
+}
+
+test "exec2 sigpipe" {
+    try memutil.checkAllocationFailures(.exhaustive, testExec2Sigpipe, .{});
 }

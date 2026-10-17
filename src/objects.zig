@@ -406,7 +406,7 @@ pub const String = struct {
 };
 
 fn testString(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     const obj = try String.newObject("hello");
@@ -1142,7 +1142,7 @@ test "enum mapping" {
 }
 
 test "tcl enum" {
-    try heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
 
     const MyEnum = enum { foo, bar, baz };
@@ -1295,7 +1295,7 @@ test "subcommand parser" {
         .{ .variant = .foo, .usage = "arg1 arg2 ?arg3?", .min_args = 2, .max_args = 3 },
     });
 
-    try heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
 
     var base_str: Shimmerable = .{ .original = try String.newValue("base") };
@@ -1710,7 +1710,7 @@ pub fn valuesToShimmerables(gpa: std.mem.Allocator, values: []Value) ![]Shimmera
 }
 
 fn testLists(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     var det: ErrorDetails = undefined;
@@ -2564,7 +2564,7 @@ pub const Dictionary = struct {
 };
 
 fn testDicts(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     var det: ErrorDetails = undefined;
@@ -2649,7 +2649,7 @@ test "dicts" {
 }
 
 fn testRecursiveDicts(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     const key_foo = try String.newValue("foo");
@@ -2714,7 +2714,7 @@ test "dict recursive" {
 }
 
 fn testGetRecursivelyAllMutable(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     const key_foo = try String.newValue("foo");

@@ -227,6 +227,11 @@ fn catchTryHelper(
                                     continue :outer;
                                 }
                             }
+                        } else {
+                            // An error with no -errorcode matches only the empty
+                            // match list, which is Tcl's "any error".
+                            const match_list = try interp.getList(&trap_params[1]);
+                            if (match_list.items.len > 0) continue;
                         }
                     }
 

@@ -614,7 +614,7 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
 }
 
 test "leak" {
-    try heap.testStart(testing.allocator, testing.io);
+    try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
 
     // Leak a String on purpose, then check the leak dump for the leaked pointer.

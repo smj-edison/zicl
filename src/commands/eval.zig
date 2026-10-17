@@ -971,6 +971,35 @@ fn testExpressionSugarErrors(ta: std.mem.Allocator) !void {
     try memutil.expectErrorOrOom(error.EvalError, interp.testRunScript("return [expr {}]"));
 }
 
+fn testRandIsInUnitInterval(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Regression: this was built with @bitCast rather than @floatFromInt, so
+    // the divisor was negative zero and the numerator was random bits read as
+    // a double. Every draw came back as an infinity.
+    try interp.testExpectScriptResult("true",
+        \\ set ok true
+        \\ for {set i 0} {$i < 200} {incr i} {
+        \\     set r [expr {rand()}]
+        \\     if {!($r >= 0.0 && $r < 1.0)} { set ok false }
+        \\ }
+        \\ set ok
+    );
+
+    // Seeding is reproducible.
+    try interp.testExpectScriptResult("true",
+        \\ expr {srand(42)}
+        \\ set a [expr {rand()}]
+        \\ expr {srand(42)}
+        \\ expr {$a == rand()}
+    );
+}
+
+test "rand is in the unit interval" {
+    try memutil.checkAllocationFailures(.exhaustive, testRandIsInUnitInterval, .{});
+}
+
 test "expression sugar errors" {
     try memutil.checkAllocationFailures(.exhaustive, testExpressionSugarErrors, .{});
 }

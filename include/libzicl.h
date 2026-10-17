@@ -944,14 +944,6 @@ void Zicl_ClearStop(Zicl_Interp *interp);
  * any target both are compiled for. Recover the backing from the head Zicl
  * hands back with `Zicl_ContainerOf`. */
 
-/* 128-bit capability identifier. Assigned by Zicl at registration; treat it as
- * opaque, and zero it before `Zicl_CapabilityNew`. */
-#if defined(__SIZEOF_INT128__)
-typedef __int128 Zicl_Id;
-#else
-#error "zicl requires 128-bit integer support (__int128)"
-#endif
-
 struct Zicl_CapabilityHead;
 
 typedef struct Zicl_CapabilityHeadVTable {
@@ -963,6 +955,10 @@ typedef struct Zicl_CapabilityHeadVTable {
     void (*destroy_backing)(struct Zicl_CapabilityHead *head);
 } Zicl_CapabilityHeadVTable;
 
+typedef struct Zicl_CapabilityId {
+    __int128 value;
+    bool is_set;
+} Zicl_CapabilityId;
 /* The generic part of a capability. Embed this as a field of a backing struct
  * (at any offset; recover the backing with the `Zicl_ContainerOf` macro). C code sets
  * `vtable`; `Zicl_CapabilityNew` initializes the rest, so the remaining fields
@@ -971,7 +967,7 @@ typedef struct Zicl_CapabilityHeadVTable {
  * asserted here (it varies between 32- and 64-bit targets). */
 typedef struct Zicl_CapabilityHead {
     const Zicl_CapabilityHeadVTable *vtable;
-    Zicl_Id id;
+    Zicl_CapabilityId id;
     bool closed;
     uint32_t ref_count;
 } Zicl_CapabilityHead;
@@ -1027,8 +1023,10 @@ int Zicl_NewPointerCapability(void *ptr, const char *type_name,
  * pointer capability, or if it's a pointer capability of some other type
  * (e.g. passing a "Gpu*" capability where "v4l2_capability*" was expected)
  * -- `*out` alone can't carry that distinction, since NULL is itself a valid
- * pointer to recover (see Zicl_NewPointerCapability). */
-int Zicl_GetPointerCapability(Zicl_Shimmerable *shim, const char *expected_type_name, void **out);
+ * pointer to recover (see Zicl_NewPointerCapability). `*out_head` receives the
+ * capability the pointer came out of, borrowed for as long as `shim` holds it. */
+int Zicl_GetPointerCapability(Zicl_Shimmerable *shim, const char *expected_type_name, void **out,
+                              struct Zicl_CapabilityHead **out_head);
 /* The type_name a pointer capability was created with, or NULL if `value`
  * isn't a pointer capability. Borrowed; valid as long as the capability is. */
 const char *Zicl_PointerCapabilityTypeName(Zicl_Value value);
@@ -1038,4 +1036,4 @@ Zicl_CapabilityHead *Zicl_CapabilityHeadBorrow(Zicl_CapabilityHead *head);
 void Zicl_CapabilityHeadRelease(Zicl_CapabilityHead *head);
 void Zicl_CapabilityHeadClose(Zicl_CapabilityHead *head);
 bool Zicl_CapabilityHeadIsClosed(Zicl_CapabilityHead *head);
-void Zicl_CapabilityHeadGetId(Zicl_CapabilityHead *head, Zicl_Id *out);
+void Zicl_CapabilityHeadGetId(Zicl_CapabilityHead *head, Zicl_CapabilityId *out);

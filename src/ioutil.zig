@@ -6,6 +6,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 
 const heap = @import("heap.zig");
+const Threaded = @import("vendor/Threaded.zig");
 
 pub threadlocal var local_stdout_fd: i32 = std.posix.STDOUT_FILENO;
 pub threadlocal var local_stderr_fd: i32 = std.posix.STDERR_FILENO;
@@ -174,7 +175,7 @@ pub fn createSelfDeletingFile(dir: Io.Dir, io: Io) !Io.File {
 
             while (true) {
                 switch (std.posix.errno(std.posix.system.unlinkat(dir.handle, &temp_filename, 0))) {
-                    .SUCCESS => return,
+                    .SUCCESS => break,
                     .NOENT => {
                         // We still hold a handle on the temp file, so even if it was deleted,
                         // we can still use it. And we don't need to unlink it, since it was
@@ -200,8 +201,10 @@ fn countDirEntries(dir: Io.Dir, io: Io) !usize {
 test "self-deleting temp file has no name" {
     if (native_os == .windows) return error.SkipZigTest;
 
-    const io = std.testing.io;
-    var env: std.process.Environ.Map = std.testing.environ.createMap(std.testing.allocator);
+    var threaded: Threaded = .init(std.testing.allocator, .{ .environ = std.testing.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env: std.process.Environ.Map = try std.testing.environ.createMap(std.testing.allocator);
     defer env.deinit();
 
     var tmpdir = std.testing.tmpDir(.{ .iterate = true });

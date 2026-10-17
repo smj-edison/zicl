@@ -507,7 +507,7 @@ fn dictSugarReadInner(
         };
         if (resolved_dict_shim.shimmered.asValue()) |new_dict|
             try setVariable(interp, det, call_frame_idx, &dict_name, new_dict);
-        if (dict_name.shimmered.asValue()) |new_dict_name| dict_sugar.dict_name.swap(new_dict_name);
+        if (dict_name.shimmered.asValue()) |new_dict_name| dict_sugar.dict_name.swap(new_dict_name.takeReference());
 
         return looked_up;
     }
@@ -925,7 +925,7 @@ pub fn expectErrorOrOom(expected_error: anyerror, actual_error_union: anytype) !
     }
 }
 fn testVariables(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();
@@ -977,7 +977,7 @@ test "variable basics" {
 }
 
 fn testVariableLink(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
     var interp = try Interp.init(.{});
     defer interp.deinit();

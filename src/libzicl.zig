@@ -8,6 +8,7 @@ const ioutil = @import("ioutil.zig");
 const leak_check = @import("leak_check.zig");
 
 const heap = @import("heap.zig");
+const ReturnCode = heap.ReturnCode;
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
 const objects = @import("objects.zig");
@@ -18,12 +19,11 @@ const Dictionary = objects.Dictionary;
 const Interp = @import("Interp.zig");
 const narrowError = Interp.narrowError;
 const evaltypes = @import("evaltypes.zig");
-const ReturnCode = heap.ReturnCode;
-const commands = @import("commands/common.zig");
-const load = @import("commands/load.zig");
-
 const Capability = @import("Capability.zig");
 const capabilities = @import("capabilities.zig");
+const commands = @import("commands/common.zig");
+const load = @import("commands/load.zig");
+const Threaded = @import("vendor/Threaded.zig");
 
 // ===== Internal: logging and panic =====
 // These are not part of the C API surface; they wire Zig's log and panic
@@ -34,6 +34,7 @@ pub const std_options: std.Options = .{ .logFn = ziclLog };
 
 // Mirrors debug.zig's threadlocal panic_stage to guard against recursive panics.
 threadlocal var zicl_panic_stage: usize = 0;
+threadlocal var io_thread_control: *Threaded.Thread = undefined;
 
 extern fn dumpLastTouchedTrace(fd: i32) void;
 
@@ -86,7 +87,7 @@ fn ziclPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 // ===== Lifecycle =====
 // See the header docs for the process/thread setup contract.
 
-var global_threaded: std.Io.Threaded = undefined;
+var global_threaded: Threaded = undefined;
 
 export fn Zicl_SetLocalStdout(fd: c_int) callconv(.c) void {
     ioutil.local_stdout_fd = fd;
@@ -98,7 +99,7 @@ export fn Zicl_SetLocalStderr(fd: c_int) callconv(.c) void {
 /// `host_name` is the name this machine goes by in the capabilities it hands
 /// out. Null asks the system for it.
 export fn Zicl_InitGlobals(host_name: ?[*:0]const u8) callconv(.c) ReturnCode {
-    global_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
+    global_threaded = Threaded.init(std.heap.c_allocator, .{});
     heap.initGlobals(std.heap.c_allocator, global_threaded.io(), .{
         .capability = .{
             .host_name = if (host_name) |name| std.mem.span(name) else null,
@@ -108,12 +109,14 @@ export fn Zicl_InitGlobals(host_name: ?[*:0]const u8) callconv(.c) ReturnCode {
 }
 
 export fn Zicl_InitThread() callconv(.c) ReturnCode {
+    io_thread_control = Threaded.initThread();
     heap.initThread() catch return .oom;
     return .ok;
 }
 
 export fn Zicl_DeinitThread() callconv(.c) void {
     heap.deinitThread();
+    Threaded.deinitThread();
 }
 
 export fn Zicl_DeinitAll() callconv(.c) void {
@@ -975,8 +978,8 @@ const ParsedName = extern struct {
 export fn Zicl_CapabilityNew(out: *Value, head: *Capability.Head) callconv(.c) ReturnCode {
     head.state = .init(.{ .in_flight = 0, .close_initiated = false });
     head.ref_count = .init(1);
-    head.id = 0;
-    const cap = Capability.new(head) catch return .oom;
+    head.id = .not_set;
+    const cap = Capability.newTakingOwnership(head) catch return .oom;
     out.* = cap.asHead().asValue();
     return .ok;
 }
@@ -1007,7 +1010,7 @@ export fn Zicl_ResolveCapability(
 }
 
 export fn Zicl_NewFileFromDescriptor(descriptor: i32, out: *Value) callconv(.c) ReturnCode {
-    const capability = capabilities.File.openDescriptor(descriptor, false) catch return .oom;
+    const capability = capabilities.File.createFromDescriptor(descriptor, false) catch return .oom;
     out.* = capability.asHead().asValue();
     return .ok;
 }
@@ -1096,5 +1099,5 @@ export fn Zicl_HeadDropInFlight(head: *Capability.Head) callconv(.c) void {
 }
 
 export fn Zicl_HeadGetId(head: *Capability.Head, out: *Capability.Id) callconv(.c) void {
-    out.* = head.id;
+    out.* = head.id.get().?;
 }

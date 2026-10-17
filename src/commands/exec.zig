@@ -802,7 +802,6 @@ const StreamStorage = struct {
 /// before the pipe we are reading gives us EOF.
 fn drainAll(files: []const File, out: [][]u8) !void {
     std.debug.assert(files.len > 0);
-
     const storage = try StreamStorage.init(files.len);
     var multi_reader: File.MultiReader = undefined;
     multi_reader.init(heap.global_gpa, heap.global_io, storage.streams(files.len), files);

@@ -233,10 +233,10 @@ pub fn fileCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             const mode: capabilities.File.Mode =
                 if (args.len == 4) try interp.wrapError(&det, FileOpenMode.get(&det, &args[3])) else .r;
 
-            const cap = capabilities.File.open(path, mode) catch |err| {
+            const file = capabilities.File.open(path, mode) catch |err| {
                 return interp.setErrorFormatted("error while opening file: {}", .{err});
             };
-            interp.setResultOwning(cap.asHead().asValue());
+            interp.setResultOwning((try Capability.newTakingOwnership(&file.head)).asHead().asValue());
         },
         .exists => {
             const path = try args[2].getString();
@@ -439,7 +439,8 @@ pub fn createTempFile(template: ?[]const u8) !TempFile {
     while (retries < max_retries) : (retries += 1) {
         var random_bytes: [8]u8 = undefined;
         heap.global_io.random(&random_bytes);
-        _ = std.fmt.bufPrint(template_slice, "{x}", .{}) catch unreachable;
+        const as_hex = std.fmt.bytesToHex(random_bytes, .lower);
+        @memcpy(template_slice, &as_hex);
 
         const file = std.Io.Dir.createFileAbsolute(heap.global_io, path_buf.items, .{
             .read = true,

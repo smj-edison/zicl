@@ -40,7 +40,8 @@ pub fn asHead(self: *Capability) *Object {
 
 /// `head` should have `id` set to null, as this function will assign
 /// the head its identifier. `head` should set the vtable, however.
-pub fn new(head: *Head) !*Capability {
+/// Does not cleanup in error cases.
+pub fn newRegistering(head: *Head) !*Capability {
     try registry.register(head); // Sets `head.id` while registering.
     errdefer registry.deregister(head);
 
@@ -49,6 +50,13 @@ pub fn new(head: *Head) !*Capability {
     return new_obj.body;
 }
 
+pub fn newTakingOwnership(head: *Head) !*Capability {
+    errdefer head.closeAndDropReference();
+    return newRegistering(head);
+}
+
+/// Marks the capability in-flight on succes, so the caller is responsible
+/// for calling `dropInFlight` when done.
 pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !*Backing {
     if (self.head.vtable != &Backing.vtable) {
         if (det) |details| details.* = .{
@@ -103,7 +111,7 @@ fn updateString(obj: *Object) !void {
     const self = obj.asType(Capability).?;
 
     var id_bytes: [@sizeOf(Id)]u8 = undefined;
-    std.mem.writeInt(Id, &id_bytes, self.head.id.?, .big);
+    std.mem.writeInt(Id, &id_bytes, self.head.id.get().?, .big);
     var encoded: [encoded_id_len]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &id_bytes);
 
@@ -160,7 +168,23 @@ pub const Head = extern struct {
     /// be set. Note though that a capability can't upgrade partway
     /// through to be public though, since I haven't figured out how
     /// all the synchronization would work for that.
-    id: ?Id,
+    id: extern struct {
+        pub const not_set: @This() = .{ .id = undefined, .is_set = .init(false) };
+
+        id: Id,
+        is_set: std.atomic.Value(bool),
+
+        /// The id, or null when if this capability has never been registered.
+        pub fn get(self: *const @This()) ?Id {
+            if (!self.is_set.load(.acquire)) return null;
+            return self.id;
+        }
+
+        fn set(self: *@This(), new_id: Id) void {
+            self.id = new_id;
+            assert(!self.is_set.swap(true, .release));
+        }
+    } = .not_set,
     state: std.atomic.Value(State) = .init(.{}),
     ref_count: std.atomic.Value(u32) = .init(1),
 
@@ -221,12 +245,21 @@ pub const Head = extern struct {
 
     /// Marks the capability as closing and removes from the registry.
     pub fn close(head: *Head) void {
-        const deinit_needed = head.markAsClosed() catch return; // Closing is idempotent.
-        if (deinit_needed) head.vtable.deinit_body(head);
+        // We mark `head` as in-flight, because `head.vtable.cancel`
+        // needs the body to stay alive until it finishes.
+        head.markInFlight() catch return;
+        // This will handle deiniting `head` if the in-flight counter
+        // reaches zero.
+        defer head.dropInFlight();
 
-        // We were the ones who marked it as closed, so we'll remove it
-        // from the registry.
-        if (head.id != null) registry.deregister(head);
+        const deinit_needed = head.markAsClosed() catch return; // Closing is idempotent.
+        assert(!deinit_needed); // Should be in-flight.
+
+        // Since `markAsClosed` didn't return error.AlreadyClosed, we are the
+        // ones that successfully changed it from non-closed to closed. Hence,
+        // the below functions will only be called once.
+        if (head.vtable.cancel) |cancel_fn| cancel_fn(head);
+        if (head.id.get() != null) registry.deregister(head);
     }
 
     pub fn closeAndDropReference(head: *Head) void {
@@ -251,11 +284,18 @@ pub const Head = extern struct {
         /// so the vtable is layout-compatible with C (see `Zicl_HeadVTable`).
         name: [*:0]const u8,
         /// Deinits the underlying body. Runs exactly once, when the capability is closed
-        /// and no longer in use.
+        /// and no longer in flight.
         deinit_body: *const fn (head: *Head) callconv(.c) void,
         /// This may be called much later than `deinitBody`, as closing the capability
         /// is not the same thing as freeing the entry and body.
         destroy_backing: *const fn (head: *Head) callconv(.c) void,
+        /// When `close` is called on this `Head`, and `cancel` is
+        /// defined, it will call `cancel` immediately. This is different
+        /// than `deinit_body`, which is deferred to when `in_flight`
+        /// reaches 0. This is guaranteed to only be called once during
+        /// closing, and `head` is also guaranteed to be in-flight
+        /// while `cancel` runs.
+        cancel: ?*const fn (head: *Head) callconv(.c) void = null,
 
         stream_ops: ?*const capabilities.StreamOps = null,
         socket_ops: ?*const capabilities.SocketOps = null,
@@ -274,7 +314,7 @@ pub const Registry = struct {
     /// `id` is not synchronized by itself, so only call `register` with
     /// a newly created, non-crossthread Head.
     pub fn register(self: *Registry, head: *Head) !void {
-        assert(head.id == null);
+        assert(head.id.get() == null);
 
         self.mutex.lockUncancelable(heap.global_io);
         defer self.mutex.unlock(heap.global_io);
@@ -283,14 +323,15 @@ pub const Registry = struct {
         errdefer comptime unreachable;
 
         // Generated while the mutex is locked because the generator is shared state.
-        head.id = self.csprng.random().int(Id);
-        self.heads.putAssumeCapacity(head.id.?, head.takeReference());
+        const id = self.csprng.random().int(Id);
+        head.id.set(id);
+        self.heads.putAssumeCapacity(id, head.takeReference());
     }
 
     /// Asserts that `head` has an identifier.
     pub fn deregister(self: *Registry, head: *Head) void {
         self.mutex.lockUncancelable(heap.global_io);
-        const removed = self.heads.fetchRemove(head.id.?);
+        const removed = self.heads.fetchRemove(head.id.get().?);
         self.mutex.unlock(heap.global_io);
 
         // Note that we assert that there was a value with `.?`,
@@ -352,6 +393,7 @@ pub fn deinitGlobals() void {
     while (iter.next()) |head_ptr| {
         const head = head_ptr.*;
         const deinit_needed = head.markAsClosed() catch false;
+        if (head.vtable.cancel) |cancel_fn| cancel_fn(head);
         if (deinit_needed) head.vtable.deinit_body(head);
         head.dropReference();
     }
@@ -429,13 +471,12 @@ const TestCapability = struct {
 
     pub fn new(deinited_ptr: *bool, payload: [3]u64) !*Capability {
         const cap_backing = try heap.global_gpa.create(Backing);
-        errdefer heap.global_gpa.destroy(cap_backing);
         cap_backing.* = .{
-            .head = .{ .vtable = &Backing.vtable, .id = null },
+            .head = .{ .vtable = &Backing.vtable, .id = .not_set },
             .body = .{ .deinited_ptr = deinited_ptr, .payload = payload },
         };
 
-        return try Capability.new(&cap_backing.head);
+        return try Capability.newTakingOwnership(&cap_backing.head);
     }
 
     pub const Backing = struct {
@@ -461,7 +502,7 @@ const TestCapability = struct {
 };
 
 fn testCapabilityRoundTrip(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     var deinited = false;
@@ -530,7 +571,7 @@ test "capability round trip" {
 }
 
 fn testRegistryWorksWithoutOriginalObject(ta: std.mem.Allocator) !void {
-    try heap.testStart(ta, testing.io);
+    try heap.testStart(ta, null);
     defer heap.testFinish();
 
     var deinited = false;
