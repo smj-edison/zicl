@@ -7,7 +7,6 @@ const capabilities = @import("../capabilities.zig");
 const strutil = @import("../strutil.zig");
 
 const common = @import("common.zig");
-const exec = @import("exec.zig");
 const heap = common.heap;
 const objects = common.objects;
 const ErrorDetails = common.ErrorDetails;
@@ -146,36 +145,6 @@ fn writeError(interp: *Interp, err: anyerror) Interp.Error {
 fn readError(interp: *Interp, err: anyerror) Interp.Error {
     try interp.setResultFormatted("failed to read: {}", .{err});
     return error.EvalError;
-}
-
-/// [pid]
-///
-/// With no arguments, this process. With a process capability, the pids of its
-/// stages, for reaching a child through something other than the capability, a
-/// signal being the usual reason. A stage already waited for contributes
-/// nothing, its number having stopped meaning anything.
-pub fn pidCmd(interp: *Interp, args: []Shimmerable) !void {
-    if (args.len == 1) {
-        interp.setResultInteger(@intCast(std.os.linux.getpid()));
-        return;
-    }
-
-    var det: ErrorDetails = undefined;
-    const cap = try interp.wrapError(&det, Capability.shimmerFrom(&det, &args[1]));
-    const backing = try interp.wrapError(&det, cap.getBacking(capabilities.Process.Backing, &det));
-    defer backing.head.dropInFlight();
-
-    var pid_buffer: [exec.max_pipeline_stages]?std.process.Child.Id = undefined;
-    const pids = backing.body.pids(&pid_buffer);
-
-    var values: std.ArrayList(heap.Value) = .empty;
-    defer values.deinit(heap.local_arena);
-    for (pids) |maybe_pid| {
-        if (maybe_pid) |pid| try values.append(heap.local_arena, objects.Integer.new(@intCast(pid)));
-    }
-
-    const list = try objects.List.new(values.items);
-    interp.setResultOwning(list.asHead().asValue());
 }
 
 /// [pwd] -- the process's current working directory, as an absolute path.
@@ -633,7 +602,6 @@ pub fn sleepCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
 pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
-    try registerCommand(interp, "pid", pidCmd, "?process?", 0, 1);
     try registerCommand(interp, "pwd", pwdCmd, "", 0, 0);
     try registerCommand(interp, "stream", streamCmd, "subcommand ?arg ...?", 2, 3);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
@@ -689,19 +657,6 @@ fn testPutsNonewlineOmitsTheTrailingNewline(ta: std.mem.Allocator) !void {
 
 test "puts -nonewline omits the trailing newline" {
     try memutil.checkAllocationFailures(.exhaustive, testPutsNonewlineOmitsTheTrailingNewline, .{});
-}
-
-fn testPidReportsThisProcess(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
-
-    var expected: [32]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&expected, "{}", .{std.os.linux.getpid()});
-    try interp.testExpectScriptResult(rendered, "pid");
-}
-
-test "pid reports this process" {
-    try memutil.checkAllocationFailures(.exhaustive, testPidReportsThisProcess, .{});
 }
 
 fn testFileSplitsAPathIntoItsParts(ta: std.mem.Allocator) !void {

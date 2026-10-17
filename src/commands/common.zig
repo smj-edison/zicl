@@ -72,7 +72,6 @@ test {
     _ = @import("math.zig");
     _ = @import("eval.zig");
     _ = @import("dict.zig");
-    _ = @import("exec-2.zig");
     _ = @import("misc.zig");
     _ = @import("variables.zig");
     _ = @import("io.zig");
@@ -81,4 +80,5 @@ test {
     _ = @import("regex.zig");
     _ = @import("load.zig");
     _ = @import("clock.zig");
+    _ = @import("exec.zig");
 }
