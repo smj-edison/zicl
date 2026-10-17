@@ -42,10 +42,10 @@ pub fn asHead(self: *Capability) *Object {
 /// the head its identifier. `head` should set the vtable, however.
 /// Does not cleanup in error cases.
 pub fn newRegistering(head: *Head) !*Capability {
-    try registry.register(head); // Sets `head.id` while registering.
-    errdefer registry.deregister(head);
-
     const new_obj = try Object.newObject(Capability);
+    errdefer new_obj.head.freeBacking();
+
+    try registry.register(head); // Sets `head.id` while registering.
     new_obj.body.* = .{ .head = head };
     return new_obj.body;
 }
@@ -589,14 +589,15 @@ fn testRegistryWorksWithoutOriginalObject(ta: std.mem.Allocator) !void {
         defer cap.asHead().dropReference();
         errdefer cap.close();
 
-        head_ref = cap.head;
+        head_ref = cap.head.takeReference();
+        errdefer head_ref.dropReference();
 
         string_rep = try heap.global_gpa.dupe(u8, try cap.asHead().getString());
     }
 
+    defer head_ref.closeAndDropReference();
     // Capability should still be alive.
     try testing.expect(!deinited);
-    defer head_ref.close();
 
     // And we should be able to recover it here.
     var shim: objects.Shimmerable = .{ .original = try objects.String.newValue(string_rep.?) };
