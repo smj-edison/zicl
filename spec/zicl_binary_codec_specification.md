@@ -29,9 +29,9 @@ set result [binary decode ?-at bit_offset? ?-state stateVar? $schema $data]
 # (which returns [list $bytes $total_bits]).
 set bin [binary encode ?-state stateVar? ?-bitlength? $schema $values]
 
-# Overwrite bits/bytes at an exact bit coordinate without manual buffer slicing
+# Overwrite bits/bytes in-place (COW) at an exact bit coordinate without manual buffer slicing
 # Errors if patch exceeds buffer bounds, unless -extend is specified.
-set patched [binary patch ?-extend? ?-bitlength $bit_len? $bin -at $bit_offset $type_or_schema $value]
+binary patch ?-at bit_offset? ?-state stateVar? ?-extend? ?-bitlength $bit_len? targetVar $type_or_schema $value
 
 # Concatenate byte or non-byte-aligned bit buffers in-place (COW) at a bit coordinate
 binary append ?-at bit_offset? ?-state stateVar? ?-bitlength $bit_len? ?-endian le|be? targetVar $chunk ?$chunk ...?
@@ -201,9 +201,9 @@ For container formats like ELF, Mach-O, or forward CRCs:
    set state {}
    set bin [binary encode -state state $elf_header $metadata]
    ```
-2. **Pass 2:** Append payload sections, compute real offsets/checksums, and stamp via `binary patch` using the recorded bit offset `$state::shoff_loc`:
+2. **Pass 2:** Append payload sections, compute real offsets/checksums, and stamp in-place via `binary patch` using the recorded bit offset `$state::shoff_loc`:
    ```tcl
-   set bin [binary patch $bin -at $state::shoff_loc u32le $actual_shoff]
+   binary patch -at $state::shoff_loc bin u32le $actual_shoff
    ```
 
 ---

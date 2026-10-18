@@ -21,16 +21,16 @@ const Codepoint = if (use_utf8) u21 else u8;
 pub fn checkAllAscii(bytes: []const u8, check: fn (u8) bool) bool {
     for (bytes) |char| {
         if (!check(char)) return false;
-    } else return true;
+    }
+    return true;
 }
 
 pub fn isGraph(c: u8) bool {
-    return std.ascii.isPrint(c) and c != 0x20;
+    return std.ascii.isPrint(c) and c != ' ';
 }
 
 pub fn isPunct(c: u8) bool {
-    _ = std.mem.findScalar(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c) orelse return false;
-    return true;
+    return std.mem.findScalar(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c) != null;
 }
 
 fn toTitlecaseUtf8(cp: u21) u21 {
@@ -71,11 +71,7 @@ pub fn encodeCodepoint(cp: Codepoint, buf: *[4]u8) error{ Utf8CannotEncodeSurrog
 
 /// Conditional uppercase
 fn condUpper(cp: Codepoint, enabled: bool) Codepoint {
-    if (enabled) {
-        return toUpper(cp);
-    } else {
-        return cp;
-    }
+    return if (enabled) toUpper(cp) else cp;
 }
 
 test "Conditional uppercase" {
@@ -410,49 +406,24 @@ fn codepointLengthAscii(str: []const u8) usize {
 
 fn codepointLengthUtf8(str: []const u8) usize {
     var len: usize = 0;
-
     var iter = Iterator.init(str);
     while (iter.next()) |_| {
         len += 1;
     }
-
     return len;
 }
 
 /// Get the length of the string in codepoints
-pub const codepointLength = if (use_utf8) codepointLengthUtf8 else codepointLengthUtf8;
+pub const codepointLength = if (use_utf8) codepointLengthUtf8 else codepointLengthAscii;
 
-pub fn strlenUtf8(str: []const u8) usize {
+/// Finds the byte index of a codepoint
+pub fn findCodepoint(str: []const u8, cp: Codepoint) ?usize {
     var iter = Iterator.init(str);
-    var count = 0;
-
-    while (iter.next()) {
-        count += 1;
-    }
-
-    return count;
-}
-
-pub fn strlenAscii(str: []const u8) usize {
-    return str.len;
-}
-
-/// get the string length in codepoints
-const strlen = if (use_utf8) strlenUtf8 else strlenAscii;
-
-/// Finds the location of a codepoint
-pub fn findCodepoint(str: []const u8, cp: u21) ?usize {
-    var iter = Iterator.init(str);
-
     var idx: usize = 0;
     while (iter.next()) |cp_to_check| {
-        if (cp == cp_to_check) {
-            return idx;
-        }
-
+        if (cp == cp_to_check) return idx;
         idx = iter.i;
     }
-
     return null;
 }
 
@@ -464,12 +435,7 @@ pub fn trimLeft(str: []const u8, trim_chars: []const u8) usize {
     // Peek rather than consume: a non-trim codepoint must be left where it
     // is, since `iter.i` after consuming it would already point past it.
     while (iter.peek()) |cp_to_check| : (_ = iter.next()) {
-        var trim_char_iter = Iterator.init(trim_chars);
-        const is_trim_char = while (trim_char_iter.next()) |check_against| {
-            if (cp_to_check == check_against) break true;
-        } else false;
-
-        if (!is_trim_char) break;
+        if (findCodepoint(trim_chars, cp_to_check) == null) break;
     }
 
     return iter.i;
@@ -482,14 +448,8 @@ pub fn trimRight(str: []const u8, trim_chars: []const u8) usize {
     iter.i = str.len;
 
     var len = iter.i;
-    outer: while (iter.prev()) |cp_to_check| : (len = iter.i) {
-        // Check this codepoint against all the trim_chars codepoints
-        var trim_char_iter = Iterator.init(trim_chars);
-        while (trim_char_iter.next()) |check_against| {
-            if (cp_to_check == check_against) {
-                continue :outer;
-            }
-        } else break;
+    while (iter.prev()) |cp_to_check| : (len = iter.i) {
+        if (findCodepoint(trim_chars, cp_to_check) == null) break;
     }
 
     return len;
@@ -510,26 +470,21 @@ pub fn trimRight(str: []const u8, trim_chars: []const u8) usize {
 ///
 /// Returns null on no match.
 pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usize {
-    // inverted = if it starts with ^
     var inverted = false;
     var found_match = false;
-
     var pattern_iter = Iterator.init(pattern);
-
     const to_check = condUpper(cp, flags.case_insensitive);
 
     if (flags.charset_scan) {
         if (pattern_iter.peek() == '^') {
             inverted = true;
-            _ = pattern_iter.next(); // advance iterator
+            _ = pattern_iter.next();
         }
 
         // Special case. If the first char is ']', it is part of the set
         if (pattern_iter.peek() == ']') {
-            if (cp == ']') {
-                found_match = true;
-            }
-            _ = pattern_iter.next(); // advance iterator
+            if (cp == ']') found_match = true;
+            _ = pattern_iter.next();
         }
     }
 
@@ -539,44 +494,35 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
             break;
         }
 
-        var check_against: ?Codepoint = null;
-
-        // Exact match
         if (pattern_cp == '\\') {
-            if (pattern_iter.next()) |unwrapped| {
-                check_against = condUpper(unwrapped, flags.case_insensitive);
-            }
-        } else {
-            // Is this a range? e.g. [a-z]
-            if (pattern_iter.peek() == '-') {
-                const start_cp = condUpper(pattern_cp, flags.case_insensitive);
-                _ = pattern_iter.next(); // skip -
-                const end_cp = condUpper(
-                    pattern_iter.next() orelse continue,
-                    flags.case_insensitive,
-                );
-
-                // Handle reversed range too
-                if ((to_check >= start_cp and to_check <= end_cp) or
-                    (to_check >= end_cp and to_check <= start_cp))
-                {
+            if (pattern_iter.next()) |escaped| {
+                if (condUpper(escaped, flags.case_insensitive) == to_check) {
                     found_match = true;
                 }
-                continue;
             }
-
-            check_against = condUpper(pattern_cp, flags.case_insensitive);
+            continue;
         }
 
-        if (check_against != null and check_against == to_check) {
+        const start_cp = condUpper(pattern_cp, flags.case_insensitive);
+        if (pattern_iter.peek() == '-') {
+            _ = pattern_iter.next(); // skip '-'
+            const end_cp = condUpper(
+                pattern_iter.next() orelse continue,
+                flags.case_insensitive,
+            );
+
+            // Handle reversed range too
+            if ((to_check >= start_cp and to_check <= end_cp) or
+                (to_check >= end_cp and to_check <= start_cp))
+            {
+                found_match = true;
+            }
+        } else if (start_cp == to_check) {
             found_match = true;
         }
     }
 
-    if (inverted) {
-        found_match = !found_match;
-    }
-
+    if (inverted) found_match = !found_match;
     return if (found_match) pattern_iter.i else null;
 }
 
@@ -599,9 +545,8 @@ pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) b
     while (pattern_iter.next()) |pattern_cp| {
         switch (pattern_cp) {
             '*' => {
-                // keep advancing until it's not an asterisk
                 while (pattern_iter.peek() == '*') {
-                    _ = pattern_iter.next(); // advance iterator
+                    _ = pattern_iter.next();
                 }
 
                 if (pattern_iter.i >= pattern.len) {
@@ -610,44 +555,33 @@ pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) b
                 }
 
                 while (string_iter.i < str.len) {
-                    // Recursive call - Does the remaining pattern match anywhere?
                     if (globMatch(pattern[pattern_iter.i..], str[string_iter.i..], case_insensitive)) {
-                        return true; // match
+                        return true;
                     }
-                    _ = string_iter.next(); // advance iterator
+                    _ = string_iter.next();
                 }
 
-                return false; // no match
+                return false;
             },
             '?' => {
-                _ = string_iter.next(); // advance iterator
+                _ = string_iter.next();
             },
             '[' => {
                 const to_check = string_iter.next() orelse return false;
                 if (pattern_iter.i >= pattern.len) break;
 
-                const result = charsetMatch(
+                const bracket_length = charsetMatch(
                     pattern[pattern_iter.i..],
                     to_check,
                     .{ .case_insensitive = case_insensitive },
-                );
-                if (result == null) return false;
+                ) orelse return false;
 
-                const bracket_length = result.?;
                 pattern_iter.i += bracket_length;
                 if (pattern_iter.i >= pattern.len) break;
             },
             else => {
-                var check_against: Codepoint = undefined;
-                if (pattern_cp == '\\') {
-                    check_against = condUpper(
-                        pattern_iter.next() orelse '\\',
-                        case_insensitive,
-                    );
-                } else {
-                    check_against = condUpper(pattern_cp, case_insensitive);
-                }
-
+                const raw_cp = if (pattern_cp == '\\') pattern_iter.next() orelse '\\' else pattern_cp;
+                const check_against = condUpper(raw_cp, case_insensitive);
                 const to_check = condUpper(
                     string_iter.next() orelse return false,
                     case_insensitive,
@@ -657,14 +591,12 @@ pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) b
         }
 
         if (string_iter.i >= str.len) {
-            // keep advancing until it's not an asterisk
             while (pattern_iter.peek() == '*') {
                 _ = pattern_iter.next();
             }
         }
     }
 
-    // did we reach the end of both?
     return (string_iter.i >= str.len) and (pattern_iter.i >= pattern.len);
 }
 
@@ -674,21 +606,15 @@ test "glob match" {
 }
 
 pub fn findFirstOccurrence(needle: []const u8, haystack: []const u8, cp_index: usize) ?usize {
-    if (needle.len > haystack.len or cp_index > haystack.len) {
+    if (needle.len == 0 or needle.len > haystack.len or cp_index > haystack.len) {
         return null;
     }
 
     var haystack_iter = Iterator.init(haystack);
     haystack_iter.i = cpIndex(haystack, cp_index) orelse return null;
 
-    while (true) : (_ = haystack_iter.next()) {
-        _ = haystack_iter.peek() orelse return null;
-        if (haystack_iter.bytes.len - haystack_iter.i < needle.len) {
-            return null;
-        }
-
-        const haystack_slice = haystack[haystack_iter.i .. haystack_iter.i + needle.len];
-        if (std.mem.eql(u8, needle, haystack_slice)) {
+    while (haystack_iter.i + needle.len <= haystack.len) : (_ = haystack_iter.next()) {
+        if (std.mem.eql(u8, needle, haystack[haystack_iter.i..][0..needle.len])) {
             return haystack_iter.i;
         }
     }
@@ -745,24 +671,23 @@ test "Find last occurrence bounded" {
 }
 
 pub fn hexDigitValue(c: u8) ?u4 {
-    if (c >= '0' and c <= '9')
-        return @intCast(c - '0');
-    if (c >= 'a' and c <= 'f')
-        return @intCast(c - 'a' + 10);
-    if (c >= 'A' and c <= 'F')
-        return @intCast(c - 'A' + 10);
-    return null;
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => null,
+    };
 }
 
 pub fn isHexDigit(c: u8) bool {
-    _ = hexDigitValue(c) orelse return false;
-    return true;
+    return hexDigitValue(c) != null;
 }
 
 fn octalDigitValue(c: u8) ?u3 {
-    if (c >= '0' and c <= '7')
-        return @intCast(c - '0');
-    return null;
+    return switch (c) {
+        '0'...'7' => @intCast(c - '0'),
+        else => null,
+    };
 }
 
 /// Parse a Tcl integer literal. Currently just uses Zig's parser,
@@ -782,140 +707,87 @@ pub fn removeEscaping(source: []const u8, dest: []u8) usize {
     var dest_i: usize = 0;
 
     while (i < source.len) {
-        switch (source[i]) {
-            '\\' => {
-                if (i + 1 < source.len) {
-                    i += 1;
-                    switch (source[i]) {
-                        'a' => {
-                            dest[dest_i] = 0x7;
-                        },
-                        'b' => {
-                            dest[dest_i] = 0x8;
-                        },
-                        'f' => {
-                            dest[dest_i] = 0xC;
-                        },
-                        'n' => {
-                            dest[dest_i] = '\n';
-                        },
-                        'r' => {
-                            dest[dest_i] = '\r';
-                        },
-                        't' => {
-                            dest[dest_i] = '\t';
-                        },
-                        'u', 'U', 'x' => {
-                            const sequence_start = i;
-
-                            // A unicode or hex sequence.
-                            // \x Expect 1-2 hex chars and convert to hex.
-                            // \u Expect 1-4 hex chars and convert to utf-8.
-                            // \U Expect 1-8 hex chars and convert to utf-8.
-                            // \u{NNN} supports 1-6 hex chars and convert to utf-8.
-                            // An invalid sequence means simply the escaped char.
-                            var max_chars: usize = 2;
-                            if (source[i] == 'U') {
-                                max_chars = 8;
-                            } else if (source[i] == 'u') {
-                                if (i + 1 < source.len and source[i + 1] == '{') {
-                                    max_chars = 6;
-                                    i += 1; // skip to brace
-                                } else {
-                                    max_chars = 4;
-                                }
-                            }
-
-                            i += 1;
-                            const hex_start = i;
-
-                            var codepoint: u21 = 0;
-                            while (i < source.len and i - hex_start < max_chars) : (i += 1) {
-                                const hex = hexDigitValue(source[i]);
-                                if (hex) |unwrapped| {
-                                    codepoint = (codepoint << 4) | unwrapped;
-                                } else break;
-                            }
-
-                            if (source[hex_start - 1] == '{') {
-                                // Did any of the following happen:
-                                // 1. Never advanced, do to invalid characters or EOF
-                                // 2. Codepoint is too large to represent
-                                // 3. Didn't end with '}'
-                                if (i - hex_start == 0 or codepoint > 0x1fffff or
-                                    (i < source.len and source[i] != '}'))
-                                {
-                                    // If so, reset cursor
-                                    i = sequence_start;
-                                } else {
-                                    // Skip closing brace
-                                    i += 1;
-                                }
-                            }
-
-                            if (i - hex_start != 0) {
-                                // Got a valid sequence, so insert
-                                if (source[sequence_start] == 'x') {
-                                    dest[dest_i] = @intCast(codepoint);
-                                    dest_i += 1;
-                                } else {
-                                    dest_i += utf8Encode(codepoint, dest[dest_i..]) catch blk: {
-                                        break :blk utf8Encode(0xFFFD, dest[dest_i..]) catch unreachable;
-                                    };
-                                }
-                                continue;
-                            }
-
-                            // Not a valid codepoint, just an escaped char
-                            dest[dest_i] = source[i];
-                        },
-                        'v' => {
-                            dest[dest_i] = 0xB;
-                        },
-                        0x0 => {
-                            dest[dest_i] = '\\';
-                        },
-                        '\n' => {
-                            // Replace all spaces and tabs after backslash newline with a single space
-                            i += 1;
-                            dest[dest_i] = ' ';
-                            while (i < source.len and (source[i] == ' ' or source[i] == '\t')) {
-                                i += 1;
-                            }
-                        },
-                        '0'...'7' => {
-                            const result = blk: {
-                                const first = octalDigitValue(source[i]).?;
-                                var codepoint: u8 = @intCast(first);
-
-                                i += 1;
-                                if (i == source.len) break :blk codepoint;
-                                if (octalDigitValue(source[i])) |second| {
-                                    codepoint = (@as(u8, @intCast(codepoint)) << 3) | second;
-                                } else break :blk codepoint;
-
-                                i += 1;
-                                if (i == source.len) break :blk codepoint;
-                                if (octalDigitValue(source[i])) |third| {
-                                    codepoint = (@as(u8, @intCast(codepoint)) << 3) | third;
-                                }
-
-                                break :blk codepoint;
-                            };
-
-                            dest[dest_i] = result;
-                        },
-                        else => {
-                            dest[dest_i] = source[i];
-                        },
+        if (source[i] == '\\' and i + 1 < source.len) {
+            i += 1;
+            switch (source[i]) {
+                'a' => dest[dest_i] = 0x7,
+                'b' => dest[dest_i] = 0x8,
+                'f' => dest[dest_i] = 0xC,
+                'n' => dest[dest_i] = '\n',
+                'r' => dest[dest_i] = '\r',
+                't' => dest[dest_i] = '\t',
+                'v' => dest[dest_i] = 0xB,
+                0x0 => dest[dest_i] = '\\',
+                '\n' => {
+                    // Replace all spaces and tabs after backslash newline with a single space
+                    dest[dest_i] = ' ';
+                    while (i + 1 < source.len and (source[i + 1] == ' ' or source[i + 1] == '\t')) {
+                        i += 1;
                     }
-                } else {
+                },
+                '0'...'7' => {
+                    var codepoint: u8 = octalDigitValue(source[i]).?;
+                    for (0..2) |_| {
+                        if (i + 1 >= source.len) break;
+                        const digit = octalDigitValue(source[i + 1]) orelse break;
+                        i += 1;
+                        codepoint = (codepoint << 3) | digit;
+                    }
+                    dest[dest_i] = codepoint;
+                },
+                'u', 'U', 'x' => {
+                    // A unicode or hex sequence.
+                    // \x Expect 1-2 hex chars and convert to hex.
+                    // \u Expect 1-4 hex chars and convert to utf-8.
+                    // \U Expect 1-8 hex chars and convert to utf-8.
+                    // \u{NNN} supports 1-6 hex chars and convert to utf-8.
+                    // An invalid sequence means simply the escaped char.
+                    const has_brace = source[i] == 'u' and i + 1 < source.len and source[i + 1] == '{';
+                    const max_chars: usize = switch (source[i]) {
+                        'x' => 2,
+                        'u' => if (has_brace) 6 else 4,
+                        'U' => 8,
+                        else => unreachable,
+                    };
+                    const hex_start = i + 1 + @intFromBool(has_brace);
+                    const hex_end = @min(source.len, hex_start + max_chars);
+
+                    var codepoint: u32 = 0;
+                    var hex_len: usize = 0;
+                    for (source[hex_start..hex_end]) |c| {
+                        const digit = hexDigitValue(c) orelse break;
+                        codepoint = (codepoint << 4) | digit;
+                        hex_len += 1;
+                    }
+
+                    const after_hex = hex_start + hex_len;
+                    const valid = if (has_brace)
+                        hex_len > 0 and codepoint <= 0x1fffff and after_hex < source.len and source[after_hex] == '}'
+                    else
+                        hex_len > 0;
+
+                    if (valid) {
+                        if (source[i] == 'x') {
+                            dest[dest_i] = @truncate(codepoint);
+                            dest_i += 1;
+                        } else {
+                            const cp = if (std.math.cast(u21, codepoint)) |c|
+                                if (std.unicode.utf8ValidCodepoint(c)) c else 0xFFFD
+                            else
+                                0xFFFD;
+                            dest_i += utf8Encode(cp, dest[dest_i..]) catch unreachable;
+                        }
+                        i = after_hex + @intFromBool(has_brace);
+                        continue;
+                    }
+
+                    // Not a valid codepoint, just an escaped char
                     dest[dest_i] = source[i];
-                }
-            },
-            else => {
-                dest[dest_i] = source[i];
-            },
+                },
+                else => dest[dest_i] = source[i],
+            }
+        } else {
+            dest[dest_i] = source[i];
         }
 
         i += 1;
@@ -926,15 +798,15 @@ pub fn removeEscaping(source: []const u8, dest: []u8) usize {
 }
 
 test "Tcl escape" {
-    var alloc = std.heap.page_allocator;
-    try testEscape(&alloc, "A B C D E \n",
+    try testEscape("A B C D E \n",
         \\\x41 \102 \u43 \u{44} \E \n
     );
+    try testEscape("xuUu{41xza\x00a a", "\\x\\u\\U\\u{41\\xza\\0a\\\n   \ta");
 }
 
-fn testEscape(alloc: *std.mem.Allocator, expected: []const u8, to_escape: []const u8) !void {
-    const write_into = alloc.alloc(u8, to_escape.len) catch @panic("Can't allocate for test");
-    defer alloc.free(write_into);
+fn testEscape(expected: []const u8, to_escape: []const u8) !void {
+    const write_into = try std.testing.allocator.alloc(u8, to_escape.len);
+    defer std.testing.allocator.free(write_into);
 
     const len = removeEscaping(to_escape, write_into);
     try expectEqualSlices(u8, expected, write_into[0..len]);
@@ -943,115 +815,59 @@ fn testEscape(alloc: *std.mem.Allocator, expected: []const u8, to_escape: []cons
 pub const QuotingType = enum(u8) { bare, brace, escape };
 pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
     // Empty string needs to be represented in braces
-    if (str.len == 0) return QuotingType.brace;
+    if (str.len == 0) return .brace;
 
-    // Whether it's possible to represent the string without
-    // braces or escaping
-    var bare_string_possible = true;
+    // Whether it's possible to represent the string without braces or escaping
+    var bare_possible = str[0] != '"' and str[0] != '{';
     var brace_level: i64 = 0;
     var bracket_level: i64 = 0;
 
-    if (str[0] == '"' or str[0] == '{') {
-        // Not possible because we began with characters that are impossible
-        // to represent without braces or escaping
-        bare_string_possible = false;
-    } else {
-        var return_bare = true;
-        for (str) |char| {
-            switch (char) {
-                ' ', '$', '"', '[', ']', ';', '\\', '\r', '\n', '\t', 12, 11 => {
-                    bare_string_possible = false;
-                    return_bare = false;
-                    break;
-                },
-                '{', '}' => {
-                    return_bare = false;
-                    break;
-                },
-                else => {},
-            }
-        }
-
-        if (return_bare) return QuotingType.bare;
-    }
-
-    // Check for any characters that we can't represent
     var i: usize = 0;
     while (i < str.len) : (i += 1) {
         switch (str[i]) {
-            '{' => {
-                brace_level += 1;
-            },
+            '{' => brace_level += 1,
             '}' => {
                 brace_level -= 1;
-                if (brace_level < 0) {
-                    // Unbalanced braces, so the only possible way is escaping
-                    return QuotingType.escape;
-                }
+                if (brace_level < 0) return .escape;
             },
             '[' => {
+                bare_possible = false;
                 bracket_level += 1;
             },
             ']' => {
+                bare_possible = false;
                 bracket_level -= 1;
             },
             '\\' => {
-                if (i + 1 < str.len) {
-                    if (str[i + 1] == '\n') {
-                        // This is a bit of an odd condition, but escaped
-                        // newlines cannot be accurately represented in braces,
-                        // as they'll be replaced with a single space. Hence,
-                        // we better go with escaping.
-                        return QuotingType.escape;
-                    } else {
-                        // skip the escaped character
-                        i += 1;
-                    }
+                bare_possible = false;
+                if (i + 1 == str.len or str[i + 1] == '\n') {
+                    // A trailing unescaped backslash would escape the closing brace,
+                    // and escaped newlines inside braces are replaced with a space.
+                    return .escape;
                 }
+                // skip the escaped character
+                i += 1;
+            },
+            ' ', '$', '"', ';', '\r', '\n', '\t', 12, 11 => {
+                bare_possible = false;
             },
             else => {},
         }
     }
 
-    if (bracket_level < 0) {
-        // Unbalanced brackets
-        return QuotingType.escape;
+    if (bracket_level < 0 or brace_level != 0) {
+        return .escape;
     }
 
-    if (brace_level == 0) {
-        // Braces are balanced, so we can definitely represent it in braces.
-        // We'll also attempt to represent it as a bare string.
-        if (!bare_string_possible) {
-            // The string started with characters that are impossible to
-            // represent as a bare string, so braces it is.
-            return QuotingType.brace;
-        }
-
-        // Last attempt at a bare string.
-        for (str) |char| {
-            switch (char) {
-                ' ', '$', '"', '[', ']', ';', '\\', '\r', '\n', '\t', 12, 11 => {
-                    // All of these characters can't be in a bare string, so braces
-                    // it is.
-                    return QuotingType.brace;
-                },
-                else => {},
-            }
-        }
-
-        return QuotingType.bare;
-    }
-
-    // Braces weren't balanced, so we better use an escaped string
-    return QuotingType.escape;
+    return if (bare_possible) .bare else .brace;
 }
 
 pub fn quoteSize(quoting_type: QuotingType, str_len: usize) usize {
-    switch (quoting_type) {
-        .bare => return str_len,
-        .brace => return str_len + 2,
-        .escape => return str_len * 2,
-    }
+    return switch (quoting_type) {
+        .bare => str_len,
+        .brace => str_len + 2,
+        .escape => str_len * 2,
+    };
 }
 
 /// Returns the amount written to dest
@@ -1068,57 +884,30 @@ pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escap
             return src.len + 2;
         },
         .escape => {
-            var i: usize = 0;
             var j: usize = 0;
-
             if (escape_first_pound and src.len > 0 and src[0] == '#') {
-                dest[j] = '\\';
+                dest[0] = '\\';
                 j += 1;
-                dest[j] = '#';
-                j += 1;
-
-                i += 1;
             }
 
-            while (i < src.len) {
-                switch (src[i]) {
-                    ' ', '$', '"', '[', ']', '{', '}', ';', '\\' => {
-                        dest[j] = '\\';
-                        j += 1;
-                        dest[j] = src[i];
-                    },
-                    '\n' => {
-                        dest[j] = '\\';
-                        j += 1;
-                        dest[j] = 'n';
-                    },
-                    '\r' => {
-                        dest[j] = '\\';
-                        j += 1;
-                        dest[j] = 'r';
-                    },
-                    '\t' => {
-                        dest[j] = '\\';
-                        j += 1;
-                        dest[j] = 't';
-                    },
-                    12 => {
-                        dest[j] = '\\';
-                        j += 1;
-                        dest[j] = 'f';
-                    },
-                    11 => {
-                        dest[j] = '\\';
-                        j += 1;
-                        dest[j] = 'v';
-                    },
-                    else => {
-                        dest[j] = src[i];
-                    },
+            for (src) |c| {
+                const escaped: ?u8 = switch (c) {
+                    ' ', '$', '"', '[', ']', '{', '}', ';', '\\' => c,
+                    '\n' => 'n',
+                    '\r' => 'r',
+                    '\t' => 't',
+                    12 => 'f',
+                    11 => 'v',
+                    else => null,
+                };
+                if (escaped) |esc| {
+                    dest[j] = '\\';
+                    dest[j + 1] = esc;
+                    j += 2;
+                } else {
+                    dest[j] = c;
+                    j += 1;
                 }
-
-                i += 1;
-                j += 1;
             }
 
             return j;

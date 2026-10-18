@@ -32,6 +32,7 @@ const need_simple = switch (builtin.zig_backend) {
 };
 
 extern fn dumpLastTouchedTrace(fd: i32) void;
+extern fn isHeapInitialized() bool;
 
 pub const panic = std.debug.FullPanic(panicFn);
 pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -198,6 +199,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 // since they are not present.
                 if (!builtin.fuzz) unreachable;
 
+                testing.environ = init.environ;
                 var gpa_instance: std.heap.DebugAllocator(.{}) = .init;
                 defer if (gpa_instance.deinit() == .leak) {
                     @panic("internal test runner memory leak");
@@ -576,22 +578,25 @@ pub fn fuzz(
     // error logs.
     const global = struct {
         var ctx: @TypeOf(context) = undefined;
+        var reset_testing_allocator: bool = true;
 
         fn test_one() callconv(.c) bool {
             @disableInstrumentation();
-            testing.allocator_instance = .{};
-            defer if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
+            if (reset_testing_allocator) {
+                testing.allocator_instance = .{};
+            }
+            defer if (reset_testing_allocator) {
+                if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
+            };
             log_err_count = 0;
             testOne(ctx, @constCast(&testing.Smith{ .in = null })) catch |err| switch (err) {
                 error.SkipZigTest => return true,
                 else => {
-                    const stderr = std.debug.lockStderr(&.{}).terminal();
-                    p: {
-                        if (@errorReturnTrace()) |trace| {
-                            std.debug.writeStackTrace(trace, stderr) catch break :p;
-                        }
-                        stderr.writer.print("failed with error.{t}\n", .{err}) catch break :p;
+                    if (@errorReturnTrace()) |trace| {
+                        std.debug.dumpErrorReturnTrace(trace);
                     }
+                    const stderr = std.debug.lockStderr(&.{}).terminal();
+                    stderr.writer.print("failed with error.{t}\n", .{err}) catch {};
                     std.process.exit(1);
                 },
             };
@@ -605,10 +610,15 @@ pub fn fuzz(
     };
 
     if (builtin.fuzz) {
+        global.reset_testing_allocator = !isHeapInitialized();
         // Preserve the calling test's allocator state
         const prev_allocator_state = testing.allocator_instance;
-        testing.allocator_instance = .{};
-        defer testing.allocator_instance = prev_allocator_state;
+        if (global.reset_testing_allocator) {
+            testing.allocator_instance = .{};
+        }
+        defer if (global.reset_testing_allocator) {
+            testing.allocator_instance = prev_allocator_state;
+        };
 
         global.ctx = context;
         fuzz_abi.fuzzer_set_test(&global.test_one);

@@ -709,7 +709,7 @@ pub fn nextBracedStringToken(self: *Tokenizer) !Token {
                 // odd number of backslashes is not counted. We intentionally do
                 // not implement the \<newline> -> space substitution inside
                 // braces, because it makes serialization of programs a pain.
-                if (!self.atEnd()) self.advance(1);
+                if (self.peek(1) != null) self.advance(1);
             },
             else => {},
         }
@@ -895,13 +895,13 @@ pub fn nextExpressionToken(self: *Tokenizer) Error!Token {
     // Argument expansion doesn't exist in expressions.
     self.can_parse_arg_expansion = false;
 
-    while (!self.atEnd()) : (self.advance(1)) {
+    while (!self.atEnd()) {
         // Discard comments and whitespace.
         if (isWhitespace(self.current())) {
-            // Advance past this.
+            self.advance(1);
         } else if (self.startsWith("\\\n")) {
             // Skip escaped newline.
-            self.advance(1);
+            self.advance(2);
         } else if (self.current() == '#') {
             try self.nextCommentToken();
         } else break;

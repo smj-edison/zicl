@@ -17,13 +17,7 @@ const memutil = common.memutil;
 
 /// [append]
 pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
-    // Get the variable's value if it exists, or else use an empty string.
     const var_name = &args[1];
-
-    const lookup = try interp.getVariableTakingRef(var_name);
-    const var_value: Value = if (lookup) |val| val else heap.interned_empty_string;
-    defer var_value.dropReference();
-    const bytes = try var_value.getString();
 
     // Fast path: no values to append, just ensure the variable exists and return it.
     if (args.len == 2) {
@@ -36,29 +30,53 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
         return;
     }
 
-    // Precompute needed length.
-    var total_len: usize = bytes.len;
+    var extra_len: usize = 0;
     for (args[2..]) |arg| {
-        total_len += (try arg.current().getString()).len;
+        var buf: [350]u8 = undefined;
+        const item_bytes = try arg.current().getStringWithBuffer(&buf);
+        extra_len = std.math.add(usize, extra_len, item_bytes.len) catch return error.OutOfMemory;
     }
 
-    const combined_str = blk: {
-        var result_bytes = try heap.global_gpa.allocSentinel(u8, total_len, 0);
-        errdefer heap.global_gpa.free(result_bytes);
+    const maybe_var = try interp.getVariableForMutation(var_name);
+    if (maybe_var) |var_value| {
+        if (try var_value.asMutableStringInPlace()) |special| {
+            const old_len = special.getString().len;
+            const total_len = std.math.add(usize, old_len, extra_len) catch return error.OutOfMemory;
+            try special.ensureTotalCapacity(total_len);
 
-        if (total_len > 0) {
-            var pos: usize = 0;
-            @memcpy(result_bytes[pos..(pos + bytes.len)], bytes);
-            pos += bytes.len;
             for (args[2..]) |arg| {
-                const item_bytes = try arg.current().getString();
-                @memcpy(result_bytes[pos..(pos + item_bytes.len)], item_bytes);
-                pos += item_bytes.len;
+                var buf: [350]u8 = undefined;
+                const item_bytes = arg.current().getStringWithBuffer(&buf) catch unreachable;
+                try special.appendInPlace(item_bytes);
             }
+            interp.setResult(var_value);
+            return;
         }
+    }
 
-        break :blk try String.newOwningNoFree(result_bytes);
-    };
+    var base_buf: [350]u8 = undefined;
+    var base_bytes: [:0]const u8 = "";
+    if (maybe_var) |var_value| {
+        base_bytes = try var_value.getStringWithBuffer(&base_buf);
+    }
+
+    const total_len = std.math.add(usize, base_bytes.len, extra_len) catch return error.OutOfMemory;
+    const result_bytes = try heap.global_gpa.allocSentinel(u8, total_len, 0);
+    errdefer heap.global_gpa.free(result_bytes);
+
+    if (total_len > 0) {
+        var pos: usize = 0;
+        @memcpy(result_bytes[pos .. pos + base_bytes.len], base_bytes);
+        pos += base_bytes.len;
+        for (args[2..]) |arg| {
+            var buf: [350]u8 = undefined;
+            const item_bytes = arg.current().getStringWithBuffer(&buf) catch unreachable;
+            @memcpy(result_bytes[pos .. pos + item_bytes.len], item_bytes);
+            pos += item_bytes.len;
+        }
+    }
+
+    const combined_str = try String.newOwningNoFree(result_bytes);
     defer combined_str.asHead().dropReference();
 
     try interp.setVariable(var_name, combined_str.asHead().asValue());
@@ -1026,6 +1044,30 @@ fn testAppendReturnValue(ta: std.mem.Allocator) !void {
 
 test "append return value" {
     try memutil.checkAllocationFailures(.exhaustive, testAppendReturnValue, .{});
+}
+
+fn testAppendInPlaceAndCow(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Repeated appends mutate the exclusively owned object in place, while
+    // shared references and self-aliasing appends copy-on-write safely.
+    try interp.testExpectScriptResult("abcd|abcd_more|ababab|hello world",
+        \\ append s a
+        \\ append s b
+        \\ append s c d
+        \\ set snap $s
+        \\ append s _more
+        \\ set self ab
+        \\ append self $self $self
+        \\ set d {k hello}
+        \\ append d::k " world"
+        \\ string cat $snap | $s | $self | $d::k
+    );
+}
+
+test "append in-place and copy-on-write" {
+    try memutil.checkAllocationFailures(.exhaustive, testAppendInPlaceAndCow, .{});
 }
 
 fn testStringMapBasic(ta: std.mem.Allocator) !void {

@@ -52,6 +52,109 @@ fn null_free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_addres
     _ = return_address;
 }
 
+/// Wraps a backing allocator and counts active allocations and bytes so callers
+/// can initialize state once, take a `Snapshot`, and verify after each iteration
+/// that all per-iteration allocations were freed.
+pub const CountingAllocator = struct {
+    child_allocator: Allocator,
+    alloc_count: std.atomic.Value(usize) = .init(0),
+    free_count: std.atomic.Value(usize) = .init(0),
+    allocated_bytes: std.atomic.Value(usize) = .init(0),
+    freed_bytes: std.atomic.Value(usize) = .init(0),
+
+    pub const Snapshot = struct {
+        live_allocs: usize,
+        live_bytes: usize,
+    };
+
+    pub fn init(child_allocator: Allocator) CountingAllocator {
+        return .{ .child_allocator = child_allocator };
+    }
+
+    pub fn allocator(self: *CountingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    pub fn takeSnapshot(self: *const CountingAllocator) Snapshot {
+        return .{
+            .live_allocs = self.alloc_count.load(.monotonic) - self.free_count.load(.monotonic),
+            .live_bytes = self.allocated_bytes.load(.monotonic) - self.freed_bytes.load(.monotonic),
+        };
+    }
+
+    pub fn expectMatchesSnapshot(self: *const CountingAllocator, snap: Snapshot) !void {
+        const current = self.takeSnapshot();
+        try testing.expectEqual(snap.live_allocs, current.live_allocs);
+        try testing.expectEqual(snap.live_bytes, current.live_bytes);
+    }
+
+    fn recordResizeBytes(self: *CountingAllocator, old_len: usize, new_len: usize) void {
+        if (new_len >= old_len) {
+            _ = self.allocated_bytes.fetchAdd(new_len - old_len, .monotonic);
+        } else {
+            _ = self.freed_bytes.fetchAdd(old_len - new_len, .monotonic);
+        }
+    }
+
+    fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.child_allocator.rawAlloc(n, alignment, ra) orelse return null;
+        _ = self.alloc_count.fetchAdd(1, .monotonic);
+        _ = self.allocated_bytes.fetchAdd(n, .monotonic);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child_allocator.rawResize(memory, alignment, new_len, ra)) return false;
+        self.recordResizeBytes(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.child_allocator.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        self.recordResizeBytes(memory.len, new_len);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child_allocator.rawFree(memory, alignment, ra);
+        _ = self.free_count.fetchAdd(1, .monotonic);
+        _ = self.freed_bytes.fetchAdd(memory.len, .monotonic);
+    }
+};
+
+test "counting allocator" {
+    var counting = CountingAllocator.init(testing.allocator);
+    const gpa = counting.allocator();
+
+    const base_alloc = try gpa.alloc(u8, 64);
+    defer gpa.free(base_alloc);
+
+    const snap = counting.takeSnapshot();
+    try testing.expectEqual(@as(usize, 1), snap.live_allocs);
+    try testing.expectEqual(@as(usize, 64), snap.live_bytes);
+
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try list.appendSlice(gpa, "hello world");
+        try testing.expect(counting.takeSnapshot().live_allocs > snap.live_allocs);
+    }
+
+    try counting.expectMatchesSnapshot(snap);
+}
+
 /// Note, this will hand out allocations that potentially alias. Really only useful for debugging.
 pub const RingBufferAllocator = struct {
     buffer: []u8,

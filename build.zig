@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     // options
     const static_link = b.option(bool, "static-link", "Whether to statically link libc") orelse true;
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
-    const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse !static_link;
+    const use_llvm = b.option(bool, "use-llvm", "Force building with llvm") orelse (!static_link or optimize != .Debug);
     const trace_mem = b.option(bool, "trace-mem", "Trace object memory operations") orelse (optimize == .Debug);
     const capture_stack_trace = b.option(bool, "capture-stack-trace", "Capture stack trace when tracing mem") orelse trace_mem;
     const test_filters = b.option(
