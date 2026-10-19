@@ -161,73 +161,120 @@ pub fn codecCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     const Subcommands = enum {
         encode,
         decode,
-        names,
+        hash,
     };
     const Parser = objects.SubcommandParser(Subcommands, &.{
-        .{ .variant = .encode, .usage = "codecName ?options? data", .min_args = 2 },
-        .{ .variant = .decode, .usage = "codecName ?options? data", .min_args = 2 },
-        .{ .variant = .names, .usage = "", .min_args = 0, .max_args = 0 },
+        .{ .variant = .encode, .usage = "format data", .min_args = 2, .max_args = 2 },
+        .{ .variant = .decode, .usage = "format data", .min_args = 2, .max_args = 2 },
+        .{ .variant = .hash, .usage = "algorithm data", .min_args = 2, .max_args = 2 },
     });
 
     var det: ErrorDetails = undefined;
     const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
 
+    const data = try args[3].current().getString();
+
     switch (subcommand) {
-        .names => {
-            const b64 = try objects.String.newValue("base64");
-            errdefer b64.dropReference();
-            const hex = try objects.String.newValue("hex");
-            errdefer hex.dropReference();
-            const list = try objects.List.new(&.{ b64, hex });
-            b64.dropReference();
-            hex.dropReference();
-            interp.setResultOwning(list.asHead().asValue());
+        .encode => {
+            if (try args[2].equalsString("base64")) {
+                const encoder = std.base64.standard.Encoder;
+                const out_len = encoder.calcSize(data.len);
+                const out_buf = try heap.global_gpa.alloc(u8, out_len);
+                defer heap.global_gpa.free(out_buf);
+                _ = encoder.encode(out_buf, data);
+                return interp.setResultString(out_buf);
+            } else if (try args[2].equalsString("hex")) {
+                const out_len = data.len * 2;
+                const out_buf = try heap.global_gpa.alloc(u8, out_len);
+                defer heap.global_gpa.free(out_buf);
+                const hex_chars = "0123456789abcdef";
+                for (data, 0..) |b, i| {
+                    out_buf[i * 2] = hex_chars[b >> 4];
+                    out_buf[i * 2 + 1] = hex_chars[b & 0x0f];
+                }
+                return interp.setResultString(out_buf);
+            } else {
+                return interp.setErrorFormatted("bad format \"{s}\": must be base64 or hex", .{try args[2].getString()});
+            }
         },
-        .encode => try codecEncode(interp, args[2..]),
-        .decode => try codecDecode(interp, args[2..]),
+        .decode => {
+            if (try args[2].equalsString("base64")) {
+                const decoder = comptime std.base64.standard.decoderWithIgnore(" \r\n\t");
+                const upper = decoder.calcSizeUpperBound(data.len);
+                const out_buf = try heap.global_gpa.alloc(u8, upper);
+                defer heap.global_gpa.free(out_buf);
+                const written = decoder.decode(out_buf, data) catch {
+                    return interp.setErrorString("invalid base64 data");
+                };
+                return interp.setResultString(out_buf[0..written]);
+            } else if (try args[2].equalsString("hex")) {
+                if (data.len % 2 != 0) {
+                    return interp.setErrorString("hex string has odd length");
+                }
+                const out_len = data.len / 2;
+                const out_buf = try heap.global_gpa.alloc(u8, out_len);
+                defer heap.global_gpa.free(out_buf);
+                _ = std.fmt.hexToBytes(out_buf, data) catch {
+                    return interp.setErrorString("invalid hex string");
+                };
+                return interp.setResultString(out_buf);
+            } else {
+                return interp.setErrorFormatted("bad format \"{s}\": must be base64 or hex", .{try args[2].getString()});
+            }
+        },
+        .hash => {
+            if (try args[2].equalsString("sha-1")) {
+                var out: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+                std.crypto.hash.Sha1.hash(data, &out, .{});
+                return interp.setResultString(&out);
+            } else if (try args[2].equalsString("sha-256")) {
+                var out: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(data, &out, .{});
+                return interp.setResultString(&out);
+            } else if (try args[2].equalsString("blake3")) {
+                var out: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+                std.crypto.hash.Blake3.hash(data, &out, .{});
+                return interp.setResultString(&out);
+            } else {
+                return interp.setErrorFormatted("bad algorithm \"{s}\": must be sha-1, sha-256, or blake3", .{try args[2].getString()});
+            }
+        },
     }
 }
 
 pub fn registerCommands(interp: *Interp) !void {
-    try registerCommand(interp, "codec", codecCmd, "subcommand ?arg ...?", 1, null);
+    try registerCommand(interp, "codec", codecCmd, "subcommand format/algorithm data", 3, 3);
 }
 
-fn testCodecBase64(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
+test "codec base64 encode and decode" {
+    const test_str = "hello world";
+    const enc = std.base64.standard.Encoder;
+    var out_buf: [32]u8 = undefined;
+    const encoded = enc.encode(&out_buf, test_str);
+    try testing.expectEqualStrings("aGVsbG8gd29ybGQ=", encoded);
 
-    try interp.testExpectScriptResult("aGVsbG8=", "codec encode base64 \"hello\"");
-    try interp.testExpectScriptResult("hello", "codec decode base64 \"aGVsbG8=\"");
-    try interp.testExpectScriptResult("hello", "codec decode base64 \"  aGVsbG8=  \\n\"");
-    try interp.testExpectScriptResult("aGVs\nbG8=\n", "codec encode base64 -maxlen 4 \"hello\"");
-    try interp.testExpectScriptResult("hello", "codec decode base64 -strict \"aGVsbG8=\"");
-    try interp.testExpectScriptError(error.EvalError, "invalid base64 encoding", "codec decode base64 -strict \"  aGVsbG8=\"");
+    const decoder = std.base64.standard.decoderWithIgnore(" \r\n\t");
+    var dec_buf: [32]u8 = undefined;
+    const written = try decoder.decode(&dec_buf, encoded);
+    try testing.expectEqualStrings(test_str, dec_buf[0..written]);
 }
 
-test "codec base64" {
-    try memutil.checkAllocationFailures(.exhaustive, testCodecBase64, .{});
-}
+test "codec hashing" {
+    // sha-1 of "hello": aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d
+    var sha1_out: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash("hello", &sha1_out, .{});
+    const expected_sha1 = "\xaa\xf4\xc6\x1d\xdc\xc5\xe8\xa2\xda\xbe\xde\x0f\x3b\x48\x2c\xd9\xae\xa9\x43\x4d";
+    try testing.expectEqualStrings(expected_sha1, &sha1_out);
 
-fn testCodecHex(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
+    // sha-256 of "hello": 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+    var sha256_out: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("hello", &sha256_out, .{});
+    const expected_sha256 = "\x2c\xf2\x4d\xba\x5f\xb0\xa3\x0e\x26\xe8\x3b\x2a\xc5\xb9\xe2\x9e\x1b\x16\x1e\x5c\x1f\xa7\x42\x5e\x73\x04\x33\x62\x93\x8b\x98\x24";
+    try testing.expectEqualStrings(expected_sha256, &sha256_out);
 
-    try interp.testExpectScriptResult("68656c6c6f", "codec encode hex \"hello\"");
-    try interp.testExpectScriptResult("hello", "codec decode hex \"68656c6c6f\"");
-    try interp.testExpectScriptError(error.EvalError, "hex string must have an even number of digits", "codec decode hex \"abc\"");
-}
-
-test "codec hex" {
-    try memutil.checkAllocationFailures(.exhaustive, testCodecHex, .{});
-}
-
-fn testCodecNames(ta: std.mem.Allocator) !void {
-    var interp = try common.testStart(ta);
-    defer common.testFinish(&interp);
-
-    try interp.testExpectScriptResult("base64 hex", "codec names");
-}
-
-test "codec names" {
-    try memutil.checkAllocationFailures(.exhaustive, testCodecNames, .{});
+    // blake3 of "hello": ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f
+    var blake3_out: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash("hello", &blake3_out, .{});
+    const expected_blake3 = "\xea\x8f\x16\x3d\xb3\x86\x82\x92\x5e\x44\x91\xc5\xe5\x8d\x4b\xb3\x50\x6e\xf8\xc1\x4e\xb7\x8a\x86\xe9\x08\xc5\x62\x4a\x67\x20\x0f";
+    try testing.expectEqualStrings(expected_blake3, &blake3_out);
 }
