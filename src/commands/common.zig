@@ -51,6 +51,7 @@ pub fn registerCoreCommands(interp: *Interp) !void {
     try @import("load.zig").registerCommands(interp);
     try @import("clock.zig").registerCommands(interp);
     try @import("binary.zig").registerCommands(interp);
+    try @import("codec.zig").registerCommands(interp);
 }
 
 pub fn testStart(ta: std.mem.Allocator) !Interp {
@@ -83,4 +84,5 @@ test {
     _ = @import("clock.zig");
     _ = @import("exec.zig");
     _ = @import("binary.zig");
+    _ = @import("codec.zig");
 }
