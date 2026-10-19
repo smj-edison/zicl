@@ -99,8 +99,11 @@ export fn Zicl_SetLocalStderr(fd: c_int) callconv(.c) void {
 /// `host_name` is the name this machine goes by in the capabilities it hands
 /// out. Null asks the system for it.
 export fn Zicl_InitGlobals(host_name: ?[*:0]const u8) callconv(.c) ReturnCode {
-    global_threaded = Threaded.init(std.heap.c_allocator, .{});
-    heap.initGlobals(std.heap.c_allocator, global_threaded.io(), .{
+    const proc_environ: std.process.Environ = .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const env_map = proc_environ.createMap(std.heap.c_allocator) catch return .oom;
+
+    global_threaded = Threaded.init(std.heap.c_allocator, .{ .environ = proc_environ });
+    heap.initGlobals(std.heap.c_allocator, global_threaded.io(), .{ .owned = env_map }, .{
         .capability = .{
             .host_name = if (host_name) |name| std.mem.span(name) else null,
         },
@@ -1010,7 +1013,8 @@ export fn Zicl_ResolveCapability(
 }
 
 export fn Zicl_NewFileFromDescriptor(descriptor: i32, out: *Value) callconv(.c) ReturnCode {
-    const capability = capabilities.File.createFromDescriptor(descriptor, false) catch return .oom;
+    const file = capabilities.File.createFromDescriptor(descriptor, false, false) catch return .oom;
+    const capability = Capability.newTakingOwnership(&file.head) catch return .oom;
     out.* = capability.asHead().asValue();
     return .ok;
 }

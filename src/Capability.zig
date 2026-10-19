@@ -50,6 +50,7 @@ pub fn newRegistering(head: *Head) !*Capability {
     return new_obj.body;
 }
 
+/// Takes ownership of `head`, including in error cases.
 pub fn newTakingOwnership(head: *Head) !*Capability {
     errdefer head.closeAndDropReference();
     return newRegistering(head);
