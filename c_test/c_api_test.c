@@ -26,10 +26,10 @@
     } while (0)
 
 /* Read list item `index` back as a long, via the shimmerable coercion path. */
-static long item_as_long(Zicl_Interp *interp, Zicl_Value *list, int index) {
-    Zicl_OptionalValue ov = Zicl_ListGetItem(interp, list, index);
+static long item_as_long(Zicl_Interp *interp, Zicl_Val *list, int index) {
+    Zicl_OptVal ov = Zicl_ListGetItem(interp, list, index);
     if (Zicl_IsNone(ov)) return -999999;
-    Zicl_Shimmerable shim = Zicl_NewShimmerable(Zicl_Unwrap(ov));
+    Zicl_Shim shim = Zicl_NewShim(Zicl_Unwrap(ov));
     long n = -888888;
     if (Zicl_GetLong(interp, &shim, &n) != ZICL_OK) return -777777;
     return n;
@@ -37,12 +37,12 @@ static long item_as_long(Zicl_Interp *interp, Zicl_Value *list, int index) {
 
 /* Reports the name of the closure currently executing (or "(none)" at the
  * top level / inside an anonymous closure) as the result. */
-static int whoami_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
+static int whoami_cmd(Zicl_Interp *interp, int argc, Zicl_Shim *argv) {
     (void)argc;
     (void)argv;
-    Zicl_OptionalValue name = Zicl_GetClosureNameBeingEvaluated(interp);
+    Zicl_OptVal name = Zicl_GetClosureNameBeingEvaluated(interp);
     if (Zicl_IsNone(name)) {
-        Zicl_Value none_marker;
+        Zicl_Val none_marker;
         if (Zicl_NewString(&none_marker, "(none)", -1) != ZICL_OK) return ZICL_OOM;
         Zicl_SetResult(interp, none_marker);
         Zicl_DropRef(none_marker);
@@ -55,7 +55,7 @@ static int whoami_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
 /* A command that asks the interpreter to stop. The check in evalObjectInner
  * fires at the next command boundary, so the script never reaches the command
  * after this one. */
-static int stop_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
+static int stop_cmd(Zicl_Interp *interp, int argc, Zicl_Shim *argv) {
     (void)argc;
     (void)argv;
     Zicl_RequestStop(interp);
@@ -69,11 +69,11 @@ static int stop_cmd(Zicl_Interp *interp, int argc, Zicl_Shimmerable *argv) {
 
 typedef struct { double x, y; } Point2D;
 
-static Zicl_Object *point2d_duplicate(const Zicl_Object *src);
-static void point2d_free_internal_rep(Zicl_Object *obj);
-static int point2d_update_string(Zicl_Object *obj);
+static Zicl_Obj *point2d_duplicate(const Zicl_Obj *src);
+static void point2d_free_internal_rep(Zicl_Obj *obj);
+static int point2d_update_string(Zicl_Obj *obj);
 
-static const Zicl_ObjectVTable point2d_vtable = {
+static const Zicl_ObjVTable point2d_vtable = {
     .is_c_vtable = true,
     .name = "Point2D",
     .duplicate = point2d_duplicate,
@@ -83,25 +83,25 @@ static const Zicl_ObjectVTable point2d_vtable = {
     .enumerate_struct = NULL,
 };
 
-static Zicl_Object *point2d_duplicate(const Zicl_Object *src) {
+static Zicl_Obj *point2d_duplicate(const Zicl_Obj *src) {
     void *body;
-    Zicl_Object *obj = Zicl_NewObject(&point2d_vtable, sizeof(Point2D), &body);
+    Zicl_Obj *obj = Zicl_NewObj(&point2d_vtable, sizeof(Point2D), &body);
     if (!obj) return NULL;
-    memcpy(body, Zicl_ObjectBodyConst(src), sizeof(Point2D));
+    memcpy(body, Zicl_ObjBodyConst(src), sizeof(Point2D));
     return obj;
 }
-static void point2d_free_internal_rep(Zicl_Object *obj) { (void)obj; }
-static int point2d_update_string(Zicl_Object *obj) {
-    const Point2D *p = (const Point2D *)Zicl_ObjectBodyConst(obj);
+static void point2d_free_internal_rep(Zicl_Obj *obj) { (void)obj; }
+static int point2d_update_string(Zicl_Obj *obj) {
+    const Point2D *p = (const Point2D *)Zicl_ObjBodyConst(obj);
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%.1f %.1f", p->x, p->y);
     return Zicl_SetObjectString(obj, buf, len);
 }
 
 /* Unrelated to Point2D; never instantiated, only used by address, to check
- * that Zicl_AsObject distinguishes types by vtable identity rather than by
+ * that Zicl_AsObj distinguishes types by vtable identity rather than by
  * structural shape. */
-static const Zicl_ObjectVTable other_vtable = {
+static const Zicl_ObjVTable other_vtable = {
     .is_c_vtable = true,
     .name = "Other",
     .duplicate = NULL,
@@ -113,13 +113,13 @@ static const Zicl_ObjectVTable other_vtable = {
 
 /* Bigger than ZICL_OBJECT_BODY_MAX_SIZE, so its body is a BigStruct* to a
  * separately malloc'd copy, rather than a BigStruct. sizeof(BigStruct*) is
- * what gets passed to Zicl_NewObject, not sizeof(BigStruct). */
+ * what gets passed to Zicl_NewObj, not sizeof(BigStruct). */
 typedef struct { char payload[128]; } BigStruct;
 
-static Zicl_Object *bigstruct_duplicate(const Zicl_Object *src);
-static void bigstruct_free_internal_rep(Zicl_Object *obj);
+static Zicl_Obj *bigstruct_duplicate(const Zicl_Obj *src);
+static void bigstruct_free_internal_rep(Zicl_Obj *obj);
 
-static const Zicl_ObjectVTable bigstruct_vtable = {
+static const Zicl_ObjVTable bigstruct_vtable = {
     .is_c_vtable = true,
     .name = "BigStruct",
     .duplicate = bigstruct_duplicate,
@@ -129,22 +129,22 @@ static const Zicl_ObjectVTable bigstruct_vtable = {
     .enumerate_struct = NULL,
 };
 
-static Zicl_Object *bigstruct_duplicate(const Zicl_Object *src) {
+static Zicl_Obj *bigstruct_duplicate(const Zicl_Obj *src) {
     void *body;
-    Zicl_Object *obj = Zicl_NewObject(&bigstruct_vtable, sizeof(BigStruct *), &body);
+    Zicl_Obj *obj = Zicl_NewObj(&bigstruct_vtable, sizeof(BigStruct *), &body);
     if (!obj) return NULL;
     BigStruct *copy = (BigStruct *)malloc(sizeof(BigStruct));
     if (!copy) return NULL;
-    BigStruct *src_data = *(BigStruct **)Zicl_ObjectBodyConst(src);
+    BigStruct *src_data = *(BigStruct **)Zicl_ObjBodyConst(src);
     memcpy(copy, src_data, sizeof(BigStruct));
     *(BigStruct **)body = copy;
     return obj;
 }
-static void bigstruct_free_internal_rep(Zicl_Object *obj) {
-    free(*(BigStruct **)Zicl_ObjectBody(obj));
+static void bigstruct_free_internal_rep(Zicl_Obj *obj) {
+    free(*(BigStruct **)Zicl_ObjBody(obj));
 }
 
-/* A plain (non-Zicl_Value, non-Object) nested struct, reached via
+/* A plain (non-Zicl_Val, non-Object) nested struct, reached via
  * Zicl_StructWalkerFollowStruct. Its enumerate_struct receives `node` as
  * exactly the pointer FollowStruct was given -- no Object wraps it, so
  * nothing to unwrap, unlike Wrapper's own (top-level) enumerate_struct
@@ -159,19 +159,19 @@ static int inner_enumerate_struct(Zicl_StructWalker *ctx, const void *node) {
 }
 
 /* Exercises all three Zicl_StructWalker functions from one enumerate_struct:
- * a plain nested struct (FollowStruct), a field that's itself a Zicl_Value
+ * a plain nested struct (FollowStruct), a field that's itself a Zicl_Val
  * (FollowValue), and (inside inner_enumerate_struct) a plain scalar field
  * (AddField). */
 typedef struct {
     Inner inner;
-    Zicl_Value label;
+    Zicl_Val label;
 } Wrapper;
 
-static Zicl_Object *wrapper_duplicate(const Zicl_Object *src);
-static void wrapper_free_internal_rep(Zicl_Object *obj);
+static Zicl_Obj *wrapper_duplicate(const Zicl_Obj *src);
+static void wrapper_free_internal_rep(Zicl_Obj *obj);
 static int wrapper_enumerate_struct(Zicl_StructWalker *ctx, const void *node);
 
-static const Zicl_ObjectVTable wrapper_vtable = {
+static const Zicl_ObjVTable wrapper_vtable = {
     .is_c_vtable = true,
     .name = "Wrapper",
     .duplicate = wrapper_duplicate,
@@ -181,25 +181,25 @@ static const Zicl_ObjectVTable wrapper_vtable = {
     .enumerate_struct = wrapper_enumerate_struct,
 };
 
-static Zicl_Object *wrapper_duplicate(const Zicl_Object *src) {
+static Zicl_Obj *wrapper_duplicate(const Zicl_Obj *src) {
     void *body;
-    Zicl_Object *obj = Zicl_NewObject(&wrapper_vtable, sizeof(Wrapper), &body);
+    Zicl_Obj *obj = Zicl_NewObj(&wrapper_vtable, sizeof(Wrapper), &body);
     if (!obj) return NULL;
-    const Wrapper *src_w = (const Wrapper *)Zicl_ObjectBodyConst(src);
+    const Wrapper *src_w = (const Wrapper *)Zicl_ObjBodyConst(src);
     Wrapper *dst_w = (Wrapper *)body;
     dst_w->inner = src_w->inner;
     dst_w->label = Zicl_Ref(src_w->label);
     return obj;
 }
-static void wrapper_free_internal_rep(Zicl_Object *obj) {
-    Wrapper *w = (Wrapper *)Zicl_ObjectBody(obj);
+static void wrapper_free_internal_rep(Zicl_Obj *obj) {
+    Wrapper *w = (Wrapper *)Zicl_ObjBody(obj);
     Zicl_DropRef(w->label);
 }
 static int wrapper_enumerate_struct(Zicl_StructWalker *ctx, const void *node) {
-    /* Top-level: `node` is the Zicl_Object* itself (see Zicl_EnumerateStructFn's
+    /* Top-level: `node` is the Zicl_Obj* itself (see Zicl_EnumerateStructFn's
      * docs), so unwrap it the same way duplicate/free_internal_rep do. */
-    Zicl_Object *obj = (Zicl_Object *)node;
-    const Wrapper *w = (const Wrapper *)Zicl_ObjectBodyConst(obj);
+    Zicl_Obj *obj = (Zicl_Obj *)node;
+    const Wrapper *w = (const Wrapper *)Zicl_ObjBodyConst(obj);
     int rc = Zicl_StructWalkerFollowStruct(ctx, "inner", &w->inner, "Inner", inner_enumerate_struct);
     if (rc != ZICL_OK) return rc;
     return Zicl_StructWalkerFollowValue(ctx, "label", w->label);
@@ -213,10 +213,10 @@ int main(void) {
 
     /* Strings and reference counting. */
     {
-        Zicl_Value s;
+        Zicl_Val s;
         CHECK(Zicl_NewString(&s, "hello", 5) == ZICL_OK);
         CHECK(Zicl_RefCount(s) == 1);  /* heap String object */
-        Zicl_Value borrowed = Zicl_Ref(s);
+        Zicl_Val borrowed = Zicl_Ref(s);
         CHECK(Zicl_RefCount(s) == 2);
         Zicl_DropRef(borrowed);
         CHECK(Zicl_RefCount(s) == 1);
@@ -228,9 +228,9 @@ int main(void) {
      * object with its own refcount; for an inline integer it returns the same
      * value (no object). Everything is a string, so the copy compares equal. */
     {
-        Zicl_Value s;
+        Zicl_Val s;
         CHECK(Zicl_NewString(&s, "hello", 5) == ZICL_OK);
-        Zicl_Value d;
+        Zicl_Val d;
         CHECK(Zicl_Duplicate(s, &d) == ZICL_OK);
         CHECK(Zicl_RefCount(d) == 1);  /* independent copy */
         int eq = 0;
@@ -239,8 +239,8 @@ int main(void) {
         Zicl_DropRef(s);
 
         /* Primitives carry no object, so duplicate is infallible and identity. */
-        Zicl_Value n = Zicl_NewLong(7);
-        Zicl_Value nd;
+        Zicl_Val n = Zicl_NewLong(7);
+        Zicl_Val nd;
         CHECK(Zicl_Duplicate(n, &nd) == ZICL_OK);
         CHECK(nd.raw.as.integer == 7);
         Zicl_DropRef(nd);  /* no-op for a primitive */
@@ -249,12 +249,12 @@ int main(void) {
     /* DuplicateAsBoxed: same copy semantics as Zicl_Duplicate, but the result
      * is always a heap object -- primitives come back boxed. */
     {
-        Zicl_Value s;
+        Zicl_Val s;
         CHECK(Zicl_NewString(&s, "hello", 5) == ZICL_OK);
-        Zicl_Object *sd = Zicl_DuplicateAsBoxed(s);
+        Zicl_Obj *sd = Zicl_DuplicateAsBoxed(s);
         CHECK(sd != NULL);
-        CHECK(sd != Zicl_AsPtr(s));  /* independent copy, not the same object */
-        Zicl_Value sdv = Zicl_BoxObject(sd);
+        CHECK(sd != Zicl_AsObj(s));  /* independent copy, not the same object */
+        Zicl_Val sdv = Zicl_BoxObject(sd);
         CHECK(Zicl_RefCount(sdv) == 1);
         int eq = 0;
         CHECK(Zicl_Equals(sdv, s, &eq) == ZICL_OK && eq == 1);
@@ -263,12 +263,12 @@ int main(void) {
 
         /* An inline integer boxes into a fresh Integer object; the original
          * stays inline. Everything is a string, so they compare equal. */
-        Zicl_Value n = Zicl_NewLong(7);
-        Zicl_Object *nb = Zicl_DuplicateAsBoxed(n);
+        Zicl_Val n = Zicl_NewLong(7);
+        Zicl_Obj *nb = Zicl_DuplicateAsBoxed(n);
         CHECK(nb != NULL);
-        Zicl_Value nbv = Zicl_BoxObject(nb);
+        Zicl_Val nbv = Zicl_BoxObject(nb);
         CHECK(Zicl_RefCount(nbv) == 1);
-        CHECK(Zicl_AsPtr(n) == NULL);
+        CHECK(Zicl_AsObj(n) == NULL);
         eq = 0;
         CHECK(Zicl_Equals(nbv, n, &eq) == ZICL_OK && eq == 1);
         CHECK(strcmp(Zicl_GetString(nbv, NULL), "7") == 0);
@@ -277,7 +277,7 @@ int main(void) {
 
     /* ReleaseArrayItems: frees a mix of heap objects and inline values. */
     {
-        Zicl_Value argv[3];
+        Zicl_Val argv[3];
         CHECK(Zicl_NewString(&argv[0], "a", 1) == ZICL_OK);
         argv[1] = Zicl_NewLong(2);       /* inline, no object */
         CHECK(Zicl_NewString(&argv[2], "c", 1) == ZICL_OK);
@@ -289,13 +289,13 @@ int main(void) {
     /* Interned string: zero-copy wrap of a static buffer. */
     {
         static const char lit[] = "world";
-        Zicl_Value iv = Zicl_InternStr(lit);
+        Zicl_Val iv = Zicl_InternStr(lit);
         CHECK(Zicl_RefCount(iv) == 0);  /* inline, no heap object */
         int len = -1;
         const char *got = Zicl_GetString(iv, &len);
         CHECK(got != NULL && len == 5 && strcmp(got, "world") == 0);
         /* "world" (interned) equals "world" (heap string): everything is a string. */
-        Zicl_Value h;
+        Zicl_Val h;
         CHECK(Zicl_NewString(&h, "world", 5) == ZICL_OK);
         int eq = 0;
         CHECK(Zicl_Equals(iv, h, &eq) == ZICL_OK && eq == 1);
@@ -307,7 +307,7 @@ int main(void) {
     {
         Zicl_List *list = Zicl_NewList(NULL, 0);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(1)) == ZICL_OK);
-        Zicl_Value lv = Zicl_BoxList(list);
+        Zicl_Val lv = Zicl_BoxList(list);
         Zicl_MakeCrossthread(lv);
         Zicl_List *ml = NULL;
         CHECK(Zicl_AsListMut(interp, lv, &ml) == ZICL_OK);
@@ -317,14 +317,14 @@ int main(void) {
 
     /* Value equality (compares by string representation, across types). */
     {
-        Zicl_Value a = Zicl_NewLong(5);
-        Zicl_Value b = Zicl_NewLong(5);
-        Zicl_Value c = Zicl_NewLong(6);
+        Zicl_Val a = Zicl_NewLong(5);
+        Zicl_Val b = Zicl_NewLong(5);
+        Zicl_Val c = Zicl_NewLong(6);
         int eq = -1;
         CHECK(Zicl_Equals(a, b, &eq) == ZICL_OK && eq == 1);  /* int == int */
         CHECK(Zicl_Equals(a, c, &eq) == ZICL_OK && eq == 0);  /* int != int */
 
-        Zicl_Value s5, shi;
+        Zicl_Val s5, shi;
         CHECK(Zicl_NewString(&s5, "5", 1) == ZICL_OK);
         CHECK(Zicl_NewString(&shi, "hi", 2) == ZICL_OK);
         /* "5" (string) equals 5 (int): everything is a string. */
@@ -337,9 +337,9 @@ int main(void) {
     /* Numbers: inline constructors, plus a shimmerable coercion. */
     {
         CHECK(Zicl_NewLong(42).raw.as.integer == 42);
-        CHECK(Zicl_NewDouble(3.5).raw.as.float_value == 3.5);
+        CHECK(Zicl_NewDouble(3.5).raw.as.float_val == 3.5);
         CHECK(Zicl_NewBool(true).raw.as.boolean);
-        Zicl_Shimmerable shim = Zicl_NewShimmerable(Zicl_NewLong(7));
+        Zicl_Shim shim = Zicl_NewShim(Zicl_NewLong(7));
         long n = 0;
         CHECK(Zicl_GetLong(interp, &shim, &n) == ZICL_OK);
         CHECK(n == 7);
@@ -353,7 +353,7 @@ int main(void) {
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(2)) == ZICL_OK);
         CHECK(Zicl_ListLength(list) == 2);
 
-        Zicl_Value lv = Zicl_BoxList(list);
+        Zicl_Val lv = Zicl_BoxList(list);
         Zicl_List *ml = NULL;
         CHECK(Zicl_AsListMut(interp, lv, &ml) == ZICL_OK);
         CHECK(ml != NULL);  /* in place: no copy */
@@ -369,8 +369,8 @@ int main(void) {
         Zicl_List *list = Zicl_NewList(NULL, 0);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(10)) == ZICL_OK);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(20)) == ZICL_OK);
-        Zicl_Value lv = Zicl_BoxList(list);
-        Zicl_Value shared = Zicl_Ref(lv);  /* refcount 2 */
+        Zicl_Val lv = Zicl_BoxList(list);
+        Zicl_Val shared = Zicl_Ref(lv);  /* refcount 2 */
 
         Zicl_List *ml = NULL;
         CHECK(Zicl_AsListMut(interp, shared, &ml) == ZICL_OK);
@@ -397,20 +397,20 @@ int main(void) {
         Zicl_List *list = Zicl_NewList(NULL, 0);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(100)) == ZICL_OK);
         CHECK(Zicl_ListAppend(list, Zicl_NewLong(200)) == ZICL_OK);
-        Zicl_Value v = Zicl_NewLong(999);
+        Zicl_Val v = Zicl_NewLong(999);
         CHECK(Zicl_ListSet(list, 0, v) == ZICL_OK);  /* takes ownership of v */
-        Zicl_Value v2 = Zicl_NewLong(555);
+        Zicl_Val v2 = Zicl_NewLong(555);
         CHECK(Zicl_ListSet(list, 5, v2) == ZICL_ERR);  /* out of range */
 
-        Zicl_Value lv = Zicl_BoxList(list);
+        Zicl_Val lv = Zicl_BoxList(list);
         CHECK(item_as_long(interp, &lv, 0) == 999);
         CHECK(item_as_long(interp, &lv, 1) == 200);
         CHECK(Zicl_IsNone(Zicl_ListGetItem(interp, &lv, 2)));   /* too large */
         CHECK(Zicl_IsNone(Zicl_ListGetItem(interp, &lv, -1)));  /* negative */
 
         /* ShimListItem over a shimmerable built from the list value. */
-        Zicl_Shimmerable shim = Zicl_NewShimmerable(lv);
-        Zicl_OptionalValue out;
+        Zicl_Shim shim = Zicl_NewShim(lv);
+        Zicl_OptVal out;
         CHECK(Zicl_ShimListItem(interp, &shim, 1, &out) == ZICL_OK);
         CHECK(!Zicl_IsNone(out));
         CHECK(Zicl_ShimListItem(interp, &shim, 9, &out) == ZICL_OK);
@@ -426,11 +426,11 @@ int main(void) {
 
     /* NewList from an array borrows the inputs. */
     {
-        Zicl_Value in[2] = { Zicl_NewLong(7), Zicl_NewLong(8) };
+        Zicl_Val in[2] = { Zicl_NewLong(7), Zicl_NewLong(8) };
         Zicl_List *list = Zicl_NewList(in, 2);
         CHECK(list != NULL);
         CHECK(Zicl_ListLength(list) == 2);
-        Zicl_Value lv = Zicl_BoxList(list);
+        Zicl_Val lv = Zicl_BoxList(list);
         CHECK(item_as_long(interp, &lv, 0) == 7);
         Zicl_DropRef(lv);
     }
@@ -457,9 +457,9 @@ int main(void) {
      * second Zicl_GetString returns the same pointer as the first). Distinct
      * from the ZICL_SWAP dup-branch commit. */
     {
-        Zicl_Value in[1] = { Zicl_NewLong(5) };
+        Zicl_Val in[1] = { Zicl_NewLong(5) };
         Zicl_List *list = Zicl_NewList(in, 1);
-        Zicl_Value lv = Zicl_BoxList(list);
+        Zicl_Val lv = Zicl_BoxList(list);
         int len = -1;
         const char *s1 = Zicl_GetString(lv, &len);
         CHECK(s1 != NULL && len == 1 && s1[0] == '5');
@@ -473,21 +473,21 @@ int main(void) {
 
     /* Dict copy-on-write: in-place branch (uniquely owned, no copy). */
     {
-        Zicl_Value kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
+        Zicl_Val kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
         Zicl_Dict *dict = Zicl_NewDict(kv, 2);
         CHECK(dict != NULL);
-        CHECK(Zicl_DictLength(dict) == 1);
+        CHECK(Zicl_DictLength(dict) == 2);
 
-        Zicl_Value dv = Zicl_BoxDict(dict);
+        Zicl_Val dv = Zicl_BoxDict(dict);
         Zicl_Dict *md = NULL;
         CHECK(Zicl_AsDictMut(interp, dv, &md) == ZICL_OK);
         CHECK(md != NULL);  /* in place: no copy */
         CHECK(Zicl_DictPut(md, Zicl_NewLong(2), Zicl_NewLong(22)) == ZICL_OK);
-        CHECK(Zicl_DictLength(md) == 2);
+        CHECK(Zicl_DictLength(md) == 4);
 
-        Zicl_Value k1 = Zicl_NewLong(1);
-        Zicl_Shimmerable dv_shim = Zicl_NewShimmerable(dv);
-        Zicl_OptionalValue got;
+        Zicl_Val k1 = Zicl_NewLong(1);
+        Zicl_Shim dv_shim = Zicl_NewShim(dv);
+        Zicl_OptVal got;
         CHECK(Zicl_ShimDictGet(interp, &dv_shim, k1, &got) == ZICL_OK);
         CHECK(!Zicl_IsNone(got));
         Zicl_ShimDiscardChanges(&dv_shim);
@@ -497,10 +497,10 @@ int main(void) {
 
     /* Dict copy-on-write: dup branch (shared, copy once, write back). */
     {
-        Zicl_Value kv[2] = { Zicl_NewLong(10), Zicl_NewLong(100) };
+        Zicl_Val kv[2] = { Zicl_NewLong(10), Zicl_NewLong(100) };
         Zicl_Dict *dict = Zicl_NewDict(kv, 2);
-        Zicl_Value dv = Zicl_BoxDict(dict);
-        Zicl_Value shared = Zicl_Ref(dv);  /* refcount 2 */
+        Zicl_Val dv = Zicl_BoxDict(dict);
+        Zicl_Val shared = Zicl_Ref(dv);  /* refcount 2 */
 
         Zicl_Dict *md = NULL;
         CHECK(Zicl_AsDictMut(interp, shared, &md) == ZICL_OK);
@@ -508,14 +508,14 @@ int main(void) {
         CHECK(Zicl_DupAsDict(interp, shared, &md) == ZICL_OK);
         CHECK(md != NULL);
         CHECK(Zicl_DictPut(md, Zicl_NewLong(20), Zicl_NewLong(200)) == ZICL_OK);
-        CHECK(Zicl_DictLength(md) == 2);
-        CHECK(Zicl_DictLength(dict) == 1);  /* original untouched */
+        CHECK(Zicl_DictLength(md) == 4);
+        CHECK(Zicl_DictLength(dict) == 2);  /* original untouched */
 
         /* Commit: release the old shared value, store the new dict. */
         ZICL_SWAP(&shared, Zicl_BoxDict(md));
-        Zicl_Value k20 = Zicl_NewLong(20);
-        Zicl_Shimmerable shared_shim = Zicl_NewShimmerable(shared);
-        Zicl_OptionalValue got;
+        Zicl_Val k20 = Zicl_NewLong(20);
+        Zicl_Shim shared_shim = Zicl_NewShim(shared);
+        Zicl_OptVal got;
         CHECK(Zicl_ShimDictGet(interp, &shared_shim, k20, &got) == ZICL_OK);
         CHECK(!Zicl_IsNone(got));  /* new key present in the copy */
         Zicl_ShimDiscardChanges(&shared_shim);
@@ -526,19 +526,19 @@ int main(void) {
 
     /* Dict remove. */
     {
-        Zicl_Value kv[4] = { Zicl_NewLong(1), Zicl_NewLong(11), Zicl_NewLong(2), Zicl_NewLong(22) };
+        Zicl_Val kv[4] = { Zicl_NewLong(1), Zicl_NewLong(11), Zicl_NewLong(2), Zicl_NewLong(22) };
         Zicl_Dict *dict = Zicl_NewDict(kv, 4);
-        Zicl_Value dv = Zicl_BoxDict(dict);
+        Zicl_Val dv = Zicl_BoxDict(dict);
         Zicl_Dict *md = NULL;
         CHECK(Zicl_AsDictMut(interp, dv, &md) == ZICL_OK);
         CHECK(md != NULL);
-        int removed = 0;
+        bool removed = false;
         CHECK(Zicl_DictRemove(md, Zicl_NewLong(1), &removed) == ZICL_OK);
-        CHECK(removed == 1);
-        CHECK(Zicl_DictLength(md) == 1);
-        Zicl_Value k1 = Zicl_NewLong(1);
-        Zicl_Shimmerable dv_shim = Zicl_NewShimmerable(dv);
-        Zicl_OptionalValue got;
+        CHECK(removed);
+        CHECK(Zicl_DictLength(md) == 2);
+        Zicl_Val k1 = Zicl_NewLong(1);
+        Zicl_Shim dv_shim = Zicl_NewShim(dv);
+        Zicl_OptVal got;
         CHECK(Zicl_ShimDictGet(interp, &dv_shim, k1, &got) == ZICL_OK);
         CHECK(Zicl_IsNone(got));  /* gone */
         Zicl_ShimDiscardChanges(&dv_shim);
@@ -552,13 +552,13 @@ int main(void) {
      * key must already be present. Distinct from the ZICL_SWAP dup-branch
      * commit. */
     {
-        Zicl_Value kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
+        Zicl_Val kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
         Zicl_Dict *dict = Zicl_NewDict(kv, 2);
-        Zicl_Value dv = Zicl_BoxDict(dict);
+        Zicl_Val dv = Zicl_BoxDict(dict);
         int len = -1;
         const char *s1 = Zicl_GetString(dv, &len);
         CHECK(s1 != NULL);
-        Zicl_Value k1 = Zicl_NewLong(1);
+        Zicl_Val k1 = Zicl_NewLong(1);
         CHECK(Zicl_DictShimmerWriteback(dict, k1, Zicl_NewLong(11)) == ZICL_OK);
         int len2 = -1;
         const char *s2 = Zicl_GetString(dv, &len2);
@@ -571,23 +571,23 @@ int main(void) {
      * both inputs untouched, and confirm a key that only the parent has
      * resolves through the link. */
     {
-        Zicl_Value parent_kv[2] = { Zicl_NewLong(100), Zicl_NewLong(1000) };
+        Zicl_Val parent_kv[2] = { Zicl_NewLong(100), Zicl_NewLong(1000) };
         Zicl_Dict *parent = Zicl_NewDict(parent_kv, 2);
-        Zicl_Value pv = Zicl_BoxDict(parent);
+        Zicl_Val pv = Zicl_BoxDict(parent);
 
-        Zicl_Value child_kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
+        Zicl_Val child_kv[2] = { Zicl_NewLong(1), Zicl_NewLong(11) };
         Zicl_Dict *child = Zicl_NewDict(child_kv, 2);
 
         Zicl_Dict *linked = Zicl_DictLink(child, pv);
         CHECK(linked != NULL);
-        CHECK(Zicl_DictLength(linked) == 2);  /* ~parent plus child's one pair */
-        CHECK(Zicl_DictLength(child) == 1);   /* child untouched */
+        CHECK(Zicl_DictLength(linked) == 4);  /* ~parent plus child's one pair (keys + values) */
+        CHECK(Zicl_DictLength(child) == 2);   /* child untouched */
 
         int klen = -1;
         const char *k0 = Zicl_GetString(Zicl_DictItems(linked)[0], &klen);
         CHECK(klen == 7 && memcmp(k0, "~parent", 7) == 0);
 
-        Zicl_Value lv = Zicl_BoxDict(linked);
+        Zicl_Val lv = Zicl_BoxDict(linked);
         int llen = -1;
         const char *ls = Zicl_GetString(lv, &llen);
         char buf[512];
@@ -604,7 +604,7 @@ int main(void) {
 
     /* Source copy-on-write: in-place branch (uniquely owned, annotate line). */
     {
-        Zicl_Value s;
+        Zicl_Val s;
         CHECK(Zicl_NewString(&s, "script text", 11) == ZICL_OK);
         CHECK(Zicl_AttachSource(&s, "file.tcl", 10) == ZICL_OK);
         CHECK(Zicl_AsSource(s) != NULL);  /* s is now a Source */
@@ -619,7 +619,7 @@ int main(void) {
     /* Source shimmer-from-string: a plain string shimmers to a Source in place,
      * starting with an empty location, which the mutable view then fills in. */
     {
-        Zicl_Value s;
+        Zicl_Val s;
         CHECK(Zicl_NewString(&s, "raw script", 10) == ZICL_OK);
         CHECK(Zicl_AsSource(s) == NULL);  /* still a plain string */
 
@@ -637,10 +637,10 @@ int main(void) {
 
     /* Source copy-on-write: dup branch (shared, copy once, write back). */
     {
-        Zicl_Value s;
+        Zicl_Val s;
         CHECK(Zicl_NewString(&s, "more script", 11) == ZICL_OK);
         CHECK(Zicl_AttachSource(&s, "other.tcl", 1) == ZICL_OK);
-        Zicl_Value shared = Zicl_Ref(s);  /* refcount 2 */
+        Zicl_Val shared = Zicl_Ref(s);  /* refcount 2 */
 
         Zicl_Source *ms = Zicl_AsSourceMut(shared);
         CHECK(ms == NULL);  /* shared: must dup */
@@ -699,7 +699,7 @@ int main(void) {
      * (unused for a plain, non-method closure). */
     {
         CHECK(Zicl_Eval(interp, "fn {a b} { + $a $b }") == ZICL_OK);
-        Zicl_Value closure_value = Zicl_GetResult(interp);
+        Zicl_Val closure_value = Zicl_GetResult(interp);
 
         Zicl_Closure *closure = NULL;
         CHECK(Zicl_GetClosure(interp, closure_value, &closure) == ZICL_OK);
@@ -715,10 +715,10 @@ int main(void) {
         CHECK(Zicl_SourceGetFilename(Zicl_ClosureGetBody(closure)) == NULL);
         CHECK(Zicl_SourceGetLine(Zicl_ClosureGetBody(closure)) >= 0);
 
-        Zicl_Shimmerable argv[3] = {
-            Zicl_NewShimmerable(closure_value),  /* name slot, unused */
-            Zicl_NewShimmerable(Zicl_NewLong(10)),
-            Zicl_NewShimmerable(Zicl_NewLong(20)),
+        Zicl_Shim argv[3] = {
+            Zicl_NewShim(closure_value),  /* name slot, unused */
+            Zicl_NewShim(Zicl_NewLong(10)),
+            Zicl_NewShim(Zicl_NewLong(20)),
         };
         CHECK(Zicl_CallClosure(interp, closure, 3, argv) == ZICL_OK);
         int len = -1;
@@ -726,16 +726,16 @@ int main(void) {
         CHECK(got != NULL && len == 2 && memcmp(got, "30", 2) == 0);
 
         /* The same handle can be called again. */
-        Zicl_Shimmerable argv2[3] = {
-            Zicl_NewShimmerable(closure_value),
-            Zicl_NewShimmerable(Zicl_NewLong(1)),
-            Zicl_NewShimmerable(Zicl_NewLong(2)),
+        Zicl_Shim argv2[3] = {
+            Zicl_NewShim(closure_value),
+            Zicl_NewShim(Zicl_NewLong(1)),
+            Zicl_NewShim(Zicl_NewLong(2)),
         };
         CHECK(Zicl_CallClosure(interp, closure, 3, argv2) == ZICL_OK);
         got = Zicl_GetString(Zicl_GetResult(interp), &len);
         CHECK(got != NULL && len == 1 && got[0] == '3');
 
-        Zicl_DropRefClosure(closure);
+        Zicl_DropClosure(closure);
 
         /* A [method] closure is rejected by Zicl_GetClosure with ZICL_ERR,
          * matching plain command dispatch when a method is invoked as a
@@ -768,31 +768,31 @@ int main(void) {
     {
         CHECK(Zicl_Eval(interp, "fn tc_b {} { return tailcalled }") == ZICL_OK);
         CHECK(Zicl_Eval(interp, "fn tc_a {} { tailcall tc_b }") == ZICL_OK);
-        Zicl_Value closure_value = Zicl_GetResult(interp);
+        Zicl_Val closure_value = Zicl_GetResult(interp);
 
         Zicl_Closure *closure = NULL;
         CHECK(Zicl_GetClosure(interp, closure_value, &closure) == ZICL_OK);
 
-        Zicl_Shimmerable argv[1] = { Zicl_NewShimmerable(closure_value) };
+        Zicl_Shim argv[1] = { Zicl_NewShim(closure_value) };
         CHECK(Zicl_CallClosure(interp, closure, 1, argv) == ZICL_OK);
         int len = -1;
         const char *got = Zicl_GetString(Zicl_GetResult(interp), &len);
         CHECK(got != NULL && len == 10 && memcmp(got, "tailcalled", 10) == 0);
 
-        Zicl_DropRefClosure(closure);
+        Zicl_DropClosure(closure);
     }
 
     /* Local arena snapshot/rewind: rendering an inline integer's string rep
      * allocates from the thread arena, so a snapshot taken across it advances,
      * and rewinding to the earlier snapshot restores the watermark exactly. */
     {
-        Zicl_ArenaSnapshot a = Zicl_LocalArenaSnapshot();
+        Zicl_ArenaSnapshot a = Zicl_LocalArenaTakeSnapshot();
         int len = -1;
         (void)Zicl_GetString(Zicl_NewLong(123456789), &len);  /* arena-allocated */
-        Zicl_ArenaSnapshot b = Zicl_LocalArenaSnapshot();
+        Zicl_ArenaSnapshot b = Zicl_LocalArenaTakeSnapshot();
         CHECK(b.end_index > a.end_index || b.current != a.current);  /* advanced */
-        Zicl_LocalArenaRewind(a);
-        Zicl_ArenaSnapshot c = Zicl_LocalArenaSnapshot();
+        Zicl_LocalArenaRestore(a);
+        Zicl_ArenaSnapshot c = Zicl_LocalArenaTakeSnapshot();
         CHECK(c.current == a.current && c.end_index == a.end_index);  /* restored */
     }
 
@@ -818,19 +818,19 @@ int main(void) {
      * every built-in type uses. */
     {
         Point2D *body;
-        Zicl_Object *obj = Zicl_NewObject(&point2d_vtable, sizeof(Point2D), (void **)&body);
+        Zicl_Obj *obj = Zicl_NewObj(&point2d_vtable, sizeof(Point2D), (void **)&body);
         CHECK(obj != NULL);
         body->x = 3.0;
         body->y = 4.0;
 
-        Zicl_Value v = Zicl_BoxObject(obj);
+        Zicl_Val v = Zicl_BoxObject(obj);
         CHECK(Zicl_RefCount(v) == 1);
 
         /* Recognized by its own vtable, by address, not structurally. */
-        Point2D *seen = (Point2D *)Zicl_AsObject(v, &point2d_vtable);
+        Point2D *seen = (Point2D *)Zicl_AsObjBody(v, &point2d_vtable);
         CHECK(seen == body);
         CHECK(seen->x == 3.0 && seen->y == 4.0);
-        CHECK(Zicl_AsObject(v, &other_vtable) == NULL);
+        CHECK(Zicl_AsObjBody(v, &other_vtable) == NULL);
 
         /* update_string is called lazily, on first need, via Zicl_SetObjectString. */
         const char *str = Zicl_String(v);
@@ -838,9 +838,9 @@ int main(void) {
 
         /* Duplicate goes through point2d_duplicate: independent object, same
          * field values. */
-        Zicl_Value dup;
+        Zicl_Val dup;
         CHECK(Zicl_Duplicate(v, &dup) == ZICL_OK);
-        Point2D *dup_body = (Point2D *)Zicl_AsObject(dup, &point2d_vtable);
+        Point2D *dup_body = (Point2D *)Zicl_AsObjBody(dup, &point2d_vtable);
         CHECK(dup_body != NULL && dup_body != body);
         CHECK(dup_body->x == 3.0 && dup_body->y == 4.0);
 
@@ -854,16 +854,16 @@ int main(void) {
      * Object code never needs to know this one is out-of-line. */
     {
         BigStruct **body;
-        Zicl_Object *obj = Zicl_NewObject(&bigstruct_vtable, sizeof(BigStruct *), (void **)&body);
+        Zicl_Obj *obj = Zicl_NewObj(&bigstruct_vtable, sizeof(BigStruct *), (void **)&body);
         CHECK(obj != NULL);
         *body = (BigStruct *)malloc(sizeof(BigStruct));
         CHECK(*body != NULL);
         memset((*body)->payload, 'a', sizeof((*body)->payload));
 
-        Zicl_Value v = Zicl_BoxObject(obj);
-        Zicl_Value dup;
+        Zicl_Val v = Zicl_BoxObject(obj);
+        Zicl_Val dup;
         CHECK(Zicl_Duplicate(v, &dup) == ZICL_OK);
-        BigStruct **dup_body = (BigStruct **)Zicl_AsObject(dup, &bigstruct_vtable);
+        BigStruct **dup_body = (BigStruct **)Zicl_AsObjBody(dup, &bigstruct_vtable);
         CHECK(dup_body != NULL && *dup_body != *body);  /* independently malloc'd */
         CHECK(memcmp((*dup_body)->payload, (*body)->payload, sizeof((*body)->payload)) == 0);
 
@@ -877,7 +877,7 @@ int main(void) {
      * AddField, FollowStruct, and FollowValue. Not released on purpose. */
     {
         Wrapper *body;
-        Zicl_Object *obj = Zicl_NewObject(&wrapper_vtable, sizeof(Wrapper), (void **)&body);
+        Zicl_Obj *obj = Zicl_NewObj(&wrapper_vtable, sizeof(Wrapper), (void **)&body);
         CHECK(obj != NULL);
         body->inner.tag = 42;
         CHECK(Zicl_NewString(&body->label, "leaked-on-purpose", -1) == ZICL_OK);
@@ -885,7 +885,8 @@ int main(void) {
 
     Zicl_InterpDestroy(interp);
     Zicl_LeakCheckAll();
-    Zicl_DeinitAll();
+    Zicl_DeinitThread();
+    Zicl_DeinitGlobals();
 
     printf("c API smoke test passed\n");
     return 0;

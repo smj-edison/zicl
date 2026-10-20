@@ -152,16 +152,16 @@ typedef struct Zicl_ObjVTable {
      * identical without the union. This only works because both variants have
      * the same number of function pointers. */
 
-    Zicl_Obj *(*duplicate)(const Zicl_Obj *src);
-    void (*free_internal_rep)(Zicl_Obj *obj);
-    int (*update_string)(Zicl_Obj *obj);
-    void (*make_crossthread)(Zicl_Obj *obj);
+    struct Zicl_Obj *(*duplicate)(const struct Zicl_Obj *src);
+    void (*free_internal_rep)(struct Zicl_Obj *obj);
+    int (*update_string)(struct Zicl_Obj *obj);
+    void (*make_crossthread)(struct Zicl_Obj *obj);
     Zicl_EnumerateStructFn enumerate_struct;
 } Zicl_ObjVTable;
 
 /* Raw object type. I wouldn't suggest touching any of the fields besides
  * `body_backing` and `vtable` though, as the atomics are fairly complicated. */
-struct Zicl_Obj {
+typedef struct Zicl_Obj {
     /* Accessed with atomics when crossthread. Can either be a pointer to
      * a byte string or a pointer to a `SpecialString`. */
     void *string;
@@ -177,7 +177,7 @@ struct Zicl_Obj {
     uint8_t hash_metadata;
     /* Body backing of the object, interpreted based on the object type. */
     ZICL_ALIGNAS(8) uint8_t body_backing[ZICL_OBJECT_BODY_MAX_SIZE];
-};
+} Zicl_Obj;
 
 /* Convenience vtable function when there's nothing to do to make an object
  * crossthread. */
@@ -193,6 +193,12 @@ Zicl_Obj *Zicl_AsObj(Zicl_Val value);
 /* Returns a pointer to `value`'s object backing, if the vtables match.
  * Otherwise returns NULL. */
 void *Zicl_AsObjBody(Zicl_Val value, const Zicl_ObjVTable *vtable);
+static inline void *Zicl_ObjBody(Zicl_Obj *obj) {
+    return obj->body_backing;
+}
+static inline const void *Zicl_ObjBodyConst(const Zicl_Obj *obj) {
+    return obj->body_backing;
+}
 /* Sets an object's string. This shouldn't be used outside of object creation
  * and inside of `update_string`, as it won't do anything if the object already
  * has a string. This is threadsafe. Will return ZICL_OK or ZICL_OOM, as it
