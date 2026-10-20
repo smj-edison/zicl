@@ -77,14 +77,11 @@ pub const Shimmerable = extern struct {
         return @ptrCast(@alignCast(body));
     }
 
-    /// The vtable-typed counterpart to `prepareToShimmer`, for callers (namely
-    /// the C API) that only have a `*const Object.VTable`, not a Zig type.
-    /// Returns the object's raw body storage; the caller fills it in.
+    /// C-compatible version of `prepareToShimmer`.
     pub fn prepareToShimmerVTable(self: *Shimmerable, vtable: *const Object.VTable) error{OutOfMemory}!*anyopaque {
         try self.ensureShimmerable();
 
-        // We know that this must be an object, since we boxed it if
-        // it was a primitive with `ensureShimmerable`.
+        // `ensureShimmerable` made sure we were an object variant.
         const obj = self.current().asPtr().?;
         // Make sure the object has a string rep before we free its body.
         _ = try obj.getString();

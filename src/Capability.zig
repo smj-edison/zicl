@@ -56,17 +56,19 @@ pub fn newTakingOwnership(head: *Head) !*Capability {
     return newRegistering(head);
 }
 
+pub fn wrongCapabilityTypeError(det: ?*ErrorDetails, expected: [*:0]const u8, got: [*:0]const u8) error{BadCapability} {
+    if (det) |details| details.* = .{ .message = try objects.allocPrintZ(
+        "expected a {s} but got a {s}",
+        .{ expected, got },
+    ) };
+    return error.BadCapability;
+}
+
 /// Marks the capability in-flight on succes, so the caller is responsible
 /// for calling `dropInFlight` when done.
 pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !*Backing {
     if (self.head.vtable != &Backing.vtable) {
-        if (det) |details| details.* = .{
-            .message = try objects.allocPrintZ(
-                "expected a {s} but got a {s}",
-                .{ Backing.vtable.name, self.head.vtable.name },
-            ),
-        };
-        return error.BadCapability;
+        return wrongCapabilityTypeError(Backing.vtable.name, self.head.vtable.name);
     }
 
     self.head.markInFlight() catch return staleError(det, try @constCast(self).asHead().getString());
