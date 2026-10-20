@@ -139,20 +139,18 @@ pub fn stringCmd(interp: *Interp, args: []Shimmerable) !void {
 
     dispatchStringCmd(interp, subcommand, args[2..]) catch |err| switch (err) {
         error.WrongUsage => {
-            try interp.setResultFormatted(
-                "wrong # args: should be \"{s} {s} {s}\"",
-                .{ try args[0].current().getString(), try args[1].current().getString(), Parser.EnumToSubcommand.get(subcommand).usage },
-            );
+            try interp.setResultFormatted("wrong # args: should be \"{s} {s} {s}\"", .{
+                try args[0].current().getString(),
+                try args[1].current().getString(),
+                Parser.EnumToSubcommand.get(subcommand).usage,
+            });
             return error.EvalError;
         },
         else => |e| return e,
     };
 }
 
-/// Runs the body of a single `[string]` subcommand. A subcommand rejects its
-/// own arguments (beyond the arity `stringCmd` already checked) by returning
-/// `error.WrongUsage`; the caller turns that into a message naming this
-/// specific subcommand's usage, not the top-level `string` command's.
+/// Separate method so we can return error.WrongUsage, and have a subcommand-specific error message.
 fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []Shimmerable) !void {
     var det: ErrorDetails = undefined;
 
@@ -177,22 +175,22 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
             try interp.setResultStringOwning(try new_str.toOwnedSliceSentinel(heap.global_gpa, 0));
         },
         .compare, .equal => {
+            // `?-nocase? ?-length? stringA string B`.
             var opt_case_insensitive = false;
             var opt_length: ?usize = null;
 
-            // The last two arguments are the strings to compare. Everything
-            // before is a flag.
             var i: usize = 0;
             while (i < sub_args.len - 2) : (i += 1) {
                 if (try sub_args[i].current().equalsString("-nocase")) {
                     opt_case_insensitive = true;
                 } else if (try sub_args[i].current().equalsString("-length")) {
-                    if (i + 1 >= sub_args.len - 2) return error.WrongUsage; // There needs to be a value after `-length`.
                     opt_length = std.math.lossyCast(usize, try interp.getInteger(&sub_args[i + 1]));
                     i += 1;
                 } else return error.WrongUsage;
             }
+            if (i + 2 < sub_args.len) return error.WrongUsage;
 
+            // The last two arguments are the strings to compare.
             const bytes_a = try sub_args[i].current().getString();
             const bytes_b = try sub_args[i + 1].current().getString();
 
@@ -336,26 +334,20 @@ fn dispatchStringCmd(interp: *Interp, subcommand: StringSubcommand, sub_args: []
                 return;
             }
 
-            // An explicit index bounds where the match may *start* (`first`
-            // searches forward from it, `last` searches backward from it);
-            // without one, `first` starts at 0 and `last` may start anywhere.
+            const provided_start: ?usize = blk: {
+                if (sub_args.len != 3) break :blk null;
+                const index = try interp.getIndex(&sub_args[2]);
+                const abs = index.asAbsoluteIndex(haystack_cp_len);
+                break :blk std.math.cast(usize, abs) orelse 0;
+            };
+
+            // Where to start the search at (by default, first match for forwards,
+            // and last match for backwards).
             const byte_offset = blk: {
                 if (subcommand == .first) {
-                    var start_cp: usize = 0;
-                    if (sub_args.len == 3) {
-                        const index = try interp.getIndex(&sub_args[2]);
-                        const abs = index.asAbsoluteIndex(haystack_cp_len);
-                        start_cp = std.math.cast(usize, abs) orelse 0;
-                    }
-                    break :blk strutil.findFirstOccurrence(needle, haystack, start_cp);
+                    break :blk strutil.findFirstOccurrence(needle, haystack, provided_start orelse 0);
                 } else {
-                    var end_cp: usize = haystack_cp_len;
-                    if (sub_args.len == 3) {
-                        const index = try interp.getIndex(&sub_args[2]);
-                        const abs = index.asAbsoluteIndex(haystack_cp_len);
-                        end_cp = std.math.cast(usize, abs) orelse 0;
-                    }
-                    const max_start_byte = strutil.cpIndex(haystack, end_cp) orelse haystack.len;
+                    const max_start_byte = provided_start orelse haystack.len;
                     break :blk strutil.findLastOccurrenceBounded(needle, haystack, max_start_byte);
                 }
             } orelse {

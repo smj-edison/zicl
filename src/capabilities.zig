@@ -232,6 +232,12 @@ pub const IpConnection = struct {
         return cap_backing;
     }
 
+    pub fn connect(address: std.Io.net.IpAddress) (std.Io.net.IpAddress.ConnectError || error{OutOfMemory})!*Backing {
+        const stream = try address.connect(heap.global_io, .{ .mode = .stream });
+        errdefer stream.close(heap.global_io);
+        return try init(stream);
+    }
+
     fn lockWriter(head: *Capability.Head) *std.Io.Writer {
         const backing: *Backing = @fieldParentPtr("head", head);
         backing.body.write_mutex.lockUncancelable(heap.global_io);
@@ -313,7 +319,7 @@ pub const IpSocket = struct {
     server: std.Io.net.Server,
 
     pub fn listen(address: std.Io.net.IpAddress) !*Backing {
-        const server = try address.listen(heap.global_io, .{ .mode = .stream });
+        var server = try address.listen(heap.global_io, .{ .mode = .stream, .reuse_address = true });
         errdefer server.deinit(heap.global_io);
 
         const cap_backing = try heap.global_gpa.create(Backing);
@@ -326,7 +332,7 @@ pub const IpSocket = struct {
         return cap_backing;
     }
 
-    fn accept(head: *Capability.Head) !*Backing {
+    fn accept(head: *Capability.Head) (std.Io.net.Server.AcceptError || error{OutOfMemory})!*Capability {
         const backing: *Backing = @fieldParentPtr("head", head);
         const stream: std.Io.net.Stream = blk: while (true) {
             const conn = backing.body.server.accept(heap.global_io) catch |err| switch (err) {
@@ -336,7 +342,8 @@ pub const IpSocket = struct {
             break :blk conn;
         };
         errdefer stream.close(heap.global_io);
-        return try IpConnection.init(stream);
+        const ip_conn = try IpConnection.init(stream);
+        return try Capability.newTakingOwnership(&ip_conn.head);
     }
 
     pub const Backing = struct {

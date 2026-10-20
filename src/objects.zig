@@ -80,7 +80,7 @@ pub const Shimmerable = extern struct {
     /// The vtable-typed counterpart to `prepareToShimmer`, for callers (namely
     /// the C API) that only have a `*const Object.VTable`, not a Zig type.
     /// Returns the object's raw body storage; the caller fills it in.
-    pub fn prepareToShimmerVTable(self: *Shimmerable, vtable: *const Object.VTable) !*anyopaque {
+    pub fn prepareToShimmerVTable(self: *Shimmerable, vtable: *const Object.VTable) error{OutOfMemory}!*anyopaque {
         try self.ensureShimmerable();
 
         // We know that this must be an object, since we boxed it if

@@ -28,7 +28,7 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
         iseos,
     };
     const Parser = objects.SubcommandParser(Subcommands, &.{
-        .{ .variant = .read, .usage = "stream", .min_args = 1, .max_args = 1 },
+        .{ .variant = .read, .usage = "stream ?numBytes?", .min_args = 1, .max_args = 2 },
         .{ .variant = .write, .usage = "stream toWrite", .min_args = 2, .max_args = 2 },
         .{ .variant = .gets, .usage = "stream", .min_args = 1, .max_args = 1 },
         .{ .variant = .iseos, .usage = "stream", .min_args = 1, .max_args = 1 },
@@ -50,16 +50,50 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
             const reader = stream_ops.lock_reader(cap.head);
             defer stream_ops.unlock_reader(cap.head);
 
-            const bytes = reader.allocRemainingAlignedSentinel(heap.global_gpa, .unlimited, .@"1", 0) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ReadFailed => return readError(interp, stream_ops.get_reader_error(cap.head).?),
-                else => return readError(interp, err),
-            };
-            // We read to the end, so obviously we've reached the end of the stream.
-            stream_ops.get_eos_ptr(cap.head).* = true;
+            if (args.len == 4) {
+                const count_i64 = try interp.getInteger(&args[3]);
+                if (count_i64 < 0) return interp.setErrorString("expected positive integer");
+                const count: usize = @intCast(count_i64);
+                if (count == 0) {
+                    interp.setEmptyResult();
+                    return;
+                }
+                const bytes = try heap.global_gpa.allocSentinel(u8, count, 0);
+                errdefer heap.global_gpa.free(bytes);
 
-            const as_string = try objects.String.newOwning(bytes);
-            interp.setResultOwning(as_string.asHead().asValue());
+                const n_read = reader.readSliceShort(bytes[0..count]) catch {
+                    return readError(interp, stream_ops.get_reader_error(cap.head).?);
+                };
+                if (n_read == 0) {
+                    stream_ops.get_eos_ptr(cap.head).* = true;
+                    heap.global_gpa.free(bytes);
+                    interp.setEmptyResult();
+                    return;
+                }
+                if (n_read < count) {
+                    stream_ops.get_eos_ptr(cap.head).* = true;
+                }
+                const final_bytes = if (n_read < count) blk: {
+                    const shrunk = try heap.global_gpa.allocSentinel(u8, n_read, 0);
+                    @memcpy(shrunk, bytes[0..n_read]);
+                    heap.global_gpa.free(bytes);
+                    break :blk shrunk;
+                } else bytes;
+
+                const as_string = try objects.String.newOwning(final_bytes);
+                interp.setResultOwning(as_string.asHead().asValue());
+            } else {
+                const bytes = reader.allocRemainingAlignedSentinel(heap.global_gpa, .unlimited, .@"1", 0) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ReadFailed => return readError(interp, stream_ops.get_reader_error(cap.head).?),
+                    else => return readError(interp, err),
+                };
+                // We read to the end, so obviously we've reached the end of the stream.
+                stream_ops.get_eos_ptr(cap.head).* = true;
+
+                const as_string = try objects.String.newOwning(bytes);
+                interp.setResultOwning(as_string.asHead().asValue());
+            }
         },
         .write => {
             const bytes_to_write = try args[3].current().getString();
@@ -74,14 +108,9 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
             defer stream_ops.unlock_reader(cap.head);
 
             while (true) {
-                const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                const maybe_line = reader.takeDelimiter('\n') catch |err| switch (err) {
                     error.ReadFailed => {
                         return readError(interp, stream_ops.get_reader_error(cap.head).?);
-                    },
-                    error.EndOfStream => {
-                        stream_ops.get_eos_ptr(cap.head).* = true;
-                        interp.setEmptyResult();
-                        return;
                     },
                     error.StreamTooLong => {
                         reader.buffer = try heap.global_gpa.realloc(reader.buffer, @max(reader.buffer.len * 2, 4096));
@@ -89,7 +118,13 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
                     },
                 };
 
-                return try interp.setResultString(line);
+                if (maybe_line) |line| {
+                    return try interp.setResultString(line);
+                } else {
+                    stream_ops.get_eos_ptr(cap.head).* = true;
+                    interp.setEmptyResult();
+                    return;
+                }
             }
         },
         .iseos => {
@@ -97,6 +132,76 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
             const is_eos = stream_ops.get_eos_ptr(cap.head).*;
             stream_ops.unlock_reader(cap.head);
             return interp.setResultBoolean(is_eos);
+        },
+    }
+}
+
+/// [socket] -- listen on or connect to IP sockets.
+pub fn socketCmd(interp: *Interp, args: []Shimmerable) !void {
+    const Subcommands = enum {
+        listen,
+        accept,
+        connect,
+    };
+    const Parser = objects.SubcommandParser(Subcommands, &.{
+        .{ .variant = .listen, .usage = "?host? port", .min_args = 1, .max_args = 2 },
+        .{ .variant = .accept, .usage = "socket", .min_args = 1, .max_args = 1 },
+        .{ .variant = .connect, .usage = "host port", .min_args = 2, .max_args = 2 },
+    });
+
+    var det: ErrorDetails = undefined;
+    const subcommand: Subcommands = try interp.wrapError(&det, Parser.parse(&det, args));
+
+    switch (subcommand) {
+        .listen => {
+            const host: ?[]const u8 = if (args.len == 4) try args[2].current().getString() else null;
+            const port_arg = if (args.len == 4) &args[3] else &args[2];
+            const port_i64 = try interp.getInteger(port_arg);
+            if (port_i64 < 1 or port_i64 > 65535) return interp.setErrorString("port out of range");
+            const port: u16 = @intCast(port_i64);
+
+            const address: std.Io.net.IpAddress = if (host) |h|
+                std.Io.net.IpAddress.resolve(heap.global_io, h, port) catch |err| {
+                    return interp.setErrorFormatted("failed to resolve \"{s}\": {s}", .{ h, @errorName(err) });
+                }
+            else
+                .{ .ip4 = std.Io.net.Ip4Address.unspecified(port) };
+
+            const backing = capabilities.IpSocket.listen(address) catch |err| {
+                return interp.setErrorFormatted("failed to listen on port {d}: {s}", .{ port, @errorName(err) });
+            };
+            const cap = try Capability.newTakingOwnership(&backing.head);
+            interp.setResultOwning(cap.asHead().asValue());
+        },
+        .accept => {
+            const cap = try interp.getCapability(&args[2]);
+            cap.head.markInFlight() catch return interp.staleCapabilityError(try args[2].current().getString());
+            defer cap.head.dropInFlight();
+
+            const socket_ops = cap.head.vtable.socket_ops orelse {
+                return interp.setErrorFormatted("capability of type \"{s}\" does not support accept", .{cap.head.vtable.name});
+            };
+
+            const conn_cap = socket_ops.accept(cap.head) catch |err| {
+                return interp.setErrorFormatted("failed to accept connection: {s}", .{@errorName(err)});
+            };
+            interp.setResultOwning(conn_cap.asHead().asValue());
+        },
+        .connect => {
+            const host = try args[2].current().getString();
+            const port_i64 = try interp.getInteger(&args[3]);
+            if (port_i64 < 1 or port_i64 > 65535) return interp.setErrorString("port out of range");
+            const port: u16 = @intCast(port_i64);
+
+            const address = std.Io.net.IpAddress.resolve(heap.global_io, host, port) catch |err| {
+                return interp.setErrorFormatted("failed to resolve \"{s}\": {s}", .{ host, @errorName(err) });
+            };
+
+            const backing = capabilities.IpConnection.connect(address) catch |err| {
+                return interp.setErrorFormatted("failed to connect to {s}:{d}: {s}", .{ host, port, @errorName(err) });
+            };
+            const cap = try Capability.newTakingOwnership(&backing.head);
+            interp.setResultOwning(cap.asHead().asValue());
         },
     }
 }
@@ -604,6 +709,7 @@ pub fn registerCommands(interp: *Interp) !void {
     try registerCommand(interp, "puts", putsCmd, "?-nonewline? ?channel? string", 1, 3);
     try registerCommand(interp, "pwd", pwdCmd, "", 0, 0);
     try registerCommand(interp, "stream", streamCmd, "subcommand ?arg ...?", 2, 3);
+    try registerCommand(interp, "socket", socketCmd, "subcommand ?arg ...?", 2, 3);
     try registerCommand(interp, "file", fileCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "glob", globCmd, "?-nocomplain? ?--? pattern ?pattern ...?", 1, null);
     try registerCommand(interp, "sleep", sleepCmd, "seconds", 1, 1);
@@ -1012,4 +1118,57 @@ fn testGlobWithoutNocomplainErrorsOnNoMatches(ta: std.mem.Allocator) !void {
 
 test "glob without -nocomplain errors on no matches" {
     try memutil.checkAllocationFailures(.exhaustive, testGlobWithoutNocomplainErrorsOnNoMatches, .{});
+}
+
+fn testStreamReadWithByteCount(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(heap.global_io, "test.txt", .{});
+    try file.writeStreamingAll(heap.global_io, "hello world");
+    file.close(heap.global_io);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_path = path_buffer[0..(try tmp.dir.realPathFile(heap.global_io, "test.txt", &path_buffer))];
+
+    const script = try std.fmt.allocPrint(ta,
+        \\set fd [file open {s} r]
+        \\set c1 [stream read $fd 5]
+        \\set c2 [stream read $fd 10]
+        \\set c3 [stream read $fd 10]
+        \\set eos [stream iseos $fd]
+        \\close $fd
+        \\list $c1 $c2 $c3 $eos
+    , .{absolute_path});
+    defer ta.free(script);
+    try interp.testExpectScriptResult("hello { world} {} true", script);
+}
+
+test "stream read with byte count" {
+    try memutil.checkAllocationFailures(.exhaustive, testStreamReadWithByteCount, .{});
+}
+
+fn testSocketListenConnectAccept(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    const script =
+        \\set l [socket listen 127.0.0.1 54321]
+        \\set c [socket connect 127.0.0.1 54321]
+        \\set s [socket accept $l]
+        \\stream write $c "ping\n"
+        \\set msg [stream gets $s]
+        \\stream write $s "pong"
+        \\set reply [stream read $c 4]
+        \\close $c
+        \\close $s
+        \\close $l
+        \\list $msg $reply
+    ;
+    try interp.testExpectScriptResult("ping pong", script);
+}
+
+test "socket listen connect accept" {
+    try memutil.checkAllocationFailures(.exhaustive, testSocketListenConnectAccept, .{});
 }

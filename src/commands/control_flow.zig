@@ -37,6 +37,59 @@ pub fn propagateLoopControl(interp: *Interp, result: Interp.Error!void) Interp.E
     return .none;
 }
 
+// const CaptureEffects = packed struct(u8) {
+//     @"break": bool = false,
+//     @"continue": bool = false,
+//     @"error": bool = false,
+// };
+// const InterpResult = union(enum) {
+//     none,
+//     ok: Value,
+//     @"error": struct {
+//         error_message: Value,
+//         error_code: ?Value,
+//     },
+//     @"break",
+//     @"continue",
+// };
+// const InterpCommand = union(enum) {
+//     eval: Value,
+// };
+// const ForCmd = struct {
+//     in: enum { init, condition, body } = .init,
+
+//     pub fn exec(state: *ForCmd, interp: *Interp, eval_result: InterpResult, args: []Shimmerable) !?InterpCommand {
+//         // If there was no result, it means we're a new instance, so we need to
+//         // evaluate the init code.
+//         if (eval_result) |result| if (result == .none) return .{ .eval = args[1].current().takeReference() };
+
+//         switch (state.*) {
+//             .init => {
+//                 // If we hit Break or Continue within the init body,
+//                 // we'll pass it up the call chain.
+//                 _ = eval_result catch |err| return err;
+
+//                 state.* = .condition;
+//                 return .{ .eval = args[2].current().takeReference() };
+//             },
+//             .condition => {
+//                 switch (eval_result catch |err| return err) {
+
+//                 }
+//             },
+//         }
+
+//         if (state.* == .enter) {
+
+//         }
+//         if (interp_result) |result| {
+
+//         } else {
+//             return .{ .eval = args[1].current().takeReference() };
+//         }
+//     }
+// };
+
 /// [for]
 pub fn forCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     // Do the initialization.
