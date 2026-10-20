@@ -56,7 +56,11 @@ pub fn newTakingOwnership(head: *Head) !*Capability {
     return newRegistering(head);
 }
 
-pub fn wrongCapabilityTypeError(det: ?*ErrorDetails, expected: [*:0]const u8, got: [*:0]const u8) error{BadCapability} {
+pub fn wrongCapabilityTypeError(
+    det: ?*ErrorDetails,
+    expected: [*:0]const u8,
+    got: [*:0]const u8,
+) error{ BadCapability, OutOfMemory } {
     if (det) |details| details.* = .{ .message = try objects.allocPrintZ(
         "expected a {s} but got a {s}",
         .{ expected, got },
@@ -68,7 +72,7 @@ pub fn wrongCapabilityTypeError(det: ?*ErrorDetails, expected: [*:0]const u8, go
 /// for calling `dropInFlight` when done.
 pub fn getBacking(self: *const Capability, Backing: type, det: ?*ErrorDetails) !*Backing {
     if (self.head.vtable != &Backing.vtable) {
-        return wrongCapabilityTypeError(Backing.vtable.name, self.head.vtable.name);
+        return wrongCapabilityTypeError(det, Backing.vtable.name, self.head.vtable.name);
     }
 
     self.head.markInFlight() catch return staleError(det, try @constCast(self).asHead().getString());

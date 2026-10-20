@@ -261,7 +261,7 @@ export fn Zicl_NewObj(
     out_body: *?*anyopaque,
 ) ?*heap.Object {
     if (size > heap.Object.body_max_size) {
-        @panic("Zicl_NewObjize exceeds ZICL_OBJECT_BODY_MAX_SIZE");
+        @panic("Zicl_NewObj size exceeds ZICL_OBJECT_BODY_MAX_SIZE");
     }
 
     const obj = heap.global_gpa.create(heap.Object) catch return null;
@@ -422,7 +422,7 @@ export fn Zicl_NewList(values: ?[*]const Value, n_values: c_int) ?*List {
 
 // The C `Zicl_Shim` layout mirrors `objects.Shimmerable`, so the
 // pointer cast is sound.
-export fn Zicl_NewListFromShimmerables(
+export fn Zicl_NewListFromShims(
     shims: ?[*]const Shimmerable,
     n_shims: c_int,
 ) ?*List {
@@ -467,7 +467,7 @@ export fn Zicl_DupAsList(interp: *Interp, value: Value, out: *?*List) ReturnCode
     }
 }
 
-export fn Zicl_ListShimmer(interp: *Interp, shim: *Shimmerable, out: *?*const List) ReturnCode {
+export fn Zicl_ShimmerToList(interp: *Interp, shim: *Shimmerable, out: *?*const List) ReturnCode {
     const list = interp.getList(shim) catch |err| return ReturnCode.fromError(err);
     out.* = list;
     return .ok;
@@ -576,14 +576,14 @@ export fn Zicl_DupAsDict(interp: *Interp, value: Value, out: *?*Dictionary) Retu
     }
 }
 
-export fn Zicl_DictShimmer(interp: *Interp, shim: *Shimmerable, out: *?*const Dictionary) ReturnCode {
+export fn Zicl_ShimmerToDict(interp: *Interp, shim: *Shimmerable, out: *?*const Dictionary) ReturnCode {
     const dict = interp.getDict(shim) catch |err| return ReturnCode.fromError(err);
     out.* = dict;
     return .ok;
 }
 
 export fn Zicl_DictLength(dict: *const Dictionary) c_int {
-    return dict.items.len;
+    return @intCast(dict.items.len);
 }
 
 export fn Zicl_DictItems(dict: *const Dictionary) [*]const Value {
@@ -952,7 +952,8 @@ export fn Zicl_ResolveCap(
         const cap_value = shim.getString() catch return .oom;
         return ReturnCode.fromError(interp.wrapError(&det, Capability.staleError(&det, cap_value)));
     };
-    return cap.head;
+    out.* = cap.head;
+    return .ok;
 }
 
 export fn Zicl_CapTakeRef(head: *Capability.Head) *Capability.Head {

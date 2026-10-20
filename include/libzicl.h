@@ -63,7 +63,7 @@ typedef struct Zicl_ValRep {
         double float_val;
         int64_t integer;
         bool boolean;
-        const uint8_t *interned;
+        const char *interned;
     } as;
     /* Only meaningful when `tag` is ZICL_TAG_INTERNED. */
     uint16_t interned_string_len;
@@ -105,8 +105,8 @@ static inline Zicl_OptVal Zicl_Wrap(Zicl_Val value) {
 
 ZICL_NORETURN void Zicl_InternStrTooLong(void);
 /* Create an interned string value. `ptr` must have a static lifetime. */
-static inline Zicl_Val Zicl_InternStr(const uint8_t *ptr) {
-    size_t len = strlen((const char *)ptr);
+static inline Zicl_Val Zicl_InternStr(const char *ptr) {
+    size_t len = strlen(ptr);
     if (len > 0xffff) Zicl_InternStrTooLong();
     Zicl_Val v;
     v.raw.as.interned = ptr;
@@ -146,7 +146,7 @@ typedef struct Zicl_ObjVTable {
     /* Always set to true. Used to distinguish C and Zig vtables, as they
      * have different calling conventions. */
     bool is_c_vtable;
-    const uint8_t *name;
+    const char *name;
 
     /* Note that we discard the union used on the Zig side, since the layout is
      * identical without the union. This only works because both variants have
@@ -197,7 +197,7 @@ void *Zicl_AsObjBody(Zicl_Val value, const Zicl_ObjVTable *vtable);
  * and inside of `update_string`, as it won't do anything if the object already
  * has a string. This is threadsafe. Will return ZICL_OK or ZICL_OOM, as it
  * can OOM when `str` is duplicated.  */
-Zicl_RetCode Zicl_SetObjectString(Zicl_Obj *obj, const uint8_t *str, int len);
+Zicl_RetCode Zicl_SetObjectString(Zicl_Obj *obj, const char *str, int len);
 
 /* A shimmerable value. Values can't always shimmer in-place, which is why we
  * wrap it in this structure to allow it to shimmer, even when not in place. */
@@ -251,9 +251,9 @@ Zicl_RetCode Zicl_Duplicate(Zicl_Val value, Zicl_Val *out);
  * may pass the value back if not an object variant. */
 Zicl_Obj *Zicl_DuplicateAsBoxed(Zicl_Val value);
 /* Get the object's string rep. NULL on OOM. */
-const uint8_t *Zicl_String(Zicl_Val object);
+const char *Zicl_String(Zicl_Val object);
 /* Get the object's string rep and length. NULL on OOM. */
-const uint8_t *Zicl_GetString(Zicl_Val object, int *len);
+const char *Zicl_GetString(Zicl_Val object, int *len);
 /* Box an object pointer into the `Zicl_Val` tagged union. */
 Zicl_Val Zicl_BoxObject(Zicl_Obj *obj);
 /* Whether this value can mutate in place. Always false for non-object variants. */
@@ -281,11 +281,11 @@ static inline Zicl_Val Zicl_Current(const Zicl_Shim *shim) {
 };
 /* The string rep of the `Zicl_Shim`'s active value. If OOM occurs, will
  * return NULL. */
-static inline const uint8_t *Zicl_ShimString(Zicl_Shim *shim) {
+static inline const char *Zicl_ShimString(Zicl_Shim *shim) {
     return Zicl_String(Zicl_Current(shim));
 };
 /* Same as above, writing the byte length to `*len` when not NULL. */
-static inline const uint8_t *Zicl_ShimGetString(Zicl_Shim *shim, int *len) {
+static inline const char *Zicl_ShimGetString(Zicl_Shim *shim, int *len) {
     return Zicl_GetString(Zicl_Current(shim), len);
 };
 /* Drops `shim->shimmered` and clears it. */
@@ -308,8 +308,8 @@ void Zicl_InterpDestroy(Zicl_Interp *interp);
 
 typedef int (*Zicl_CCommandFn)(Zicl_Interp *interp, int argc, Zicl_Shim *argv);
 
-Zicl_RetCode Zicl_CreateCommand(Zicl_Interp *interp, const uint8_t *name, Zicl_CCommandFn command,
-                                const uint8_t *description, int min_arity, int max_arity);
+Zicl_RetCode Zicl_CreateCommand(Zicl_Interp *interp, const char *name, Zicl_CCommandFn command,
+                                const char *description, int min_arity, int max_arity);
 
 /* Zicl has "lazy commands", commands that have their name registered, but have
  * not yet been initialized in an interpreter. This way, the first time an
@@ -322,30 +322,31 @@ Zicl_RetCode Zicl_CreateCommand(Zicl_Interp *interp, const uint8_t *name, Zicl_C
  * This is the type of the function that registers these lazy commands, and it
  * will be called right before the command is used. */
 typedef void (*Zicl_LazyRegisterFn)(Zicl_Interp *interp);
-Zicl_RetCode Zicl_RegisterLazyFn(const uint8_t *name, const uint8_t *library, Zicl_LazyRegisterFn init_fn);
+Zicl_RetCode Zicl_RegisterLazyFn(const char *name, const char *library, Zicl_LazyRegisterFn init_fn);
 
 Zicl_RetCode Zicl_EvalValue(Zicl_Interp *interp, Zicl_Val script);
-Zicl_RetCode Zicl_Eval(Zicl_Interp *interp, const uint8_t *script);
-Zicl_RetCode Zicl_EvalFile(Zicl_Interp *interp, const uint8_t *filename);
+Zicl_RetCode Zicl_Eval(Zicl_Interp *interp, const char *script);
+Zicl_RetCode Zicl_EvalFile(Zicl_Interp *interp, const char *filename);
 Zicl_Val Zicl_GetErrorStack(Zicl_Interp *interp);
 Zicl_RetCode Zicl_MakeErrorMessage(Zicl_Interp *interp);
 Zicl_OptVal Zicl_GetClosureNameBeingEvaluated(Zicl_Interp *interp);
 uint32_t Zicl_CurrentEvalFrameIdx(Zicl_Interp *interp);
+Zicl_Val Zicl_GetScriptBeingEvaluated(Zicl_Interp *interp);
 Zicl_Val Zicl_EvalFrameScript(Zicl_Interp *interp, uint32_t frame);
 Zicl_Val Zicl_GetResult(Zicl_Interp *interp);
 void Zicl_SetResult(Zicl_Interp *interp, Zicl_Val value);
 void Zicl_SetResultOwning(Zicl_Interp *interp, Zicl_Val value);
-Zicl_RetCode Zicl_SetResultString(Zicl_Interp *interp, const uint8_t *str, int len);
+Zicl_RetCode Zicl_SetResultString(Zicl_Interp *interp, const char *str, int len);
 /* Set the interpreter result to `str` and report it as an error: returns
  * ZICL_ERR on the success path, ZICL_OOM if storing the string allocates and
  * fails. Never returns ZICL_OK. `len` is the byte length, or -1 for NUL-terminated. */
-Zicl_RetCode Zicl_SetErrorString(Zicl_Interp *interp, const uint8_t *str, int len);
+Zicl_RetCode Zicl_SetErrorString(Zicl_Interp *interp, const char *str, int len);
 Zicl_RetCode Zicl_SetResultBool(Zicl_Interp *interp, int value);
 Zicl_RetCode Zicl_SetResultLong(Zicl_Interp *interp, long value);
 Zicl_RetCode Zicl_SetEmptyResult(Zicl_Interp *interp);
 
 Zicl_RetCode Zicl_SetVariable(Zicl_Interp *interp, Zicl_Shim *name, Zicl_Val value);
-Zicl_RetCode Zicl_SetVariableString(Zicl_Interp *interp, const uint8_t *name, Zicl_Val value);
+Zicl_RetCode Zicl_SetVariableString(Zicl_Interp *interp, const char *name, Zicl_Val value);
 
 void Zicl_RequestStop(Zicl_Interp *interp);
 bool Zicl_StopRequested(Zicl_Interp *interp);
@@ -353,7 +354,7 @@ void Zicl_ClearStop(Zicl_Interp *interp);
 
 /* ===== Core objects and object methods ===== */
 
-Zicl_RetCode Zicl_NewString(Zicl_Val *out, const uint8_t *ptr, size_t len);
+Zicl_RetCode Zicl_NewString(Zicl_Val *out, const char *ptr, int len);
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((format(printf, 2, 3)))
@@ -373,17 +374,17 @@ static inline int Zicl_NewStringFormatted(Zicl_Val *out, const char *fmt, ...) {
     }
     if ((size_t)needed < sizeof(stack_buf)) {
         va_end(args_copy);
-        return Zicl_NewString(out, (const uint8_t *)stack_buf, needed);
+        return Zicl_NewString(out, stack_buf, needed);
     }
 
-    uint8_t *heap_buf = (uint8_t *)malloc((size_t)needed + 1);
+    char *heap_buf = (char *)malloc((size_t)needed + 1);
     if (!heap_buf) {
         va_end(args_copy);
         return ZICL_OOM;
     }
-    vsnprintf((char *)heap_buf, (size_t)needed + 1, fmt, args_copy);
+    vsnprintf(heap_buf, (size_t)needed + 1, fmt, args_copy);
     va_end(args_copy);
-    int rc = Zicl_NewString(out, (uint8_t *)heap_buf, needed);
+    int rc = Zicl_NewString(out, heap_buf, needed);
     free(heap_buf);
     return rc;
 }
@@ -422,7 +423,7 @@ typedef struct Zicl_List Zicl_List;
 /* Takes a reference of each value. */
 Zicl_List *Zicl_NewList(const Zicl_Val *values, int n_values);
 /* Takes a reference of each active value. */
-Zicl_List *Zicl_NewListFromShimmerables(const Zicl_Shim *shims, int n_shims);
+Zicl_List *Zicl_NewListFromShims(const Zicl_Shim *shims, int n_shims);
 Zicl_Val Zicl_BoxList(Zicl_List *list);
 Zicl_List *Zicl_RefList(Zicl_List *list);
 void Zicl_DropRefList(Zicl_List *list);
@@ -461,7 +462,7 @@ Zicl_Val Zicl_BoxDict(Zicl_Dict *dict);
 Zicl_Dict *Zicl_RefDict(Zicl_Dict *dict);
 void Zicl_DropRefDict(Zicl_Dict *dict);
 
-Zicl_RetCode Zicl_DictShimmer(Zicl_Interp *interp, Zicl_Shim *shim, const Zicl_Dict **out);
+Zicl_RetCode Zicl_ShimmerToDict(Zicl_Interp *interp, Zicl_Shim *shim, const Zicl_Dict **out);
 /* Number of keys + values, including duplicate entries. */
 int Zicl_DictLength(const Zicl_Dict *dictPtr);
 const Zicl_Val *Zicl_DictItems(const Zicl_Dict *dictPtr);
@@ -472,8 +473,8 @@ Zicl_RetCode Zicl_ShimDictGet(Zicl_Interp *interp, Zicl_Shim *shim, Zicl_Val key
 /* COW helpers. `Zicl_AsDictMut` attempts to prepare `value` for in-place mutation,
  * setting `out` to the list pointer on success. If not successful, `Zicl_AsDictMut`
  *sets `out` to NULL, at which point the caller should use `Zicl_DupAsDict`. */
-int Zicl_AsDictMut(Zicl_Interp *interp, Zicl_Val value, Zicl_Dict **out);
-int Zicl_DupAsDict(Zicl_Interp *interp, Zicl_Val value, Zicl_Dict **out);
+Zicl_RetCode Zicl_AsDictMut(Zicl_Interp *interp, Zicl_Val value, Zicl_Dict **out);
+Zicl_RetCode Zicl_DupAsDict(Zicl_Interp *interp, Zicl_Val value, Zicl_Dict **out);
 /* Set `key` to `value`, borrowing `value` and potentially `key`. Asserts that
  *`dictPtr` can mutate. */
 Zicl_RetCode Zicl_DictPut(Zicl_Dict *dictPtr, Zicl_Val key, Zicl_Val value);
@@ -503,11 +504,11 @@ Zicl_Source *Zicl_RefSource(Zicl_Source *source);
 void Zicl_DropRefSource(Zicl_Source *source);
 
 /* NULL if not a source, or if OOM occured. */
-const uint8_t *Zicl_SourceGetFilename(Zicl_Val source);
+const char *Zicl_SourceGetFilename(Zicl_Val source);
 /* -1 if not a source. */
 int Zicl_SourceGetLine(Zicl_Val source);
 /* On success replace `value` with a new value, but with source info attached. */
-Zicl_RetCode Zicl_AttachSource(Zicl_Val *value, const uint8_t *filename, int line_no);
+Zicl_RetCode Zicl_AttachSource(Zicl_Val *value, const char *filename, int line_no);
 
 /* COW helpers. `Zicl_AsSourceMut` attempts to prepare `value` for in-place mutation,
  * setting `out` to the list pointer on success. If not successful, `Zicl_AsSourceMut`
@@ -533,7 +534,7 @@ Zicl_Dict *Zicl_ClosureGetScope(const Zicl_Closure *closure);
  * the native functions it creates. This init function also needs to return a
  * `*Zicl_Dict` containing "{apiName1 internalName apiName2 internalName2 ...}".
  * */
-Zicl_RetCode Zicl_LoadLibrary(Zicl_Interp *interp, const uint8_t *path);
+Zicl_RetCode Zicl_LoadLibrary(Zicl_Interp *interp, const char *path);
 
 /* ===== Globals and thread lifecycle ===== */
 
@@ -542,7 +543,7 @@ void Zicl_SetLocalStderr(int fd);
 
 /* `host_name` is the name that created capabilities will use. Call will NULL to
  * use the default hostname. */
-Zicl_RetCode Zicl_InitGlobals(const uint8_t *host_name);
+Zicl_RetCode Zicl_InitGlobals(const char *host_name);
 /* Per-thread setup. Call whenever spinning up a new thread. */
 Zicl_RetCode Zicl_InitThread(void);
 void Zicl_DeinitThread(void);
@@ -570,14 +571,14 @@ void Zicl_LocalArenaRestore(Zicl_ArenaSnapshot snap);
 
 /* Add a literal value to the trace. `fieldName` must have a static lifetime.
  * `valueStr` is copied though. */
-Zicl_RetCode Zicl_StructWalkerAddField(Zicl_StructWalker *ctx, const uint8_t *fieldName, const uint8_t *valueStr);
+Zicl_RetCode Zicl_StructWalkerAddField(Zicl_StructWalker *ctx, const char *fieldName, const char *valueStr);
 /* Follow a field of type `Zicl_Val`. */
-Zicl_RetCode Zicl_StructWalkerFollowValue(Zicl_StructWalker *ctx, const uint8_t *fieldName, Zicl_Val value);
+Zicl_RetCode Zicl_StructWalkerFollowValue(Zicl_StructWalker *ctx, const char *fieldName, Zicl_Val value);
 /* Follow a pointer field to its respective struct. `enumerateStruct` is the enumeration
  * function for the followed struct. `enumerateStruct` can be NULL, which will still trace
  * `ptr`, but will treat it as an opaque leaf. */
-Zicl_RetCode Zicl_StructWalkerFollowStruct(Zicl_StructWalker *ctx, const uint8_t *fieldName,
-                                           const void *ptr, const uint8_t *typeName,
+Zicl_RetCode Zicl_StructWalkerFollowStruct(Zicl_StructWalker *ctx, const char *fieldName,
+                                           const void *ptr, const char *typeName,
                                            Zicl_EnumerateStructFn enumerateStruct);
 
 
@@ -596,7 +597,7 @@ struct Zicl_CapHead;
 
 typedef struct Zicl_CapHeadVTable {
     /* NUL-terminated, e.g. "file-handle". */
-    const uint8_t *name;
+    const char *name;
     /* Deinits the body. Runs exactly once, from close. */
     void (*deinit_body)(struct Zicl_CapHead *head);
     /* Frees the backing. Runs at ref count zero, which may be long after close. */
@@ -631,8 +632,9 @@ Zicl_RetCode Zicl_CapNew(Zicl_CapHead *head, Zicl_Val *out);
 /* Attempts to resolve `shim` as a live capability, failing if
  * 1. it's not a capability, 2. it's not the right capability type,
  * or 3. it's been closed. On success, the capability's in_flight
- * counter goes up by one, so be sure to call  */
-Zicl_RetCode Zicl_ResolveCap(Zicl_Shim *shim, const Zicl_CapHeadVTable *expected, Zicl_CapHead **out);
+ * counter goes up by one, so be sure to call `Zicl_CapDropInFlight`
+ * when you're done with the capability operation. */
+Zicl_RetCode Zicl_ResolveCap(Zicl_Interp *interp, Zicl_Shim *shim, const Zicl_CapHeadVTable *expected, Zicl_CapHead **out);
 
 /* Head operations, mirroring Capability.Head. */
 Zicl_CapHead *Zicl_CapTakeRef(Zicl_CapHead *head);
