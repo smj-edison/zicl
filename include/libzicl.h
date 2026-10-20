@@ -953,6 +953,11 @@ typedef struct Zicl_CapabilityHeadVTable {
     void (*deinit_body)(struct Zicl_CapabilityHead *head);
     /* Frees the backing. Runs at ref count zero, which may be long after close. */
     void (*destroy_backing)(struct Zicl_CapabilityHead *head);
+    /* Interrupts the capability so it can fully close. */
+    void (*cancel)(struct Zicl_CapabilityHead *head);
+
+    void *stream_ops;
+    void *socket_ops;
 } Zicl_CapabilityHeadVTable;
 
 typedef struct Zicl_CapabilityId {
@@ -995,41 +1000,6 @@ int Zicl_CapabilityNew(Zicl_Value *out, Zicl_CapabilityHead *head);
 Zicl_CapabilityHead *Zicl_ResolveCapability(Zicl_Shimmerable *shim, const Zicl_CapabilityHeadVTable *expected);
 
 int Zicl_NewFileFromDescriptor(int descriptor, Zicl_Value *out);
-
-/* Wraps `ptr` in a "pointer" capability whose lifetime is now managed by
- * Zicl -- useful for C code (chiefly generated FFI wrappers) that wants to
- * hand a script a raw pointer to hold and eventually release, without
- * defining a bespoke Zicl_CapabilityHeadVTable for every pointed-to type.
- * `type_name` is copied, and must match exactly what's later passed to
- * Zicl_GetPointerCapability -- see that function for why. If `destructor`
- * is non-NULL, it runs once, handed back `ptr`, when the capability is
- * closed (explicitly, or at process shutdown if never closed); it never runs
- * if `ptr` itself is NULL, since there is nothing to destroy. `ptr` may be
- * NULL: the capability's own identity (id, refcount, open/closed) is
- * independent of the pointer value it happens to carry, so a C API whose
- * pointer type uses NULL as a meaningful state (not just "allocation
- * failed") still round-trips through a capability like any other value. */
-int Zicl_NewPointerCapability(void *ptr, const char *type_name,
-                               void (*destructor)(void *ptr), Zicl_Value *out);
-/* Recovers the pointer from a "pointer" capability into `*out`, resolving
- * `shim` in place first (same as Zicl_GetLong/Zicl_ListShimmer do for their
- * own target type) -- so this works directly on a value that's still in
- * string form, which is the common case for an argument coming from Tcl. The
- * type check can't ride on vtable identity the way Zicl_ResolveCapability
- * rides on it for capability types with their own vtable, since every
- * pointer capability shares one vtable; `expected_type_name` is required and
- * compared against what the capability was created with instead. Errors
- * (rather than writing NULL to `*out`) if `shim` doesn't resolve to a live
- * pointer capability, or if it's a pointer capability of some other type
- * (e.g. passing a "Gpu*" capability where "v4l2_capability*" was expected)
- * -- `*out` alone can't carry that distinction, since NULL is itself a valid
- * pointer to recover (see Zicl_NewPointerCapability). `*out_head` receives the
- * capability the pointer came out of, borrowed for as long as `shim` holds it. */
-int Zicl_GetPointerCapability(Zicl_Shimmerable *shim, const char *expected_type_name, void **out,
-                              struct Zicl_CapabilityHead **out_head);
-/* The type_name a pointer capability was created with, or NULL if `value`
- * isn't a pointer capability. Borrowed; valid as long as the capability is. */
-const char *Zicl_PointerCapabilityTypeName(Zicl_Value value);
 
 /* Head operations, mirroring Capability.Head. */
 Zicl_CapabilityHead *Zicl_CapabilityHeadBorrow(Zicl_CapabilityHead *head);

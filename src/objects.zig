@@ -1624,9 +1624,9 @@ pub const List = struct {
                 .simple_string, .escaped_string => {
                     const token_value = bytes[next_token.loc.start..next_token.loc.end];
                     const source = if (next_token.tag == .escaped_string)
-                        try Source.newFromEscaped(token_value, file_name.takeReference(), line_no)
+                        try Source.newFromEscaped(token_value, file_name.takeReference(), next_token.loc.line_no)
                     else
-                        try Source.new(token_value, file_name.takeReference(), line_no);
+                        try Source.new(token_value, file_name.takeReference(), next_token.loc.line_no);
                     errdefer source.asHead().dropReference();
 
                     try new_items.append(heap.global_gpa, source.asHead().asValue());

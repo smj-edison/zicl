@@ -429,7 +429,6 @@ The concrete capability kinds built on `Capability.Head`. Each is a `Backing = s
 
 - `capabilities.File` -- An open file. `.open(path, mode)` (`Mode` is `r`/`r+`/`w`/`w+`) creates a `"file-handle"` capability; `.openDescriptor(handle)` wraps an already-open fd without closing it when the capability closes. `.writeAll(file, bytes)` / `.readAll(file)` (whole-file slurp only; no partial/character-counted read yet).
 - `capabilities.Process` -- A running pipeline, held as one capability regardless of stage count, since nothing else reaps its children. `.new(stages)` takes ownership of an already-spawned `[]Stage`. `.wait(self)` blocks until every stage exits and returns the pipeline's overall `Term` (an earlier failure is not masked by a later success); safe to call from two threads or call again after any outcome. `.pids(self, out)` reports each stage's pid, or null once reaped. `.pipelineTerm(stages)` / `.isNormalExit(term)` compute the overall result from already-waited stages. `Process.Stage.wait(self)` / `.kill(self)` operate on one stage.
-- `capabilities.Pointer` -- A raw C pointer whose lifetime Zicl now owns, for FFI wrappers that want to hand a script an opaque handle without a bespoke capability type per pointed-to C type. `.new(ptr, type_name, destructor)` creates a `"pointer"` capability; `destructor` runs once at close (never for a null `ptr`). `.getTyped(cap, expected_type_name, det)` is `Capability.getBacking` plus a `type_name` check, since every `Pointer` shares one vtable and so gets no vtable-identity type safety for free.
 
 ---
 
