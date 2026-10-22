@@ -55,6 +55,11 @@ typedef enum Zicl_ValTag : uint8_t {
     ZICL_TAG_INTEGER,
     ZICL_TAG_FLOAT,
     ZICL_TAG_INTERNED,
+    /* If you want to pass around a custom data structure, tag it with
+     * ZICL_TAG_EXTERNAL. As long as you don't generate a string for it directly
+     * or indirectly, you can use it like a Zicl value (put it in a list, or a
+     * dictionary value, etc). */
+    ZICL_TAG_EXTERNAL = 255,
 } Zicl_ValTag;
 typedef struct Zicl_ValRep {
     union {
@@ -64,6 +69,7 @@ typedef struct Zicl_ValRep {
         int64_t integer;
         bool boolean;
         const char *interned;
+        void *external;
     } as;
     /* Only meaningful when `tag` is ZICL_TAG_INTERNED. */
     uint16_t interned_string_len;
@@ -472,6 +478,7 @@ Zicl_RetCode Zicl_ShimmerToDict(Zicl_Interp *interp, Zicl_Shim *shim, const Zicl
 /* Number of keys + values, including duplicate entries. */
 int Zicl_DictLength(const Zicl_Dict *dictPtr);
 const Zicl_Val *Zicl_DictItems(const Zicl_Dict *dictPtr);
+Zicl_RetCode Zicl_DictGetNoFollow(const Zicl_Dict *dictPtr, Zicl_Val key, Zicl_OptVal *out);
 /* Look up `key` in `shim`, following parent references if needed. Sets `out`
  * to ZICL_NONE if not found. */
 Zicl_RetCode Zicl_ShimDictGet(Zicl_Interp *interp, Zicl_Shim *shim, Zicl_Val key, Zicl_OptVal *out);

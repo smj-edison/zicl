@@ -582,6 +582,12 @@ export fn Zicl_ShimmerToDict(interp: *Interp, shim: *Shimmerable, out: *?*const 
     return .ok;
 }
 
+export fn Zicl_DictGetNoFollow(dict: *const Dictionary, key: Value, out: *OptionalValue) ReturnCode {
+    out.* = .none;
+    out.* = OptionalValue.fromValue(dict.getNoFollow(key) catch |err| return ReturnCode.fromError(err));
+    return .ok;
+}
+
 export fn Zicl_DictLength(dict: *const Dictionary) c_int {
     return @intCast(dict.items.len);
 }

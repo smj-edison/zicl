@@ -537,6 +537,7 @@ const ValueRep = extern struct {
         integer,
         float,
         interned,
+        external = 255,
     };
 
     as: extern union {
@@ -585,6 +586,7 @@ const ValueRep = extern struct {
             .boolean => try objects.String.newObject(if (rep.as.boolean) "true" else "false"),
             .interned => try objects.String.newObject(rep.as.interned[0..rep.interned_string_len]),
             .float => (try objects.Float.newBoxed(rep.as.float)).asHead(),
+            .external => @panic("external value used"),
         };
     }
 
@@ -627,6 +629,7 @@ const ValueRep = extern struct {
             },
             .pointer => {},
             .none => return b.tag == .none,
+            .external => return false,
         }
         return false;
     }
@@ -846,6 +849,7 @@ pub const Value = extern struct {
             .integer => return try std.fmt.allocPrintSentinel(local_arena, "{}", .{value.raw.as.integer}, 0),
             .boolean => return if (value.raw.as.boolean) "true" else "false",
             .interned => return value.raw.as.interned[0..value.raw.interned_string_len :0],
+            .external => @panic("external value used"),
         }
     }
 
@@ -862,6 +866,7 @@ pub const Value = extern struct {
             .integer => return std.fmt.bufPrintSentinel(buf, "{}", .{value.raw.as.integer}, 0) catch unreachable,
             .boolean => return if (value.raw.as.boolean) "true" else "false",
             .interned => return value.raw.as.interned[0..value.raw.interned_string_len :0],
+            .external => @panic("external value used"),
         }
     }
 
