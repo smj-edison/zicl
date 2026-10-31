@@ -6,7 +6,7 @@ const objects = @import("objects.zig");
 const common = @import("commands/common.zig");
 
 pub fn main(init: std.process.Init) !void {
-    try heap.initGlobals(init.gpa, init.io, .{});
+    try heap.initGlobals(init.gpa, init.io, .{ .shared = init.environ_map }, .{});
     defer heap.deinitGlobals();
     try heap.initThread();
     defer heap.deinitThread();

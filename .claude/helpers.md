@@ -518,7 +518,6 @@ this as `common` and re-use its `heap`/`objects`/`Interp` aliases.
 ## src/memutil.zig
 
 ### Allocators
-- `memutil.null_allocator` -- An allocator that fails every request; use it to assert a path does not allocate.
 - `RingBufferAllocator.init(buffer)` -- Initialize a ring buffer allocator over a fixed buffer.
 - `RingBufferAllocator.allocator(self)` -- Return a standard `Allocator` backed by this ring buffer. `free` is a no-op; `resize`/`remap` unsupported.
 - `ScopedArena.init(child_allocator)` -- Create an empty scoped arena (bump allocator over a linked list of segments, modeled on std's `ArenaAllocator`).

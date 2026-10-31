@@ -696,7 +696,7 @@ fn setSplitResult(interp: *Interp, termination: process.Child.Term, stdout: []co
     // stage as 128 plus its signal, the way a shell does.
     const code: i64 = switch (termination) {
         .exited => |exit_code| exit_code,
-        .signal, .stopped => |sig| 128 + @as(i64, @intFromEnum(sig)),
+        .signal, .stopped => |sig| 128 + @as(i64, @backingInt(sig)),
         .unknown => 1,
     };
     const out_value = try objects.String.newValue(stdout);
@@ -716,8 +716,8 @@ fn setSplitResult(interp: *Interp, termination: process.Child.Term, stdout: []co
 fn childStatus(stages: []const Process.Stage, outcome: Process.Outcome) [3]Value {
     const kind: Value, const detail: i64 = switch (outcome.termination) {
         .exited => |exit_code| .{ interned_childstatus, exit_code },
-        .signal => |sig| .{ interned_childkilled, @intFromEnum(sig) },
-        .stopped => |sig| .{ interned_childsusp, @intFromEnum(sig) },
+        .signal => |sig| .{ interned_childkilled, @backingInt(sig) },
+        .stopped => |sig| .{ interned_childsusp, @backingInt(sig) },
         // Its own word, so a pipeline whose outcome was lost is not mistaken
         // for one that exited with whatever is in the raw wait status.
         .unknown => |raw| .{ interned_childunknown, raw },
@@ -731,8 +731,8 @@ const TermMessage = struct {
 
     pub fn format(message: TermMessage, writer: *Io.Writer) Io.Writer.Error!void {
         switch (message.term) {
-            .signal => |sig| try writer.print("child killed by signal {d}", .{@intFromEnum(sig)}),
-            .stopped => |sig| try writer.print("child suspended by signal {d}", .{@intFromEnum(sig)}),
+            .signal => |sig| try writer.print("child killed by signal {d}", .{@backingInt(sig)}),
+            .stopped => |sig| try writer.print("child suspended by signal {d}", .{@backingInt(sig)}),
             .exited, .unknown => try writer.writeAll("child process exited abnormally"),
         }
     }

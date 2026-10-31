@@ -166,7 +166,7 @@ pub fn createSelfDeletingFile(dir: Io.Dir, io: Io) !Io.File {
                 .truncate = false,
                 .exclusive = true,
                 // No need for it to be visible to anyone but us.
-                .permissions = @enumFromInt(0o600),
+                .permissions = @fromBackingInt(@intCast(0o600)),
             }) catch |err| switch (err) {
                 error.PathAlreadyExists => continue,
                 else => |e| return e,

@@ -199,7 +199,7 @@ pub const Parser = struct {
     }
 
     fn addNode(p: *Parser, elem: Node) !Node.Index {
-        const new_index: Node.Index = @enumFromInt(p.nodes.items.len);
+        const new_index: Node.Index = @fromBackingInt(@intCast(p.nodes.items.len));
         try p.nodes.append(p.gpa, elem);
         return new_index;
     }
@@ -511,7 +511,7 @@ pub const Parser = struct {
                     // We checked all things that weren't binary operators, so we're good to
                     // do binary operator stuff.
                     const operator_tag = token_tag;
-                    const info = binary_oper_table[@as(usize, @intCast(@intFromEnum(operator_tag)))];
+                    const info = binary_oper_table[@as(usize, @intCast(@backingInt(operator_tag)))];
                     if (info.prec < min_prec) {
                         return node;
                     }
@@ -696,7 +696,7 @@ pub const Parsed = struct {
     pub fn enumerateStruct(ctx: StructIterator, info: *const StructIterator.NodeInfo) StructIterator.Error!void {
         const parsed: *const Parsed = @ptrCast(@alignCast(info.node));
 
-        try ctx.addField(TokenIndex, info, "root_node", "{}", .{@intFromEnum(parsed.root_node)});
+        try ctx.addField(TokenIndex, info, "root_node", "{}", .{@backingInt(parsed.root_node)});
 
         var alloc_writer = std.Io.Writer.Allocating.init(ctx.arena);
         defer alloc_writer.deinit();
@@ -717,8 +717,8 @@ pub const Parsed = struct {
     }
 
     pub fn renderInner(parsed: *const Parsed, writer: *Writer, node_index: Node.Index) !void {
-        const tag = parsed.nodes[@intFromEnum(node_index)].tag;
-        const data = parsed.nodes[@intFromEnum(node_index)].data;
+        const tag = parsed.nodes[@backingInt(node_index)].tag;
+        const data = parsed.nodes[@backingInt(node_index)].data;
         switch (tag) {
             .none => {},
             // Binary operators

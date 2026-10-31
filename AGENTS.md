@@ -99,7 +99,6 @@ When writing tests, use `memutil.checkAllocationFailures`, unless you're working
 -   `IndexedMemoryPool(Item)` -- a pool that returns `usize` indices instead of pointers.
 -   `LruCache(K, V, Context)` -- the LRU cache used for parsed scripts, expressions, closures, and substitutions.
 -   `StructIterator` and `GraphWalker` -- the heap-graph walking machinery that powers leak diagnostics. Types opt in by providing an `enumerate_struct` vtable entry.
--   `null_allocator` -- an allocator that always fails, used to prove a code path does not allocate.
 
 **Leak Checking (src/leak_check.zig)**: The diagnostic layer. When `options.trace_mem` is on, this tracks every alloc/free/incr ref/decr ref and prints if a leak occured.
 

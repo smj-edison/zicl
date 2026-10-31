@@ -377,8 +377,13 @@ pub const LazyFnRegistry = struct {
 ///    can just bump the instances count.
 pub const HashRegistry = struct {
     pub const Entry = struct {
-        /// Registry owns a reference to the representative.
+        /// Registry owns a reference of the representative.
         representative: *Object,
+        /// It's possible for another `Object` to have the same content, and thus,
+        /// resolve to the same hash. When we register a second object, we have
+        /// to keep the representative alive until both the respresentative and
+        /// second object are dropped. This is a total count of instances of this
+        /// hash (both our representative and duplicate instances).
         instances: std.atomic.Value(usize),
     };
 
@@ -420,14 +425,15 @@ pub const HashRegistry = struct {
             return;
         }
 
-        // Entry doesn't exist, so we'll create it.
+        // Entry doesn't exist yet, so we'll upgrade to exclusive lock to insert.
         registry.rw_lock.unlockShared(global_io);
         registry.rw_lock.lockUncancelable(global_io);
         defer registry.rw_lock.unlock(global_io);
 
         const new_entry = try registry.entries.getOrPut(global_gpa, key);
         if (new_entry.found_existing) {
-            if (obj.hash_metadata.fetchOr(.{ .hash_registered = true }, .acq_rel).hash_registered == true) {
+            const before_marking = obj.hash_metadata.fetchOr(.{ .hash_registered = true }, .acq_rel);
+            if (before_marking.hash_registered == true) {
                 // Someone registered it in-between upgrading the shared lock to an exclusive lock.
             } else {
                 // We successfully marked it as registered, so we can increment the instances count.
@@ -446,11 +452,16 @@ pub const HashRegistry = struct {
         }
     }
 
+    /// Called when either:
+    /// - `obj` is the representative and its ref_count just dropped to 1, or
+    /// - `obj` is a non-representative registered object and its ref_count just dropped to 0.
     pub fn unregister(registry: *HashRegistry, key: u256, obj: *Object) void {
         registry.rw_lock.lockSharedUncancelable(global_io);
 
         if (registry.entries.getPtr(key)) |entry| {
-            if (obj.hash_metadata.fetchAnd(.{ .is_representative = true }, .acq_rel).hash_registered == false) {
+            // Clear `.hash_registered`.
+            const before_clearing = obj.hash_metadata.fetchAnd(.{ .is_representative = true }, .acq_rel);
+            if (before_clearing.hash_registered == false) {
                 // Someone else unregistered this already, so no need to do anything.
                 registry.rw_lock.unlockShared(global_io);
             } else {
@@ -1866,7 +1877,7 @@ fn testSpecialSourceHash(ta: std.mem.Allocator) !void {
     // Over 1024 bytes, so the string rep is stored as a `SpecialString` and both
     // it and `Source.hash` have a slot to fill. A `Source` is the only type where
     // the two coexist, so it is the only place they can disagree.
-    const script = "set x 1\n" ** 200;
+    const script = memutil.repeat("set x 1\n", 200);
     comptime assert(script.len > hashutil.quick_hash_cutoff);
     const source = try objects.Source.new(script, .none, 1);
     defer source.asHead().dropReference();
