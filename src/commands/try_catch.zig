@@ -32,9 +32,9 @@ fn buildErrorOptions(
     // a return still travelling outward is on its way to completing normally, so
     // what the caller sees for it is ok.
     const visible_code: i64 = if (exit_code == .@"return")
-        @intFromEnum(@as(Interp.ReturnCode, .ok))
+        @backingInt(@as(Interp.ReturnCode, .ok))
     else
-        @intFromEnum(exit_code);
+        @backingInt(exit_code);
 
     try options.put(interned_code, objects.Integer.new(visible_code));
     try options.put(interned_level, objects.Integer.new(interp.return_propagate.left_to_go));
@@ -72,7 +72,7 @@ fn catchTryHelper(
     interp.pending_error_during.swapWithNone();
 
     // If we catch an return code and it's in this set, we propagate it up instead of returning it.
-    var to_propagate = std.EnumSet(Interp.ReturnCode).initEmpty();
+    var to_propagate = std.EnumSet(Interp.ReturnCode).empty;
     // By default these return codes are ignored, e.g. propagated.
     to_propagate.insert(.exit);
     // Out of memory belongs to the allocator's caller, not the script: catching it
@@ -355,7 +355,7 @@ fn catchTryHelper(
 
     switch (mode) {
         .@"catch" => {
-            interp.setResultInteger(@intFromEnum(Interp.ReturnCode.fromErrorUnion(script_result)));
+            interp.setResultInteger(@backingInt(Interp.ReturnCode.fromErrorUnion(script_result)));
             return;
         },
         .@"try" => {

@@ -356,10 +356,10 @@ fn checkIdMinting() !void {
     // skip-zero branch in `CancelableTask.Id.next` is ever executed.
     const Id = Threaded.CancelableTask.Id;
     const IdInt = @typeInfo(Id).@"enum".tag_type;
-    thread.task_counter = @enumFromInt(std.math.maxInt(IdInt));
+    thread.task_counter = @fromBackingInt(@intCast(std.math.maxInt(IdInt)));
     const wrapped = Threaded.startTask();
     try testing.expect(wrapped != .null);
-    try testing.expectEqual(@as(Id, @enumFromInt(1)), thread.task_counter);
+    try testing.expectEqual(@as(Id, @fromBackingInt(@intCast(1))), thread.task_counter);
     Threaded.finishTask();
 }
 

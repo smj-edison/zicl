@@ -726,7 +726,7 @@ pub const Expression = struct {
     };
 
     pub fn evalNode(interp: *Interp, nodes: []expr_parse.Node, node_index: expr_parse.Node.Index) EvalNodeError!Value {
-        const node = nodes[@intFromEnum(node_index)];
+        const node = nodes[@backingInt(node_index)];
         switch (node.tag) {
             .mul,
             .div,

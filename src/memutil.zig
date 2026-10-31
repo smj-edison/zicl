@@ -11,45 +11,23 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
-var null_ctx: usize = 0;
-/// Use to always fail any allocation operation.
-pub const null_allocator: Allocator = .{
-    .ptr = &null_ctx,
-    .vtable = &.{
-        .alloc = null_alloc,
-        .resize = null_resize,
-        .remap = null_remap,
-        .free = null_free,
-    },
-};
-fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
-    _ = ctx;
-    _ = n;
-    _ = alignment;
-    _ = ra;
-    return null;
+fn RepeatType(comptime T: type, comptime count: comptime_int) type {
+    const info = @typeInfo(T).array;
+    return [count * info.len]info.child;
 }
-fn null_resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_size: usize, return_address: usize) bool {
-    _ = ctx;
-    _ = buf;
-    _ = alignment;
-    _ = new_size;
-    _ = return_address;
-    return false;
-}
-fn null_remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
-    _ = context;
-    _ = memory;
-    _ = alignment;
-    _ = new_len;
-    _ = return_address;
-    return null;
-}
-fn null_free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_address: usize) void {
-    _ = ctx;
-    _ = buf;
-    _ = alignment;
-    _ = return_address;
+
+pub fn repeat(comptime pattern: anytype, comptime count: comptime_int) RepeatType(@TypeOf(pattern), count) {
+    const T = @TypeOf(pattern);
+    const info = @typeInfo(T);
+
+    if (info != .array) @compileError("repeat expects a fixed-size array literal, got: " ++ @typeName(T));
+
+    var result: [pattern.len * count]info.array.child = undefined;
+    inline for (0..count) |i| {
+        @memcpy(result[(i * pattern.len)..((i + 1) * pattern.len)], pattern);
+    }
+
+    return result;
 }
 
 /// Wraps a backing allocator and counts active allocations and bytes so callers

@@ -166,14 +166,9 @@ fn wrapErrorDetailsReturnType(ResultType: type) type {
         return error{ OutOfMemory, EvalError }!@typeInfo(ResultType).error_union.payload;
     }
 }
-/// Reject wrapping a call that already reports through the interpreter.
-///
-/// Such a call returns exactly what `wrapErrorDetailsReturnType` produces, and
-/// it consumed its own `ErrorDetails` on the way out. Wrapping it again means
-/// this call's `det` is never written, and `wrapError` then hands that
-/// uninitialized `message` to `setResultStringOwning`, which faults rather than
-/// failing. Catching it here turns a general protection exception into a
-/// compile error naming the call site.
+
+/// Makes sure that we don't accidentally use `wrapError` twice in a row, to
+/// avoid using `det` twice.
 fn assertWrappable(ResultType: type) void {
     comptime {
         const ErrorSet = switch (@typeInfo(ResultType)) {
@@ -184,10 +179,10 @@ fn assertWrappable(ResultType: type) void {
         };
         // `anyerror` and an unresolved inferred set carry no member list, so
         // they cannot be checked. `wrapShimmerFn` legitimately lands here.
-        const members = @typeInfo(ErrorSet).error_set orelse return;
+        const members = @typeInfo(ErrorSet).error_set.error_names orelse return;
         for (members) |member| {
-            const already_interpreter_level = std.mem.eql(u8, member.name, "OutOfMemory") or
-                std.mem.eql(u8, member.name, "EvalError");
+            const already_interpreter_level = std.mem.eql(u8, member, "OutOfMemory") or
+                std.mem.eql(u8, member, "EvalError");
             if (!already_interpreter_level) return;
         }
         @compileError("wrapError on a call that already reports its own errors, so this " ++

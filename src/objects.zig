@@ -1059,7 +1059,7 @@ pub fn EnumMapping(comptime E: type, include_numbers: bool) type {
                 for (values, 0..) |value, i| {
                     entries[i * 2] = .{ @tagName(value), value };
                     // Add an entry for the integer value of the enum, to match Tcl behavior.
-                    entries[i * 2 + 1] = .{ std.fmt.comptimePrint("{}", .{@intFromEnum(value)}), value };
+                    entries[i * 2 + 1] = .{ std.fmt.comptimePrint("{}", .{@backingInt(value)}), value };
                 }
                 break :blk entries;
             } else {
@@ -1343,12 +1343,9 @@ pub const Boolean = struct {
     }
 };
 
-pub fn quoteValues(gpa: std.mem.Allocator, items: []const Value) ![:0]u8 {
-    var fallback = std.heap.stackFallback(64, gpa);
-    // `stackFallback.get()` asserts it's called once, so reuse the stored allocator for both alloc and free.
-    const fb = fallback.get();
-    var quoting_types = try fb.alloc(strutil.QuotingType, items.len);
-    defer fb.free(quoting_types);
+pub fn quoteValues(gpa: std.mem.Allocator, scratch: std.mem.Allocator, items: []const Value) ![:0]u8 {
+    var quoting_types = try scratch.alloc(strutil.QuotingType, items.len);
+    defer scratch.free(quoting_types);
 
     var upper_bound_len: usize = 0;
     for (0.., items, quoting_types) |i, item, *quote_type| {
@@ -1650,7 +1647,7 @@ pub const List = struct {
 
     fn updateString(obj: *Object) !void {
         const as_list = obj.asType(List).?;
-        const bytes = try quoteValues(heap.global_gpa, as_list.items);
+        const bytes = try quoteValues(heap.global_gpa, heap.local_arena, as_list.items);
         try obj.setStringIgnoreRace(bytes);
     }
 
@@ -2539,7 +2536,7 @@ pub const Dictionary = struct {
 
     fn updateString(obj: *Object) !void {
         const as_dict = obj.asType(Dictionary).?;
-        const bytes = try quoteValues(heap.global_gpa, as_dict.items);
+        const bytes = try quoteValues(heap.global_gpa, heap.local_arena, as_dict.items);
         try obj.setStringIgnoreRace(bytes);
     }
 
