@@ -2894,7 +2894,7 @@ fn testBinaryModifiersAndExpressions(ta: std.mem.Allocator) !void {
         \\     set before "$n $_"
         \\     set bin [binary encode {n=u8 {payload=bytes len {$n}}} {n 5 payload abcde}]
         \\     set d [binary decode {n=u8 {payload=bytes len {$n}}} $bin]
-        \\     set after "$n $_ [info exists _cursor]"
+        \\     set after "$n $_ [vm exists _cursor]"
         \\     string cat $before | "$d::n $d::payload" | $after
         \\ }
         \\ run_decode

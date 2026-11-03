@@ -757,7 +757,7 @@ fn testTailcallThroughUplevel(ta: std.mem.Allocator) !void {
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("1",
-        \\ fn d {} { return [info level] }
+        \\ fn d {} { return [vm level] }
         \\ fn c {} { tailcall d }
         \\ fn b {} { uplevel 1 c }
         \\ fn a {} { tailcall b }
@@ -774,7 +774,7 @@ fn testTailcallChained(ta: std.mem.Allocator) !void {
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("1",
-        \\ fn c {} { return [info level] }
+        \\ fn c {} { return [vm level] }
         \\ fn b {} { tailcall tailcall c }
         \\ fn a {} { b }
         \\ a
@@ -790,7 +790,7 @@ fn testTailcallUplevel(ta: std.mem.Allocator) !void {
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult("2",
-        \\ fn c {} { return [info level] }
+        \\ fn c {} { return [vm level] }
         \\ fn b {} { uplevel 1 tailcall c }
         \\ fn a {} { b }
         \\ a

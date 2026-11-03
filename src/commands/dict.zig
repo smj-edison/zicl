@@ -443,7 +443,7 @@ fn testDictAssign(ta: std.mem.Allocator) !void {
     // for Tcl's [dict with]: an absent key stays absent rather than erroring.
     try interp.testExpectScriptResult("no",
         \\ dict assign -all {a 1}
-        \\ expr {[info exists notInTheDict] ? "yes" : "no"}
+        \\ expr {[vm exists notInTheDict] ? "yes" : "no"}
     );
 
     // Reaches inherited keys, and binds the link itself as a variable no more
