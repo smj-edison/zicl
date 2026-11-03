@@ -14270,6 +14270,22 @@ fn spawnPosix(t: *Threaded, options: process.SpawnOptions) process.SpawnError!Sp
             }
         }
 
+        // We don't want the child process to inherit the parent's signal
+        // configuration, as that may cause the child process to inherit
+        // ignoring SIGPIPE.
+        if (posix.Sigaction != void) {
+            if (have_sig_pipe) {
+                const act: posix.Sigaction = .{
+                    .handler = .{ .handler = posix.SIG.DFL },
+                    .mask = posix.sigemptyset(),
+                    .flags = 0,
+                };
+                posix.sigaction(.PIPE, &act, null);
+            }
+            const empty_mask = posix.sigemptyset();
+            posix.sigprocmask(posix.SIG.SETMASK, &empty_mask, null);
+        }
+
         const err = posixExec(options.exe, argv_buf.ptr, options.expand_arg0, env_block, PATH);
         forkBail(ep1, err);
     }

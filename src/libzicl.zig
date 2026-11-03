@@ -215,6 +215,16 @@ export fn Zicl_Duplicate(value: Value, out: *Value) ReturnCode {
     return .ok;
 }
 
+export fn Zicl_DuplicateHead(obj: *const heap.Object, out: **heap.Object) ReturnCode {
+    const new_obj = heap.Object.newObjectWithVTable(obj.vtable) catch return .oom;
+    obj.duplicateHeadOnto(new_obj) catch {
+        heap.global_gpa.destroy(new_obj);
+        return .oom;
+    };
+    out.* = new_obj;
+    return .ok;
+}
+
 export fn Zicl_DuplicateAsBoxed(value: Value) ?*heap.Object {
     return value.duplicateAsBoxed() catch null;
 }
@@ -264,18 +274,9 @@ export fn Zicl_NewObj(
         @panic("Zicl_NewObj size exceeds ZICL_OBJECT_BODY_MAX_SIZE");
     }
 
-    const obj = heap.global_gpa.create(heap.Object) catch return null;
-    obj.* = .{
-        .vtable = vtable,
-        .ref_count = 1,
-        .metadata = .{},
-        .hash_metadata = .init(.{}),
-        .string = .init(null),
-        .string_metadata = .init(.{}),
-        .body_backing = @splat(0),
-        .sequence_number = if (options.trace_mem) heap.Object.next_sequence_number.fetchAdd(1, .monotonic) else 0,
-    };
-    leak_check.globalTrace(obj, .alloc);
+    const obj = heap.Object.newObjectWithVTable(vtable) catch return null;
+    obj.string = .init(null);
+    obj.string_metadata = .init(.{});
 
     out_body.* = &obj.body_backing;
     return obj;
@@ -385,6 +386,12 @@ export fn Zicl_NewDouble(value: f64) Value {
 
 export fn Zicl_NewBool(value: bool) Value {
     return objects.Boolean.new(value);
+}
+
+export fn Zicl_GetInt(interp: *Interp, shim: *Shimmerable, out: *c_int) ReturnCode {
+    const val = interp.getInteger(shim) catch |err| return ReturnCode.fromError(err);
+    out.* = std.math.cast(c_int, val) orelse return .@"error";
+    return .ok;
 }
 
 export fn Zicl_GetLong(interp: *Interp, shim: *Shimmerable, out: *c_long) ReturnCode {
@@ -568,6 +575,17 @@ export fn Zicl_AsDictMut(interp: *Interp, value: Value, out: *?*Dictionary) Retu
 export fn Zicl_DupAsDict(interp: *Interp, value: Value, out: *?*Dictionary) ReturnCode {
     var det: ErrorDetails = undefined;
     if (interp.wrapError(&det, value.duplicateAsType(Dictionary, &det))) |dup| {
+        out.* = dup;
+        return .ok;
+    } else |err| {
+        out.* = null;
+        return ReturnCode.fromError(err);
+    }
+}
+
+export fn Zicl_DupAsFlattenedDict(interp: *Interp, shim: *Shimmerable, out: *?*Dictionary) ReturnCode {
+    var det: ErrorDetails = undefined;
+    if (interp.wrapError(&det, Dictionary.dupAsFlattened(&det, shim))) |dup| {
         out.* = dup;
         return .ok;
     } else |err| {
@@ -931,12 +949,31 @@ const ParsedName = extern struct {
     id: Capability.Id,
 };
 
-export fn Zicl_CapNew(head: *Capability.Head, out: *Value) ReturnCode {
+export fn Zicl_CapNewOwning(head: *Capability.Head, out: *Value) ReturnCode {
     head.state = .init(.{ .in_flight = 0, .close_initiated = false });
     head.ref_count = .init(1);
     head.id = .not_set;
     const cap = Capability.newTakingOwnership(head) catch return .oom;
     out.* = cap.asHead().asValue();
+    return .ok;
+}
+
+export fn Zicl_CapNewReferencing(head: *Capability.Head, out: *Value) ReturnCode {
+    assert(head.id.get() != null);
+    const cap = heap.Object.newObject(Capability) catch return .oom;
+    cap.body.* = .{ .head = head.takeReference() };
+    out.* = cap.head.asValue();
+    return .ok;
+}
+
+export fn Zicl_CapHeadRegister(head: *Capability.Head) ReturnCode {
+    head.state = .init(.{ .in_flight = 0, .close_initiated = false });
+    head.ref_count = .init(1);
+    head.id = .not_set;
+    Capability.registry.register(head) catch {
+        head.closeAndDropReference();
+        return .oom;
+    };
     return .ok;
 }
 
@@ -976,6 +1013,17 @@ export fn Zicl_CapClose(head: *Capability.Head) void {
 
 export fn Zicl_CapIsClosed(head: *Capability.Head) bool {
     return head.hasCloseBeenInitiated();
+}
+
+export fn Zicl_CapMarkInFlight(interp: *Interp, head: *Capability.Head) ReturnCode {
+    head.markInFlight() catch {
+        var det: ErrorDetails = undefined;
+        return ReturnCode.fromError(interp.wrapError(
+            &det,
+            Capability.staleError(&det, std.mem.span(head.vtable.name)),
+        ));
+    };
+    return .ok;
 }
 
 export fn Zicl_CapDropInFlight(head: *Capability.Head) void {

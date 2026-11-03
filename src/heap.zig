@@ -1453,12 +1453,10 @@ pub const Object = extern struct {
         return special;
     }
 
-    pub fn newObjectUninitialized(T: type) !struct { head: *Object, body: *T } {
-        assertValidType(T);
-
+    pub fn newObjectWithVTable(vtable: *const VTable) !*Object {
         const obj = try global_gpa.create(Object);
         obj.* = .{
-            .vtable = &T.vtable,
+            .vtable = vtable,
             .ref_count = 1,
             .metadata = .{},
             .hash_metadata = .init(.{}),
@@ -1470,6 +1468,13 @@ pub const Object = extern struct {
 
         leak_check.globalTrace(obj, .alloc);
 
+        return obj;
+    }
+
+    pub fn newObjectUninitialized(T: type) !struct { head: *Object, body: *T } {
+        assertValidType(T);
+
+        const obj = try newObjectWithVTable(&T.vtable);
         return .{ .head = obj, .body = obj.asType(T).? };
     }
 
@@ -2201,7 +2206,7 @@ fn testSpecialSourceHash(ta: std.mem.Allocator) !void {
     // the two coexist, so it is the only place they can disagree.
     const script = memutil.repeat("set x 1\n", 200);
     comptime assert(script.len > hashutil.quick_hash_cutoff);
-    const source = try objects.Source.new(script, .none, 1);
+    const source = try objects.Source.new(&script, .none, 1);
     defer source.asHead().dropReference();
 
     const hash = try source.asHead().getHashRegistering();
@@ -2272,10 +2277,10 @@ fn testSpecialStringSlidingWindowHashRef(ta: std.mem.Allocator) !void {
             "a",
             "blake3~",
             "blake3~not_a_valid_hash_because_of_bang!_padding_",
-            "x" ** 48,
-            "x" ** 49,
-            "x" ** 50,
-            "x" ** 51,
+            &memutil.repeat("x", 48),
+            &memutil.repeat("x", 49),
+            &memutil.repeat("x", 50),
+            &memutil.repeat("x", 51),
         };
         const suffixes = [_][]const u8{
             "",

@@ -40,7 +40,7 @@ typedef enum Zicl_RetCode : int {
 
 /* Stolen and renamed from the Linux kernel's `container_of`. */
 #define Zicl_ContainerOf(ptr, type, member) ({ \
-    const typeof(((type *)0)->member) *__mptr = (ptr); \
+    const __typeof__(((type *)0)->member) *__mptr = (ptr); \
     (type *)((char *)__mptr - offsetof(type, member)); })
 
 /* ===== Core value types ===== */
@@ -259,8 +259,11 @@ void Zicl_MakeCrossthread(Zicl_Val value);
 /* If an object variant, this will call the object's duplicate function.
  * If not, just returns the value back. */
 Zicl_RetCode Zicl_Duplicate(Zicl_Val value, Zicl_Val *out);
+/* Duplicates just the head of the object. Use for implementations of the
+ * `duplicate` vtable function. */
+Zicl_RetCode Zicl_DuplicateHead(const Zicl_Obj *obj, Zicl_Obj **out);
 /* This guarantees to duplicate the value as an object, whereas `Zicl_Duplicate`
- * may pass the value back if not an object variant. */
+ * may pass the value back if not an object variant. Returns NULL on OOM. */
 Zicl_Obj *Zicl_DuplicateAsBoxed(Zicl_Val value);
 /* Get the object's string rep. NULL on OOM. */
 const char *Zicl_String(Zicl_Val object);
@@ -425,6 +428,7 @@ static inline Zicl_Val Zicl_NewBool(bool value) {
         .tag = ZICL_TAG_BOOLEAN
     } };
 };
+Zicl_RetCode Zicl_GetInt(Zicl_Interp *interp, Zicl_Shim *shim, int *out);
 Zicl_RetCode Zicl_GetLong(Zicl_Interp *interp, Zicl_Shim *shim, long *out);
 Zicl_RetCode Zicl_GetDouble(Zicl_Interp *interp, Zicl_Shim *shim, double *out);
 Zicl_RetCode Zicl_GetBoolean(Zicl_Interp *interp, Zicl_Shim *shim, int *out);
@@ -488,6 +492,9 @@ Zicl_RetCode Zicl_ShimDictGet(Zicl_Interp *interp, Zicl_Shim *shim, Zicl_Val key
  *sets `out` to NULL, at which point the caller should use `Zicl_DupAsDict`. */
 Zicl_RetCode Zicl_AsDictMut(Zicl_Interp *interp, Zicl_Val value, Zicl_Dict **out);
 Zicl_RetCode Zicl_DupAsDict(Zicl_Interp *interp, Zicl_Val value, Zicl_Dict **out);
+/* Shimmers `shim` to a dictionary and returns a new mutable dictionary with
+ * all `~parent` links flattened and duplicate keys removed. */
+Zicl_RetCode Zicl_DupAsFlattenedDict(Zicl_Interp *interp, Zicl_Shim *shim, Zicl_Dict **out);
 /* Set `key` to `value`, borrowing `value` and potentially `key`. Asserts that
  *`dictPtr` can mutate. */
 Zicl_RetCode Zicl_DictPut(Zicl_Dict *dictPtr, Zicl_Val key, Zicl_Val value);
@@ -640,7 +647,13 @@ typedef struct Zicl_CapHead {
 
 /* Registers `head` in the Capability DB and creates a Capability object.
  * `head->vtable` needs to be set, but the rest is initialized here. */
-Zicl_RetCode Zicl_CapNew(Zicl_CapHead *head, Zicl_Val *out);
+Zicl_RetCode Zicl_CapNewOwning(Zicl_CapHead *head, Zicl_Val *out);
+/* Creates a new capability object based on an existing head, referencing
+ * that head. */
+Zicl_RetCode Zicl_CapNewReferencing(Zicl_CapHead *head, Zicl_Val *out);
+/* Registers `head` in the Capability DB with an initial ref_count of 1 for the
+ * caller (plus 1 for the registry). `head->vtable` must be set. */
+Zicl_RetCode Zicl_CapRegister(Zicl_CapHead *head);
 
 /* Attempts to resolve `shim` as a live capability, failing if
  * 1. it's not a capability, 2. it's not the right capability type,
@@ -653,6 +666,7 @@ Zicl_RetCode Zicl_ResolveCap(Zicl_Interp *interp, Zicl_Shim *shim, const Zicl_Ca
 Zicl_CapHead *Zicl_CapTakeRef(Zicl_CapHead *head);
 void Zicl_CapDropRef(Zicl_CapHead *head);
 void Zicl_CapClose(Zicl_CapHead *head);
+Zicl_RetCode Zicl_CapMarkInFlight(Zicl_Interp *interp, Zicl_CapHead *head);
 void Zicl_CapDropInFlight(Zicl_CapHead *head);
 bool Zicl_CapIsClosed(Zicl_CapHead *head);
 

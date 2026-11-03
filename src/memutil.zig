@@ -12,17 +12,30 @@ const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
 fn RepeatType(comptime T: type, comptime count: comptime_int) type {
-    const info = @typeInfo(T).array;
+    const ArrayType = switch (@typeInfo(T)) {
+        .array => T,
+        .pointer => |ptr| switch (@typeInfo(ptr.child)) {
+            .array => ptr.child,
+            else => @compileError("expected array or pointer to array"),
+        },
+        else => @compileError("expected array or pointer to array"),
+    };
+    const info = @typeInfo(ArrayType).array;
     return [count * info.len]info.child;
 }
 
 pub fn repeat(comptime pattern: anytype, comptime count: comptime_int) RepeatType(@TypeOf(pattern), count) {
     const T = @TypeOf(pattern);
-    const info = @typeInfo(T);
+    const ElemType = switch (@typeInfo(T)) {
+        .array => |arr| arr.child,
+        .pointer => |ptr| switch (@typeInfo(ptr.child)) {
+            .array => |arr| arr.child,
+            else => @compileError("expected array or pointer to array"),
+        },
+        else => @compileError("expected array or pointer to array"),
+    };
 
-    if (info != .array) @compileError("repeat expects a fixed-size array literal, got: " ++ @typeName(T));
-
-    var result: [pattern.len * count]info.array.child = undefined;
+    var result: [pattern.len * count]ElemType = undefined;
     inline for (0..count) |i| {
         @memcpy(result[(i * pattern.len)..((i + 1) * pattern.len)], pattern);
     }

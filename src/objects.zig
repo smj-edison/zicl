@@ -1360,8 +1360,8 @@ pub fn quoteValues(gpa: std.mem.Allocator, scratch: std.mem.Allocator, items: []
         }
 
         upper_bound_len += strutil.quoteSize(quote_type.*, item_bytes.len);
-        upper_bound_len += 1; // Space between each element.
     }
+    upper_bound_len += items.len -| 1; // Spaces between elements.
 
     var unfinished_str = try gpa.alloc(u8, upper_bound_len + 1);
     errdefer gpa.free(unfinished_str);
@@ -1385,12 +1385,14 @@ pub fn quoteValues(gpa: std.mem.Allocator, scratch: std.mem.Allocator, items: []
     // Slap a nul on the end.
     unfinished_str[written] = 0x00;
 
-    // We actually need to realloc, because `allocator.free` needs the
-    // original slice length (and we don't track the original slice
-    // length, only the accessible length). TODO PERF might be worth
-    // creating a long string if this string is long enough.
-    const finished_str = try gpa.realloc(unfinished_str, written + 1);
-    return finished_str[0..written :0];
+    if (unfinished_str.len != written + 1) {
+        // As the written length doesn't match the allocation length,
+        // we need to realloc, as the slice will be freed directly
+        // later on, which requires its allocated length.
+        const finished_str = try gpa.realloc(unfinished_str, written + 1);
+        return finished_str[0..written :0];
+    }
+    return unfinished_str[0..written :0];
 }
 
 pub const List = struct {
@@ -2443,6 +2445,26 @@ pub const Dictionary = struct {
             result.mapping.deinit(arena);
         }
     };
+
+    pub fn dupAsFlattened(det: ?*ErrorDetails, shim: *Shimmerable) !*Dictionary {
+        const as_dict = try shimmerFrom(det, shim);
+        if (try as_dict.getNoFollow(interned_tilde_parent) == null) {
+            const dup = try shim.current().duplicateAsType(Dictionary, det);
+            _ = dup.removeDuplicates(null);
+            return dup;
+        }
+
+        var kv_result = try getKvPairs(det, heap.local_arena, shim);
+        defer kv_result.deinit(heap.local_arena);
+
+        const count = kv_result.mapping.count();
+        const flat = try newWithCapacity(&.{}, count * 2);
+        errdefer flat.asHead().dropReference();
+        for (kv_result.mapping.keys(), kv_result.mapping.values()) |k, v| {
+            try flat.put(k, v);
+        }
+        return flat;
+    }
 
     pub fn getKvPairs(det: ?*ErrorDetails, arena: std.mem.Allocator, shim: *Shimmerable) !KvResult {
         var result: KvResult = .{ .mapping = .empty };
