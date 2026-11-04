@@ -638,7 +638,12 @@ const ValueRep = extern struct {
                 // be equal strings, if one pointer came from a different
                 // source. Hence, we fall through.
             },
-            .pointer => {},
+            .pointer => {
+                switch (b.tag) {
+                    .pointer => if (a.as.pointer == b.as.pointer) return true,
+                    else => {},
+                }
+            },
             .none => return b.tag == .none,
             .external => return false,
         }
