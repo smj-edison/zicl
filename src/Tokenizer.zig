@@ -451,7 +451,7 @@ fn nextQuotedStringToken(self: *Tokenizer) !Token {
     return Error.MissingCloseQuote;
 }
 
-pub fn nextVariableToken(self: *Tokenizer) !Token {
+pub fn nextVariableToken(self: *Tokenizer) error{ MissingCloseBrace, MissingCloseParen, NotVariable, TrailingBackslash }!Token {
     const start = self.mark();
 
     // Skip the '$'
@@ -460,7 +460,7 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
     if (self.atEnd()) {
         // rewind our location
         self.restore(start);
-        return Error.NotVariable;
+        return error.NotVariable;
     }
 
     if (self.current() == '(') {
@@ -494,7 +494,7 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
                 .index = brace_index,
                 .line_no = brace_line_no,
             };
-            return Error.MissingCloseBrace;
+            return error.MissingCloseBrace;
         }
 
         token.loc.end = self.index;
@@ -527,7 +527,7 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
     // a string.
     if (token.loc.start == self.index) {
         self.restore(start);
-        return Error.NotVariable;
+        return error.NotVariable;
     }
 
     return token;
@@ -535,7 +535,7 @@ pub fn nextVariableToken(self: *Tokenizer) !Token {
 
 /// Called with `self` pointing at the '('. Captures the value between
 /// the parentheses.
-fn nextExpressionSugarToken(self: *Tokenizer) Error!Token {
+fn nextExpressionSugarToken(self: *Tokenizer) error{ TrailingBackslash, MissingCloseParen }!Token {
     // Save in case the paren is not matched for better error message.
     const index = self.index;
     const line_no = self.line_no;
@@ -581,7 +581,7 @@ fn nextExpressionSugarToken(self: *Tokenizer) Error!Token {
         .index = index,
         .line_no = line_no,
     };
-    return Error.MissingCloseParen;
+    return error.MissingCloseParen;
 }
 
 pub fn nextCommandToken(self: *Tokenizer) Error!Token {
@@ -1194,7 +1194,7 @@ pub fn convertTokenizerError(gpa: std.mem.Allocator, err: Tokenizer.Error) error
         error.FunctionMissingParentheses => try gpa.dupeSentinel(u8, "function missing parentheses", 0),
         error.NotOperator => try gpa.dupeSentinel(u8, "not operator", 0),
         error.NotNumber => try gpa.dupeSentinel(u8, "not number", 0),
-        error.NotVariable => unreachable,
+        error.NotVariable => try gpa.dupeSentinel(u8, "not variable", 0),
     };
 }
 
@@ -1223,13 +1223,13 @@ fn singleCharToken(self: *Tokenizer, tag: Token.Tag) Token {
     };
 }
 
-fn errorIfAtEndAfterBackslash(self: *Tokenizer) !void {
+fn errorIfAtEndAfterBackslash(self: *Tokenizer) error{TrailingBackslash}!void {
     if (self.atEnd()) {
         self.error_details = .{
             .index = self.index,
             .line_no = self.line_no,
         };
-        return Error.TrailingBackslash;
+        return error.TrailingBackslash;
     }
 }
 

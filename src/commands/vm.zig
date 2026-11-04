@@ -28,7 +28,7 @@ pub fn vmCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .{ .variant = .frame, .usage = "?level?", .min_args = 0, .max_args = 1 },
         .{ .variant = .hostname, .usage = "", .min_args = 0, .max_args = 0 },
         .{ .variant = .level, .usage = "?levelNum?", .min_args = 0, .max_args = 1 },
-        .{ .variant = .parse, .usage = "parseType ?args...? -- buffer", .min_args = 3 },
+        .{ .variant = .parse, .usage = "parseType buffer", .min_args = 2, .max_args = 2 },
         .{ .variant = .source, .usage = "script ?fileName lineNo?", .min_args = 1, .max_args = 3 },
         .{ .variant = .stacktrace, .usage = "", .min_args = 0, .max_args = 0 },
         .{ .variant = .type, .usage = "object", .min_args = 1, .max_args = 1 },
@@ -155,22 +155,12 @@ pub fn vmCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         .parse => {
             const ParseType = enum {
                 command,
+                variable,
             };
             const EnumParser = objects.EnumConstructor(ParseType, false);
             const parse_type = try interp.wrapError(&det, EnumParser.get(&det, &args[2]));
 
-            var index: usize = 3;
-            var dash_dash_index: ?usize = 0;
-            while (index < args.len) : (index += 1) {
-                if (try args[index].equalsString("--")) {
-                    dash_dash_index = index;
-                    break;
-                }
-            }
-
-            const sub_arg_count = dash_dash_index orelse return interp.setErrorInterned("-- missing");
-            if (sub_arg_count + 1 >= args.len) return interp.setErrorInterned("parse buffer missing");
-            const buffer = try args[sub_arg_count + 1].getString();
+            const buffer = try args[3].getString();
             if (buffer.len < 1) return interp.setErrorInterned("empty buffer");
 
             var tokenizer = Tokenizer.init(buffer, 1);
@@ -178,19 +168,29 @@ pub fn vmCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
                 .command => {
                     if (buffer[0] != '[') return interp.setErrorInterned("must start with [");
                     const token = tokenizer.nextCommandToken() catch |err| {
-                        return interp.setResultStringOwning(try Tokenizer.convertTokenizerError(heap.global_gpa, err));
+                        try interp.setResultStringOwning(try Tokenizer.convertTokenizerError(heap.global_gpa, err));
+                        return error.EvalError;
                     };
 
                     const token_value = try String.newValue(buffer[token.loc.start..token.loc.end]);
                     defer token_value.dropReference();
-                    const after_end_bracket = token.loc.end + 1;
-                    const remaining = if (after_end_bracket < buffer.len)
-                        try String.newValue(buffer[after_end_bracket..])
-                    else
-                        heap.interned_empty_string;
-                    defer remaining.dropReference();
+                    const advance_by = Value.newInt(tokenizer.index);
 
-                    const return_list = try List.new(&.{ token_value, remaining });
+                    const return_list = try List.new(&.{ token_value, advance_by });
+                    interp.setResultOwning(return_list.asHead().asValue());
+                },
+                .variable => {
+                    if (buffer[0] != '$') return interp.setErrorInterned("must start with $");
+                    const token = tokenizer.nextVariableToken() catch |err| {
+                        try interp.setResultStringOwning(try Tokenizer.convertTokenizerError(heap.global_gpa, err));
+                        return error.EvalError;
+                    };
+
+                    const token_value = try String.newValue(buffer[token.loc.start..token.loc.end]);
+                    defer token_value.dropReference();
+                    const advance_by = Value.newInt(tokenizer.index);
+
+                    const return_list = try List.new(&.{ token_value, advance_by });
                     interp.setResultOwning(return_list.asHead().asValue());
                 },
             }

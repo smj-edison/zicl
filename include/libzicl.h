@@ -653,7 +653,7 @@ Zicl_RetCode Zicl_CapNewOwning(Zicl_CapHead *head, Zicl_Val *out);
 Zicl_RetCode Zicl_CapNewReferencing(Zicl_CapHead *head, Zicl_Val *out);
 /* Registers `head` in the Capability DB with an initial ref_count of 1 for the
  * caller (plus 1 for the registry). `head->vtable` must be set. */
-Zicl_RetCode Zicl_CapRegister(Zicl_CapHead *head);
+Zicl_RetCode Zicl_CapHeadRegister(Zicl_CapHead *head);
 
 /* Attempts to resolve `shim` as a live capability, failing if
  * 1. it's not a capability, 2. it's not the right capability type,
