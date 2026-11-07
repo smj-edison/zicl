@@ -11,6 +11,85 @@ const Threaded = @import("vendor/Threaded.zig");
 pub threadlocal var local_stdout_fd: i32 = std.posix.STDOUT_FILENO;
 pub threadlocal var local_stderr_fd: i32 = std.posix.STDERR_FILENO;
 
+/// Small helper struct to manage correct unlocking, as well as lock upgrading.
+///
+/// Note that downgrading and upgrading _leaves a gap_ where another person
+/// may be able to acquire the lock.
+pub const RwLockHelper = struct {
+    lock_state: enum { shared, exclusive, unlocked },
+    lock: *Io.RwLock,
+
+    pub fn init(lock: *Io.RwLock) RwLockHelper {
+        return .{
+            .lock_state = .unlocked,
+            .lock = lock,
+        };
+    }
+
+    pub fn initShared(lock: *Io.RwLock, io: Io) RwLockHelper {
+        var helper: RwLockHelper = .init(lock);
+        helper.lockSharedAsserting(io);
+        return helper;
+    }
+
+    pub fn initExclusive(lock: *Io.RwLock, io: Io) RwLockHelper {
+        var helper: RwLockHelper = .init(lock);
+        helper.lockExclusiveAsserting(io);
+        return helper;
+    }
+
+    /// Must be .unlocked.
+    pub fn lockSharedAsserting(helper: *RwLockHelper, io: Io) void {
+        switch (helper.lock_state) {
+            .unlocked => helper.lock.lockSharedUncancelable(io),
+            .shared, .exclusive => unreachable,
+        }
+        helper.lock_state = .shared;
+    }
+
+    pub fn lockSharedMaybeDowngrade(helper: *RwLockHelper, io: Io) void {
+        switch (helper.lock_state) {
+            .unlocked => helper.lock.lockSharedUncancelable(io),
+            .exclusive => {
+                helper.lock.unlock(io);
+                helper.lock.lockSharedUncancelable(io);
+            },
+            .shared => {},
+        }
+        helper.lock_state = .shared;
+    }
+
+    /// Must be .unlocked.
+    pub fn lockExclusiveAsserting(helper: *RwLockHelper, io: Io) void {
+        switch (helper.lock_state) {
+            .unlocked => helper.lock.lockUncancelable(io),
+            .shared, .exclusive => unreachable,
+        }
+        helper.lock_state = .exclusive;
+    }
+
+    pub fn lockExclusiveMaybeUpgrade(helper: *RwLockHelper, io: Io) void {
+        switch (helper.lock_state) {
+            .unlocked => helper.lock.lockUncancelable(io),
+            .shared => {
+                helper.lock.unlockShared(io);
+                helper.lock.lockUncancelable(io);
+            },
+            .exclusive => {},
+        }
+        helper.lock_state = .exclusive;
+    }
+
+    pub fn unlock(helper: *RwLockHelper, io: Io) void {
+        switch (helper.lock_state) {
+            .shared => helper.lock.unlockShared(io),
+            .exclusive => helper.lock.unlock(io),
+            .unlocked => unreachable,
+        }
+        helper.lock_state = .unlocked;
+    }
+};
+
 // TODO threadlocal version of stdout and stderr
 
 pub fn getStdout() std.Io.File {

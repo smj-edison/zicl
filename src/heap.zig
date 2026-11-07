@@ -459,52 +459,69 @@ pub const HashRegistry = struct {
     /// Called when either:
     /// - `obj` is the representative and its ref_count just dropped to 1, or
     /// - `obj` is a non-representative registered object and its ref_count just dropped to 0.
-    pub fn unregister(registry: *HashRegistry, key: u256, obj: *Object) void {
-        registry.rw_lock.lockSharedUncancelable(global_io);
+    pub fn unregister(registry: *HashRegistry, key: u256, obj: *Object, is_rep: bool) void {
+        var lock_helper: ioutil.RwLockHelper = .init(&registry.rw_lock);
+        if (is_rep) {
+            // We actually need to clear `.hash_registered` of the rep under an
+            // exclusive lock, since otherwise we might atomically clear `.hash_registered`
+            // while another thread returned it from `register`, causing the other thread
+            // to return a broken object.
+            lock_helper.lockExclusiveAsserting(global_io);
+        } else {
+            lock_helper.lockSharedAsserting(global_io);
+        }
 
-        if (registry.entries.getPtr(key)) |entry| {
+        if (registry.entries.getPtr(key)) |entry_first_load| {
             // Clear `.hash_registered`.
             const before_clearing = obj.hash_metadata.fetchAnd(.{ .is_representative = true }, .acq_rel);
             if (before_clearing.hash_registered == false) {
                 // Someone else unregistered this already, so no need to do anything.
-                registry.rw_lock.unlockShared(global_io);
+                lock_helper.unlock(global_io);
+                return;
             } else {
                 // We were the ones to successfully set `value` as not registered.
-                const instance_count = entry.instances.fetchSub(1, .monotonic) - 1;
+                const instance_count = entry_first_load.instances.fetchSub(1, .monotonic) - 1;
                 if (instance_count == 0) {
                     // This was the last instance of this hash, so we can now clean it up.
 
-                    registry.rw_lock.unlockShared(global_io);
-                    registry.rw_lock.lockUncancelable(global_io);
+                    lock_helper.lockExclusiveMaybeUpgrade(global_io);
 
                     // The entry should still exist here, as we were the ones who set instances
                     // to 0. It could have moved locations though, when upgrading to an exclusive
                     // lock.
-                    const entry_second_check = registry.entries.getPtr(key).?;
-                    const entry_derefed = entry_second_check.*;
-                    if (entry_second_check.instances.load(.monotonic) != 0) {
+                    const entry_second_load = registry.entries.getPtr(key) orelse {
+                        // Our thread could drop instances to 0, but then a second
+                        // thread could come in, resurrect the object, drop instances
+                        // to 0 a second time, and then remove it from the registry.
+                        // Hence we return early if it's no longer in the registry.
+                        lock_helper.unlock(global_io);
+                        return;
+                    };
+                    const entry_derefed = entry_second_load.*;
+                    if (entry_second_load.instances.load(.monotonic) != 0) {
                         // Someone was able to re-register this value when upgrading
                         // to an exclusive lock.
-                        registry.rw_lock.unlock(global_io);
+                        lock_helper.unlock(global_io);
                         return;
                     }
 
                     _ = entry_derefed.representative.hash_metadata.fetchAnd(.{}, .acq_rel);
                     assert(registry.entries.remove(key));
-                    registry.rw_lock.unlock(global_io);
+                    lock_helper.unlock(global_io);
 
                     // Make sure to `decrRefCount` only after unlocking the mutex, to avoid
                     // recursive locking.
                     entry_derefed.representative.dropReference();
+                    return;
                 } else {
-                    registry.rw_lock.unlockShared(global_io);
+                    lock_helper.unlock(global_io);
+                    return;
                 }
             }
-
-            return;
         } else {
             // Was already unregistered by the time we checked, so nothing to do.
-            registry.rw_lock.unlockShared(global_io);
+            lock_helper.unlock(global_io);
+            return;
         }
     }
 };
@@ -1823,7 +1840,7 @@ pub const Object = extern struct {
                 // which means that the hash was registered and owned
                 // by the registry.
                 const hash = obj.getHashNoRegister() catch unreachable;
-                registered_hashes.unregister(hash, obj);
+                registered_hashes.unregister(hash, obj, metadata.is_representative);
             }
         } else if (new_ref_count == 0) {
             if (metadata.hash_registered) {
@@ -1834,7 +1851,7 @@ pub const Object = extern struct {
                 // we are the true last owners. When we brought it to one,
                 // there was still someone else who could bring it to zero.
                 const hash = obj.getHashNoRegister() catch unreachable;
-                registered_hashes.unregister(hash, obj);
+                registered_hashes.unregister(hash, obj, metadata.is_representative);
             }
             obj.deinit();
         }

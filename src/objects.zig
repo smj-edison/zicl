@@ -423,6 +423,7 @@ pub const Source = extern struct {
     pub fn new(bytes: []const u8, file_name: OptionalValue, line: u32) !*Source {
         const obj = try String.newObject(bytes);
 
+        obj.invalidateInternalRep();
         obj.vtable = &vtable;
         const as_source = obj.asType(Source).?;
         as_source.* = .{
@@ -437,6 +438,7 @@ pub const Source = extern struct {
     pub fn newFromEscaped(escaped: []const u8, file_name: OptionalValue, line: u32) !*Source {
         const obj = (try String.newFromEscaped(escaped)).asHead();
 
+        obj.invalidateInternalRep();
         obj.vtable = &vtable;
         const as_source = obj.asType(Source).?;
         as_source.* = .{
