@@ -1142,6 +1142,8 @@ pub fn getExpression(interp: *Interp, value: Value, cache_key: u256) !*Expressio
 }
 
 pub fn evalExpression(interp: *Interp, value: Value) !Value {
+    if (interp.stop_executing.load(.monotonic)) return error.Exit;
+
     // Combine the signature's cache id with the expression's content hash, so
     // identical expressions at different call sites get their own cached
     // variable lookups.
@@ -1150,6 +1152,7 @@ pub fn evalExpression(interp: *Interp, value: Value) !Value {
 
     return Expression.evalNode(interp, expr.parsed.nodes, expr.parsed.root_node) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.Exit => error.Exit,
         else => {
             var alloc_writer: std.Io.Writer.Allocating = .init(heap.global_gpa);
             defer alloc_writer.deinit();
@@ -1331,6 +1334,10 @@ pub fn invokeCommandMaybeMethod(
     args_raw: []Shimmerable,
 ) InternalEvalError!void {
     var args = args_raw[1..];
+    if (args.len == 0) {
+        interp.setEmptyResult();
+        return;
+    }
 
     const cmd_and_self = try interp.getCommandAndSelfParam(args);
     var command: CommandVariant = cmd_and_self.command orelse {
@@ -1502,10 +1509,17 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     }
     defer for (args_raw) |*arg| arg.deinit();
 
+    if (args.len == 0) {
+        interp.setEmptyResult();
+        return;
+    }
+
     try interp.invokeCommandMaybeMethod(args_raw);
 }
 
 pub fn evalValueInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) InternalEvalError!void {
+    if (interp.stop_executing.load(.monotonic)) return error.Exit;
+
     // A loop evaluates its body through here once per iteration, which is what
     // keeps an iterating script from accumulating. Nesting is safe, since an
     // inner evaluation snapshots at a higher watermark than an outer one.
@@ -1619,6 +1633,24 @@ pub fn evalFile(interp: *Interp, filename: []const u8) InternalEvalError!void {
     defer source.asHead().dropReference();
 
     try interp.evalValue(source.asHead().asValue());
+}
+
+pub fn clearCachesRetainingCapacity(interp: *Interp) void {
+    var scripts = interp.parsed_scripts.valueIterator();
+    while (scripts.next()) |script| script.*.asHead().dropReference();
+    interp.parsed_scripts.clearRetainingCapacity();
+
+    var exprs = interp.parsed_exprs.valueIterator();
+    while (exprs.next()) |expr| expr.*.asHead().dropReference();
+    interp.parsed_exprs.clearRetainingCapacity();
+
+    var closures = interp.parsed_closures.valueIterator();
+    while (closures.next()) |closure| closure.*.asHead().dropReference();
+    interp.parsed_closures.clearRetainingCapacity();
+
+    var substs = interp.parsed_substs.valueIterator();
+    while (substs.next()) |subst| subst.*.asHead().dropReference();
+    interp.parsed_substs.clearRetainingCapacity();
 }
 
 /// Reads `filename` and evaluates it in a call frame of its own, then hands

@@ -172,7 +172,7 @@ pub fn nextScriptToken(self: *Tokenizer) Error!Token {
                         break :blk try self.nextStringToken();
                     }
                 },
-                '\t', 12, '\r', ' ' => {
+                '\t', 11, 12, '\r', ' ' => {
                     if (self.in_quote) {
                         self.comment_possible = false;
                         break :blk try self.nextStringToken();
@@ -746,7 +746,7 @@ pub fn nextSeparatorToken(self: *Tokenizer) Token {
 
     while (!self.atEnd()) : (self.advance(1)) {
         switch (self.current()) {
-            '\t', 12, '\r', ' ' => {},
+            '\t', 11, 12, '\r', ' ' => {},
             '\\' => {
                 if (self.peek(1) == '\n') {
                     // Escaped newline, so advance past the newline.

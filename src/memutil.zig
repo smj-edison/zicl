@@ -48,14 +48,12 @@ pub fn repeat(comptime pattern: anytype, comptime count: comptime_int) RepeatTyp
 /// that all per-iteration allocations were freed.
 pub const CountingAllocator = struct {
     child_allocator: Allocator,
-    alloc_count: std.atomic.Value(usize) = .init(0),
-    free_count: std.atomic.Value(usize) = .init(0),
-    allocated_bytes: std.atomic.Value(usize) = .init(0),
-    freed_bytes: std.atomic.Value(usize) = .init(0),
+    alloc_count: std.atomic.Value(isize) = .init(0),
+    allocated_bytes: std.atomic.Value(isize) = .init(0),
 
     pub const Snapshot = struct {
-        live_allocs: usize,
-        live_bytes: usize,
+        live_allocs: isize,
+        live_bytes: isize,
     };
 
     pub fn init(child_allocator: Allocator) CountingAllocator {
@@ -76,8 +74,8 @@ pub const CountingAllocator = struct {
 
     pub fn takeSnapshot(self: *const CountingAllocator) Snapshot {
         return .{
-            .live_allocs = self.alloc_count.load(.monotonic) - self.free_count.load(.monotonic),
-            .live_bytes = self.allocated_bytes.load(.monotonic) - self.freed_bytes.load(.monotonic),
+            .live_allocs = self.alloc_count.load(.monotonic),
+            .live_bytes = self.allocated_bytes.load(.monotonic),
         };
     }
 
@@ -89,9 +87,9 @@ pub const CountingAllocator = struct {
 
     fn recordResizeBytes(self: *CountingAllocator, old_len: usize, new_len: usize) void {
         if (new_len >= old_len) {
-            _ = self.allocated_bytes.fetchAdd(new_len - old_len, .monotonic);
+            _ = self.allocated_bytes.fetchAdd(@intCast(new_len - old_len), .monotonic);
         } else {
-            _ = self.freed_bytes.fetchAdd(old_len - new_len, .monotonic);
+            _ = self.allocated_bytes.fetchSub(@intCast(old_len - new_len), .monotonic);
         }
     }
 
@@ -99,7 +97,7 @@ pub const CountingAllocator = struct {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         const ptr = self.child_allocator.rawAlloc(n, alignment, ra) orelse return null;
         _ = self.alloc_count.fetchAdd(1, .monotonic);
-        _ = self.allocated_bytes.fetchAdd(n, .monotonic);
+        _ = self.allocated_bytes.fetchAdd(@intCast(n), .monotonic);
         return ptr;
     }
 
@@ -120,8 +118,8 @@ pub const CountingAllocator = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.child_allocator.rawFree(memory, alignment, ra);
-        _ = self.free_count.fetchAdd(1, .monotonic);
-        _ = self.freed_bytes.fetchAdd(memory.len, .monotonic);
+        _ = self.alloc_count.fetchSub(1, .monotonic);
+        _ = self.allocated_bytes.fetchSub(@intCast(memory.len), .monotonic);
     }
 };
 
@@ -133,8 +131,8 @@ test "counting allocator" {
     defer gpa.free(base_alloc);
 
     const snap = counting.takeSnapshot();
-    try testing.expectEqual(@as(usize, 1), snap.live_allocs);
-    try testing.expectEqual(@as(usize, 64), snap.live_bytes);
+    try testing.expectEqual(1, snap.live_allocs);
+    try testing.expectEqual(64, snap.live_bytes);
 
     {
         var list: std.ArrayList(u8) = .empty;

@@ -306,19 +306,23 @@ pub fn importCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     interp.setResultOwning(module.asHead().asValue());
 }
 
-pub fn registerCommands(interp: *Interp) !void {
+pub fn registerSafeCommands(interp: *Interp) !void {
     try registerCommand(interp, "apply", applyCmd, "fn ?arg ...?", 1, null);
     try registerCommand(interp, "applymethod", applymethodCmd, "self method ?arg ...?", 1, null);
     try registerCommand(interp, "eval", evalCmd, "arg ?arg ...?", 1, null);
     try registerCommand(interp, "expr", exprCmd, "expression", 1, 1);
     try registerCommand(interp, "fn", fnCmd, "?name? argList body", 2, 3);
-    try registerCommand(interp, "import", importCmd, "fileName", 1, 1);
     try registerCommand(interp, "letrec", letrecCmd, "subcommand ?arg ...?", 1, null);
     try registerCommand(interp, "method", methodCmd, "?name? argList body", 2, 3);
-    try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1);
     try registerCommand(interp, "subst", substCmd, "?options? string", 1, 4);
     try registerCommand(interp, "tailcall", tailcallCmd, "command ?arg ...?", 1, null);
     try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null);
+}
+
+pub fn registerCommands(interp: *Interp) !void {
+    try registerSafeCommands(interp);
+    try registerCommand(interp, "import", importCmd, "fileName", 1, 1);
+    try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1);
 }
 
 fn testFnNamed(ta: std.mem.Allocator) !void {
