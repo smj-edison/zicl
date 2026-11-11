@@ -3060,8 +3060,8 @@ test "binary struct float pad and hash refs" {
 
 const BinaryFuzzContext = struct {
     interp: *Interp,
-    counting: *memutil.CountingAllocator,
-    baseline_allocs: memutil.CountingAllocator.Snapshot,
+    counting: *memutil.FuzzAllocator,
+    baseline_allocs: memutil.FuzzAllocator.Snapshot,
     baseline_arena: memutil.ScopedArena.Snapshot,
     initial_var_count: usize,
 };
@@ -3309,7 +3309,7 @@ fn testBinaryFuzzOne(ctx: *BinaryFuzzContext, smith: *testing.Smith) !void {
 
 test "binary fuzz random schemas and data" {
     const backing_gpa = if (@import("builtin").fuzz) std.heap.c_allocator else testing.allocator;
-    var counting = memutil.CountingAllocator.init(backing_gpa);
+    var counting = memutil.FuzzAllocator.init(backing_gpa);
 
     var interp = try common.testStart(counting.allocator());
     defer common.testFinish(&interp);

@@ -269,6 +269,10 @@ Zicl_Obj *Zicl_DuplicateAsBoxed(Zicl_Val value);
 const char *Zicl_String(Zicl_Val object);
 /* Get the object's string rep and length. NULL on OOM. */
 const char *Zicl_GetString(Zicl_Val object, int *len);
+/* Formats an array of null-terminated strings into a properly escaped Tcl
+ * list/dictionary string, allocated in the thread-local arena. Returns NULL on
+ * OOM. `len` is optional. */
+const char *Zicl_FormatList(const char *const *items, size_t count, int *len);
 /* Box an object pointer into the `Zicl_Val` tagged union. */
 Zicl_Val Zicl_BoxObject(Zicl_Obj *obj);
 /* Whether this value can mutate in place. Always false for non-object variants. */

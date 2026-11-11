@@ -63,6 +63,22 @@ zig build test -Dfull-oom-testing -Doptimize=ReleaseSafe
 zig build test -Dfull-oom-testing -Dtest-filter="the one that leaked" -Dtrace-mem=true
 ```
 
+Run a fuzz test (without `--fuzz`, `zig build test` only replays the corpus):
+
+```bash
+zig build test -Dtest-filter="Interp fuzz core" -Dtrace-mem=false -Duse-llvm=true --fuzz=200K
+```
+
+`-Duse-llvm=true` is required, since the self-hosted backend emits no coverage instrumentation.
+
+Benchmark a release build:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dtrace-mem=false
+```
+
+Be sure not to benchmark with the self-hosted backend.
+
 Other options: `-Dstatic-link` (statically link libc, default true), `-Duse-utf8`
 (UTF-8 support in `strutil`, default true), and `-Dthreading` (default true).
 
@@ -161,6 +177,8 @@ Scripts go through several stages:
 ### Closures, Modules, and Scope Capture
 
 **Scope capture.** `[fn]`/`[method]` (`closureHelper` in `src/commands/eval.zig`) capture the currently executing call frame as `Closure.Content.scope`, via `Interp.captureCurrentScope`/`captureScope`. The capture is a snapshot dict: every local variable is copied in by value (upvars are resolved eagerly, since the linked frame may not outlive the closure), and if the current frame itself has a lexical parent (`.signature.scope`), that parent is chained in as a `~parent` `HashReference` entry, so a name miss in the snapshot walks up the chain via `Dictionary.getFollowingLinks`. A closure is therefore frozen at *definition* time: `fn foo {} {...}` captures whatever frame is current when `[fn]` runs, not the frame active when `foo` is later called.
+
+**Scope hashes are lazy, and must stay that way.** Capturing a scope happens on every `[fn]`/`[method]` and every call through a closure, so it must never hash the scope or build its string rep; that would make capture cost proportional to the scope's size every time. A captured scope is only hashed when something actually needs it, such as rendering the closure as a string (which embeds the scope as a `blake3~` reference) or registering it. So don't design anything (cache keys, identity checks, invariants) that assumes a scope's hash is available. To identify a closure's lexical environment, use its `cache_id`: every site that creates a `Closure.Content` assigns a fresh one in the same initializer that sets its `scope`, and `Content.duplicate` copies both, so one `cache_id` always means one scope, by construction rather than by hash.
 
 **`[import]` and modules.** `[import fileName]` (`Interp.evalFileAsModule`) reads a file and evaluates it in a brand-new call frame (`pushCallFrame`), unlike `[source]` (`Interp.evalFile`), which reuses the caller's frame outright and so shares its variables completely. The module frame's `.signature.scope` is set to the importer's `captureCurrentScope()`, so a name miss in the module body still walks up to the importer's bindings as of the moment `[import]` ran, the same `~parent` chain closures use. Writes never propagate back, though: `vartypes.setVariable` always shadows a lexically-inherited name into the local `VarTable` rather than mutating the captured parent. `[return]` and `[tailcall]` are both rejected at a module's top level. Instead of the body's result, `evalFileAsModule` returns `captureScope` of the module's own frame: a `Dictionary` of every name the module bound at its own top level (`set`, a named `fn`/`method`, ...).
 

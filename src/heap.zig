@@ -413,6 +413,26 @@ pub const HashRegistry = struct {
         } else return null;
     }
 
+    /// Reallocates the table at the smallest capacity that holds its current
+    /// entries. The table otherwise keeps the capacity of its peak, even after
+    /// every object that grew it has been freed.
+    pub fn shrinkToFit(registry: *HashRegistry) error{OutOfMemory}!void {
+        registry.rw_lock.lockUncancelable(global_io);
+        defer registry.rw_lock.unlock(global_io);
+
+        var shrunk: @TypeOf(registry.entries) = .empty;
+        try shrunk.ensureTotalCapacity(global_gpa, registry.entries.count());
+        if (shrunk.capacity() >= registry.entries.capacity()) {
+            shrunk.deinit(global_gpa);
+            return;
+        }
+
+        var iter = registry.entries.iterator();
+        while (iter.next()) |entry| shrunk.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+        registry.entries.deinit(global_gpa);
+        registry.entries = shrunk;
+    }
+
     pub fn register(registry: *HashRegistry, key: u256, obj: *Object) !void {
         registry.rw_lock.lockSharedUncancelable(global_io);
         obj.makeCrossthread();

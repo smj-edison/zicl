@@ -77,10 +77,8 @@ pub fn uplevelCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     if (args.len - script_start < 1) return error.WrongUsage;
 
     const current_frame = interp.callFrameIdx();
-    const target_frame = interp.getRelativeCallFrame(current_frame, levels_up) orelse {
-        try interp.setResultString("bad level");
-        return error.EvalError;
-    };
+    var det: ErrorDetails = undefined;
+    const target_frame = try interp.wrapError(&det, interp.getRelativeCallFrame(&det, current_frame, levels_up));
 
     const script = if (args.len - script_start == 1)
         args[script_start].current().takeReference()
@@ -454,6 +452,37 @@ fn testLetrec(ta: std.mem.Allocator) !void {
 
 test "letrec" {
     try memutil.checkAllocationFailures(.exhaustive, testLetrec, .{});
+}
+
+fn testSharedNameResolvesPerScope(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // `n` is a variable name object shared by both calls, so a lexical lookup
+    // cached on it from one closure's scope should not resolve to the other's.
+    try interp.testExpectScriptResult("one two",
+        \\ fn mk {x} { fn {name} { set $name } }
+        \\ set a [mk one]
+        \\ set b [mk two]
+        \\ set n x
+        \\ list [a $n] [b $n]
+    );
+
+    // The same closure resolves against its letrec scope only when called
+    // through [letrec].
+    try interp.testExpectScriptResult("captured letrec captured",
+        \\ set x captured
+        \\ set scope::x letrec
+        \\ fn scope::g {name} { set $name }
+        \\ set direct [dict get $scope g]
+        \\ set via_letrec [letrec select $scope g]
+        \\ set n x
+        \\ list [direct $n] [via_letrec $n] [direct $n]
+    );
+}
+
+test "shared name resolves per scope" {
+    try memutil.checkAllocationFailures(.exhaustive, testSharedNameResolvesPerScope, .{});
 }
 
 fn testLetrecMutualRecursion(ta: std.mem.Allocator) !void {
@@ -1387,11 +1416,42 @@ fn testUnknown(ta: std.mem.Allocator) !void {
     defer common.testFinish(&interp);
 
     try interp.testExpectScriptResult(
-        "foo bar",
+        "badfunction foo bar",
         \\ fn unknown {args} { return $args }
         \\ badfunction foo bar
         ,
     );
+
+    // [unknown] resolves from the frame the missing command ran in, so closures
+    // see it through their captured scope.
+    try interp.testExpectScriptResult(
+        "lexical badfunction x",
+        \\ fn unknown {args} { return "lexical $args" }
+        \\ fn g {} { badfunction x }
+        \\ g
+        ,
+    );
+}
+
+fn testUnknownIsScoped(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // A local [unknown] only handles misses in its own frame.
+    try interp.testExpectScriptResult(
+        "local badfunction a b",
+        \\ fn f {} {
+        \\     fn unknown {args} { return "local $args" }
+        \\     badfunction a b
+        \\ }
+        \\ f
+        ,
+    );
+    try interp.testExpectScriptError(error.EvalError, "invalid command name \"badfunction\"", "badfunction a b");
+}
+
+test "unknown is scoped" {
+    try memutil.checkAllocationFailures(.exhaustive, testUnknownIsScoped, .{});
 }
 
 test "unknown" {

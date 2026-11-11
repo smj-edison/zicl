@@ -43,24 +43,30 @@ pub fn repeat(comptime pattern: anytype, comptime count: comptime_int) RepeatTyp
     return result;
 }
 
-/// Wraps a backing allocator and counts active allocations and bytes so callers
-/// can initialize state once, take a `Snapshot`, and verify after each iteration
-/// that all per-iteration allocations were freed.
-pub const CountingAllocator = struct {
+/// Wraps a backing allocator for fuzzing. It counts live allocations and bytes,
+/// so callers can initialize state once, take a `Snapshot`, and verify after
+/// each iteration that all per-iteration allocations were freed. It can also be
+/// armed with `failAfter` to fail a single allocation, exercising OOM paths.
+pub const FuzzAllocator = struct {
     child_allocator: Allocator,
     alloc_count: std.atomic.Value(isize) = .init(0),
     allocated_bytes: std.atomic.Value(isize) = .init(0),
+    /// Allocations left to succeed before they start failing. Zero or below
+    /// means every allocation fails.
+    allocs_until_failure: std.atomic.Value(isize) = .init(allocs_until_failure_max),
+
+    const allocs_until_failure_max = std.math.maxInt(isize);
 
     pub const Snapshot = struct {
         live_allocs: isize,
         live_bytes: isize,
     };
 
-    pub fn init(child_allocator: Allocator) CountingAllocator {
+    pub fn init(child_allocator: Allocator) FuzzAllocator {
         return .{ .child_allocator = child_allocator };
     }
 
-    pub fn allocator(self: *CountingAllocator) Allocator {
+    pub fn allocator(self: *FuzzAllocator) Allocator {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -72,20 +78,35 @@ pub const CountingAllocator = struct {
         };
     }
 
-    pub fn takeSnapshot(self: *const CountingAllocator) Snapshot {
+    pub fn takeSnapshot(self: *const FuzzAllocator) Snapshot {
         return .{
             .live_allocs = self.alloc_count.load(.monotonic),
             .live_bytes = self.allocated_bytes.load(.monotonic),
         };
     }
 
-    pub fn expectMatchesSnapshot(self: *const CountingAllocator, snap: Snapshot) !void {
+    pub fn expectMatchesSnapshot(self: *const FuzzAllocator, snap: Snapshot) !void {
         const current = self.takeSnapshot();
         try testing.expectEqual(snap.live_allocs, current.live_allocs);
         try testing.expectEqual(snap.live_bytes, current.live_bytes);
     }
 
-    fn recordResizeBytes(self: *CountingAllocator, old_len: usize, new_len: usize) void {
+    /// Lets `allocs` more allocations succeed, then fails every allocation
+    /// until `disarm`, so that cleanup paths which allocate fail too. Growing
+    /// an allocation in place counts as an allocation.
+    pub fn failAfter(self: *FuzzAllocator, allocs: u32) void {
+        self.allocs_until_failure.store(allocs, .monotonic);
+    }
+
+    pub fn disarm(self: *FuzzAllocator) void {
+        self.allocs_until_failure.store(allocs_until_failure_max, .monotonic);
+    }
+
+    fn allocFails(self: *FuzzAllocator) bool {
+        return self.allocs_until_failure.fetchSub(1, .monotonic) <= 0;
+    }
+
+    fn recordResizeBytes(self: *FuzzAllocator, old_len: usize, new_len: usize) void {
         if (new_len >= old_len) {
             _ = self.allocated_bytes.fetchAdd(@intCast(new_len - old_len), .monotonic);
         } else {
@@ -94,7 +115,8 @@ pub const CountingAllocator = struct {
     }
 
     fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const self: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+        if (self.allocFails()) return null;
         const ptr = self.child_allocator.rawAlloc(n, alignment, ra) orelse return null;
         _ = self.alloc_count.fetchAdd(1, .monotonic);
         _ = self.allocated_bytes.fetchAdd(@intCast(n), .monotonic);
@@ -102,35 +124,37 @@ pub const CountingAllocator = struct {
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const self: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and self.allocFails()) return false;
         if (!self.child_allocator.rawResize(memory, alignment, new_len, ra)) return false;
         self.recordResizeBytes(memory.len, new_len);
         return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const self: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and self.allocFails()) return null;
         const ptr = self.child_allocator.rawRemap(memory, alignment, new_len, ra) orelse return null;
         self.recordResizeBytes(memory.len, new_len);
         return ptr;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const self: *FuzzAllocator = @ptrCast(@alignCast(ctx));
         self.child_allocator.rawFree(memory, alignment, ra);
         _ = self.alloc_count.fetchSub(1, .monotonic);
         _ = self.allocated_bytes.fetchSub(@intCast(memory.len), .monotonic);
     }
 };
 
-test "counting allocator" {
-    var counting = CountingAllocator.init(testing.allocator);
-    const gpa = counting.allocator();
+test "fuzz allocator counts allocations" {
+    var fuzz_alloc = FuzzAllocator.init(testing.allocator);
+    const gpa = fuzz_alloc.allocator();
 
     const base_alloc = try gpa.alloc(u8, 64);
     defer gpa.free(base_alloc);
 
-    const snap = counting.takeSnapshot();
+    const snap = fuzz_alloc.takeSnapshot();
     try testing.expectEqual(1, snap.live_allocs);
     try testing.expectEqual(64, snap.live_bytes);
 
@@ -138,10 +162,27 @@ test "counting allocator" {
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(gpa);
         try list.appendSlice(gpa, "hello world");
-        try testing.expect(counting.takeSnapshot().live_allocs > snap.live_allocs);
+        try testing.expect(fuzz_alloc.takeSnapshot().live_allocs > snap.live_allocs);
     }
 
-    try counting.expectMatchesSnapshot(snap);
+    try fuzz_alloc.expectMatchesSnapshot(snap);
+}
+
+test "fuzz allocator fails allocations until disarmed" {
+    var fuzz_alloc = FuzzAllocator.init(testing.allocator);
+    const gpa = fuzz_alloc.allocator();
+
+    fuzz_alloc.failAfter(1);
+    const first = try gpa.alloc(u8, 8);
+    defer gpa.free(first);
+    try testing.expectError(error.OutOfMemory, gpa.alloc(u8, 8));
+    try testing.expectError(error.OutOfMemory, gpa.alloc(u8, 8));
+    // Growing fails too, both in place and through the fallback allocation.
+    try testing.expectError(error.OutOfMemory, gpa.realloc(first, 4096));
+
+    fuzz_alloc.disarm();
+    const after_disarm = try gpa.alloc(u8, 8);
+    defer gpa.free(after_disarm);
 }
 
 /// Note, this will hand out allocations that potentially alias. Really only useful for debugging.

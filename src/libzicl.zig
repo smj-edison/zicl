@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 const options = @import("options");
 
 const memutil = @import("memutil.zig");
+const strutil = @import("strutil.zig");
 const ioutil = @import("ioutil.zig");
 const leak_check = @import("leak_check.zig");
 
@@ -197,6 +198,23 @@ export fn Zicl_GetString(value: Value, len: ?*c_int) ?[*:0]const u8 {
     const str = value.getString() catch return null;
     if (len) |ptr| ptr.* = @intCast(str.len);
     return str;
+}
+
+export fn Zicl_FormatList(items: [*]const ?[*:0]const u8, count: usize, len: ?*c_int) ?[*:0]const u8 {
+    const arena = heap.local_arena;
+    const slices = arena.alloc([]const u8, count) catch return null;
+    for (0..count) |i| {
+        if (items[i]) |ptr| {
+            slices[i] = std.mem.span(ptr);
+        } else {
+            slices[i] = "";
+        }
+    }
+    const res = strutil.quoteStrings(arena, slices) catch return null;
+    if (len) |out_len| {
+        out_len.* = @intCast(res.len);
+    }
+    return res.ptr;
 }
 
 // ===== Reference counting and object introspection =====

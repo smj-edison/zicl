@@ -82,7 +82,7 @@ pub fn vmCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             if (target_level < 0 or target_level > current_level) return interp.setError(bad_level_err);
 
             const levels_up: u32 = @intCast(current_level - target_level);
-            const target_frame = interp.getRelativeCallFrame(current_frame, levels_up).?;
+            const target_frame = try interp.wrapError(&det, interp.getRelativeCallFrame(&det, current_frame, levels_up));
 
             // Find the topmost eval frame for the target call frame. We start at
             // `eval_frames.items.len` since by design, the current eval frame is
@@ -131,7 +131,7 @@ pub fn vmCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
             }
 
             const levels_up: u32 = @intCast(current_level - target_level);
-            const target_frame = interp.getRelativeCallFrame(current_frame, levels_up).?;
+            const target_frame = try interp.wrapError(&det, interp.getRelativeCallFrame(&det, current_frame, levels_up));
 
             const frame_args = interp.call_frames.items[target_frame].args;
             const list = try objects.List.newFromShimmerables(frame_args);

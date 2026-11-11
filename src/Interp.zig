@@ -62,8 +62,6 @@ max_eval_depth: usize,
 max_call_depth: usize,
 /// Depth of [unknown] calls. Used to catch infinite recursion.
 unknown_depth: usize,
-/// String containing `unknown`. Used to cache unknown lookup.
-unknown_str: Value,
 
 /// Used to propagate `error.Continue` or `error.Break` up multiple
 /// loop levels. This is a separate counter from return_propagate, since
@@ -91,6 +89,9 @@ pending_tailcall: ?Tailcall,
 /// Set to true if you'd like the interpreter to stop evaluating. Checked
 /// after each command evaluated.
 stop_executing: std.atomic.Value(bool),
+/// The lowest call frame level that commands like [upvar] and [uplevel] can reach,
+/// including this call frame.
+call_frame_fence: u32 = 0,
 
 parsed_scripts: ParsedScripts,
 parsed_exprs: ParsedExpressions,
@@ -117,6 +118,7 @@ const ParsedSubstitutions = memutil.LruCache(u256, *Substitution, FullHashContex
 pub const CommandHashTable = std.StringArrayHashMapUnmanaged(evaltypes.NativeCommand);
 
 const interned_name = heap.InternedString.newValue("name");
+const interned_unknown = heap.InternedString.newValue("unknown");
 const interned_impl = heap.InternedString.newValue("impl");
 const interned_scope = heap.InternedString.newValue("scope");
 const interned_zicl_oom = heap.InternedString.newValue("ZICL OOM");
@@ -597,10 +599,32 @@ pub fn callFrame(interp: *Interp) *CallFrame {
     return &interp.call_frames.items[interp.callFrameIdx()];
 }
 
-pub fn getRelativeCallFrame(interp: *Interp, from: u32, levels_up: u32) ?u32 {
+/// Returns the frame `levels_up` above `from`, failing with error.OutOfBounds
+/// if there's no such frame, or error.BehindFence if it sits behind
+/// `call_frame_fence`. `det` explains either failure.
+pub fn getRelativeCallFrame(
+    interp: *Interp,
+    det: ?*ErrorDetails,
+    from: u32,
+    levels_up: u32,
+) error{ OutOfMemory, OutOfBounds, BehindFence }!u32 {
+    const from_level = interp.call_frames.items[from].level;
+    if (levels_up > from_level) {
+        if (det) |details| details.* = .{ .message = try allocPrintZ("bad level", .{}) };
+        return error.OutOfBounds;
+    }
+
+    const target_level = from_level - levels_up;
+    if (target_level < interp.call_frame_fence) {
+        if (det) |details| details.* = .{
+            .message = try allocPrintZ("bad level: level {} is behind a call frame fence", .{target_level}),
+        };
+        return error.BehindFence;
+    }
+
     // See `CallFrame` on why we can't just return `from - levels_up`.
     var target: u32 = from;
-    for (0..levels_up) |_| target = interp.call_frames.items[target].parent orelse return null;
+    for (0..levels_up) |_| target = interp.call_frames.items[target].parent.?;
     return target;
 }
 
@@ -1027,9 +1051,9 @@ pub fn getCommand(interp: *Interp, call_frame_idx: u32, name: *Shimmerable, can_
 }
 
 fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
-    var unknown_str: Shimmerable = .{ .original = interp.unknown_str };
-    defer unknown_str.discardChanges();
-    var unknown_cmd = interp.getCommand(0, &unknown_str, false) catch |err| switch (err) {
+    var unknown_name: Shimmerable = .{ .original = interned_unknown };
+    defer unknown_name.discardChanges();
+    var unknown_cmd = interp.getCommand(interp.callFrameIdx(), &unknown_name, false) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandNotFound => {
             // No [unknown] command exists, so we'll default to the "no command found" error.
@@ -1048,9 +1072,9 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     interp.unknown_depth += 1;
     defer interp.unknown_depth -= 1;
 
-    var new_args = try heap.local_arena.alloc(Shimmerable, args.len);
-    new_args[0] = .{ .original = interp.unknown_str };
-    @memcpy(new_args[1..], args[1..]);
+    var new_args = try heap.local_arena.alloc(Shimmerable, args.len + 1);
+    new_args[0] = .{ .original = interned_unknown };
+    @memcpy(new_args[1..], args);
 
     try interp.invokeCommand(&unknown_cmd, new_args);
 }
@@ -1718,9 +1742,6 @@ pub fn evalFileAsModule(interp: *Interp, filename: []const u8) InternalEvalError
 }
 
 pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
-    const unknown_str = try objects.String.newValue("unknown");
-    errdefer unknown_str.dropReference();
-
     var new_interp: Interp = .{
         .result = heap.interned_empty_string,
         .eval_frames = .empty,
@@ -1732,7 +1753,6 @@ pub fn init(cfg: struct { cache_capacity: u32 = 512 }) !Interp {
         .max_eval_depth = 1000,
         .max_call_depth = 1000,
         .unknown_depth = 0,
-        .unknown_str = unknown_str,
         .stack_trace = .none,
         .pending_error_code = .none,
         .pending_error_during = .none,
@@ -1794,7 +1814,6 @@ pub fn deinit(interp: *Interp) void {
     interp.pending_error_code.swapWithNone();
     interp.pending_error_during.swapWithNone();
     if (interp.pending_tailcall) |*tailcall| tailcall.deinit();
-    interp.unknown_str.dropReference();
     interp.global_commands.deinit(heap.global_gpa);
 
     // Deinit all frames.

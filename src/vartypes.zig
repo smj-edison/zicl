@@ -164,8 +164,7 @@ pub const CachedLocalVar = struct {
 
 pub const CachedLexicalVar = struct {
     ref: Value,
-    /// We still need to track the call epoch for the cached lexical var, since it's
-    /// possible that this was shadowed by a local variable.
+    /// The cached value is only valid in the frame epoch it was resolved in.
     call_epoch: u64,
 
     pub fn asHead(self: *CachedLexicalVar) *Object {
@@ -418,18 +417,16 @@ pub fn ensureValidVariableType(
         if (lexical_var.call_epoch == call_frame.call_epoch) {
             return .normal;
         } else {
-            // Since this is a lexical value lookup, and the lexical scopes are immutable,
-            // the only case where this lookup becomes invalid is if it were shadowed by
-            // a local variable.
-            if (try call_frame.variables.getIndex(name.current()) != null) {
-                // Shadowed, so we need to look up again.
-                return try reshimmerToVariable(interp, det, var_call_frame, name);
-            } else {
-                // Wasn't shadowed, so be sure to update its epoch so we don't do
-                // this expensive lookup again.
-                lexical_var.call_epoch = call_frame.call_epoch;
-                return .normal;
-            }
+            // Lexical scopes are immutable, but which scope applies depends on the
+            // frame, and a shared name object can be resolved from many frames:
+            // ```
+            // fn mk {x} { fn {name} { set $name } }
+            // set a [mk one]; set b [mk two]; set n x
+            // list [a $n] [b $n]   ;# one two
+            // ```
+            // Even one closure can see different scopes, depending on whether it
+            // was called through [letrec]. So any epoch change resolves again.
+            return try reshimmerToVariable(interp, det, var_call_frame, name);
         }
     } else if (name.current().asType(DictSugar)) |_| {
         return .dict_sugar;
