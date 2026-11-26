@@ -763,7 +763,7 @@ pub const SpecialString = struct {
     // (mmaping is in the plans, for example). Since it has special properties,
     // we have to track them so it can be freed correctly.
 
-    pub const HashAndInfo = struct {
+    pub const ResolvedHash = struct {
         str_index: usize,
         value: ?*Object,
     };
@@ -781,7 +781,7 @@ pub const SpecialString = struct {
     /// Length has not been determined if == `maxInt(u64)`.
     utf8_length: std.atomic.Value(u64) = .init(math.maxInt(u64)),
 
-    tracked_hashes: []HashAndInfo,
+    tracked_hashes: []ResolvedHash,
     hash: std.atomic.Value(?*u256),
     ref_count: std.atomic.Value(u32) = .init(1),
 
@@ -855,7 +855,7 @@ pub const SpecialString = struct {
 /// new, potentially empty bytes. It's guaranteed to either be atomically
 /// applied, or to fail without changing anything.
 pub const strpatch = struct {
-    const HashAndInfo = SpecialString.HashAndInfo;
+    const ResolvedHash = SpecialString.ResolvedHash;
 
     /// Replaces `[start, end)` of the original string with `bytes`.
     /// A pure insert uses `start == end`, while a pure delete has
@@ -877,7 +877,7 @@ pub const strpatch = struct {
 
         const old: struct {
             bytes: []const u8,
-            hashes: []const HashAndInfo,
+            hashes: []const ResolvedHash,
             special: ?*SpecialString,
         } = switch (obj.getStringDetails()) {
             .normal => |bytes| .{ .bytes = bytes, .hashes = &.{}, .special = null },
@@ -906,11 +906,10 @@ pub const strpatch = struct {
         const new_tracked = try hashjoin.trackedHashes(
             global_gpa,
             &scan_buffer,
-            &.{ old.bytes[0..edit.start], edit.bytes, old_tail },
             &.{
-                .{ .hashes = old.hashes, .source_start = 0 },
-                null,
-                .{ .hashes = old.hashes, .source_start = edit.end },
+                .fromSource(old.bytes, old.hashes, 0, edit.start),
+                .{ .bytes = edit.bytes },
+                .fromSource(old.bytes, old.hashes, edit.end, old.bytes.len),
             },
         );
         errdefer hashjoin.release(global_gpa, new_tracked);
@@ -1866,7 +1865,7 @@ fn testCurrentBytes(obj: *Object) []const u8 {
     };
 }
 
-fn testTrackedHashes(obj: *Object) []const SpecialString.HashAndInfo {
+fn testTrackedHashes(obj: *Object) []const SpecialString.ResolvedHash {
     return switch (obj.getStringDetails()) {
         .normal => &.{},
         .special => |special| special.tracked_hashes,

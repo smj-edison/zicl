@@ -7,6 +7,7 @@ const heap = @import("heap.zig");
 const Object = heap.Object;
 const Value = heap.Value;
 const SpecialString = heap.SpecialString;
+const ResolvedHash = SpecialString.ResolvedHash;
 
 // It is _very important_ that we have both a hash prepend and a hash
 // postpend that are unique from the body of the hash, and from each other.
@@ -283,7 +284,7 @@ pub fn parseHashReference(bytes: []const u8) ?u256 {
 /// Resolves each of `found` into the matching slot of `out`, taking a
 /// reference to every registered value. The caller must hold
 /// `heap.registered_hashes`'s shared lock.
-pub fn resolveHashRefsInner(found: []const HashInstance, out: []SpecialString.HashAndInfo) void {
+pub fn resolveHashRefsInner(found: []const HashInstance, out: []ResolvedHash) void {
     assert(found.len == out.len);
     for (found, out) |found_hash, *resolved_hash| {
         resolved_hash.* = .{
@@ -296,13 +297,13 @@ pub fn resolveHashRefsInner(found: []const HashInstance, out: []SpecialString.Ha
     }
 }
 
-pub fn scanAndResolveHashRefs(gpa: Allocator, bytes: []const u8) error{OutOfMemory}![]SpecialString.HashAndInfo {
+pub fn scanAndResolveHashRefs(gpa: Allocator, bytes: []const u8) error{OutOfMemory}![]ResolvedHash {
     var found_hashes: std.ArrayList(HashInstance) = .empty;
     defer found_hashes.deinit(gpa);
     try scanStringForHashRefs(gpa, bytes, 0, &found_hashes);
 
     // Look up all the found hashes.
-    const resolved_hashes = try gpa.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
+    const resolved_hashes = try gpa.alloc(ResolvedHash, found_hashes.items.len);
     errdefer comptime unreachable;
 
     heap.registered_hashes.rw_lock.lockSharedUncancelable(heap.global_io);
@@ -329,4 +330,219 @@ pub fn cacheQuickHash(value: Value) error{OutOfMemory}!void {
     if (bytes.len >= heap.considered_large_string) {
         if (!obj.hashIsCached()) _ = try obj.getHashNoRegister();
     }
+}
+
+// -- String joining --
+// Joining multiple strings together is a real pain in Zicl, because we
+// have to track hashes that are created when joining strings together.
+// This section creates some helpers for dealing with exactly this
+// situation.
+
+const half_window_size = hash_token_len - 1;
+const window_size = half_window_size * 2;
+
+pub const Piece = struct {
+    bytes: []const u8,
+    /// The tokens in `metadata.hashes` must be fully contained within `bytes`,
+    /// i.e. avoid indices which have their ends hanging outside of `bytes`.
+    metadata: ?Metadata,
+
+    pub const Metadata = struct {
+        /// Resolved hashes in this piece.
+        hashes: []const ResolvedHash,
+        /// `bytes` may be an subslice of an owning string, where the subslice's
+        /// start is non-zero. This means that `hashes` will be indexed relative
+        /// to that object's string, not relative to `bytes`. So we use this
+        /// to correct `hashes[i].str_index` relative to our piece.
+        hash_index_offset: usize,
+    };
+
+    /// If `hashes` are indexed relative to a different slice than `bytes`, set
+    /// `hash_index_offset` to the amount to subtract by in order to be relative
+    /// to `bytes`. `hashes` can contain hash indices that are outside of
+    /// `bytes`, and this function will correctly exclude them.
+    pub fn init(bytes: []const u8, maybe_metadata: ?Metadata) Piece {
+        const metadata = maybe_metadata orelse return .{ .bytes = bytes, .metadata = null };
+        const hashes = metadata.hashes;
+        const hash_index_offset = metadata.hash_index_offset;
+
+        const Search = struct {
+            fn startsBefore(limit: usize, hash: ResolvedHash) bool {
+                return hash.str_index < limit;
+            }
+            fn endsBy(limit: usize, hash: ResolvedHash) bool {
+                return hash.str_index + hash_token_len <= limit;
+            }
+        };
+        const first = std.sort.partitionPoint(ResolvedHash, hashes, hash_index_offset, Search.startsBefore);
+        const count = std.sort.partitionPoint(ResolvedHash, hashes[first..], hash_index_offset + bytes.len, Search.endsBy);
+        return .{
+            .bytes = bytes,
+            .metadata = .{
+                .hashes = hashes[first..][0..count],
+                .hash_index_offset = hash_index_offset,
+            },
+        };
+    }
+
+    /// `obj` must have a string rep, and must not be mutated or freed for the
+    /// duration of this piece's existence, as this may borrow the object's
+    /// hashes.
+    pub fn fromObject(obj: *const Object, start: usize, end: usize) Piece {
+        return switch (obj.getStringDetails()) {
+            .normal => |bytes| .{
+                .bytes = bytes[start..end],
+                .metadata = .{ .hashes = &.{}, .hash_index_offset = 0 },
+            },
+            .special => |special| .init(
+                special.getString()[start..end],
+                .{ .hashes = special.tracked_hashes, .hash_index_offset = start },
+            ),
+            .none => unreachable,
+        };
+    }
+};
+
+/// Similar to a Zig Writer, this allows a caller to write fragments
+/// of a string in, and it will continuously scan for any hash
+/// references.
+const HashScanner = struct {
+    buffer: []u8,
+    /// Amount "written" in `buffer`.
+    len: usize = 0,
+    /// Where `buffer[0]` is in the joined string. Used to emit hash indices.
+    cursor: usize = 0,
+
+    pub fn init(buffer: []u8) HashScanner {
+        assert(buffer.len > half_window_size);
+        return .{ .buffer = buffer };
+    }
+
+    pub fn write(
+        scanner: *HashScanner,
+        gpa: Allocator,
+        found: *std.ArrayList(HashInstance),
+        bytes: []const u8,
+    ) error{OutOfMemory}!void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const amount_to_copy = @min(rest.len, scanner.buffer.len - scanner.len);
+            @memcpy(scanner.buffer[scanner.len..][0..amount_to_copy], rest[0..amount_to_copy]);
+            scanner.len += amount_to_copy;
+            rest = rest[amount_to_copy..];
+
+            if (scanner.len == scanner.buffer.len) {
+                // We've completely filled up, so we need to scan our current buffer,
+                // and then clear everything except for the overlapping section.
+                try scanStringForHashRefs(gpa, scanner.buffer, scanner.cursor, found);
+                @memmove(
+                    scanner.buffer[0..half_window_size],
+                    scanner.buffer[(scanner.buffer.len - half_window_size)..],
+                );
+                // Advance the writer by the amount we shifted.
+                scanner.cursor += scanner.buffer.len - half_window_size;
+                scanner.len = half_window_size;
+            }
+        }
+    }
+
+    pub fn endWindow(scanner: *HashScanner, gpa: Allocator, found: *std.ArrayList(HashInstance)) error{OutOfMemory}!void {
+        try scanStringForHashRefs(gpa, scanner.buffer[0..scanner.len], scanner.cursor, found);
+        scanner.cursor += scanner.len;
+        scanner.len = 0;
+    }
+};
+
+/// If you were to join `pieces` together, back-to-back, this returns the
+/// resolved hashes that the joined string would reference.
+///
+/// `buffer` is used internally to scan overlaps of `pieces`, so it needs to be
+/// at least as big as a token, preferably a couple times bigger. 256 should
+/// probably do the trick.
+pub fn getHashesFromJoining(gpa: Allocator, buffer: []u8, pieces: []const Piece) error{OutOfMemory}![]ResolvedHash {
+    // Every hash token in the joined string either lies fully inside one piece,
+    // or crosses at least one boundary. Tokens that cross a boundary are
+    // found by streaming the windows through `buffer`.
+
+    var found: std.ArrayList(HashInstance) = .empty;
+    defer found.deinit(gpa);
+    // A run is a piece that we can pass through without scanning.
+    var runs: std.ArrayList(struct {
+        metadata: Piece.Metadata,
+        /// Where this run starts relative to the final joined string.
+        in_joined: usize,
+    }) = .empty;
+    defer runs.deinit(gpa);
+    // Total count of all hashes in all runs. Used to size the
+    // out hashes array.
+    var total_run_hashes: usize = 0;
+
+    var scanner: HashScanner = .init(buffer);
+    for (pieces) |piece| {
+        const bytes = piece.bytes;
+        if (bytes.len <= window_size) {
+            // Because this piece's bytes are smaller than a window,
+            // the "before" and "after" windows overlap, so we have
+            // to handle it with the scanner.
+            try scanner.write(gpa, &found, bytes);
+            continue;
+        }
+
+        try scanner.write(gpa, &found, bytes[0..half_window_size]);
+        try scanner.endWindow(gpa, &found); // End of this streamed window.
+
+        if (piece.metadata) |metadata| {
+            if (metadata.hashes.len > 0) {
+                // Invariant check to make sure the hashes don't include hashes
+                // from outside their `bytes`.
+                assert(metadata.hashes[0].str_index >= metadata.hash_index_offset);
+                const last_index = metadata.hashes[metadata.hashes.len - 1].str_index;
+                assert(last_index + hash_token_len <= metadata.hash_index_offset + bytes.len);
+
+                try runs.append(gpa, .{
+                    .metadata = metadata,
+                    // Back up to the boundary between windows,
+                    // since that's where this run starts.
+                    .in_joined = scanner.cursor - half_window_size,
+                });
+                total_run_hashes += metadata.hashes.len;
+            }
+        } else {
+            try scanStringForHashRefs(gpa, bytes, scanner.cursor - half_window_size, &found);
+        }
+        // `- window_size`, since we already advanced half a window,
+        // and the next write will advance another half window.
+        scanner.cursor += bytes.len - window_size;
+
+        // Write the start of the ending window.
+        try scanner.write(gpa, &found, bytes[(bytes.len - half_window_size)..]);
+    }
+    try scanner.endWindow(gpa, &found);
+
+    var out: std.ArrayList(ResolvedHash) = try .initCapacity(gpa, total_run_hashes + found.items.len);
+    errdefer comptime unreachable;
+
+    // We will now interleave the found hashes in `found` with the preserved
+    // hashes in `runs`. This of course means we need to look up all the hashes
+    // in `found`, which we will now do.
+    heap.registered_hashes.rw_lock.lockSharedUncancelable(heap.global_io);
+    defer heap.registered_hashes.rw_lock.unlockShared(heap.global_io);
+
+    var remaining = found.items;
+    for (runs.items) |run| {
+        // Figure out how many `found` come before `run`.
+        var found_to_insert: usize = 0;
+        while (found_to_insert < remaining.len and remaining[found_to_insert].index < run.in_joined) found_to_insert += 1;
+        resolveHashRefsInner(remaining[0..found_to_insert], out.addManyAsSliceAssumeCapacity(found_to_insert));
+        remaining = remaining[found_to_insert..];
+
+        // Now we can insert our hashes, with the corresponding correction.
+        for (run.metadata.hashes) |hash| out.appendAssumeCapacity(.{
+            .str_index = hash.str_index - run.metadata.hash_index_offset + run.in_joined,
+            .value = if (hash.value) |value| value.takeReference() else null,
+        });
+    }
+    // Be sure to take care of the tailing found hashes.
+    resolveHashRefsInner(remaining, out.addManyAsSliceAssumeCapacity(remaining.len));
+    return out.toOwnedSliceAssert();
 }
