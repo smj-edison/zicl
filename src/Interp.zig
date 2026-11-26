@@ -1350,12 +1350,13 @@ fn getCommandAndSelfParam(interp: *Interp, args: []Shimmerable) !struct { comman
 }
 
 /// Takes care of populating the `self` parameter. `args_raw` should be one item
-/// larger than `args`, and `args` should be `args_raw[1..]`. If called with a
-/// method, `args_raw[1]` will become `args_raw[0]`, opening up a space for the
-/// `self` parameter.
+/// larger than the number of arguments. If this is called with a method,
+/// `args_raw[1]` will become `args_raw[0]`, opening up a space for the `self`
+/// parameter. `sources_raw` will also be updated in this case.
 pub fn invokeCommandMaybeMethod(
     interp: *Interp,
     args_raw: []Shimmerable,
+    sources_raw: []ArgSource,
 ) InternalEvalError!void {
     var args = args_raw[1..];
     if (args.len == 0) {
@@ -1376,6 +1377,10 @@ pub fn invokeCommandMaybeMethod(
     if (maybe_self.asValue()) |self| {
         args_raw[0] = args_raw[1]; // Move command name to the left.
         args_raw[1] = .{ .original = self };
+        sources_raw[0] = sources_raw[1];
+        // `self` gets modified back through `args_raw`, never through
+        // `sources_raw`.
+        sources_raw[1] = .none;
         args = args_raw[0..]; // Include all the allocated args now.
     }
 
@@ -1439,7 +1444,11 @@ pub fn invokeCommandMaybeMethod(
     }
 }
 
-fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const evaltypes.Script, command_token_i: *usize) !void {
+/// Where an argument's word came from: the token of a literal or `$name` word,
+/// or `none` for a word built fresh for the call.
+const ArgSource = enum(u32) { none = std.math.maxInt(u32), _ };
+
+fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *evaltypes.Script, command_token_i: *usize) !void {
     _ = try interp.pushEvalFrame(call_frame, script);
     defer interp.popEvalFrame();
 
@@ -1462,6 +1471,10 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
     // Contains what is considered to be the current arguments.
     var args = args_raw[1..];
     args_raw[0] = .{ .original = heap.interned_empty_string };
+    // Parallel to `args_raw`, so `writebackArgs` can find where each argument
+    // was read from.
+    var sources_raw = try heap.local_arena.alloc(ArgSource, args_raw.len);
+    sources_raw[0] = .none;
 
     {
         // This is not always the same as which word token we're on, as argument expansion
@@ -1482,8 +1495,13 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
                 word_token_i += 1;
             }
 
+            var word_source: ArgSource = .none;
             var resultant_word: Value = blk: {
                 if (word_parts == 1) {
+                    switch (tags[word_token_i]) {
+                        .simple_string, .variable_subst => word_source = @fromBackingInt(@intCast(word_token_i)),
+                        else => {},
+                    }
                     // Simple one-to-one substitution, so an easy case.
                     const res = try interp.substituteOneToken(tags[word_token_i], parsed.values[word_token_i]);
                     word_token_i += 1;
@@ -1515,13 +1533,16 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
                     // Note: len == 0 means the word disappears, so we shrink by 1.
                     args_raw = try heap.local_arena.realloc(args_raw, args_raw.len + expansion_len - 1);
                     args = args_raw[1..];
+                    sources_raw = try heap.local_arena.realloc(sources_raw, args_raw.len);
                 }
 
                 for (0..expansion_len) |list_idx| {
+                    sources_raw[1 + args_written] = .none;
                     args[args_written] = .{ .original = as_list.items[list_idx].takeReference() };
                     args_written += 1;
                 }
             } else {
+                sources_raw[1 + args_written] = word_source;
                 args[args_written] = .{ .original = resultant_word };
                 args_written += 1;
             }
@@ -1531,14 +1552,38 @@ fn evalCommand(interp: *Interp, call_frame: u32, script: Value, parsed: *const e
 
         command_token_i.* = word_token_i;
     }
-    defer for (args_raw) |*arg| arg.deinit();
+    defer {
+        interp.argsShimmerWriteback(call_frame, parsed, args_raw, sources_raw);
+        for (args_raw) |*arg| arg.deinit();
+    }
 
     if (args.len == 0) {
         interp.setEmptyResult();
         return;
     }
 
-    try interp.invokeCommandMaybeMethod(args_raw);
+    try interp.invokeCommandMaybeMethod(args_raw, sources_raw);
+}
+
+/// Shimmer writeback after a command executed. Uses `sources_raw` to follow
+/// tokens back to their source so they can be replaced with their new values.
+fn argsShimmerWriteback(interp: *Interp, call_frame: u32, parsed: *evaltypes.Script, args_raw: []Shimmerable, sources_raw: []const ArgSource) void {
+    for (args_raw, sources_raw) |*arg, source| {
+        if (source == .none) continue;
+        const new_value = arg.shimmered.asValue() orelse continue;
+
+        const token_i = @backingInt(source);
+        switch (parsed.tags[token_i]) {
+            .simple_string => {
+                const token = &parsed.values[token_i];
+                // A recursive evaluation of this script may have already
+                // written back to this token.
+                if (token.asPtr() != null and token.asPtr() == arg.original.asPtr()) token.swap(new_value.takeReference());
+            },
+            .variable_subst => vartypes.variableShimmerWriteback(interp, call_frame, parsed.values[token_i], arg.original, new_value),
+            else => unreachable,
+        }
+    }
 }
 
 pub fn evalValueInner(interp: *Interp, call_frame: u32, script: Value, cache_key: u256) InternalEvalError!void {
@@ -1989,25 +2034,21 @@ pub fn getVariableForMutationInFrame(interp: *Interp, call_frame_idx: u32, name:
 }
 
 pub fn getVariableForMutationOrError(interp: *Interp, name: *Shimmerable) !Value {
-    try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, vartypes.getVariableForMutationOrError(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn getVariableTakingRefOrError(interp: *Interp, name: *Shimmerable) !Value {
-    try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
     return try interp.wrapError(&det, vartypes.getVariableTakingRefOrError(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn unsetVariable(interp: *Interp, name: *Shimmerable) !void {
-    try name.ensureShimmerable();
     var det: ErrorDetails = undefined;
     try interp.wrapError(&det, vartypes.unsetVariable(interp, &det, interp.callFrameIdx(), name));
 }
 
 pub fn unsetVariableSilent(interp: *Interp, name: *Shimmerable) !void {
-    try name.ensureShimmerable();
     try vartypes.unsetVariable(interp, null, interp.callFrameIdx(), name);
 }
 

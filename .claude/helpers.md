@@ -38,7 +38,6 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Value.asInlineFloat(value)` -- Return `?f64` (non-null only for the `float` tag; use `objects.Float.asFloat` to also catch boxed floats).
 - `Value.asInlineBool(value)` -- Return `?bool` (non-null only for the `boolean` tag).
 - `Value.asType(value, T)` -- Return `?*T` if the value points at an `Object` whose vtable is `T.vtable`.
-- `Value.canShimmer(value)` -- True if the value points at a non-cross-thread object (false for primitives).
 - `Value.canMutate(value)` -- True if the value points at an exclusively-owned, non-cross-thread, non-hash-registered object (false for primitives).
 - `Value.asMutableInPlace(value, T, det)` -- Return `?*T` when the value can be shimmered to `T` _and_ mutated without duplicating; null when the caller has to duplicate instead (`duplicateAsBoxed`, mutate the copy, store it back). The preferred entry point for mutation; see the copy-on-write recipe in the cookbook.
 - `Value.incrRefCount(value)` -- Increment the ref count if the value is a pointer (no-op for primitives).
@@ -91,7 +90,6 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Object.asTypeConst(obj, T)` -- Const variant of `asType`.
 - `Object.asValue(obj)` -- Build a `pointer` `Value` from this object.
 - `Object.canMutate(obj)` -- True if ref count is 1, not cross-thread, and not hash-registered.
-- `Object.canShimmer(obj)` -- True if not cross-thread.
 - `Object.newObjectUninitialized(T)` -- Allocate a slot, set vtable/ref_count/metadata, return `{ head: *Object, body: *T }`. Does not zero the string fields.
 - `Object.newObject(T)` -- Like `newObjectUninitialized` but also initializes `string`/`string_metadata` to "no string".
 - `Object.duplicate(obj)` -- Dispatch to the vtable's `duplicate` (panics if none).

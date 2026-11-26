@@ -67,7 +67,7 @@ pub const Shimmerable = extern struct {
     pub fn ensureShimmerable(self: *Shimmerable) error{OutOfMemory}!void {
         _ = try self.ensureBoxed();
         if (self.current().asPtr()) |obj| {
-            if (!obj.canShimmer()) self.shimmered.swap((try obj.duplicate()).asValue());
+            if (!obj.canMutate()) self.shimmered.swap((try obj.duplicate()).asValue());
         }
     }
 
@@ -563,6 +563,7 @@ pub const HashReference = struct {
             };
             return error.HashLookupFailed;
         };
+        errdefer target.dropReference();
 
         const as_hash_ref = try shim.prepareToShimmer(HashReference);
         as_hash_ref.* = .{ .ref = target };
@@ -1516,7 +1517,8 @@ pub const List = struct {
     }
 
     /// Replace the item at `index` with `value` in place, without invalidating
-    /// the string rep.
+    /// the string rep. This drops the old item, so be sure to reference the
+    /// old item if you still need it.
     pub fn shimmerWriteback(list: *List, index: usize, value: Value) void {
         assert(!list.asHead().metadata.cross_thread);
         list.items[index].swap(value.takeReference());
@@ -1938,7 +1940,8 @@ pub const Dictionary = struct {
     /// This is different than a normal put operation, since it should be used
     /// exclusively for swapping one value of one internal rep with a equivalent
     /// value of a different internal rep. Used for shimmer writeback. It also
-    /// doesn't invalidate the dictionary's current string.
+    /// doesn't invalidate the dictionary's current string. This drops the old
+    /// value, so be sure to reference the old value if you still need it.
     pub fn shimmerWriteback(dict: *Dictionary, key: Value, value: Value) !void {
         assert(!dict.asHead().metadata.cross_thread);
 
@@ -2011,7 +2014,7 @@ pub const Dictionary = struct {
 
     /// Dict must be shimmerable.
     pub fn resolveParentDict(dict: *Dictionary, det: ?*ErrorDetails) error{ LookupFailed, OutOfMemory }!?*const Dictionary {
-        assert(dict.asHead().canShimmer());
+        assert(dict.asHead().canMutate());
 
         const tilde_parent = interned_tilde_parent;
         if ((try dict.getNoFollow(tilde_parent)).asValue()) |hash_ref| {

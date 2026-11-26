@@ -196,6 +196,9 @@ pub const CachedLexicalVar = struct {
 /// dict_path: {bar baz}
 /// ```
 pub const DictSugar = struct {
+    /// `dictSugarReadInner` may swap this for a different value with the same
+    /// string, to keep its variable lookup cached, so be sure to reference
+    /// it if you're holding it across `dictSugarReadInner` et al.
     dict_name: Value,
     dict_path: *objects.List,
 
@@ -584,6 +587,20 @@ fn dictSugarWrite(
     };
 }
 
+/// Swaps `new_value` into the local variable `name` resolved to, if it still
+/// holds `old_value`. `new_value` must have the same string as `old_value`.
+pub fn variableShimmerWriteback(interp: *Interp, call_frame_idx: u32, name: Value, old_value: Value, new_value: Value) void {
+    const cached_var = name.asType(CachedLocalVar) orelse return;
+    // A stale epoch means the frame's variables changed since `name` was
+    // resolved, so its slot index may no longer be valid.
+    if (cached_var.call_epoch != interp.call_frames.items[call_frame_idx].call_epoch) return;
+    switch (cached_var.getCurrentSlot().*) {
+        .normal => |*slot_value| if (slot_value.asPtr() != null and slot_value.asPtr() == old_value.asPtr()) slot_value.swap(new_value.takeReference()),
+        // The value lives in another frame under another name.
+        .upvar => {},
+    }
+}
+
 pub fn setVariable(interp: *Interp, det: ?*ErrorDetails, call_frame_idx: u32, name: *Shimmerable, value: Value) error{
     OutOfMemory,
     LookupFailed,
@@ -856,7 +873,7 @@ pub fn getVariableInner(
                 var name_in_other_scope: Shimmerable = .{ .original = link.linked_name };
                 defer name_in_other_scope.discardChanges();
                 const lookup_result = try getVariableInner(interp, det, link.call_frame, &name_in_other_scope, get_for_mutation);
-                if (name_in_other_scope.shimmered.asValue()) |shimmered| link.linked_name.swap(shimmered);
+                if (name_in_other_scope.shimmered.asValue()) |shimmered| link.linked_name.swap(shimmered.takeReference());
                 return lookup_result;
             },
             .normal => |value| {

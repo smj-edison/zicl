@@ -67,22 +67,24 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
     }
 
     const total_len = std.math.add(usize, base_bytes.len, extra_len) catch return error.OutOfMemory;
-    const result_bytes = try heap.global_gpa.allocSentinel(u8, total_len, 0);
-    errdefer heap.global_gpa.free(result_bytes);
+    const combined_str = blk: {
+        const result_bytes = try heap.global_gpa.allocSentinel(u8, total_len, 0);
+        errdefer heap.global_gpa.free(result_bytes);
 
-    if (total_len > 0) {
-        var pos: usize = 0;
-        @memcpy(result_bytes[pos .. pos + base_bytes.len], base_bytes);
-        pos += base_bytes.len;
-        for (args[2..]) |arg| {
-            var buf: [350]u8 = undefined;
-            const item_bytes = arg.current().getStringWithBuffer(&buf) catch unreachable;
-            @memcpy(result_bytes[pos .. pos + item_bytes.len], item_bytes);
-            pos += item_bytes.len;
+        if (total_len > 0) {
+            var pos: usize = 0;
+            @memcpy(result_bytes[pos .. pos + base_bytes.len], base_bytes);
+            pos += base_bytes.len;
+            for (args[2..]) |arg| {
+                var buf: [350]u8 = undefined;
+                const item_bytes = arg.current().getStringWithBuffer(&buf) catch unreachable;
+                @memcpy(result_bytes[pos .. pos + item_bytes.len], item_bytes);
+                pos += item_bytes.len;
+            }
         }
-    }
 
-    const combined_str = try String.newOwningNoFree(result_bytes);
+        break :blk try String.newOwningNoFree(result_bytes);
+    };
     defer combined_str.asHead().dropReference();
 
     try interp.setVariable(var_name, combined_str.asHead().asValue());

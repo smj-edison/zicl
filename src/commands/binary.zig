@@ -641,13 +641,29 @@ fn setDirectionalOption(slot: *DirectionalValue, dir: @FieldType(ParsedOptionKey
     }
 }
 
-fn parseSchemaFields(interp: *Interp, arena: std.mem.Allocator, schema_val: Value) !struct {
+const ParsedSchema = struct {
     fields: []FieldSpec,
     has_named: bool,
-} {
+    /// Lists the schema had to shimmer as duplicates. `fields` borrows from
+    /// their items, so they're held until the fields are freed.
+    kept_lists: []const Value,
+
+    fn deinit(parsed: ParsedSchema) void {
+        freeSchemaFields(parsed.fields);
+        for (parsed.kept_lists) |list| list.dropReference();
+    }
+};
+
+fn parseSchemaFields(interp: *Interp, arena: std.mem.Allocator, schema_val: Value) !ParsedSchema {
+    var kept_lists: std.ArrayList(Value) = .empty;
+    errdefer for (kept_lists.items) |list| list.dropReference();
+
     var schema_shim: Shimmerable = .{ .original = schema_val };
     defer schema_shim.discardChanges();
     const schema_list = try interp.getList(&schema_shim);
+    if (schema_shim.shimmered.asValue()) |duplicate| {
+        try kept_lists.append(arena, duplicate.takeReference());
+    }
 
     var fields: std.ArrayList(FieldSpec) = .empty;
     errdefer freeSchemaFields(fields.items);
@@ -682,6 +698,9 @@ fn parseSchemaFields(interp: *Interp, arena: std.mem.Allocator, schema_val: Valu
         var item_shim: Shimmerable = .{ .original = item_val };
         defer item_shim.discardChanges();
         const sub_list = try interp.getList(&item_shim);
+        if (item_shim.shimmered.asValue()) |duplicate| {
+            try kept_lists.append(arena, duplicate.takeReference());
+        }
         if (sub_list.items.len == 0) {
             return interp.setErrorString("empty field definition in binary schema");
         }
@@ -745,7 +764,7 @@ fn parseSchemaFields(interp: *Interp, arena: std.mem.Allocator, schema_val: Valu
                 }
                 if (field.schema.both) |sub_schema_val| {
                     const sub_parsed = try parseSchemaFields(interp, arena, sub_schema_val);
-                    defer freeSchemaFields(sub_parsed.fields);
+                    defer sub_parsed.deinit();
                 }
             },
             .custom => {
@@ -764,6 +783,8 @@ fn parseSchemaFields(interp: *Interp, arena: std.mem.Allocator, schema_val: Valu
     return .{
         .fields = try fields.toOwnedSlice(arena),
         .has_named = has_named,
+        // `arena` owns the backing memory, so there's nothing to transfer.
+        .kept_lists = kept_lists.items,
     };
 }
 
@@ -1646,7 +1667,7 @@ fn executeDecodeSchema(
     parent_scope: ?*EvalScope,
 ) Interp.Error!Value {
     const parsed_schema = try parseSchemaFields(interp, arena, schema_val);
-    defer freeSchemaFields(parsed_schema.fields);
+    defer parsed_schema.deinit();
 
     const decoded_dict = try Dictionary.new(&.{});
     defer decoded_dict.asHead().dropReference();
@@ -2027,7 +2048,7 @@ fn executeEncodeSchema(
     parent_scope: ?*EvalScope,
 ) Interp.Error!void {
     const parsed_schema = try parseSchemaFields(interp, arena, schema_val);
-    defer freeSchemaFields(parsed_schema.fields);
+    defer parsed_schema.deinit();
 
     const encode_dict = try Dictionary.new(&.{});
     defer encode_dict.asHead().dropReference();
@@ -2529,7 +2550,7 @@ fn binaryPatchCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
     // Determine bit endianness from schema if unaligned.
     var patch_endian: std.builtin.Endian = .big;
     const parsed_schema = try parseSchemaFields(interp, heap.local_arena, schema_val);
-    defer freeSchemaFields(parsed_schema.fields);
+    defer parsed_schema.deinit();
     if (parsed_schema.fields.len > 0) {
         if (parsed_schema.fields[0].bitEndian()) |e| {
             patch_endian = e;

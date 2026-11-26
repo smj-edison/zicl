@@ -513,7 +513,10 @@ pub fn returnCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         const flag = &args[i];
         const value = &args[i + 1];
 
-        const flag_value = Flags.get(null, flag) catch null;
+        const flag_value = Flags.get(null, flag) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
 
         if (flag_value) |val| switch (val) {
             .@"-code" => {

@@ -260,10 +260,6 @@ export fn Zicl_CanMutate(value: Value) bool {
     return value.canMutate();
 }
 
-export fn Zicl_CanShimmer(value: Value) bool {
-    return value.canShimmer();
-}
-
 export fn Zicl_RefCount(value: Value) u32 {
     const obj = value.asPtr() orelse return 0;
     return obj.getRefCount();

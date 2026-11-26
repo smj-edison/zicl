@@ -573,15 +573,6 @@ pub const Value = extern struct {
         return null;
     }
 
-    pub fn canShimmer(value: Value) bool {
-        if (value.asPtr()) |obj| {
-            return obj.canShimmer();
-        } else {
-            // Primitives can't shimmer.
-            return false;
-        }
-    }
-
     pub fn canMutate(value: Value) bool {
         // Note: a crossthread object can _never_ mutate. A lot of asserts around
         // the codebase assume that `canMutate` means that an object is not crossthread.
@@ -1151,10 +1142,6 @@ pub const Object = extern struct {
         return true;
     }
 
-    pub fn canShimmer(obj: *const Object) bool {
-        return !obj.metadata.cross_thread;
-    }
-
     /// If `obj` is exclusively owned (`canMutate()`), ensures its string rep is
     /// an exclusively owned `*SpecialString`, invalidates any internal rep, and
     /// returns the mutable `*SpecialString`. Returns `null` if `obj` cannot be
@@ -1558,7 +1545,7 @@ pub const Object = extern struct {
     }
 
     pub fn invalidateString(obj: *Object) void {
-        assert(obj.canShimmer());
+        assert(obj.canMutate());
         if (options.trace_mem) {
             const was: []u8 = switch (obj.getStringDetails()) {
                 .none => &.{},
@@ -1691,6 +1678,9 @@ pub const Object = extern struct {
         const new_obj = try newObjectUninitialized(objects.None);
         errdefer new_obj.head.freeBacking();
         try src.duplicateHeadOnto(new_obj.head);
+        // `duplicateHeadOnto` copies the head, but not the body, which means
+        // it'll potentially copy a vtable that no longer applies.
+        new_obj.head.vtable = &objects.None.vtable;
 
         return new_obj.head;
     }

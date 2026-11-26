@@ -48,6 +48,7 @@ pub const Regexp = struct {
             }
             return error.BadRegexp;
         };
+        errdefer pcre2.pcre2_code_free_8(compiled);
 
         const as_regexp = try shim.prepareToShimmer(Regexp);
         as_regexp.* = .{

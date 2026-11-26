@@ -874,6 +874,40 @@ test "lindex basic" {
     try memutil.checkAllocationFailures(.exhaustive, testLindexBasic, .{});
 }
 
+fn testLindexAliasedArgs(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // The list and the index are the same object, so shimmering the index
+    // must not replace the list body `lindex` is still reading.
+    try interp.testExpectScriptResult("0", "set x 0; lindex $x $x");
+}
+
+test "lindex with the list as its own index" {
+    try memutil.checkAllocationFailures(.exhaustive, testLindexAliasedArgs, .{});
+}
+
+fn testShimmerWritebackToVariable(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // `$l` is shared by the variable and the argument, so [llength] shimmers a
+    // duplicate, which is written back so the variable keeps the parsed list.
+    try interp.testExpectScriptResult("3", "set l [string trim { a b c }]; llength $l");
+
+    const name = try String.newValue("l");
+    defer name.dropReference();
+    var name_shim: Shimmerable = .{ .original = name };
+    defer name_shim.discardChanges();
+    const value = (try interp.getVariableTakingRef(&name_shim)).?;
+    defer value.dropReference();
+    try std.testing.expect(value.asType(List) != null);
+}
+
+test "shimmered arguments are written back to their variable" {
+    try memutil.checkAllocationFailures(.exhaustive, testShimmerWritebackToVariable, .{});
+}
+
 fn testLrangeBasic(ta: std.mem.Allocator) !void {
     var interp = try common.testStart(ta);
     defer common.testFinish(&interp);
