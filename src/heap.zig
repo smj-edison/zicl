@@ -15,7 +15,6 @@ const memutil = @import("memutil.zig");
 const StructIterator = memutil.StructIterator;
 const ioutil = @import("ioutil.zig");
 const hashutil = @import("hashutil.zig");
-const hashjoin = @import("hashjoin.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
@@ -903,16 +902,16 @@ pub const strpatch = struct {
         // Both old pieces keep the tokens fully inside them, so only the
         // inserted bytes and the bytes around the edit get scanned.
         var scan_buffer: [256]u8 = undefined;
-        const new_tracked = try hashjoin.trackedHashes(
+        const new_tracked = try hashutil.getHashesFromJoining(
             global_gpa,
             &scan_buffer,
             &.{
-                .fromSource(old.bytes, old.hashes, 0, edit.start),
-                .{ .bytes = edit.bytes },
-                .fromSource(old.bytes, old.hashes, edit.end, old.bytes.len),
+                .init(old.bytes[0..edit.start], .{ .hashes = old.hashes, .hash_index_offset = 0 }),
+                .init(edit.bytes, null),
+                .init(old_tail, .{ .hashes = old.hashes, .hash_index_offset = edit.end }),
             },
         );
-        errdefer hashjoin.release(global_gpa, new_tracked);
+        errdefer hashutil.deinitResolvedHashes(global_gpa, new_tracked);
 
         // The special string itself may be shared with other objects
         // (`duplicateHeadOnto` shares rather than copies), even when `obj` is

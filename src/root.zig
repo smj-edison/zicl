@@ -149,7 +149,7 @@ test {
     _ = @import("leak_check.zig");
 
     _ = @import("heap.zig");
-    _ = @import("hashjoin.zig");
+    _ = @import("hashutil.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("objects.zig");
     _ = @import("Capability.zig");

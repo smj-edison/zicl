@@ -1,9 +1,13 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
 const ioutil = @import("ioutil.zig");
+const memutil = @import("memutil.zig");
+const options = @import("options");
 const heap = @import("heap.zig");
+const objects = @import("objects.zig");
 const Object = heap.Object;
 const Value = heap.Value;
 const SpecialString = heap.SpecialString;
@@ -545,4 +549,247 @@ pub fn getHashesFromJoining(gpa: Allocator, buffer: []u8, pieces: []const Piece)
     // Be sure to take care of the tailing found hashes.
     resolveHashRefsInner(remaining, out.addManyAsSliceAssumeCapacity(remaining.len));
     return out.toOwnedSliceAssert();
+}
+
+/// Drops every reference in `hashes`, and frees it.
+pub fn deinitResolvedHashes(gpa: Allocator, hashes: []const ResolvedHash) void {
+    for (hashes) |hash| if (hash.value) |value| value.dropReference();
+    gpa.free(hashes);
+}
+
+/// Fails unless `getHashesFromJoining` gives exactly what a full rescan of the joined
+/// bytes finds. It's checked with a full-size scan buffer, and again with the
+/// smallest allowed one, which overlaps on nearly every byte.
+fn expectMatchesRescan(pieces: []const Piece) !void {
+    const gpa = heap.global_gpa;
+
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(gpa);
+    for (pieces) |piece| try joined.appendSlice(gpa, piece.bytes);
+
+    const expected = try scanAndResolveHashRefs(gpa, joined.items);
+    defer deinitResolvedHashes(gpa, expected);
+
+    var scan_buffer: [256]u8 = undefined;
+    for ([_]usize{ scan_buffer.len, hash_token_len }) |buffer_len| {
+        const actual = try getHashesFromJoining(gpa, scan_buffer[0..buffer_len], pieces);
+        defer deinitResolvedHashes(gpa, actual);
+
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |exp, act| {
+            try testing.expectEqual(exp.str_index, act.str_index);
+            try testing.expectEqual(exp.value, act.value);
+        }
+    }
+}
+
+const TestRefs = struct {
+    targets: [2]*objects.String,
+    registered: [2][hash_token_len]u8,
+    unregistered: [hash_token_len]u8,
+
+    fn init() !TestRefs {
+        var refs: TestRefs = undefined;
+        var created: usize = 0;
+        errdefer for (refs.targets[0..created]) |target| target.asHead().dropReference();
+        for (&refs.targets, &refs.registered, 0..) |*target, *ref, i| {
+            var name_buf: [24]u8 = undefined;
+            target.* = try objects.String.new(try std.fmt.bufPrint(&name_buf, "join payload {d}", .{i}));
+            created += 1;
+            ref.* = objects.HashReference.render(try target.*.asHead().getHashRegistering());
+        }
+        refs.unregistered = objects.HashReference.render(hashBytes("never registered"));
+        return refs;
+    }
+
+    fn deinit(refs: TestRefs) void {
+        for (refs.targets) |target| target.asHead().dropReference();
+    }
+};
+
+/// Checks every way of cutting a string into three pieces whose first cut is
+/// at `first_cut`, with each piece either tracked or raw. Cutting through a
+/// token leaves it to the boundary scan to find.
+fn testSplitsFrom(ta: Allocator, first_cut: usize) !void {
+    try heap.testStart(ta, null);
+    defer heap.testFinish();
+    const refs = try TestRefs.init();
+    defer refs.deinit();
+
+    const source_bytes = testSplitsSource(refs);
+    const source = try objects.String.new(&source_bytes);
+    defer source.asHead().dropReference();
+    const obj = source.asHead();
+    const len = (try obj.getString()).len;
+    // Runs only come from a source that tracks its tokens.
+    try testing.expect(obj.getStringDetails() == .special);
+
+    for (first_cut..len + 1) |second_cut| for (0..8) |raw_mask| {
+        if (!isInterestingCut(second_cut, first_cut)) continue;
+        const bounds = [_]usize{ 0, first_cut, second_cut, len };
+        var pieces: [3]Piece = undefined;
+        for (&pieces, 0..) |*piece, i| {
+            piece.* = .fromObject(obj, bounds[i], bounds[i + 1]);
+            if (raw_mask & (@as(usize, 1) << @intCast(i)) != 0) piece.metadata = null;
+        }
+        try expectMatchesRescan(&pieces);
+    };
+}
+
+const splits_source_len = 2 + hash_token_len + 1 + 2 * hash_token_len + 4;
+
+fn testSplitsSource(refs: TestRefs) [splits_source_len]u8 {
+    return ("ab" ++ refs.registered[0] ++ "x" ++ refs.registered[1] ++ refs.unregistered ++ "tail").*;
+}
+
+/// Whether a cut at `cut` can behave differently from its neighbors. Cuts
+/// that only move within padding or a token's middle give the same pieces
+/// the same treatment, so outside of -Dfull-oom-testing only cuts near a
+/// token's edge, an end of the source, or a short piece's length limit are
+/// tried. `first_cut` is null when `cut` is the first cut.
+fn isInterestingCut(cut: usize, first_cut: ?usize) bool {
+    if (options.full_oom_testing) return true;
+
+    const short_limit = 2 * half_window_size;
+    const token_edges = [_]usize{
+        2,                      2 + hash_token_len,
+        3 + hash_token_len,     3 + 2 * hash_token_len,
+        3 + 3 * hash_token_len,
+    };
+    const ends = [_]usize{ 0, splits_source_len, short_limit, splits_source_len - short_limit };
+    const radius = 2;
+    for (token_edges ++ ends) |anchor| {
+        if (@max(cut, anchor) - @min(cut, anchor) <= radius) return true;
+    }
+    if (first_cut) |first| {
+        if (cut >= first + short_limit -| radius and cut <= first + short_limit + radius) return true;
+        if (cut <= first + radius) return true;
+    }
+    return false;
+}
+
+test "joining matches a rescan for every three-way split" {
+    // Each first cut gets its own heap cycle, since the whole sweep traces
+    // more operations than one cycle's trace log holds.
+    for (0..splits_source_len + 1) |first_cut| {
+        if (!isInterestingCut(first_cut, null)) continue;
+        try testSplitsFrom(testing.allocator, first_cut);
+    }
+}
+
+fn testBoundaries(ta: Allocator) !void {
+    try heap.testStart(ta, null);
+    defer heap.testFinish();
+    const refs = try TestRefs.init();
+    defer refs.deinit();
+    const ref = &refs.registered[0];
+
+    // A token made from bytes of two different strings, neither of which
+    // tracks it.
+    {
+        const head = try objects.String.new("left " ++ ref[0..10]);
+        defer head.asHead().dropReference();
+        const tail = try objects.String.new(ref[10..] ++ " right");
+        defer tail.asHead().dropReference();
+        try expectMatchesRescan(&.{
+            Piece.fromObject(head.asHead(), 0, 15),
+            Piece.fromObject(tail.asHead(), 0, hash_token_len - 10 + 6),
+        });
+    }
+
+    // One token crossing many boundaries, with empty pieces between some of them.
+    {
+        var pieces: [2 * hash_token_len]Piece = undefined;
+        for (0..hash_token_len) |i| {
+            pieces[2 * i] = .init(ref[i..][0..1], null);
+            pieces[2 * i + 1] = .init("", null);
+        }
+        try expectMatchesRescan(&pieces);
+    }
+
+    // The same string joined to itself, around an inserted token. This is
+    // the shape of a patch: `old[0..at] ++ add ++ old[at..]`.
+    {
+        const doubled = try objects.String.new(refs.registered[1] ++ "mid" ++ refs.unregistered);
+        defer doubled.asHead().dropReference();
+        const obj = doubled.asHead();
+        const len = (try obj.getString()).len;
+        try testing.expect(obj.getStringDetails() == .special);
+        for (0..len + 1) |at| try expectMatchesRescan(&.{
+            Piece.fromObject(obj, 0, at),
+            .init(ref, null),
+            Piece.fromObject(obj, at, len),
+            Piece.fromObject(obj, 0, len),
+        });
+    }
+
+    // Long raw pieces, scanned in place.
+    try expectMatchesRescan(&.{
+        .init("a fairly long raw prefix " ++ ref.* ++ " and " ++ refs.unregistered, null),
+        .init(&(ref.* ++ ref.*), null),
+    });
+}
+
+test "joining boundaries" {
+    try memutil.checkAllocationFailures(.exhaustive, testBoundaries, .{});
+}
+
+/// Fails unless `getHashesFromJoining` gives exactly `expected`, with both a
+/// full-size and the smallest allowed scan buffer.
+fn expectTrackedHashes(pieces: []const Piece, expected: []const ResolvedHash) !void {
+    const gpa = heap.global_gpa;
+    var scan_buffer: [256]u8 = undefined;
+    for ([_]usize{ scan_buffer.len, hash_token_len }) |buffer_len| {
+        const actual = try getHashesFromJoining(gpa, scan_buffer[0..buffer_len], pieces);
+        defer deinitResolvedHashes(gpa, actual);
+
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |exp, act| {
+            try testing.expectEqual(exp.str_index, act.str_index);
+            try testing.expectEqual(exp.value, act.value);
+        }
+    }
+}
+
+fn testRunsSkipRescan(ta: Allocator) !void {
+    try heap.testStart(ta, null);
+    defer heap.testFinish();
+    const refs = try TestRefs.init();
+    defer refs.deinit();
+
+    // A rescan can't tell a run from a scan of the same bytes, so these
+    // pieces carry metadata that disagrees with their bytes. `bytes` holds
+    // a real token for `targets[0]`, padded so that neither window around
+    // the piece holds all of it.
+    const padding: [hash_token_len]u8 = @splat(' ');
+    const bytes = padding ++ refs.registered[0] ++ padding;
+    const claimed = [_]ResolvedHash{
+        .{ .str_index = hash_token_len, .value = refs.targets[1].asHead() },
+        .{ .str_index = 2 * hash_token_len, .value = null },
+    };
+
+    // A tracked piece that tracks nothing is never scanned inside.
+    try expectTrackedHashes(&.{.init(&bytes, .{ .hashes = &.{}, .hash_index_offset = 0 })}, &.{});
+
+    // A run's values come from its metadata, not the registry.
+    try expectTrackedHashes(&.{.init(&bytes, .{ .hashes = &claimed, .hash_index_offset = 0 })}, &claimed);
+
+    // A run starting partway into its source, between scanned tokens.
+    const head = "<" ++ refs.registered[0];
+    const source_start = 10;
+    const tail_start = head.len + bytes.len - source_start;
+    try expectTrackedHashes(&.{
+        .init(head, null),
+        .init(bytes[source_start..], .{ .hashes = &claimed, .hash_index_offset = source_start }),
+        .init(refs.unregistered ++ ">", null),
+    }, &.{
+        .{ .str_index = 1, .value = refs.targets[0].asHead() },
+        .{ .str_index = head.len + hash_token_len - source_start, .value = refs.targets[1].asHead() },
+        .{ .str_index = head.len + 2 * hash_token_len - source_start, .value = null },
+        .{ .str_index = tail_start, .value = null },
+    });
+}
+
+test "joining passes runs through without rescanning" {
+    try memutil.checkAllocationFailures(.exhaustive, testRunsSkipRescan, .{});
 }
