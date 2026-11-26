@@ -614,6 +614,9 @@ export fn dumpTraceForObject(addr: usize, verbose: bool) void {
 }
 
 test "leak" {
+    // Leaks are only recorded while tracing.
+    if (!options.trace_mem) return error.SkipZigTest;
+
     try heap.testStart(testing.allocator, null);
     defer heap.testFinish();
 

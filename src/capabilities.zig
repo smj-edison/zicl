@@ -341,8 +341,11 @@ pub const IpSocket = struct {
             };
             break :blk conn;
         };
-        errdefer stream.close(heap.global_io);
-        const ip_conn = try IpConnection.init(stream);
+        const ip_conn = blk: {
+            errdefer stream.close(heap.global_io);
+            break :blk try IpConnection.init(stream);
+        };
+        // `newTakingOwnership` closes `ip_conn` if it fails.
         return try Capability.newTakingOwnership(&ip_conn.head);
     }
 

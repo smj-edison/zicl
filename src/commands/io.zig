@@ -58,28 +58,29 @@ pub fn streamCmd(interp: *Interp, args: []Shimmerable) !void {
                     interp.setEmptyResult();
                     return;
                 }
-                const bytes = try heap.global_gpa.allocSentinel(u8, count, 0);
-                errdefer heap.global_gpa.free(bytes);
+                const final_bytes = blk: {
+                    const bytes = try heap.global_gpa.allocSentinel(u8, count, 0);
+                    errdefer heap.global_gpa.free(bytes);
 
-                const n_read = reader.readSliceShort(bytes[0..count]) catch {
-                    return readError(interp, stream_ops.get_reader_error(cap.head).?);
-                };
-                if (n_read == 0) {
+                    const n_read = reader.readSliceShort(bytes[0..count]) catch {
+                        return readError(interp, stream_ops.get_reader_error(cap.head).?);
+                    };
+                    if (n_read == 0) {
+                        stream_ops.get_eos_ptr(cap.head).* = true;
+                        heap.global_gpa.free(bytes);
+                        interp.setEmptyResult();
+                        return;
+                    }
+                    if (n_read == count) break :blk bytes;
+
                     stream_ops.get_eos_ptr(cap.head).* = true;
-                    heap.global_gpa.free(bytes);
-                    interp.setEmptyResult();
-                    return;
-                }
-                if (n_read < count) {
-                    stream_ops.get_eos_ptr(cap.head).* = true;
-                }
-                const final_bytes = if (n_read < count) blk: {
                     const shrunk = try heap.global_gpa.allocSentinel(u8, n_read, 0);
                     @memcpy(shrunk, bytes[0..n_read]);
                     heap.global_gpa.free(bytes);
                     break :blk shrunk;
-                } else bytes;
+                };
 
+                // `newOwning` frees `final_bytes` if it fails.
                 const as_string = try objects.String.newOwning(final_bytes);
                 interp.setResultOwning(as_string.asHead().asValue());
             } else {
