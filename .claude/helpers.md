@@ -133,8 +133,15 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `hashutil.hashBytes(bytes)` -- Blake3 hash of a byte slice, returning `u256`.
 - `hashutil.scanStringForHashRefs(gpa, bytes, offset, found_hashes)` -- Append every hash reference in `bytes` to `found_hashes` as a `HashInstance`, with `offset` added to each index.
 - `hashutil.parseHashReference(bytes)` -- Parse a string that is exactly one hash reference; return the `u256` or null.
-- `hashutil.scanAndResolveHashRefs(gpa, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, taking representatives; returns `[]SpecialString.HashAndInfo`.
+- `hashutil.scanAndResolveHashRefs(gpa, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, taking representatives; returns `[]SpecialString.ResolvedHash`.
 - `hashutil.resolveHashRefsInner(found, out)` -- Resolve each `HashInstance` into the matching slot of `out`, taking a reference to every registered value. The caller holds `registered_hashes`'s shared lock, so several calls can share one lock.
+
+### Joining strings
+- `hashutil.Piece` -- A byte slice to join, with optional `Piece.Metadata` (`hashes`, `hash_index_offset`). Null metadata makes a raw piece, which gets scanned.
+- `hashutil.Piece.init(bytes, metadata)` -- Build a piece. With metadata, `hashes` may be a whole source string's tracked hashes indexed from `hash_index_offset`; only the ones fully inside `bytes` are kept.
+- `hashutil.Piece.fromObject(obj, start, end)` -- Borrow `obj`'s string `[start, end)` as a piece, with its tracked hashes.
+- `hashutil.getHashesFromJoining(gpa, buffer, pieces)` -- The resolved hashes `pieces` would track once joined, sorted by index, each holding a caller-owned reference. `buffer` is scratch space of at least `hash_token_len` bytes. Only reads the pieces.
+- `hashutil.releaseResolvedHashes(gpa, hashes)` -- Drop every reference in a `[]ResolvedHash` and free it.
 
 ### HashRegistry (instance: `heap.registered_hashes`)
 - `getAndTakeReference(hash)` -- Look up a `u256` hash and return a referenced `*Object` (or null). Thread-safe via shared lock.
@@ -146,14 +153,6 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `heap.considered_large_string` (1024) -- The switch point between Wyhash and the cached Blake3 hash.
 - `hashutil.quickHash(value)` -- Hash a value for a table's index (dictionary keys, variable tables). Wyhash below `heap.considered_large_string`, the truncated cached Blake3 hash at or above it. Not cryptographically secure; only for hash tables paired with equality, not content addressing.
 - `hashutil.cacheQuickHash(value)` -- Force the object's content hash to be cached ahead of time, for a key at or above `heap.considered_large_string`, so a later `quickHash` on it cannot OOM.
-
----
-
-## src/hashjoin.zig
-- `hashjoin.PieceMetadata` -- A piece's tracked hashes: its source string's `tracked_hashes` and where the piece starts in that source.
-- `hashjoin.PieceMetadata.fromObject(obj, start, end)` -- Borrow `obj`'s string `[start, end)` as a `{ bytes, metadata }` pair.
-- `hashjoin.trackedHashes(gpa, scan_buffer, bytes, metadata)` -- The hash references the pieces `bytes` (parallel to `metadata`, null for raw bytes) would track once joined, sorted by index, each holding a caller-owned reference. `scan_buffer` is scratch space of at least `hashutil.hash_token_len` bytes. Only reads the pieces.
-- `hashjoin.release(gpa, hashes)` -- Drop every reference in a `trackedHashes` result and free it.
 
 ---
 

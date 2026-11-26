@@ -317,8 +317,8 @@ pub fn registerSafeCommands(interp: *Interp) !void {
     try registerCommand(interp, "uplevel", uplevelCmd, "?level? script ?arg ...?", 1, null);
 }
 
-pub fn registerCommands(interp: *Interp) !void {
-    try registerSafeCommands(interp);
+/// The commands that read files, which a sandboxed interpreter leaves out.
+pub fn registerFileCommands(interp: *Interp) !void {
     try registerCommand(interp, "import", importCmd, "fileName", 1, 1);
     try registerCommand(interp, "source", sourceCmd, "fileName", 1, 1);
 }

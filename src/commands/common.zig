@@ -57,6 +57,7 @@ pub fn registerSafeCoreCommands(interp: *Interp) !void {
 
 pub fn registerCoreCommands(interp: *Interp) !void {
     try registerSafeCoreCommands(interp);
+    try @import("eval.zig").registerFileCommands(interp);
     try @import("exec.zig").registerCommands(interp);
     try @import("io.zig").registerCommands(interp);
     try @import("load.zig").registerCommands(interp);
