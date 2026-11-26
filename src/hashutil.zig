@@ -280,22 +280,6 @@ pub fn parseHashReference(bytes: []const u8) ?u256 {
     return @bitCast(output);
 }
 
-pub fn scanAndResolveHashRefs(gpa: Allocator, bytes: []const u8) error{OutOfMemory}![]SpecialString.HashAndInfo {
-    var found_hashes: std.ArrayList(HashInstance) = .empty;
-    defer found_hashes.deinit(gpa);
-    try scanStringForHashRefs(gpa, bytes, 0, &found_hashes);
-
-    // Look up all the found hashes.
-    const resolved_hashes = try gpa.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
-    errdefer comptime unreachable;
-
-    heap.registered_hashes.rw_lock.lockSharedUncancelable(heap.global_io);
-    defer heap.registered_hashes.rw_lock.unlockShared(heap.global_io);
-    resolveHashRefsInner(found_hashes.items, resolved_hashes);
-
-    return resolved_hashes;
-}
-
 /// Resolves each of `found` into the matching slot of `out`, taking a
 /// reference to every registered value. The caller must hold
 /// `heap.registered_hashes`'s shared lock.
@@ -310,6 +294,22 @@ pub fn resolveHashRefsInner(found: []const HashInstance, out: []SpecialString.Ha
                 null,
         };
     }
+}
+
+pub fn scanAndResolveHashRefs(gpa: Allocator, bytes: []const u8) error{OutOfMemory}![]SpecialString.HashAndInfo {
+    var found_hashes: std.ArrayList(HashInstance) = .empty;
+    defer found_hashes.deinit(gpa);
+    try scanStringForHashRefs(gpa, bytes, 0, &found_hashes);
+
+    // Look up all the found hashes.
+    const resolved_hashes = try gpa.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
+    errdefer comptime unreachable;
+
+    heap.registered_hashes.rw_lock.lockSharedUncancelable(heap.global_io);
+    defer heap.registered_hashes.rw_lock.unlockShared(heap.global_io);
+    resolveHashRefsInner(found_hashes.items, resolved_hashes);
+
+    return resolved_hashes;
 }
 
 /// Use only for hash tables and similar data structures that also use equality,

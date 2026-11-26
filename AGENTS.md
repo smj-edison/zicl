@@ -96,11 +96,11 @@ When writing tests, use `memutil.checkAllocationFailures`, unless you're working
 -   `SpecialString` -- the wrapper for large strings (> 1024 bytes) and strings that embed hash references, ref-counted independently of their owning object.
 -   `heap.registered_hashes` -- the global `hashutil.HashRegistry` instance.
 -   `NativeFnRegistry` (`heap.nativefn_registry`) -- a global, mutex-protected map from command name to a lazy `LazyRegisterFn`, for lazily loading C commands.
--   `strpatch` -- OOM-safe in-place patching of a string, keeping its tracked hash references correct.
+-   `strpatch` -- OOM-safe in-place patching of a string. Its tracked hash references come from `hashjoin`, treating the patch as a three-piece join.
 
 **Hashing (src/hashutil.zig)**: Blake3 hashing, base64url encoding of hashes, scanning strings for `blake3.<hash>~` references and resolving them, and quick (non-cryptographic) hashing for hash tables. It also defines `HashRegistry`, a `RwLock`-protected, content-addressable store mapping `u256` Blake3 hashes to a representative `*Object`. It lets any thread resolve a shared object by hash, and reclaims the representative once every instance of the hash is gone.
 
-**Joined hash references (src/hashjoin.zig)**: Computes the hash references a string built by joining pieces would track, without building the string. Pieces that already track their hashes contribute them directly, so only raw bytes and the bytes around each seam are scanned. Callers assemble the bytes themselves.
+**Joined hash references (src/hashjoin.zig)**: Computes the hash references a string built by joining pieces would track, without building the string. Pieces that already track their hashes contribute them directly, so only raw bytes and the bytes around each boundary between pieces are scanned. Callers assemble the bytes themselves.
 
 **Object System (src/objects.zig)**: Implements Tcl's dynamic typing through vtable-based type shimmering. Each Tcl type is a Zig struct that owns a `pub const vtable: Object.VTable` and a body that lives in the `Object`'s inline `body_backing` (at most `Object.body_max_size` = 48 bytes, aligned to `Object.body_align` = 8):
 

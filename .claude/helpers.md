@@ -150,9 +150,9 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 ---
 
 ## src/hashjoin.zig
-- `hashjoin.Tracked` -- A piece's tracked hashes: its source string's `tracked_hashes` and where the piece starts in that source.
-- `hashjoin.Tracked.fromObject(obj, start, end)` -- Borrow `obj`'s string `[start, end)` as a `{ bytes, tracked }` pair.
-- `hashjoin.trackedHashes(gpa, bytes, tracked)` -- The hash references the pieces `bytes` (parallel to `tracked`, null for raw bytes) would track once joined, sorted by index, each holding a caller-owned reference. Only reads the pieces.
+- `hashjoin.PieceMetadata` -- A piece's tracked hashes: its source string's `tracked_hashes` and where the piece starts in that source.
+- `hashjoin.PieceMetadata.fromObject(obj, start, end)` -- Borrow `obj`'s string `[start, end)` as a `{ bytes, metadata }` pair.
+- `hashjoin.trackedHashes(gpa, scan_buffer, bytes, metadata)` -- The hash references the pieces `bytes` (parallel to `metadata`, null for raw bytes) would track once joined, sorted by index, each holding a caller-owned reference. `scan_buffer` is scratch space of at least `hashutil.hash_token_len` bytes. Only reads the pieces.
 - `hashjoin.release(gpa, hashes)` -- Drop every reference in a `trackedHashes` result and free it.
 
 ---

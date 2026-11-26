@@ -15,6 +15,7 @@ const memutil = @import("memutil.zig");
 const StructIterator = memutil.StructIterator;
 const ioutil = @import("ioutil.zig");
 const hashutil = @import("hashutil.zig");
+const hashjoin = @import("hashjoin.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
@@ -856,131 +857,6 @@ pub const SpecialString = struct {
 pub const strpatch = struct {
     const HashAndInfo = SpecialString.HashAndInfo;
 
-    /// Length of a full hash reference token.
-    const token_len = hashutil.hash_token_len;
-
-    // /// Attempts to atomically patch `obj`, by replacing `obj.string[edit_at..remove]` with `add`.
-    // /// Corrects any changed hashes, and leaves `string` untouched if OOM occurs. `add`
-    // /// must not alias the object's string.
-    // pub fn patch2(obj: *Object, edit_at: usize, remove: usize, add: []const u8) error{OutOfMemory}!void {
-    //     // Note: when we say "token" in the below code, we're referring specifically to a hash token,
-    //     // e.g. `blake3.abc123~`.
-
-    //     assert(obj.canMutate());
-    //     _ = obj.getString();
-
-    //     const old: struct {
-    //         bytes: []const u8,
-    //         hashes: []const HashAndInfo,
-    //         special: ?*SpecialString,
-    //     } = switch (obj.getStringDetails()) {
-    //         .normal => |bytes| .{ .bytes = bytes, .hashes = &.{}, .special = null },
-    //         .special => |special| .{ .bytes = special.getString(), .hashes = special.tracked_hashes, .special = special },
-    //         .none => unreachable, // `String` objects always have a string rep.
-    //     };
-
-    //     assert(edit_at + remove <= old.bytes.len);
-
-    //     // We will now allocate all needed structures for the patch, so we can
-    //     // do all the fallible steps at once. We won't take any references until
-    //     // this section successfully completes, so all that is needed for cleanup
-    //     // is freeing the allocated structures.
-    //     //
-    //     // Some terminology we use below: There are "guaranteed" surviving
-    //     // tokens, which are tokens in ranges where it's impossible for the edit
-    //     // to damage them, and then we have "found" tokens, which are tokens
-    //     // that were found either in the edit's bytes, or crossing the edit's
-    //     // boundaries. This means that the tokens' start indices form a
-    //     // partition: `guaranteed ∪ found = all tokens`, and
-    //     // `guaranteed ∩ found = ∅`.
-
-    //     // The edit is as follows:
-    //     // old: text before|to be removed|text after edit section
-    //     //                 ^ edit_at     ^ edit_at + remove
-    //     // new: text before|newly added text|text after edit section
-    //     //                 ^ edit_at        ^ edit_at + add.len
-    //     const old_edit_end = edit_at + remove;
-    //     const new_edit_end = edit_at + add.len;
-
-    //     const guaranteed_ranges: [2]struct { old_start: usize, new_start: usize, len: usize } = .{
-    //         .{
-    //             .old_start = 0,
-    //             .new_start = 0,
-    //             .len = edit_at -| (token_len - 1),
-    //         },
-    //         .{
-    //             .old_start = old_edit_end,
-    //             .new_start = new_edit_end,
-    //             .len = old.bytes.len - old_edit_end,
-    //         },
-    //     };
-
-    //     // We have two (potentially overlapping) windows where we will find
-    //     // new hashes. This diagram is in new string indices:
-    //     //                                       v edit_at                                       v new_edit_end
-    //     // |- guaranteed starts -|               |----------------- added text ------------------|- guaranteed starts -|
-    //     //                       |`token_len - 1`|`token_len - 1`|               |`token_len - 1`|`token_len - 1`|
-    //     //                       |-------- window before --------|               |-------- window after ---------|
-    //     // We'll also scan "added text", since it can also have new hashes
-    //     // (unless the windows overlap, as explained below).
-    //     //
-    //     // Some notes:
-    //     // 1. You may notice that "guaranteed starts" doesn't overlap with
-    //     //    "window before", but it does overlap with "window after." This is
-    //     //    because "guaranteed starts" contains all the indices where the
-    //     //    _start_ of the token is valid. We can have absolutely no overlap
-    //     //    between "guaranteed starts" and "window before", or else we'll
-    //     //    double count a token. Conversely, we need overlap between
-    //     //    "guaranteed starts" and "window after", because only the first
-    //     //    half of "window after" has the start indices of full tokens, while
-    //     //    the second half only contains the end of tokens from the first
-    //     //    half.
-    //     // 2. When `add.len < 2 * (token_len - 1)`, the two windows will
-    //     //    overlap. If we scanned both windows when they overlap, we could
-    //     //    potentially scan a hash token twice. To prevent this, we merge the
-    //     //    two windows into one that gets scanned in its entirety. We also
-    //     //    don't scan `add`, since its contents will be scanned when
-    //     //    scanning the merged window.
-
-    //     var found_hashes: std.ArrayList(hashutil.HashInstance) = .empty;
-    //     defer found_hashes.deinit(global_gpa);
-    //     if (add.len < 2 * (token_len - 1)) {
-    //         // Windows overlap, so we'll copy them into the same buffer.
-    //         var buffer: [(token_len - 1) * 4]u8 = undefined;
-    //         var writer: std.ArrayList(u8) = .initBuffer(&buffer);
-
-    //         const window_start = edit_at -| (token_len - 1);
-    //         // Part before `edit_at`.
-    //         writer.appendSliceAssumeCapacity(old.bytes[window_start..edit_at]);
-    //         writer.appendSliceAssumeCapacity(add);
-    //         // Part after `old_edit_end`.
-    //         writer.appendSliceAssumeCapacity(old.bytes[old_edit_end..@min(old_edit_end + (token_len - 1), old.bytes.len)]);
-    //         try hashutil.scanStringForHashRefs(global_gpa, writer.items, window_start, &found_hashes);
-    //     } else {
-    //         // No overlap, so we'll scan each one separately.
-    //         var buffer: [(token_len - 1) * 2]u8 = undefined;
-    //         var writer: std.ArrayList(u8) = .initBuffer(&buffer);
-
-    //         // Scan "before window."
-    //         const window_start = edit_at -| (token_len - 1);
-    //         writer.appendSliceAssumeCapacity(old.bytes[window_start..edit_at]);
-    //         writer.appendSliceAssumeCapacity(add[0..(token_len - 1)]);
-    //         try hashutil.scanStringForHashRefs(global_gpa, writer.items, window_start, &found_hashes);
-
-    //         // Scan "added text."
-    //         try hashutil.scanStringForHashRefs(global_gpa, add, edit_at, &found_hashes);
-
-    //         // Scan "after window."
-    //         writer = .initBuffer(&buffer);
-    //         writer.appendSliceAssumeCapacity(add[(add.len - (token_len - 1))..]);
-    //         writer.appendSliceAssumeCapacity(old.bytes[old_edit_end..@min(old_edit_end + (token_len - 1), old.bytes.len)]);
-    //         try hashutil.scanStringForHashRefs(global_gpa, writer.items, new_edit_end - (token_len - 1), &found_hashes);
-    //     }
-
-    //     // Do after successfully changing the string.
-    //     obj.invalidateInternalRep();
-    // }
-
     /// Replaces `[start, end)` of the original string with `bytes`.
     /// A pure insert uses `start == end`, while a pure delete has
     /// empty `bytes`.
@@ -1023,58 +899,21 @@ pub const strpatch = struct {
         const new_tail_start = edit.start + edit.bytes.len;
         const new_len = new_tail_start + old_tail.len;
 
-        // We will now allocate all needed structures for the patch. We won't
-        // take any references until this section successfully completes, to
-        // simplify error handling.
-        //
-        // Some terminology we use below: There are "guaranteed" surviving
-        // tokens, which are tokens in ranges where it's impossible for the
-        // edit to damage them, and then we have "found" tokens, which are
-        // tokens that were found either in the edit's bytes, or crossing one
-        // of the edit's boundaries. This means that the tokens' start indices
-        // form a partition: `guaranteed ∪ found = all tokens`, and
-        // `guaranteed ∩ found = ∅`.
-
-        // We first locate the "guaranteed" tokens. We don't need to scan for
-        // them, since we can take them from the old hashes. Those are sorted,
-        // so removing the damaged ones from the middle leaves the guaranteed
-        // ones on either side.
-        //
-        // The edit damages a token iff it's a deletion overlapping the token,
-        // or an insertion strictly inside it. An edit ending at or before a
-        // token's start (an insert exactly at its start included) moves the
-        // token but cannot damage it.
-        var damaged_start: usize = 0;
-        while (damaged_start < old.hashes.len and old.hashes[damaged_start].str_index + token_len <= edit.start) damaged_start += 1;
-        var damaged_end = damaged_start;
-        while (damaged_end < old.hashes.len and old.hashes[damaged_end].str_index < edit.end) damaged_end += 1;
-        const guaranteed_before = old.hashes[0..damaged_start];
-        const guaranteed_after = old.hashes[damaged_end..];
-
-        // We next look for our "found" tokens. Every one of them crosses a
-        // boundary of the edit or lies inside its bytes, so only the
-        // `token_len - 1` bytes on each side need scanning, plus the edit's
-        // bytes. Neither side holds enough old bytes to contain a guaranteed
-        // token, so nothing here is reported twice.
-        //
-        // `window` may begin partway through a surviving token. The token
-        // format is overlap-free, so no valid token can start inside those
-        // bytes and the scanner can't be thrown off by them.
-        const window_start = edit.start -| (token_len - 1);
-        var found: std.ArrayList(hashutil.HashInstance) = .empty;
-        defer found.deinit(global_gpa);
-        {
-            const window = try mem.concat(global_gpa, u8, &.{
-                old.bytes[window_start..edit.start],
-                edit.bytes,
-                old_tail[0..@min(old_tail.len, token_len - 1)],
-            });
-            defer global_gpa.free(window);
-            try hashutil.scanStringForHashRefs(global_gpa, window, 0, &found);
-        }
-
-        const new_tracked = try global_gpa.alloc(HashAndInfo, guaranteed_before.len + found.items.len + guaranteed_after.len);
-        errdefer global_gpa.free(new_tracked);
+        // The new string is the join `old[0..start] ++ bytes ++ old[end..]`.
+        // Both old pieces keep the tokens fully inside them, so only the
+        // inserted bytes and the bytes around the edit get scanned.
+        var scan_buffer: [256]u8 = undefined;
+        const new_tracked = try hashjoin.trackedHashes(
+            global_gpa,
+            &scan_buffer,
+            &.{ old.bytes[0..edit.start], edit.bytes, old_tail },
+            &.{
+                .{ .hashes = old.hashes, .source_start = 0 },
+                null,
+                .{ .hashes = old.hashes, .source_start = edit.end },
+            },
+        );
+        errdefer hashjoin.release(global_gpa, new_tracked);
 
         // The special string itself may be shared with other objects
         // (`duplicateHeadOnto` shares rather than copies), even when `obj` is
@@ -1103,9 +942,7 @@ pub const strpatch = struct {
             }
             const capacity = buf.len - 1;
 
-            errdefer comptime unreachable; // We now take references, and know nothing will go wrong.
-
-            fillTrackedHashes(new_tracked, edit, guaranteed_before, window_start, found.items, guaranteed_after);
+            errdefer comptime unreachable;
 
             // Move the untouched tail of old bytes. Inserted bytes go in last,
             // since they can overlap the tail's old position.
@@ -1141,9 +978,7 @@ pub const strpatch = struct {
             // Null when the result fits the normal-string rules.
             const new_special = if (needs_special) try global_gpa.create(SpecialString) else null;
 
-            errdefer comptime unreachable; // We now take references, and know nothing will go wrong.
-
-            fillTrackedHashes(new_tracked, edit, guaranteed_before, window_start, found.items, guaranteed_after);
+            errdefer comptime unreachable;
 
             @memcpy(buf[0..edit.start], old.bytes[0..edit.start]);
             @memcpy(buf[edit.start..new_tail_start], edit.bytes);
@@ -1188,47 +1023,6 @@ pub const strpatch = struct {
             };
             leak_check.globalTrace(obj, .{ .set_string = .{ .set_to = leak_check.dupeForTrace(final_bytes) } });
         }
-    }
-
-    /// Fills `out` with the new string's tokens in increasing order, taking a
-    /// reference to each resolved value. Indices are unique, since tokens
-    /// can't overlap. The indices in `found` are relative to `window_start`.
-    fn fillTrackedHashes(
-        out: []HashAndInfo,
-        edit: Edit,
-        guaranteed_before: []const HashAndInfo,
-        window_start: usize,
-        found: []const hashutil.HashInstance,
-        guaranteed_after: []const HashAndInfo,
-    ) void {
-        var filled: std.ArrayList(HashAndInfo) = .initBuffer(out);
-
-        for (guaranteed_before) |hash| filled.appendAssumeCapacity(.{
-            .str_index = hash.str_index,
-            .value = if (hash.value) |value| value.takeReference() else null,
-        });
-
-        if (found.len > 0) {
-            registered_hashes.rw_lock.lockSharedUncancelable(global_io);
-            defer registered_hashes.rw_lock.unlockShared(global_io);
-
-            for (found) |token| filled.appendAssumeCapacity(.{
-                .str_index = window_start + token.index,
-                .value = if (registered_hashes.entries.get(token.hash)) |resolved|
-                    resolved.representative.takeReference()
-                else
-                    null,
-            });
-        }
-
-        // These tokens move with the old bytes just after the edit. This won't
-        // underflow, as they all start at or after `edit.end`.
-        for (guaranteed_after) |hash| filled.appendAssumeCapacity(.{
-            .str_index = hash.str_index - edit.end + edit.start + edit.bytes.len,
-            .value = if (hash.value) |value| value.takeReference() else null,
-        });
-
-        assert(filled.items.len == out.len);
     }
 };
 
