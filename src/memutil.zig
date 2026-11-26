@@ -36,6 +36,8 @@ pub fn repeat(comptime pattern: anytype, comptime count: comptime_int) RepeatTyp
     };
 
     var result: [pattern.len * count]ElemType = undefined;
+    // Each unrolled copy costs a backwards branch.
+    @setEvalBranchQuota(count + 1000);
     inline for (0..count) |i| {
         @memcpy(result[(i * pattern.len)..((i + 1) * pattern.len)], pattern);
     }

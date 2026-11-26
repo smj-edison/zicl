@@ -9,7 +9,7 @@ const heap = common.heap;
 const Value = common.Value;
 const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
-const SpecialString = heap.SpecialString;
+const hashutil = common.hashutil;
 const objects = common.objects;
 const String = objects.String;
 const List = objects.List;
@@ -988,7 +988,7 @@ const EvalScope = struct {
     }
 
     fn putSavingOld(self: *EvalScope, name: Value, val: Value) !void {
-        try heap.hashutil.cacheQuickHash(name);
+        try hashutil.cacheQuickHash(name);
         try self.saved.ensureUnusedCapacity(heap.global_gpa, 1);
 
         const frame = self.interp.callFrame();
@@ -2352,7 +2352,7 @@ fn binaryEncodeCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 }
 
 /// Applies a bit-stream write (`patch_bytes`, `patch_bits` bits) at `start_bit` onto `target_var`,
-/// mutating its `SpecialString` in-place when exclusively owned, or performing copy-on-write otherwise.
+/// patching its string in place when exclusively owned, or performing copy-on-write otherwise.
 fn applyBitSpliceToVariable(
     interp: *Interp,
     target_var: *Shimmerable,
@@ -2366,47 +2366,32 @@ fn applyBitSpliceToVariable(
     const needed_byte_len = (math.add(usize, end_bit, 7) catch return error.OutOfMemory) / 8;
 
     if (maybe_var) |var_value| {
-        if (try var_value.asMutableStringInPlace()) |special| {
-            if (patch_bits == 0 and needed_byte_len <= special.getString().len) {
+        if (try var_value.asMutableInPlace(String, null)) |string| {
+            const old_bytes = try string.asHead().getString();
+            if (patch_bits == 0 and needed_byte_len <= old_bytes.len) {
                 return var_value;
             }
 
-            // Byte-aligned fast path.
-            if (start_bit % 8 == 0 and patch_bits % 8 == 0) {
-                const byte_offset = start_bit / 8;
-                const byte_count = patch_bits / 8;
-                if (byte_offset == special.getString().len) {
-                    try special.appendInPlace(patch_bytes[0..byte_count]);
-                } else {
-                    try special.patchBytesInPlace(byte_offset, patch_bytes[0..byte_count]);
-                }
-                return var_value;
-            }
+            // The write becomes one edit over every byte it touches, starting
+            // no later than the old end so that a gap before `start_bit` is
+            // zero-filled. Its partial first and last bytes keep the old bits
+            // around the write.
+            const range_start = @min(start_bit / 8, old_bytes.len);
+            const range_old_end = @min(needed_byte_len, old_bytes.len);
+            const merged = try heap.global_gpa.alloc(u8, needed_byte_len - range_start);
+            defer heap.global_gpa.free(merged);
+            const kept = range_old_end - range_start;
+            @memcpy(merged[0..kept], old_bytes[range_start..range_old_end]);
+            @memset(merged[kept..], 0);
 
-            const old_len = special.getString().len;
-            const new_len = @max(old_len, needed_byte_len);
-            try special.ensureTotalCapacity(new_len);
-
-            const ptr = special.getMutableString().ptr;
-            if (new_len > old_len) {
-                @memset(ptr[old_len..new_len], 0);
-            }
-            ptr[new_len] = 0;
-            errdefer ptr[old_len] = 0;
-
-            var bit_pos = start_bit;
+            var bit_pos = start_bit - range_start * 8;
             var last_endian: ?std.builtin.Endian = endian;
-            writeBitStreamIntoSlice(ptr[0..new_len], &bit_pos, &last_endian, patch_bytes, patch_bits, endian) catch |err| switch (err) {
+            writeBitStreamIntoSlice(merged, &bit_pos, &last_endian, patch_bytes, patch_bits, endian) catch |err| switch (err) {
                 error.MidByteEndianSwitch => return interp.setErrorString("cannot switch bit endianness mid-byte"),
                 error.EndOfStream, error.InvalidBitWidth => unreachable,
             };
 
-            const mod_start_byte = @min(old_len, start_bit / 8);
-            const mod_end_byte = needed_byte_len;
-            try special.updateHashesAfterModification(ptr[0..new_len], mod_start_byte, mod_end_byte);
-
-            special.setLengthWithinCapacity(new_len);
-            special.invalidateCachedHashAndUtf8Len();
+            try heap.strpatch.patch(string, .{ .start = range_start, .end = range_old_end, .bytes = merged });
             return var_value;
         }
     }
@@ -2693,18 +2678,28 @@ fn binaryAppendCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         }
     }
 
-    // Fast in-place reserve when appending whole bytes at the end of an exclusively owned SpecialString.
+    // Fast path for appending whole bytes to an exclusively owned string.
     if (all_whole_bytes and bit_pos == existing_byte_len * 8) {
         if (maybe_var) |var_value| {
-            if (try var_value.asMutableStringInPlace()) |special| {
-                const target_cap = math.add(usize, existing_byte_len, total_extra_bytes) catch return error.OutOfMemory;
-                try special.ensureTotalCapacity(target_cap);
+            if (try var_value.asMutableInPlace(String, null)) |string| {
+                // One edit for all chunks, since each chunk's bytes may only
+                // live in a stack buffer for the duration of its loop iteration.
+                const appended = try heap.global_gpa.alloc(u8, total_extra_bytes);
+                defer heap.global_gpa.free(appended);
+                var pos: usize = 0;
                 for (chunks) |chunk_shim| {
                     var c_buf: [350]u8 = undefined;
                     const c_bytes = chunk_shim.current().getStringWithBuffer(&c_buf) catch unreachable;
-                    try special.appendInPlace(c_bytes);
-                    bit_pos += c_bytes.len * 8;
+                    @memcpy(appended[pos..][0..c_bytes.len], c_bytes);
+                    pos += c_bytes.len;
                 }
+
+                try heap.strpatch.patch(string, .{
+                    .start = existing_byte_len,
+                    .end = existing_byte_len,
+                    .bytes = appended,
+                });
+                bit_pos += appended.len * 8;
                 if (state_var_opt) |sv| {
                     try writeStateCursor(interp, state_dict.?, bit_pos);
                     try interp.setVariable(sv, state_dict.?.asHead().asValue());
@@ -3016,7 +3011,7 @@ fn testBinaryStructFloatPadAndHashRefs(ta: std.mem.Allocator) !void {
         \\ string cat $bin | [list $d::a $d::b $d::pt::x $d::pt::y $d::tag $d::msg]
     );
 
-    // Copy-on-write when shared vs in-place when exclusively owned, plus blake3~ hash-ref preservation.
+    // Copy-on-write when shared vs in-place when exclusively owned, plus hash reference preservation.
     const k_val = try String.newValue("k");
     defer k_val.dropReference();
     const v_val = try String.newValue("v");

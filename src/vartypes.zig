@@ -7,6 +7,7 @@ const StructIterator = memutil.StructIterator;
 const heap = @import("heap.zig");
 const Object = heap.Object;
 const Value = heap.Value;
+const hashutil = @import("hashutil.zig");
 const objects = @import("objects.zig");
 const IterHelper = objects.IterHelper;
 const Shimmerable = objects.Shimmerable;
@@ -68,7 +69,7 @@ pub const VarTable = struct {
     /// that hashes exist, and by extension, that they both have a string rep.
     const Context = struct {
         pub fn hash(_: Context, key: Value) u32 {
-            return @truncate(heap.hashutil.quickHash(key) catch unreachable);
+            return @truncate(hashutil.quickHash(key) catch unreachable);
         }
         pub fn eql(_: Context, a: Value, b: Value, _: usize) bool {
             return a.equals(b) catch unreachable;
@@ -99,7 +100,7 @@ pub const VarTable = struct {
     }
 
     pub fn getIndex(table: *const VarTable, name: Value) error{OutOfMemory}!?usize {
-        try heap.hashutil.cacheQuickHash(name);
+        try hashutil.cacheQuickHash(name);
         return table.map.getIndex(name);
     }
 
@@ -111,7 +112,7 @@ pub const VarTable = struct {
     /// contents. Returns the entry's index, which is stable until a variable is
     /// removed from this frame (which bumps the frame's call epoch).
     pub fn put(table: *VarTable, name: Value, slot: VariableSlot) !usize {
-        try heap.hashutil.cacheQuickHash(name);
+        try hashutil.cacheQuickHash(name);
         const result = try table.map.getOrPut(heap.global_gpa, name);
         if (result.found_existing) {
             result.value_ptr.dropReference();
@@ -125,7 +126,7 @@ pub const VarTable = struct {
     /// Remove `name`, returning whether it was present. Ordered so that the
     /// iteration order the capture hash depends on survives the removal.
     pub fn remove(table: *VarTable, name: Value) error{OutOfMemory}!bool {
-        try heap.hashutil.cacheQuickHash(name);
+        try hashutil.cacheQuickHash(name);
         const entry = table.map.fetchOrderedRemove(name) orelse return false;
         entry.key.dropReference();
         entry.value.dropReference();

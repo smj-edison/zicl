@@ -21,9 +21,7 @@ this before implementing anything that might already exist.
 - `heap.LazyRegisterFn` -- Signature for a lazy native command initializer: `*const fn (interp: *anyopaque) callconv(.c) void`.
 - `heap.nativefn_registry.register(gpa, name, init_fn)` -- Register a lazy C command initializer; `error.DuplicateLazyFn` on duplicates.
 - `heap.nativefn_registry.get(name)` -- Look up a lazy initializer by name, or null.
-- `heap.registered_hashes.getAndTakeReference(hash)` -- Look up a `u256` hash and return a referenced `*Object` (or null). Thread-safe via shared lock.
-- `heap.registered_hashes.register(key, obj)` -- Idempotently register `obj` under `key`; marks it cross-thread and bumps the instance count.
-- `heap.registered_hashes.unregister(key, obj)` -- Decrement the instance count for `key`; frees the representative when the last instance goes away.
+- `heap.registered_hashes` -- The global `hashutil.HashRegistry`; see src/hashutil.zig for its methods.
 
 ### Value (16-byte tagged union)
 `Value` wraps a `ValueRep`: an `extern union` payload plus `interned_string_len: u16`
@@ -121,22 +119,41 @@ and `tag: Tag`, where `Tag` is `none`, `pointer`, `boolean`, `integer`, `float`,
 - `Object.duplicateHeadOnto(src, dest)` -- Copy the vtable, metadata, and string rep from `src` onto an uninitialized `dest` header.
 - `Object.duplicateStringOnly(src)` -- Allocate a fresh `None` object duplicating only the string rep of `src`.
 
-### hashutil
-- `hashutil.hash_prepend` (`"blake3~"`), `hashutil.hash_len`, `hashutil.hash_and_prepend_len` -- Layout constants for rendered hash references.
-- `hashutil.hash_encoder` / `hashutil.hash_decoder` -- base64url codecs for the 32-byte hash.
-- `hashutil.hashBytes(bytes)` -- Blake3 hash of a byte slice, returning `u256`.
-- `hashutil.scanStringForHashRefs(arena, bytes)` -- Find all `blake3~<hash>` occurrences; returns an `ArrayList(HashInstance)`.
-- `hashutil.parseHashReference(bytes)` -- Parse a string that is exactly one `blake3~<hash>` reference; return the `u256` or null.
-- `hashutil.scanAndResolveHashRefs(arena, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, taking representatives; returns `[]SpecialString.HashAndInfo`.
-
-### Quick hashing (for hash tables, not for content addressing)
-- `hashutil.quick_hash_cutoff` (1024) -- The switch point between Wyhash and the cached Blake3 hash.
-- `hashutil.quickHash(value)` -- Hash a value for a table's index (dictionary keys, variable tables). Wyhash below `quick_hash_cutoff`, the truncated cached Blake3 hash at or above it. Not cryptographically secure; only for hash tables paired with equality, not content addressing.
-- `hashutil.cacheQuickHash(value)` -- Force the object's content hash to be cached ahead of time, for a key at or above `quick_hash_cutoff`, so a later `quickHash` on it cannot OOM.
-
 ### Refcount primitives
 - `heap.incrRefCountOf(T, ref, is_atomic)` -- Generic ref count increment; returns the new count.
 - `heap.decrRefCountOf(T, ref, is_atomic)` -- Generic ref count decrement; returns the new count (with acquire fence at zero for atomic).
+
+---
+
+## src/hashutil.zig
+
+### Hash references
+- `hashutil.hash_prepend` (`"blake3."`), `hashutil.hash_postpend` (`"~"`), `hashutil.hash_body_len`, `hashutil.hash_token_len` -- Layout constants for rendered hash references (`blake3.<hash>~`).
+- `hashutil.hash_encoder` / `hashutil.hash_decoder` -- base64url codecs for the 32-byte hash.
+- `hashutil.hashBytes(bytes)` -- Blake3 hash of a byte slice, returning `u256`.
+- `hashutil.scanStringForHashRefs(gpa, bytes, offset, found_hashes)` -- Append every hash reference in `bytes` to `found_hashes` as a `HashInstance`, with `offset` added to each index.
+- `hashutil.parseHashReference(bytes)` -- Parse a string that is exactly one hash reference; return the `u256` or null.
+- `hashutil.scanAndResolveHashRefs(gpa, bytes)` -- Scan for hash refs and resolve each against `registered_hashes`, taking representatives; returns `[]SpecialString.HashAndInfo`.
+- `hashutil.resolveHashRefsInner(found, out)` -- Resolve each `HashInstance` into the matching slot of `out`, taking a reference to every registered value. The caller holds `registered_hashes`'s shared lock, so several calls can share one lock.
+
+### HashRegistry (instance: `heap.registered_hashes`)
+- `getAndTakeReference(hash)` -- Look up a `u256` hash and return a referenced `*Object` (or null). Thread-safe via shared lock.
+- `register(key, obj)` -- Idempotently register `obj` under `key`; marks it cross-thread and bumps the instance count.
+- `unregister(key, obj, is_rep)` -- Decrement the instance count for `key`; frees the representative when the last instance goes away.
+- `shrinkToFit()` -- Reallocate the table at the smallest capacity holding its current entries.
+
+### Quick hashing (for hash tables, not for content addressing)
+- `heap.considered_large_string` (1024) -- The switch point between Wyhash and the cached Blake3 hash.
+- `hashutil.quickHash(value)` -- Hash a value for a table's index (dictionary keys, variable tables). Wyhash below `heap.considered_large_string`, the truncated cached Blake3 hash at or above it. Not cryptographically secure; only for hash tables paired with equality, not content addressing.
+- `hashutil.cacheQuickHash(value)` -- Force the object's content hash to be cached ahead of time, for a key at or above `heap.considered_large_string`, so a later `quickHash` on it cannot OOM.
+
+---
+
+## src/hashjoin.zig
+- `hashjoin.Tracked` -- A piece's tracked hashes: its source string's `tracked_hashes` and where the piece starts in that source.
+- `hashjoin.Tracked.fromObject(obj, start, end)` -- Borrow `obj`'s string `[start, end)` as a `{ bytes, tracked }` pair.
+- `hashjoin.trackedHashes(gpa, bytes, tracked)` -- The hash references the pieces `bytes` (parallel to `tracked`, null for raw bytes) would track once joined, sorted by index, each holding a caller-owned reference. Only reads the pieces.
+- `hashjoin.release(gpa, hashes)` -- Drop every reference in a `trackedHashes` result and free it.
 
 ---
 

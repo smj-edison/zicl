@@ -12,7 +12,7 @@ const memutil = @import("memutil.zig");
 const StructIterator = memutil.StructIterator;
 const heap = @import("heap.zig");
 const leak_check = @import("leak_check.zig");
-const hashutil = heap.hashutil;
+const hashutil = @import("hashutil.zig");
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
@@ -541,11 +541,11 @@ pub const HashReference = struct {
         if (shim.current().asType(HashReference)) |hash_ref| return hash_ref;
 
         const bytes = try shim.current().getString();
-        const hash = heap.hashutil.parseHashReference(bytes) orelse {
+        const hash = hashutil.parseHashReference(bytes) orelse {
             if (det) |details| details.* = .{
                 .message = try std.fmt.allocPrintSentinel(
                     heap.global_gpa,
-                    "expected a hash reference like \"blake3~...\" in \"{s}\".",
+                    "expected a hash reference like \"blake3.<hash>~\" in \"{s}\".",
                     .{bytes},
                     0,
                 ),
@@ -594,10 +594,13 @@ pub const HashReference = struct {
         return Object.from(HashReference, self);
     }
 
-    pub fn render(hash: u256) [hashutil.hash_and_prepend_len]u8 {
-        var encoded: [hashutil.hash_and_prepend_len]u8 = undefined;
-        _ = hashutil.hash_encoder.encode(encoded[hashutil.hash_prepend.len..], &@as([32]u8, @bitCast(hash)));
-        @memcpy(encoded[0..hashutil.hash_prepend.len], hashutil.hash_prepend);
+    pub fn render(hash: u256) [hashutil.hash_token_len]u8 {
+        var encoded: [hashutil.hash_token_len]u8 = undefined;
+        const body_start = hashutil.hash_prepend.len;
+        const body_end = body_start + hashutil.hash_body_len;
+        @memcpy(encoded[0..body_start], hashutil.hash_prepend);
+        _ = hashutil.hash_encoder.encode(encoded[body_start..body_end], &@as([32]u8, @bitCast(hash)));
+        @memcpy(encoded[body_end..], hashutil.hash_postpend);
         return encoded;
     }
 
@@ -1794,7 +1797,7 @@ pub const Dictionary = struct {
     /// key inserted will always be able to generate a quick hash.
     const Table = std.HashMapUnmanaged(Value, usize, struct {
         pub fn hash(_: @This(), key: Value) u64 {
-            return heap.hashutil.quickHash(key) catch unreachable;
+            return hashutil.quickHash(key) catch unreachable;
         }
         pub fn eql(_: @This(), a: Value, b: Value) bool {
             return a.equals(b) catch unreachable;
@@ -1860,7 +1863,7 @@ pub const Dictionary = struct {
         while (item_index < items.len) : (item_index += 2) {
             // Note that if a key appears multiple times, the last instance
             // of that key will win.
-            try heap.hashutil.cacheQuickHash(items[item_index]); // Make sure it has a hash in advance.
+            try hashutil.cacheQuickHash(items[item_index]); // Make sure it has a hash in advance.
             try table.put(heap.global_gpa, items[item_index], item_index + 1);
         }
         return table;
@@ -1905,14 +1908,14 @@ pub const Dictionary = struct {
     }
 
     pub fn getNoFollow(self: *const Dictionary, key: Value) !?Value {
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
         if (self.table.get(key)) |idx| return self.items[idx];
         return null;
     }
 
     pub fn getFollowingLinks(self: *Dictionary, det: ?*ErrorDetails, key: Value) !?Value {
         assert(self.asHead().canMutate());
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
 
         var dict_shim: Shimmerable = .{ .original = self.asHead().asValue() };
         const result = try shimGetFollowingLinks(det, &dict_shim, key);
@@ -1927,7 +1930,7 @@ pub const Dictionary = struct {
     }
 
     pub fn getPtrNoFollow(self: *const Dictionary, key: Value) !?*Value {
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
         if (self.table.get(key)) |idx| return &self.items[idx];
         return .none;
     }
@@ -1941,7 +1944,7 @@ pub const Dictionary = struct {
 
         // Ensure the key already has a hash, since the table requires everything used
         // to have a precomputed hash.
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
         const value_index = dict.table.get(key).?; // Key is replaced in place, so it must exist.
         dict.items[value_index].swap(value.takeReference());
 
@@ -1973,7 +1976,7 @@ pub const Dictionary = struct {
 
         // Ensure the key already has a hash, since the table requires everything used
         // to have a precomputed hash.
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
         if (dict.table.get(key)) |existing_value_index| {
             // Key exists, so replace the value in place.
 
@@ -2030,7 +2033,7 @@ pub const Dictionary = struct {
     /// Transaction safe.
     pub fn remove(dict: *Dictionary, det: ?*ErrorDetails, key: Value) error{ OutOfMemory, LookupFailed }!bool {
         assert(dict.asHead().canMutate());
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
 
         // Locate the first key. We have to do a scan instead of using `dict.get`, since
         // `dict.get` only returns the last key.
@@ -2245,7 +2248,7 @@ pub const Dictionary = struct {
     }
 
     pub fn shimGetFollowingLinks(det: ?*ErrorDetails, shim: *Shimmerable, key: Value) error{ OutOfMemory, LookupFailed }!?Value {
-        try heap.hashutil.cacheQuickHash(key);
+        try hashutil.cacheQuickHash(key);
 
         var dict = shimmerFrom(det, shim) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2413,7 +2416,7 @@ pub const Dictionary = struct {
             } else {
                 const child_dict_mut = try child_dict_shim.getMutable(Dictionary, det);
                 defer child_dict_mut.asHead().dropReference();
-                try heap.hashutil.cacheQuickHash(child_dict_key);
+                try hashutil.cacheQuickHash(child_dict_key);
 
                 const did_remove = try child_dict_mut.removeRecursively(det, context.sliceAfter(1));
                 errdefer comptime unreachable; // Continue from above transaction.
@@ -2434,7 +2437,7 @@ pub const Dictionary = struct {
         /// A key->value map, with parent keys inserted before child keys.
         mapping: std.array_hash_map.Custom(Value, Value, struct {
             pub fn hash(_: @This(), key: Value) u32 {
-                return @truncate(heap.hashutil.quickHash(key) catch unreachable);
+                return @truncate(hashutil.quickHash(key) catch unreachable);
             }
             pub fn eql(_: @This(), a: Value, b: Value, _: usize) bool {
                 return a.equals(b) catch unreachable;

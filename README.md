@@ -65,7 +65,7 @@ method methods::add {self amount} {
 }
 set newObject [dict link $methods {count 0}]
 newObject::add 1
-puts $newObject ;# {count 1 ~parent blake3^W9aTJiCMFQKJXFqkFxyx5am1XFJ16ctLUeQ8auJFbts}
+puts $newObject ;# {count 1 ~parent blake3.W9aTJiCMFQKJXFqkFxyx5am1XFJ16ctLUeQ8auJFbts~}
 ```
 
 You'll notice that there's a "~parent" field. This contains a hash of the linked dictionary. This is very important: it's not a pointer, it's a hash. That means it's content based, and so it's stable across systems. It's also stable when saved to disk. The biggest downside to this is you have to keep the hash's value alive. So how do we keep hash values alive?

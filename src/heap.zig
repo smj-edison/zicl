@@ -14,6 +14,7 @@ const options = @import("options");
 const memutil = @import("memutil.zig");
 const StructIterator = memutil.StructIterator;
 const ioutil = @import("ioutil.zig");
+const hashutil = @import("hashutil.zig");
 const objects = @import("objects.zig");
 const leak_check = @import("leak_check.zig");
 const regex = @import("regex.zig");
@@ -74,7 +75,7 @@ fn getTestEnviron() *const std.process.Environ.Map {
     return &test_environ.?.map;
 }
 pub var lazy_fn_registry: LazyFnRegistry = .{};
-pub var registered_hashes: HashRegistry = .{};
+pub var registered_hashes: hashutil.HashRegistry = .{};
 
 var trace_mutex: std.Io.Mutex = .init;
 /// Preallocated fallback used by `[catch]` when a script OOMs and building
@@ -334,215 +335,6 @@ pub const LazyFnRegistry = struct {
             global_gpa.free(entry.value_ptr.library);
         }
         self.entries.deinit(gpa);
-    }
-};
-
-/// The hash registry is the lifeblood of how Zicl deals with hashes. I think it's first
-/// useful to understand the requirements that brought the hash registry about, to
-/// contextualize the design decisions made:
-///
-/// 1. If someone has a hash of something in the Zicl heap, it must resolve to that
-///    thing in the heap.
-/// 2. If that hash no longer exists anywhere in the Zicl heap, that object needs to be
-///    able to be freed, so that objects aren't leaked when nothing refers to them.
-/// 3. Registering and unregistering a hash needs to be fast, since hashes will
-///    be made and destroyed constantly.
-///
-/// (1) rules out an LRU cache, since an object could be evicted even though it still
-/// had a live hash reference. (2) rules out an infinitely growing cache. (3) rules out
-/// duplicating the value to have it be exclusively owned by the registry.
-///
-/// The above requirements have brought me to the following design:
-/// a. We assume a closed world. If a hash reference does not exist in this global heap,
-///    then we don't hang onto the object just because some other computer could contain
-///    a hash to the object. This way we have reclaimation.
-/// b. Every time an object is registered, we set a flag on the object called
-///    `hash_registered`. This way we can register a hash idempotently, and quickly
-///    determine whether the object needs to be unregistered before locking the RwLock.
-/// c. Multiple objects may resolve to the same hash, so we choose the first one registered
-///    to be called the "representative". The representative will have an identical value
-///    to every other object by virtue of hashing, so we only need to hold onto the
-///    representative. What gets tricky though is that we need the representative to stay
-///    alive, even when everyone else has dropped the representative, since a second object
-///    could resolve to the representative's hash and then cause a UAF. Hence, the registry
-///    references the representative until every instance of the hash reference has disappeared.
-///    You might wonder then, won't that mean that there's a circular reference between the
-///    hash registry and the representative? The representative only unregisters when it's
-///    freed, but the hash registry owns the representative. The way around this is that
-///    an object will unregister itself in `decrRefCount` when the new ref count is less than
-///    _or equal_ to 1. That way the representative can unregister itself when nobody else
-///    besides the registry owns it.
-/// d. This registry is in the global heap, not in the threadlocal heap. I couldn't figure
-///    out a good way to have object references moving between threads and have a threadlocal
-///    heap. In particular, the `hash_registered` field makes no sense with multiple heaps,
-///    because it would have to check what heaps it's been registered with.
-/// e. We use an RwLock, not a Mutex, since in many cases a caller just wants to look up a
-///    hash, not register it. And in some cases, if a hash already has a representative, we
-///    can just bump the instances count.
-pub const HashRegistry = struct {
-    pub const Entry = struct {
-        /// Registry owns a reference of the representative.
-        representative: *Object,
-        /// It's possible for another `Object` to have the same content, and thus,
-        /// resolve to the same hash. When we register a second object, we have
-        /// to keep the representative alive until both the respresentative and
-        /// second object are dropped. This is a total count of instances of this
-        /// hash (both our representative and duplicate instances).
-        instances: std.atomic.Value(usize),
-    };
-
-    rw_lock: std.Io.RwLock = .init,
-    entries: std.HashMapUnmanaged(u256, Entry, struct {
-        pub fn hash(self: @This(), full_hash: u256) u64 {
-            _ = self;
-            return @truncate(full_hash);
-        }
-        pub fn eql(self: @This(), a: u256, b: u256) bool {
-            _ = self;
-            return a == b;
-        }
-    }, 80) = .empty,
-
-    pub fn getAndTakeReference(registry: *HashRegistry, hash: u256) ?*Object {
-        registry.rw_lock.lockSharedUncancelable(global_io);
-        defer registry.rw_lock.unlockShared(global_io);
-
-        if (registry.entries.getPtr(hash)) |entry| {
-            assert(entry.instances.load(.monotonic) > 0);
-            return entry.representative.takeReference(); // Take while still locked.
-        } else return null;
-    }
-
-    /// Reallocates the table at the smallest capacity that holds its current
-    /// entries. The table otherwise keeps the capacity of its peak, even after
-    /// every object that grew it has been freed.
-    pub fn shrinkToFit(registry: *HashRegistry) error{OutOfMemory}!void {
-        registry.rw_lock.lockUncancelable(global_io);
-        defer registry.rw_lock.unlock(global_io);
-
-        var shrunk: @TypeOf(registry.entries) = .empty;
-        try shrunk.ensureTotalCapacity(global_gpa, registry.entries.count());
-        if (shrunk.capacity() >= registry.entries.capacity()) {
-            shrunk.deinit(global_gpa);
-            return;
-        }
-
-        var iter = registry.entries.iterator();
-        while (iter.next()) |entry| shrunk.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
-        registry.entries.deinit(global_gpa);
-        registry.entries = shrunk;
-    }
-
-    pub fn register(registry: *HashRegistry, key: u256, obj: *Object) !void {
-        registry.rw_lock.lockSharedUncancelable(global_io);
-        obj.makeCrossthread();
-
-        if (registry.entries.getPtr(key)) |entry| {
-            if (obj.hash_metadata.fetchOr(.{ .hash_registered = true }, .acq_rel).hash_registered == true) {
-                // Someone else registered this already, so no need to do anything.
-            } else {
-                // We were the ones to successfully set `value` as registered.
-                _ = entry.instances.fetchAdd(1, .monotonic);
-            }
-
-            registry.rw_lock.unlockShared(global_io);
-            return;
-        }
-
-        // Entry doesn't exist yet, so we'll upgrade to exclusive lock to insert.
-        registry.rw_lock.unlockShared(global_io);
-        registry.rw_lock.lockUncancelable(global_io);
-        defer registry.rw_lock.unlock(global_io);
-
-        const new_entry = try registry.entries.getOrPut(global_gpa, key);
-        if (new_entry.found_existing) {
-            const before_marking = obj.hash_metadata.fetchOr(.{ .hash_registered = true }, .acq_rel);
-            if (before_marking.hash_registered == true) {
-                // Someone registered it in-between upgrading the shared lock to an exclusive lock.
-            } else {
-                // We successfully marked it as registered, so we can increment the instances count.
-                _ = new_entry.value_ptr.instances.fetchAdd(1, .monotonic);
-            }
-        } else {
-            new_entry.key_ptr.* = key;
-            new_entry.value_ptr.* = .{
-                .representative = obj.takeReference(),
-                .instances = .init(1),
-            };
-
-            // We have an exclusive lock on rw_lock, so nobody else could have registered this value.
-            const expected: Object.HashMetadata = .{ .hash_registered = false, .is_representative = false };
-            assert(obj.hash_metadata.fetchOr(.{ .hash_registered = true, .is_representative = true }, .acq_rel) == expected);
-        }
-    }
-
-    /// Called when either:
-    /// - `obj` is the representative and its ref_count just dropped to 1, or
-    /// - `obj` is a non-representative registered object and its ref_count just dropped to 0.
-    pub fn unregister(registry: *HashRegistry, key: u256, obj: *Object, is_rep: bool) void {
-        var lock_helper: ioutil.RwLockHelper = .init(&registry.rw_lock);
-        if (is_rep) {
-            // We actually need to clear `.hash_registered` of the rep under an
-            // exclusive lock, since otherwise we might atomically clear `.hash_registered`
-            // while another thread returned it from `register`, causing the other thread
-            // to return a broken object.
-            lock_helper.lockExclusiveAsserting(global_io);
-        } else {
-            lock_helper.lockSharedAsserting(global_io);
-        }
-
-        if (registry.entries.getPtr(key)) |entry_first_load| {
-            // Clear `.hash_registered`.
-            const before_clearing = obj.hash_metadata.fetchAnd(.{ .is_representative = true }, .acq_rel);
-            if (before_clearing.hash_registered == false) {
-                // Someone else unregistered this already, so no need to do anything.
-                lock_helper.unlock(global_io);
-                return;
-            } else {
-                // We were the ones to successfully set `value` as not registered.
-                const instance_count = entry_first_load.instances.fetchSub(1, .monotonic) - 1;
-                if (instance_count == 0) {
-                    // This was the last instance of this hash, so we can now clean it up.
-
-                    lock_helper.lockExclusiveMaybeUpgrade(global_io);
-
-                    // The entry should still exist here, as we were the ones who set instances
-                    // to 0. It could have moved locations though, when upgrading to an exclusive
-                    // lock.
-                    const entry_second_load = registry.entries.getPtr(key) orelse {
-                        // Our thread could drop instances to 0, but then a second
-                        // thread could come in, resurrect the object, drop instances
-                        // to 0 a second time, and then remove it from the registry.
-                        // Hence we return early if it's no longer in the registry.
-                        lock_helper.unlock(global_io);
-                        return;
-                    };
-                    const entry_derefed = entry_second_load.*;
-                    if (entry_second_load.instances.load(.monotonic) != 0) {
-                        // Someone was able to re-register this value when upgrading
-                        // to an exclusive lock.
-                        lock_helper.unlock(global_io);
-                        return;
-                    }
-
-                    _ = entry_derefed.representative.hash_metadata.fetchAnd(.{}, .acq_rel);
-                    assert(registry.entries.remove(key));
-                    lock_helper.unlock(global_io);
-
-                    // Make sure to `decrRefCount` only after unlocking the mutex, to avoid
-                    // recursive locking.
-                    entry_derefed.representative.dropReference();
-                    return;
-                } else {
-                    lock_helper.unlock(global_io);
-                    return;
-                }
-            }
-        } else {
-            // Was already unregistered by the time we checked, so nothing to do.
-            lock_helper.unlock(global_io);
-            return;
-        }
     }
 };
 
@@ -822,11 +614,6 @@ pub const Value = extern struct {
         } else return null;
     }
 
-    pub fn asMutableStringInPlace(value: Value) error{OutOfMemory}!?*SpecialString {
-        const obj = value.asPtr() orelse return null;
-        return try obj.asMutableStringInPlace();
-    }
-
     pub fn incrRefCount(value: Value) void {
         if (value.asPtr()) |obj| obj.incrRefCount();
     }
@@ -963,6 +750,9 @@ pub const Value = extern struct {
     }
 };
 
+/// The length of a string when it starts being considered large.
+pub const considered_large_string: usize = 1024;
+
 /// Special strings are strings that have special properties, such as being large,
 /// having a different allocation backing then what's visible, or (in the future)
 /// being memory mapped. This means that they have some more specialized handling,
@@ -998,7 +788,9 @@ pub const SpecialString = struct {
         switch (self.value) {
             .normal => |string| global_gpa.free(string),
             .different_capacity => |info| {
-                global_gpa.free(info.string.ptr[0..info.original_capacity :0]);
+                // The allocation also holds the string's sentinel, but nothing
+                // keeps a zero at the capacity, so this isn't a sentinel slice.
+                global_gpa.free(info.string.ptr[0 .. info.original_capacity + 1]);
             },
         }
         for (self.tracked_hashes) |hash| if (hash.value) |val| val.dropReference();
@@ -1041,274 +833,11 @@ pub const SpecialString = struct {
         }
     }
 
-    pub fn createWithCapacity(initial_bytes: []const u8, min_capacity: usize) error{OutOfMemory}!*SpecialString {
-        const cap = @max(initial_bytes.len, min_capacity);
-        const buf = try global_gpa.allocSentinel(u8, cap, 0);
-        errdefer global_gpa.free(buf);
-
-        if (initial_bytes.len > 0) {
-            @memcpy(buf[0..initial_bytes.len], initial_bytes);
-        }
-        buf[initial_bytes.len] = 0;
-
-        const self = try global_gpa.create(SpecialString);
-        errdefer global_gpa.destroy(self);
-
-        const hashes = try hashutil.scanAndResolveHashRefs(global_gpa, buf[0..initial_bytes.len]);
-        errdefer comptime unreachable;
-
-        const string_value: Type = if (cap == initial_bytes.len) .{
-            .normal = buf,
-        } else .{
-            .different_capacity = .{
-                .string = buf[0..initial_bytes.len :0],
-                .original_capacity = cap,
-            },
-        };
-        self.* = .{
-            .value = string_value,
-            .tracked_hashes = hashes,
-            .hash = .init(null),
-        };
-        return self;
-    }
-
-    pub fn capacity(self: *const SpecialString) usize {
-        switch (self.value) {
-            .normal => |s| return s.len,
-            .different_capacity => |info| return @intCast(info.original_capacity),
-        }
-    }
-
-    pub fn getMutableString(self: *SpecialString) [:0]u8 {
-        assert(self.ref_count.load(.monotonic) == 1);
-        switch (self.value) {
-            .normal => |s| return s,
-            .different_capacity => |info| return info.string,
-        }
-    }
-
-    /// Ensures the backing allocation can hold at least `needed_cap` bytes (excluding sentinel).
-    pub fn ensureTotalCapacity(self: *SpecialString, needed_cap: usize) error{OutOfMemory}!void {
-        assert(self.ref_count.load(.monotonic) == 1);
-        const old_cap = self.capacity();
-        if (needed_cap <= old_cap) return;
-
-        const new_cap = @max(needed_cap, old_cap *| 2);
-        const cur = self.getMutableString();
-        const cur_len = cur.len;
-        const old_backing = cur.ptr[0..old_cap :0];
-
-        const new_buf = try global_gpa.allocSentinel(u8, new_cap, 0);
-        @memcpy(new_buf[0..cur_len], cur);
-        new_buf[cur_len] = 0;
-        global_gpa.free(old_backing);
-
-        self.value = .{ .different_capacity = .{
-            .string = new_buf[0..cur_len :0],
-            .original_capacity = new_cap,
-        } };
-    }
-
-    /// Resizes the visible string slice within the existing capacity and writes the NUL sentinel.
-    pub fn setLengthWithinCapacity(self: *SpecialString, new_len: usize) void {
-        assert(self.ref_count.load(.monotonic) == 1);
-        const cap = self.capacity();
-        assert(new_len <= cap);
-        const ptr = self.getMutableString().ptr;
-        ptr[new_len] = 0;
-
-        if (new_len == cap) {
-            self.value = .{ .normal = ptr[0..new_len :0] };
-        } else {
-            self.value = .{ .different_capacity = .{
-                .string = ptr[0..new_len :0],
-                .original_capacity = cap,
-            } };
-        }
-    }
-
-    /// Appends `extra` bytes in place, scanning only the seam + newly appended bytes for `blake3~` references.
-    pub fn appendInPlace(self: *SpecialString, extra: []const u8) error{OutOfMemory}!void {
-        assert(self.ref_count.load(.monotonic) == 1);
-        if (extra.len == 0) return;
-
-        const old_len = self.getString().len;
-        const new_len = math.add(usize, old_len, extra.len) catch return error.OutOfMemory;
-        try self.ensureTotalCapacity(new_len);
-
-        const ptr = self.getMutableString().ptr;
-        @memcpy(ptr[old_len..new_len], extra);
-        ptr[new_len] = 0;
-        errdefer ptr[old_len] = 0;
-
-        try self.updateHashesAfterModification(ptr[0..new_len], old_len, new_len);
-
-        self.setLengthWithinCapacity(new_len);
-        self.invalidateCachedHashAndUtf8Len();
-    }
-
-    /// Overwrites bytes starting at `offset` (extending with zeros if `offset > old_len`),
-    /// incrementally updating `tracked_hashes` on the modified window and taking new references
-    /// before dropping overwritten ones.
-    pub fn patchBytesInPlace(self: *SpecialString, offset: usize, data: []const u8) error{OutOfMemory}!void {
-        assert(self.ref_count.load(.monotonic) == 1);
-        if (data.len == 0) return;
-
-        const old_len = self.getString().len;
-        const patch_end = math.add(usize, offset, data.len) catch return error.OutOfMemory;
-        const new_len = @max(old_len, patch_end);
-        try self.ensureTotalCapacity(new_len);
-
-        const ptr = self.getMutableString().ptr;
-        const mod_start = @min(old_len, offset);
-        if (offset > old_len) {
-            @memset(ptr[old_len..offset], 0);
-        }
-        @memcpy(ptr[offset..patch_end], data);
-        ptr[new_len] = 0;
-        errdefer ptr[old_len] = 0;
-
-        try self.updateHashesAfterModification(ptr[0..new_len], mod_start, patch_end);
-
-        self.setLengthWithinCapacity(new_len);
-        self.invalidateCachedHashAndUtf8Len();
-    }
-
-    fn advanceReplacedSuffix(
-        tracked: []const HashAndInfo,
-        suffix_idx: *usize,
-        search_until: *usize,
-        up_to: usize,
-    ) void {
-        while (suffix_idx.* < tracked.len) {
-            const entry = tracked[suffix_idx.*];
-            if (entry.str_index >= up_to) break;
-
-            const entry_end = entry.str_index + hashutil.hash_and_prepend_len;
-            search_until.* = @max(search_until.*, entry_end);
-            suffix_idx.* += 1;
-        }
-    }
-
-    pub fn updateHashesAfterModification(
-        self: *SpecialString,
-        bytes: []const u8,
-        mod_start: usize,
-        mod_end: usize,
-    ) error{OutOfMemory}!void {
-        assert(self.ref_count.load(.monotonic) == 1);
-
-        // 1. Keep all prefix entries that end at or before `mod_start`.
-        var prefix_keep_count: usize = 0;
-        for (self.tracked_hashes) |entry| {
-            const entry_end = entry.str_index + hashutil.hash_and_prepend_len;
-            if (entry_end > mod_start) break;
-            prefix_keep_count += 1;
-        }
-
-        var after_last_prefix: usize = 0;
-        if (prefix_keep_count > 0) {
-            const last_kept = self.tracked_hashes[prefix_keep_count - 1];
-            after_last_prefix = last_kept.str_index + hashutil.hash_and_prepend_len;
-        }
-
-        const overlap = hashutil.hash_and_prepend_len - 1;
-        const scan_start = @max(after_last_prefix, mod_start -| overlap);
-
-        // 2. Advance `suffix_idx` past any old entries that overlapped `[mod_start .. mod_end)`.
-        var suffix_idx: usize = prefix_keep_count;
-        var search_until: usize = mod_end;
-        advanceReplacedSuffix(self.tracked_hashes, &suffix_idx, &search_until, mod_end);
-
-        var found_hashes: std.ArrayList(hashutil.HashInstance) = .empty;
-        defer found_hashes.deinit(global_gpa);
-
-        var current_index: usize = scan_start;
-        while (bytes.len >= hashutil.hash_and_prepend_len) {
-            advanceReplacedSuffix(self.tracked_hashes, &suffix_idx, &search_until, current_index);
-            if (current_index >= search_until) break;
-
-            const window_end = @min(bytes.len, search_until + overlap);
-            if (current_index >= window_end) break;
-
-            const maybe_next = mem.findPos(u8, bytes[0..window_end], current_index, hashutil.hash_prepend);
-            const next = maybe_next orelse {
-                current_index = search_until;
-                continue;
-            };
-
-            advanceReplacedSuffix(self.tracked_hashes, &suffix_idx, &search_until, next);
-            if (next >= search_until) break;
-
-            // If we reached an untouched suffix token at or after `mod_end`, we are back in sync.
-            if (next >= mod_end and suffix_idx < self.tracked_hashes.len) {
-                if (self.tracked_hashes[suffix_idx].str_index == next) break;
-            }
-
-            if (bytes.len - next < hashutil.hash_and_prepend_len) break;
-
-            const encoded_hash = bytes[(next + hashutil.hash_prepend.len)..][0..hashutil.hash_len];
-            var output: [32]u8 = undefined;
-            hashutil.hash_decoder.decode(&output, encoded_hash) catch {
-                current_index = next + hashutil.hash_prepend.len;
-                continue;
-            };
-
-            try found_hashes.append(global_gpa, .{ .index = next, .hash = @bitCast(output) });
-            current_index = next + hashutil.hash_and_prepend_len;
-            search_until = @max(search_until, current_index);
-        }
-
-        // Fast path: no old hashes were invalidated and no new hashes were found.
-        if (prefix_keep_count == suffix_idx and found_hashes.items.len == 0) return;
-
-        const suffix_keep_count = self.tracked_hashes.len - suffix_idx;
-        const new_total = prefix_keep_count + found_hashes.items.len + suffix_keep_count;
-        const new_tracked = try global_gpa.alloc(HashAndInfo, new_total);
-
-        const new_hashes_end = prefix_keep_count + found_hashes.items.len;
-        @memcpy(new_tracked[0..prefix_keep_count], self.tracked_hashes[0..prefix_keep_count]);
-
-        // Resolve and take references to new hashes BEFORE dropping replaced references.
-        {
-            registered_hashes.rw_lock.lockSharedUncancelable(global_io);
-            defer registered_hashes.rw_lock.unlockShared(global_io);
-
-            for (found_hashes.items, new_tracked[prefix_keep_count..new_hashes_end]) |found_hash, *dest| {
-                var resolved_obj: ?*Object = null;
-                if (registered_hashes.entries.get(found_hash.hash)) |resolved| {
-                    resolved_obj = resolved.representative.takeReference();
-                }
-                dest.* = .{
-                    .str_index = found_hash.index,
-                    .value = resolved_obj,
-                };
-            }
-        }
-
-        @memcpy(new_tracked[new_hashes_end..new_total], self.tracked_hashes[suffix_idx..]);
-
-        for (self.tracked_hashes[prefix_keep_count..suffix_idx]) |old_h| {
-            if (old_h.value) |val| val.dropReference();
-        }
-        global_gpa.free(self.tracked_hashes);
-        self.tracked_hashes = new_tracked;
-    }
-
-    pub fn invalidateCachedHashAndUtf8Len(self: *SpecialString) void {
-        if (self.hash.load(.monotonic)) |h| {
-            global_gpa.destroy(h);
-            self.hash.store(null, .monotonic);
-        }
-        self.utf8_length.store(math.maxInt(u64), .monotonic);
-    }
-
-    pub fn incrRefCount(self: *SpecialString) void {
+    pub fn takeReference(self: *SpecialString) void {
         _ = self.ref_count.fetchAdd(1, .monotonic);
     }
 
-    pub fn decrRefCount(self: *SpecialString) void {
+    pub fn dropReference(self: *SpecialString) void {
         if (self.ref_count.fetchSub(1, .release) == 1) {
             // The release store above synchronizes with this acquire load to
             // ensure all prior operations on this string (from other threads)
@@ -1316,6 +845,390 @@ pub const SpecialString = struct {
             _ = self.ref_count.load(.acquire);
             self.deinit();
         }
+    }
+};
+
+/// OOM-safe in-place string patching.
+///
+/// A "patch" is a single `Edit`, which replaces a range of the string with
+/// new, potentially empty bytes. It's guaranteed to either be atomically
+/// applied, or to fail without changing anything.
+pub const strpatch = struct {
+    const HashAndInfo = SpecialString.HashAndInfo;
+
+    /// Length of a full hash reference token.
+    const token_len = hashutil.hash_token_len;
+
+    // /// Attempts to atomically patch `obj`, by replacing `obj.string[edit_at..remove]` with `add`.
+    // /// Corrects any changed hashes, and leaves `string` untouched if OOM occurs. `add`
+    // /// must not alias the object's string.
+    // pub fn patch2(obj: *Object, edit_at: usize, remove: usize, add: []const u8) error{OutOfMemory}!void {
+    //     // Note: when we say "token" in the below code, we're referring specifically to a hash token,
+    //     // e.g. `blake3.abc123~`.
+
+    //     assert(obj.canMutate());
+    //     _ = obj.getString();
+
+    //     const old: struct {
+    //         bytes: []const u8,
+    //         hashes: []const HashAndInfo,
+    //         special: ?*SpecialString,
+    //     } = switch (obj.getStringDetails()) {
+    //         .normal => |bytes| .{ .bytes = bytes, .hashes = &.{}, .special = null },
+    //         .special => |special| .{ .bytes = special.getString(), .hashes = special.tracked_hashes, .special = special },
+    //         .none => unreachable, // `String` objects always have a string rep.
+    //     };
+
+    //     assert(edit_at + remove <= old.bytes.len);
+
+    //     // We will now allocate all needed structures for the patch, so we can
+    //     // do all the fallible steps at once. We won't take any references until
+    //     // this section successfully completes, so all that is needed for cleanup
+    //     // is freeing the allocated structures.
+    //     //
+    //     // Some terminology we use below: There are "guaranteed" surviving
+    //     // tokens, which are tokens in ranges where it's impossible for the edit
+    //     // to damage them, and then we have "found" tokens, which are tokens
+    //     // that were found either in the edit's bytes, or crossing the edit's
+    //     // boundaries. This means that the tokens' start indices form a
+    //     // partition: `guaranteed ∪ found = all tokens`, and
+    //     // `guaranteed ∩ found = ∅`.
+
+    //     // The edit is as follows:
+    //     // old: text before|to be removed|text after edit section
+    //     //                 ^ edit_at     ^ edit_at + remove
+    //     // new: text before|newly added text|text after edit section
+    //     //                 ^ edit_at        ^ edit_at + add.len
+    //     const old_edit_end = edit_at + remove;
+    //     const new_edit_end = edit_at + add.len;
+
+    //     const guaranteed_ranges: [2]struct { old_start: usize, new_start: usize, len: usize } = .{
+    //         .{
+    //             .old_start = 0,
+    //             .new_start = 0,
+    //             .len = edit_at -| (token_len - 1),
+    //         },
+    //         .{
+    //             .old_start = old_edit_end,
+    //             .new_start = new_edit_end,
+    //             .len = old.bytes.len - old_edit_end,
+    //         },
+    //     };
+
+    //     // We have two (potentially overlapping) windows where we will find
+    //     // new hashes. This diagram is in new string indices:
+    //     //                                       v edit_at                                       v new_edit_end
+    //     // |- guaranteed starts -|               |----------------- added text ------------------|- guaranteed starts -|
+    //     //                       |`token_len - 1`|`token_len - 1`|               |`token_len - 1`|`token_len - 1`|
+    //     //                       |-------- window before --------|               |-------- window after ---------|
+    //     // We'll also scan "added text", since it can also have new hashes
+    //     // (unless the windows overlap, as explained below).
+    //     //
+    //     // Some notes:
+    //     // 1. You may notice that "guaranteed starts" doesn't overlap with
+    //     //    "window before", but it does overlap with "window after." This is
+    //     //    because "guaranteed starts" contains all the indices where the
+    //     //    _start_ of the token is valid. We can have absolutely no overlap
+    //     //    between "guaranteed starts" and "window before", or else we'll
+    //     //    double count a token. Conversely, we need overlap between
+    //     //    "guaranteed starts" and "window after", because only the first
+    //     //    half of "window after" has the start indices of full tokens, while
+    //     //    the second half only contains the end of tokens from the first
+    //     //    half.
+    //     // 2. When `add.len < 2 * (token_len - 1)`, the two windows will
+    //     //    overlap. If we scanned both windows when they overlap, we could
+    //     //    potentially scan a hash token twice. To prevent this, we merge the
+    //     //    two windows into one that gets scanned in its entirety. We also
+    //     //    don't scan `add`, since its contents will be scanned when
+    //     //    scanning the merged window.
+
+    //     var found_hashes: std.ArrayList(hashutil.HashInstance) = .empty;
+    //     defer found_hashes.deinit(global_gpa);
+    //     if (add.len < 2 * (token_len - 1)) {
+    //         // Windows overlap, so we'll copy them into the same buffer.
+    //         var buffer: [(token_len - 1) * 4]u8 = undefined;
+    //         var writer: std.ArrayList(u8) = .initBuffer(&buffer);
+
+    //         const window_start = edit_at -| (token_len - 1);
+    //         // Part before `edit_at`.
+    //         writer.appendSliceAssumeCapacity(old.bytes[window_start..edit_at]);
+    //         writer.appendSliceAssumeCapacity(add);
+    //         // Part after `old_edit_end`.
+    //         writer.appendSliceAssumeCapacity(old.bytes[old_edit_end..@min(old_edit_end + (token_len - 1), old.bytes.len)]);
+    //         try hashutil.scanStringForHashRefs(global_gpa, writer.items, window_start, &found_hashes);
+    //     } else {
+    //         // No overlap, so we'll scan each one separately.
+    //         var buffer: [(token_len - 1) * 2]u8 = undefined;
+    //         var writer: std.ArrayList(u8) = .initBuffer(&buffer);
+
+    //         // Scan "before window."
+    //         const window_start = edit_at -| (token_len - 1);
+    //         writer.appendSliceAssumeCapacity(old.bytes[window_start..edit_at]);
+    //         writer.appendSliceAssumeCapacity(add[0..(token_len - 1)]);
+    //         try hashutil.scanStringForHashRefs(global_gpa, writer.items, window_start, &found_hashes);
+
+    //         // Scan "added text."
+    //         try hashutil.scanStringForHashRefs(global_gpa, add, edit_at, &found_hashes);
+
+    //         // Scan "after window."
+    //         writer = .initBuffer(&buffer);
+    //         writer.appendSliceAssumeCapacity(add[(add.len - (token_len - 1))..]);
+    //         writer.appendSliceAssumeCapacity(old.bytes[old_edit_end..@min(old_edit_end + (token_len - 1), old.bytes.len)]);
+    //         try hashutil.scanStringForHashRefs(global_gpa, writer.items, new_edit_end - (token_len - 1), &found_hashes);
+    //     }
+
+    //     // Do after successfully changing the string.
+    //     obj.invalidateInternalRep();
+    // }
+
+    /// Replaces `[start, end)` of the original string with `bytes`.
+    /// A pure insert uses `start == end`, while a pure delete has
+    /// empty `bytes`.
+    ///
+    /// `bytes` is borrowed for the duration of `patch`, and must not alias the
+    /// string being patched.
+    pub const Edit = struct {
+        start: usize,
+        end: usize,
+        bytes: []const u8,
+    };
+
+    /// Attempts to atomically apply `edit` to `string`, leaving `string`
+    /// untouched in the case of OOM. Asserts that `string` can be mutated.
+    pub fn patch(string: *objects.String, edit: Edit) error{OutOfMemory}!void {
+        const obj = string.asHead();
+        assert(obj.canMutate());
+
+        const old: struct {
+            bytes: []const u8,
+            hashes: []const HashAndInfo,
+            special: ?*SpecialString,
+        } = switch (obj.getStringDetails()) {
+            .normal => |bytes| .{ .bytes = bytes, .hashes = &.{}, .special = null },
+            .special => |special| .{ .bytes = special.getString(), .hashes = special.tracked_hashes, .special = special },
+            .none => unreachable, // `String` objects always have a string rep.
+        };
+
+        {
+            assert(edit.start <= edit.end); // Make sure the edit bounds are correct.
+            assert(edit.end <= old.bytes.len);
+            const old_start = @intFromPtr(old.bytes.ptr); // Used for checking aliasing.
+            const edit_start = @intFromPtr(edit.bytes.ptr);
+            assert(edit.bytes.len == 0 or
+                edit_start + edit.bytes.len <= old_start or
+                old_start + old.bytes.len <= edit_start); // Make sure the edit doesn't alias the string.
+        }
+
+        const old_tail = old.bytes[edit.end..];
+        const new_tail_start = edit.start + edit.bytes.len;
+        const new_len = new_tail_start + old_tail.len;
+
+        // We will now allocate all needed structures for the patch. We won't
+        // take any references until this section successfully completes, to
+        // simplify error handling.
+        //
+        // Some terminology we use below: There are "guaranteed" surviving
+        // tokens, which are tokens in ranges where it's impossible for the
+        // edit to damage them, and then we have "found" tokens, which are
+        // tokens that were found either in the edit's bytes, or crossing one
+        // of the edit's boundaries. This means that the tokens' start indices
+        // form a partition: `guaranteed ∪ found = all tokens`, and
+        // `guaranteed ∩ found = ∅`.
+
+        // We first locate the "guaranteed" tokens. We don't need to scan for
+        // them, since we can take them from the old hashes. Those are sorted,
+        // so removing the damaged ones from the middle leaves the guaranteed
+        // ones on either side.
+        //
+        // The edit damages a token iff it's a deletion overlapping the token,
+        // or an insertion strictly inside it. An edit ending at or before a
+        // token's start (an insert exactly at its start included) moves the
+        // token but cannot damage it.
+        var damaged_start: usize = 0;
+        while (damaged_start < old.hashes.len and old.hashes[damaged_start].str_index + token_len <= edit.start) damaged_start += 1;
+        var damaged_end = damaged_start;
+        while (damaged_end < old.hashes.len and old.hashes[damaged_end].str_index < edit.end) damaged_end += 1;
+        const guaranteed_before = old.hashes[0..damaged_start];
+        const guaranteed_after = old.hashes[damaged_end..];
+
+        // We next look for our "found" tokens. Every one of them crosses a
+        // boundary of the edit or lies inside its bytes, so only the
+        // `token_len - 1` bytes on each side need scanning, plus the edit's
+        // bytes. Neither side holds enough old bytes to contain a guaranteed
+        // token, so nothing here is reported twice.
+        //
+        // `window` may begin partway through a surviving token. The token
+        // format is overlap-free, so no valid token can start inside those
+        // bytes and the scanner can't be thrown off by them.
+        const window_start = edit.start -| (token_len - 1);
+        var found: std.ArrayList(hashutil.HashInstance) = .empty;
+        defer found.deinit(global_gpa);
+        {
+            const window = try mem.concat(global_gpa, u8, &.{
+                old.bytes[window_start..edit.start],
+                edit.bytes,
+                old_tail[0..@min(old_tail.len, token_len - 1)],
+            });
+            defer global_gpa.free(window);
+            try hashutil.scanStringForHashRefs(global_gpa, window, 0, &found);
+        }
+
+        const new_tracked = try global_gpa.alloc(HashAndInfo, guaranteed_before.len + found.items.len + guaranteed_after.len);
+        errdefer global_gpa.free(new_tracked);
+
+        // The special string itself may be shared with other objects
+        // (`duplicateHeadOnto` shares rather than copies), even when `obj` is
+        // exclusively ours. Unlike everything else a patch touches, its count
+        // is atomic, since a sharer can be cross-thread.
+        const exclusive_special: ?*SpecialString = if (old.special) |special|
+            (if (special.ref_count.load(.monotonic) == 1) special else null)
+        else
+            null;
+
+        if (exclusive_special) |special| {
+            // The object exclusively owns a special string: patch its buffer
+            // in place, growing it if needed.
+            const string_bytes: [:0]u8, const old_capacity: usize = switch (special.value) {
+                .normal => |bytes| .{ bytes, bytes.len },
+                .different_capacity => |info| .{ info.string, info.original_capacity },
+            };
+            // The `+ 1` is for the sentinel.
+            var buf = string_bytes.ptr[0 .. old_capacity + 1];
+            if (new_len > old_capacity) {
+                const new_capacity = @max(new_len, old_capacity +| old_capacity / 2);
+                // Last fallible step. A failed `realloc` leaves the buffer as
+                // it was, and nothing after a successful one can fail, which
+                // matters since `special` still points to the old buffer.
+                buf = try global_gpa.realloc(buf, new_capacity + 1);
+            }
+            const capacity = buf.len - 1;
+
+            errdefer comptime unreachable; // We now take references, and know nothing will go wrong.
+
+            fillTrackedHashes(new_tracked, edit, guaranteed_before, window_start, found.items, guaranteed_after);
+
+            // Move the untouched tail of old bytes. Inserted bytes go in last,
+            // since they can overlap the tail's old position.
+            @memmove(buf[new_tail_start..][0..old_tail.len], buf[edit.end..][0..old_tail.len]);
+            @memcpy(buf[edit.start..][0..edit.bytes.len], edit.bytes);
+            buf[new_len] = 0;
+
+            special.value = if (capacity == new_len)
+                .{ .normal = buf[0..new_len :0] }
+            else
+                .{ .different_capacity = .{
+                    .string = buf[0..new_len :0],
+                    .original_capacity = capacity,
+                } };
+
+            for (special.tracked_hashes) |tracked| if (tracked.value) |value| value.dropReference();
+            global_gpa.free(special.tracked_hashes);
+            special.tracked_hashes = new_tracked;
+
+            // Invalidate what was derived from the old bytes.
+            if (special.hash.raw) |hash| {
+                global_gpa.destroy(hash);
+                special.hash.raw = null;
+            }
+            special.utf8_length.raw = math.maxInt(u64);
+        } else {
+            // Gather-copy into a new buffer. Used for normal strings (small,
+            // with no spare capacity to work in) and for special strings
+            // shared with other objects.
+            const buf = try global_gpa.allocSentinel(u8, new_len, 0);
+            errdefer global_gpa.free(buf);
+            const needs_special = new_tracked.len > 0 or new_len > considered_large_string;
+            // Null when the result fits the normal-string rules.
+            const new_special = if (needs_special) try global_gpa.create(SpecialString) else null;
+
+            errdefer comptime unreachable; // We now take references, and know nothing will go wrong.
+
+            fillTrackedHashes(new_tracked, edit, guaranteed_before, window_start, found.items, guaranteed_after);
+
+            @memcpy(buf[0..edit.start], old.bytes[0..edit.start]);
+            @memcpy(buf[edit.start..new_tail_start], edit.bytes);
+            @memcpy(buf[new_tail_start..], old_tail);
+
+            // Frees a normal string, or drops our reference to a shared
+            // special one (which keeps its own tracked references; ours were
+            // taken separately).
+            obj.freeStringInner();
+
+            if (new_special) |special| {
+                special.* = .{
+                    .value = .{ .normal = buf },
+                    .tracked_hashes = new_tracked,
+                    .hash = .init(null),
+                };
+                obj.string.raw = special;
+                obj.string_metadata.raw = .{
+                    .has_value = true,
+                    .is_special = true,
+                    .len = math.maxInt(u16),
+                };
+            } else {
+                assert(new_tracked.len == 0);
+                global_gpa.free(new_tracked);
+                obj.string.raw = buf.ptr;
+                obj.string_metadata.raw = .{
+                    .has_value = true,
+                    .is_special = false,
+                    .len = @intCast(new_len),
+                };
+            }
+        }
+
+        // The body caches the codepoint length of normal strings.
+        string.* = .{};
+        if (options.trace_mem) {
+            const final_bytes: []const u8 = switch (obj.getStringDetails()) {
+                .normal => |bytes| bytes,
+                .special => |special| special.getString(),
+                .none => unreachable,
+            };
+            leak_check.globalTrace(obj, .{ .set_string = .{ .set_to = leak_check.dupeForTrace(final_bytes) } });
+        }
+    }
+
+    /// Fills `out` with the new string's tokens in increasing order, taking a
+    /// reference to each resolved value. Indices are unique, since tokens
+    /// can't overlap. The indices in `found` are relative to `window_start`.
+    fn fillTrackedHashes(
+        out: []HashAndInfo,
+        edit: Edit,
+        guaranteed_before: []const HashAndInfo,
+        window_start: usize,
+        found: []const hashutil.HashInstance,
+        guaranteed_after: []const HashAndInfo,
+    ) void {
+        var filled: std.ArrayList(HashAndInfo) = .initBuffer(out);
+
+        for (guaranteed_before) |hash| filled.appendAssumeCapacity(.{
+            .str_index = hash.str_index,
+            .value = if (hash.value) |value| value.takeReference() else null,
+        });
+
+        if (found.len > 0) {
+            registered_hashes.rw_lock.lockSharedUncancelable(global_io);
+            defer registered_hashes.rw_lock.unlockShared(global_io);
+
+            for (found) |token| filled.appendAssumeCapacity(.{
+                .str_index = window_start + token.index,
+                .value = if (registered_hashes.entries.get(token.hash)) |resolved|
+                    resolved.representative.takeReference()
+                else
+                    null,
+            });
+        }
+
+        // These tokens move with the old bytes just after the edit. This won't
+        // underflow, as they all start at or after `edit.end`.
+        for (guaranteed_after) |hash| filled.appendAssumeCapacity(.{
+            .str_index = hash.str_index - edit.end + edit.start + edit.bytes.len,
+            .value = if (hash.value) |value| value.takeReference() else null,
+        });
+
+        assert(filled.items.len == out.len);
     }
 };
 
@@ -1454,47 +1367,6 @@ pub const Object = extern struct {
     /// an exclusively owned `*SpecialString`, invalidates any internal rep, and
     /// returns the mutable `*SpecialString`. Returns `null` if `obj` cannot be
     /// mutated in place.
-    pub fn asMutableStringInPlace(obj: *Object) error{OutOfMemory}!?*SpecialString {
-        if (!obj.canMutate()) return null;
-
-        _ = try obj.getString();
-
-        var special: *SpecialString = undefined;
-        switch (obj.getStringDetails()) {
-            .none => unreachable,
-            .special => |existing| {
-                if (existing.ref_count.load(.monotonic) == 1) {
-                    special = existing;
-                } else {
-                    const existing_bytes = existing.getString();
-                    special = try SpecialString.createWithCapacity(existing_bytes, existing_bytes.len);
-                    existing.decrRefCount();
-                    obj.string = .init(@ptrCast(special));
-                }
-            },
-            .normal => |normal| {
-                // Any `.normal` string on an `Object` is guaranteed to have 0 `blake3~`
-                // references and to be exclusively owned by `obj`.
-                special = try global_gpa.create(SpecialString);
-                special.* = .{
-                    .value = .{ .normal = @constCast(normal) },
-                    .tracked_hashes = &.{},
-                    .hash = .init(null),
-                };
-                obj.string = .init(@ptrCast(special));
-                obj.string_metadata = .init(.{
-                    .has_value = true,
-                    .is_special = true,
-                    .len = std.math.maxInt(u16),
-                });
-            },
-        }
-
-        obj.invalidateInternalRep();
-        obj.vtable = &objects.None.vtable;
-        return special;
-    }
-
     pub fn newObjectWithVTable(vtable: *const VTable) !*Object {
         const obj = try global_gpa.create(Object);
         obj.* = .{
@@ -1887,10 +1759,10 @@ pub const Object = extern struct {
         switch (obj.getStringDetails()) {
             .none => {},
             .normal => |normal| global_gpa.free(normal),
-            .special => |special| special.decrRefCount(),
+            .special => |special| special.dropReference(),
         }
-        obj.string.store(null, .unordered);
-        obj.string_metadata.store(.{}, .unordered);
+        obj.string.raw = null;
+        obj.string_metadata.raw = .{};
     }
 
     pub fn invalidateString(obj: *Object) void {
@@ -1967,7 +1839,7 @@ pub const Object = extern struct {
 
     /// Whether `getHashNoRegister` can return the object's hash without
     /// allocating (e.g. potentially returning OOM).
-    fn hashIsCached(obj: *const Object) bool {
+    pub fn hashIsCached(obj: *const Object) bool {
         if (obj.asTypeConst(objects.Source)) |source| {
             if (source.hash.load(.monotonic) == null) return false;
             // Note that if the source has a hash, we also need to make sure
@@ -2002,7 +1874,7 @@ pub const Object = extern struct {
                 });
             },
             .special => |special| {
-                special.incrRefCount();
+                special.takeReference();
                 dest.string = .init(special);
                 dest.string_metadata = .init(.{
                     .has_value = true,
@@ -2029,110 +1901,6 @@ pub const Object = extern struct {
         try src.duplicateHeadOnto(new_obj.head);
 
         return new_obj.head;
-    }
-};
-
-pub const hashutil = struct {
-    pub const hash_prepend = "blake3~";
-    pub const hash_chars = std.base64.url_safe_alphabet_chars;
-    pub const hash_encoder = std.base64.Base64Encoder.init(hash_chars, null);
-    pub const hash_decoder = std.base64.Base64Decoder.init(hash_chars, null);
-    pub const hash_len = hash_encoder.calcSize(32);
-    pub const hash_and_prepend_len = hash_prepend.len + hash_len;
-    pub const HashInstance = struct { index: usize, hash: u256 };
-
-    /// Uses blake3 to make a hash that, in theory, should never
-    /// overlap with any other byte string.
-    pub fn hashBytes(bytes: []const u8) u256 {
-        var out: [32]u8 = @splat(0);
-        std.crypto.hash.Blake3.hash(bytes, &out, .{});
-        return @bitCast(out);
-    }
-
-    pub fn scanStringForHashRefs(arena: Allocator, bytes: []const u8) !std.ArrayList(HashInstance) {
-        var found_hashes: std.ArrayList(HashInstance) = .empty;
-        errdefer found_hashes.deinit(arena);
-
-        if (bytes.len < hash_and_prepend_len) return found_hashes;
-
-        var current_index: usize = 0;
-        while (true) {
-            if (std.mem.findPos(u8, bytes, current_index, hash_prepend)) |next| {
-                if (bytes.len - next >= hash_and_prepend_len) {
-                    var output: [32]u8 = undefined;
-                    hash_decoder.decode(&output, bytes[(next + hash_prepend.len)..][0..hash_len]) catch {
-                        current_index = next + hash_prepend.len;
-                        continue;
-                    };
-
-                    try found_hashes.append(arena, .{ .index = next, .hash = @bitCast(output) });
-                    current_index = next + hash_and_prepend_len;
-                } else break;
-            } else break;
-        }
-
-        return found_hashes;
-    }
-
-    /// Parse a string that is exactly a single hash reference.
-    /// The string must start with `blake3~` at position 0, followed by a valid
-    /// base64-encoded 32-byte hash.
-    pub fn parseHashReference(bytes: []const u8) ?u256 {
-        if (!std.mem.startsWith(u8, bytes, hash_prepend)) return null;
-        if (bytes.len != hash_and_prepend_len) return null;
-
-        var output: [32]u8 = undefined;
-        hash_decoder.decode(&output, bytes[hash_prepend.len..]) catch return null;
-        return @bitCast(output);
-    }
-
-    pub fn scanAndResolveHashRefs(arena: Allocator, bytes: []const u8) error{OutOfMemory}![]SpecialString.HashAndInfo {
-        var found_hashes = try scanStringForHashRefs(arena, bytes);
-        defer found_hashes.deinit(arena);
-
-        // Look up all the found hashes.
-        const resolved_hashes: []SpecialString.HashAndInfo = try arena.alloc(SpecialString.HashAndInfo, found_hashes.items.len);
-        {
-            registered_hashes.rw_lock.lockSharedUncancelable(global_io);
-            defer registered_hashes.rw_lock.unlockShared(global_io);
-
-            for (found_hashes.items, resolved_hashes) |found_hash, *resolved_hash| {
-                resolved_hash.* = .{
-                    .str_index = found_hash.index,
-                    .value = if (registered_hashes.entries.get(found_hash.hash)) |resolved| resolved.representative.takeReference() else null,
-                };
-            }
-        }
-
-        return resolved_hashes;
-    }
-
-    // Quick hashes are used internally for structures like dictionary keys and
-    // variable tables. They're not cryptographically secure, so they're not used
-    // for content addressing, but there's no point in wasting compute on a secure
-    // hash when it's not used in a secure setting.
-
-    /// Strings below this length get hashed with wyhash, while above this length
-    /// they use their blake3 hash (truncated to fit in a u64).
-    pub const quick_hash_cutoff = 1024;
-
-    /// Use only for hash tables and similar data structures that also use equality,
-    /// as this is not cryptographically secure.
-    pub fn quickHash(value: Value) !u64 {
-        var buf: [350]u8 = undefined;
-        const bytes = try value.getStringWithBuffer(&buf);
-        if (bytes.len < quick_hash_cutoff) return std.hash.Wyhash.hash(0, bytes);
-        return @truncate(try value.getHashNoRegister());
-    }
-
-    /// This ensures that `quickHash` is guaranteed not to OOM when hashed in the
-    /// future.
-    pub fn cacheQuickHash(value: Value) error{OutOfMemory}!void {
-        const obj = value.asPtr() orelse return;
-        const bytes = try obj.getString();
-        if (bytes.len >= quick_hash_cutoff) {
-            if (!obj.hashIsCached()) _ = try obj.getHashNoRegister();
-        }
     }
 };
 
@@ -2243,11 +2011,11 @@ fn testSpecialSourceHash(ta: std.mem.Allocator) !void {
     try testStart(ta, null);
     defer testFinish();
 
-    // Over 1024 bytes, so the string rep is stored as a `SpecialString` and both
-    // it and `Source.hash` have a slot to fill. A `Source` is the only type where
-    // the two coexist, so it is the only place they can disagree.
-    const script = memutil.repeat("set x 1\n", 200);
-    comptime assert(script.len > hashutil.quick_hash_cutoff);
+    // Over `considered_large_string` bytes, so the string rep is stored as a
+    // `SpecialString` and both it and `Source.hash` have a slot to fill. A
+    // `Source` is the only type where the two coexist, so it is the only place
+    // they can disagree.
+    const script = memutil.repeat("set x 1\n", considered_large_string);
     const source = try objects.Source.new(&script, .none, 1);
     defer source.asHead().dropReference();
 
@@ -2276,15 +2044,16 @@ fn testScanStringForHashRefs(ta: std.mem.Allocator) !void {
     const ref_str = try hash_ref.asHead().getString();
     const expected_hash = try target.asHead().getHashNoRegister();
 
-    // Prepend a prefix AND a malformed `blake3~` (< 50 bytes before the real one)
+    // Prepend a prefix AND a malformed `blake3.` (less than a token length before the real one)
     // to verify both that `.index` is the exact start of the match (`next`, not `current_index`)
-    // and that a failed base64 decode only advances past `blake3~` rather than skipping 50 bytes.
-    const prefix = "hello blake3~invalid! ";
+    // and that a failed base64 decode only advances past `blake3.` rather than skipping a whole token.
+    const prefix = "hello blake3.invalid! ";
     const combined = try std.fmt.allocPrint(ta, "{s}{s} trailing", .{ prefix, ref_str });
     defer ta.free(combined);
 
-    var found = try hashutil.scanStringForHashRefs(ta, combined);
+    var found: std.ArrayList(hashutil.HashInstance) = .empty;
     defer found.deinit(ta);
+    try hashutil.scanStringForHashRefs(ta, combined, 0, &found);
 
     try expectEqual(@as(usize, 1), found.items.len);
     try expectEqual(prefix.len, found.items[0].index);
@@ -2295,19 +2064,69 @@ test "scanStringForHashRefs records exact index and recovers after invalid prefi
     try testing.checkAllAllocationFailures(testing.allocator, testScanStringForHashRefs, .{});
 }
 
-fn assertSingleTrackedHashAt(special: *SpecialString, expected_index: usize) !void {
-    try expectEqual(@as(usize, 1), special.tracked_hashes.len);
-    try expectEqual(expected_index, special.tracked_hashes[0].str_index);
-    try testing.expect(special.tracked_hashes[0].value != null);
-    try testing.expectEqualStrings("sliding payload", try special.tracked_hashes[0].value.?.getString());
+fn testCurrentBytes(obj: *Object) []const u8 {
+    return switch (obj.getStringDetails()) {
+        .normal => |bytes| bytes,
+        .special => |special| special.getString(),
+        .none => unreachable,
+    };
 }
 
-fn testSpecialStringSlidingWindowHashRef(ta: std.mem.Allocator) !void {
+fn testTrackedHashes(obj: *Object) []const SpecialString.HashAndInfo {
+    return switch (obj.getStringDetails()) {
+        .normal => &.{},
+        .special => |special| special.tracked_hashes,
+        .none => unreachable,
+    };
+}
+
+/// Fails unless `obj` tracks exactly the hash references a full rescan finds.
+fn expectTrackedMatchesRescan(obj: *Object) !void {
+    const expected = try hashutil.scanAndResolveHashRefs(global_gpa, testCurrentBytes(obj));
+    defer {
+        for (expected) |entry| if (entry.value) |value| value.dropReference();
+        global_gpa.free(expected);
+    }
+
+    const actual = testTrackedHashes(obj);
+    try expectEqual(expected.len, actual.len);
+    for (expected, actual) |exp, act| {
+        try expectEqual(exp.str_index, act.str_index);
+        try expectEqual(exp.value, act.value);
+    }
+}
+
+fn testAppend(obj: *Object, bytes: []const u8) !void {
+    const len = testCurrentBytes(obj).len;
+    try strpatch.patch(obj.asType(objects.String).?, .{ .start = len, .end = len, .bytes = bytes });
+}
+
+/// Overwrites `data` at `offset`, zero-filling any gap past the old end.
+fn testOverwrite(obj: *Object, offset: usize, data: []const u8) !void {
+    const old_len = testCurrentBytes(obj).len;
+    const start = @min(offset, old_len);
+    const bytes = try global_gpa.alloc(u8, offset - start + data.len);
+    defer global_gpa.free(bytes);
+    @memset(bytes[0 .. offset - start], 0);
+    @memcpy(bytes[offset - start ..], data);
+
+    try strpatch.patch(obj.asType(objects.String).?, .{ .start = start, .end = @min(offset + data.len, old_len), .bytes = bytes });
+}
+
+fn expectSingleTrackedHashAt(obj: *Object, expected_index: usize) !void {
+    const tracked = testTrackedHashes(obj);
+    try expectEqual(@as(usize, 1), tracked.len);
+    try expectEqual(expected_index, tracked[0].str_index);
+    try testing.expect(tracked[0].value != null);
+    try testing.expectEqualStrings("sliding payload", try tracked[0].value.?.getString());
+}
+
+fn testStrpatchSlidingWindow(ta: std.mem.Allocator) !void {
     try testStart(ta, null);
     defer testFinish();
 
-    // 1. Test every possible split point (0..50) across `appendInPlace` with various prefix lengths,
-    //    including decoy `blake3~` prefixes immediately before and after the real hash.
+    // 1. Every split point of a hash reference across two appends, with decoy
+    //    prepends and postpends immediately before and after the real reference.
     {
         const target = try objects.String.new("sliding payload");
         defer target.asHead().dropReference();
@@ -2317,44 +2136,44 @@ fn testSpecialStringSlidingWindowHashRef(ta: std.mem.Allocator) !void {
         const prefixes = [_][]const u8{
             "",
             "a",
-            "blake3~",
-            "blake3~not_a_valid_hash_because_of_bang!_padding_",
-            &memutil.repeat("x", 48),
-            &memutil.repeat("x", 49),
-            &memutil.repeat("x", 50),
-            &memutil.repeat("x", 51),
+            hashutil.hash_prepend,
+            hashutil.hash_postpend,
+            hashutil.hash_prepend ++ "not_a_valid_hash_because_of_bang!_padding____" ++ hashutil.hash_postpend,
+            &memutil.repeat("x", hashutil.hash_token_len - 1),
+            &memutil.repeat("x", hashutil.hash_token_len),
+            &memutil.repeat("x", hashutil.hash_token_len + 1),
         };
         const suffixes = [_][]const u8{
             "",
             "z",
-            "blake3~",
-            "blake3~short",
+            hashutil.hash_prepend,
+            hashutil.hash_postpend,
+            hashutil.hash_prepend ++ "short",
         };
 
         for (prefixes) |prefix| {
             for (suffixes) |suffix| {
                 for (0..ref_bytes.len + 1) |split| {
-                    var special = try SpecialString.createWithCapacity(prefix, 8);
-                    defer special.decrRefCount();
+                    const string = try objects.String.new(prefix);
+                    defer string.asHead().dropReference();
+                    const obj = string.asHead();
 
-                    try special.appendInPlace(ref_bytes[0..split]);
-                    if (split < ref_bytes.len) {
-                        try expectEqual(@as(usize, 0), special.tracked_hashes.len);
-                    }
-                    try special.appendInPlace(ref_bytes[split..]);
-                    try assertSingleTrackedHashAt(special, prefix.len);
+                    try testAppend(obj, ref_bytes[0..split]);
+                    if (split < ref_bytes.len) try expectEqual(@as(usize, 0), testTrackedHashes(obj).len);
+                    try testAppend(obj, ref_bytes[split..]);
+                    try expectSingleTrackedHashAt(obj, prefix.len);
 
-                    try special.appendInPlace(suffix);
-                    try assertSingleTrackedHashAt(special, prefix.len);
+                    try testAppend(obj, suffix);
+                    try expectSingleTrackedHashAt(obj, prefix.len);
                 }
             }
         }
     }
 
-    // 2. Sliding-window patch test where `special` holds the ONLY live reference to `target`
-    //    outside `registered_hashes`. If `patchBytesInPlace` ever drops the old hash ref before
-    //    taking the new one, or misses a window boundary by even 1 byte, `target` will unregister
-    //    and free itself immediately.
+    // 2. Slide a hash reference while the patched string holds the only
+    //    reference to its target outside `registered_hashes`. Dropping the old
+    //    reference before taking the new one, or misjudging a window boundary
+    //    by a byte, unregisters and frees the target.
     {
         const target = try objects.String.new("sliding payload");
         const hash = try target.asHead().getHashRegistering();
@@ -2362,38 +2181,36 @@ fn testSpecialStringSlidingWindowHashRef(ta: std.mem.Allocator) !void {
 
         var initial_buf: [220]u8 = @splat('_');
         @memcpy(initial_buf[0..ref_bytes.len], &ref_bytes);
+        const string = try objects.String.new(&initial_buf);
+        defer string.asHead().dropReference();
+        const obj = string.asHead();
 
-        var special = try SpecialString.createWithCapacity(&initial_buf, initial_buf.len);
-        defer special.decrRefCount();
-
-        // Drop `target` so `special.tracked_hashes[0].value` is the sole external owner!
         target.asHead().dropReference();
-        try assertSingleTrackedHashAt(special, 0);
+        try expectSingleTrackedHashAt(obj, 0);
 
-        // Slide the 50-byte hash reference forward 1 byte at a time from 0 to 120.
-        var step_forward: [hashutil.hash_and_prepend_len + 1]u8 = undefined;
+        // Forward one byte at a time.
+        var step_forward: [hashutil.hash_token_len + 1]u8 = undefined;
         step_forward[0] = '_';
         @memcpy(step_forward[1..], &ref_bytes);
-
         var pos: usize = 0;
         while (pos < 120) : (pos += 1) {
-            try special.patchBytesInPlace(pos, &step_forward);
-            try assertSingleTrackedHashAt(special, pos + 1);
+            try testOverwrite(obj, pos, &step_forward);
+            try expectSingleTrackedHashAt(obj, pos + 1);
         }
 
-        // Slide the 50-byte hash reference backward 1 byte at a time from 120 down to 0.
-        var step_backward: [hashutil.hash_and_prepend_len + 1]u8 = undefined;
+        // Backward one byte at a time.
+        var step_backward: [hashutil.hash_token_len + 1]u8 = undefined;
         @memcpy(step_backward[0..ref_bytes.len], &ref_bytes);
         step_backward[ref_bytes.len] = '_';
-
         while (pos > 0) {
             pos -= 1;
-            try special.patchBytesInPlace(pos, &step_backward);
-            try assertSingleTrackedHashAt(special, pos);
+            try testOverwrite(obj, pos, &step_backward);
+            try expectSingleTrackedHashAt(obj, pos);
         }
 
-        // Jump across critical boundary distances (7, 43, 48, 49, 50, 51, 60) in a single patch.
-        const jumps = [_]usize{ 7, 43, 48, 49, 50, 51, 60, 0, 50, 1, 50, 49, 0, 60 };
+        // Jumps across the boundary distances, each in a single patch.
+        const token_len = hashutil.hash_token_len;
+        const jumps = [_]usize{ 7, 43, token_len - 1, token_len, token_len + 1, 60, 0, token_len, 1, token_len, token_len - 1, 0, 60 };
         var cur_pos: usize = 0;
         for (jumps) |next_pos| {
             const patch_start = @min(cur_pos, next_pos);
@@ -2401,26 +2218,38 @@ fn testSpecialStringSlidingWindowHashRef(ta: std.mem.Allocator) !void {
             var patch_buf: [220]u8 = @splat('_');
             @memcpy(patch_buf[next_pos - patch_start ..][0..ref_bytes.len], &ref_bytes);
 
-            try special.patchBytesInPlace(patch_start, patch_buf[0 .. patch_end - patch_start]);
+            try testOverwrite(obj, patch_start, patch_buf[0 .. patch_end - patch_start]);
             cur_pos = next_pos;
-            try assertSingleTrackedHashAt(special, cur_pos);
+            try expectSingleTrackedHashAt(obj, cur_pos);
         }
 
-        // Patch decoy `blake3~` prefixes immediately adjacent to the live hash at `cur_pos = 60`
-        // (ending at byte 60 and starting at byte 110) without touching `[60..110)`.
-        try special.patchBytesInPlace(cur_pos - hashutil.hash_prepend.len, hashutil.hash_prepend);
-        try assertSingleTrackedHashAt(special, cur_pos);
-
-        try special.patchBytesInPlace(cur_pos + ref_bytes.len, hashutil.hash_prepend);
-        try assertSingleTrackedHashAt(special, cur_pos);
+        // Decoy prefixes ending exactly where the reference starts, and
+        // starting exactly where it ends.
+        try testOverwrite(obj, cur_pos - hashutil.hash_prepend.len, hashutil.hash_prepend);
+        try expectSingleTrackedHashAt(obj, cur_pos);
+        try testOverwrite(obj, cur_pos + ref_bytes.len, hashutil.hash_prepend);
+        try expectSingleTrackedHashAt(obj, cur_pos);
     }
 }
 
-test "SpecialString sliding window and boundary hash tracking" {
-    try testSpecialStringSlidingWindowHashRef(testing.allocator);
+test "strpatch sliding window and boundary hash tracking" {
+    try testStrpatchSlidingWindow(testing.allocator);
 }
 
-fn testSpecialStringGrowableOom(ta: std.mem.Allocator) !void {
+/// Patches `obj`, and if that fails, checks that neither its bytes nor its
+/// tracked hashes changed.
+fn testPatchOrUnchanged(obj: *Object, edit: strpatch.Edit) !void {
+    const before = try global_gpa.dupe(u8, testCurrentBytes(obj));
+    defer global_gpa.free(before);
+
+    strpatch.patch(obj.asType(objects.String).?, edit) catch |err| {
+        try testing.expectEqualStrings(before, testCurrentBytes(obj));
+        try expectTrackedMatchesRescan(obj);
+        return err;
+    };
+}
+
+fn testStrpatchOom(ta: std.mem.Allocator) !void {
     try testStart(ta, null);
     defer testFinish();
 
@@ -2429,23 +2258,220 @@ fn testSpecialStringGrowableOom(ta: std.mem.Allocator) !void {
     const hash = try target.asHead().getHashRegistering();
     const ref_bytes = objects.HashReference.render(hash);
 
-    var special = try SpecialString.createWithCapacity("prefix:", 8);
-    defer special.decrRefCount();
+    const string = try objects.String.new("prefix:");
+    defer string.asHead().dropReference();
+    const obj = string.asHead();
 
-    try special.appendInPlace(ref_bytes[0..20]);
-    try special.appendInPlace(ref_bytes[20..]);
-    try expectEqual(@as(usize, 1), special.tracked_hashes.len);
-    try expectEqual(@as(usize, 7), special.tracked_hashes[0].str_index);
+    // Normal to special, then in place.
+    try testPatchOrUnchanged(obj, .{ .start = 7, .end = 7, .bytes = ref_bytes[0..20] });
+    try testPatchOrUnchanged(obj, .{ .start = 27, .end = 27, .bytes = ref_bytes[20..] });
+    try expectEqual(@as(usize, 1), testTrackedHashes(obj).len);
+    try expectEqual(@as(usize, 7), testTrackedHashes(obj)[0].str_index);
 
-    var shifted: [hashutil.hash_and_prepend_len + 2]u8 = undefined;
-    shifted[0] = '_';
-    shifted[1] = '_';
-    @memcpy(shifted[2..], &ref_bytes);
-    try special.patchBytesInPlace(7, &shifted);
-    try expectEqual(@as(usize, 1), special.tracked_hashes.len);
-    try expectEqual(@as(usize, 9), special.tracked_hashes[0].str_index);
+    // Shift the reference right by two, growing past the capacity.
+    try testPatchOrUnchanged(obj, .{ .start = 0, .end = 0, .bytes = "__" });
+    try expectEqual(@as(usize, 1), testTrackedHashes(obj).len);
+    try expectEqual(@as(usize, 9), testTrackedHashes(obj)[0].str_index);
+    try expectTrackedMatchesRescan(obj);
 }
 
-test "SpecialString growable OOM safety" {
-    try testing.checkAllAllocationFailures(testing.allocator, testSpecialStringGrowableOom, .{});
+test "strpatch leaves the string unchanged on OOM" {
+    try testing.checkAllAllocationFailures(testing.allocator, testStrpatchOom, .{});
+}
+
+fn testStrpatchSharedSpecial(ta: std.mem.Allocator) !void {
+    try testStart(ta, null);
+    defer testFinish();
+
+    const target = try objects.String.new("shared payload");
+    defer target.asHead().dropReference();
+    const ref_bytes = objects.HashReference.render(try target.asHead().getHashRegistering());
+
+    const original = try objects.String.new(&ref_bytes);
+    defer original.asHead().dropReference();
+    // Duplicating shares the special string rather than copying it, so the
+    // patch has to copy instead of editing in place.
+    const copy = try original.asHead().duplicate();
+    defer copy.dropReference();
+
+    try strpatch.patch(copy.asType(objects.String).?, .{ .start = 0, .end = 0, .bytes = "head:" });
+
+    try testing.expectEqualStrings(&ref_bytes, testCurrentBytes(original.asHead()));
+    try testing.expectEqualStrings("head:" ++ ref_bytes, testCurrentBytes(copy));
+    try expectSingleTrackedHashAtIn(original.asHead(), 0);
+    try expectSingleTrackedHashAtIn(copy, 5);
+}
+
+fn expectSingleTrackedHashAtIn(obj: *Object, expected_index: usize) !void {
+    const tracked = testTrackedHashes(obj);
+    try expectEqual(@as(usize, 1), tracked.len);
+    try expectEqual(expected_index, tracked[0].str_index);
+    try testing.expect(tracked[0].value != null);
+}
+
+test "strpatch copies a shared special string" {
+    try testing.checkAllAllocationFailures(testing.allocator, testStrpatchSharedSpecial, .{});
+}
+
+/// Patches `obj` with `edit`, then checks its bytes against `expected`, its
+/// tracked hashes against a full rescan, and that its cached hash was
+/// invalidated.
+fn expectPatch(obj: *Object, edit: strpatch.Edit, expected: []const u8) !void {
+    _ = try obj.getHashNoRegister();
+    try strpatch.patch(obj.asType(objects.String).?, edit);
+    try testing.expectEqualStrings(expected, testCurrentBytes(obj));
+    try expectTrackedMatchesRescan(obj);
+    try expectEqual(hashutil.hashBytes(expected), try obj.getHashNoRegister());
+}
+
+fn testStrpatchEdgeCases(ta: std.mem.Allocator) !void {
+    try testStart(ta, null);
+    defer testFinish();
+
+    const target = try objects.String.new("edge payload");
+    defer target.asHead().dropReference();
+    const ref = objects.HashReference.render(try target.asHead().getHashRegistering());
+    const no_postpend = ref[0 .. ref.len - hashutil.hash_postpend.len];
+
+    // Deleting the bytes between two halves joins them into a reference.
+    {
+        const string = try objects.String.new(ref[0..20] ++ "xx" ++ ref[20..]);
+        defer string.asHead().dropReference();
+        try expectEqual(@as(usize, 0), testTrackedHashes(string.asHead()).len);
+        try expectPatch(string.asHead(), .{ .start = 20, .end = 22, .bytes = "" }, &ref);
+        try expectEqual(@as(usize, 1), testTrackedHashes(string.asHead()).len);
+    }
+
+    // Deleting one byte of a reference, or inserting one inside it, breaks it.
+    {
+        const string = try objects.String.new(&ref);
+        defer string.asHead().dropReference();
+        try expectPatch(string.asHead(), .{ .start = 10, .end = 11, .bytes = "" }, ref[0..10] ++ ref[11..]);
+    }
+    {
+        const string = try objects.String.new(&ref);
+        defer string.asHead().dropReference();
+        try expectPatch(string.asHead(), .{ .start = 25, .end = 25, .bytes = "_" }, ref[0..25] ++ "_" ++ ref[25..]);
+    }
+
+    // A reference is only recognized with its postpend. Without the check,
+    // `no_postpend` followed by any byte would be tracked.
+    {
+        const string = try objects.String.new(no_postpend ++ "x");
+        defer string.asHead().dropReference();
+        try expectEqual(@as(usize, 0), testTrackedHashes(string.asHead()).len);
+        try expectPatch(string.asHead(), .{ .start = no_postpend.len, .end = no_postpend.len + 1, .bytes = hashutil.hash_postpend }, &ref);
+        try expectEqual(@as(usize, 1), testTrackedHashes(string.asHead()).len);
+
+        try expectPatch(string.asHead(), .{ .start = no_postpend.len, .end = ref.len, .bytes = "x" }, no_postpend ++ "x");
+        try expectEqual(@as(usize, 0), testTrackedHashes(string.asHead()).len);
+    }
+
+    // A reference inserted between two survivors lands between them in the
+    // tracked hashes.
+    {
+        const string = try objects.String.new(ref ++ "||" ++ ref);
+        defer string.asHead().dropReference();
+        try expectPatch(string.asHead(), .{ .start = ref.len + 1, .end = ref.len + 1, .bytes = &ref }, ref ++ "|" ++ ref ++ "|" ++ ref);
+        const tracked = testTrackedHashes(string.asHead());
+        try expectEqual(@as(usize, 3), tracked.len);
+        try expectEqual(ref.len + 1, tracked[1].str_index);
+    }
+
+    // Growing an exclusively owned special string past its capacity
+    // reallocates it with spare capacity, which then has to free cleanly.
+    {
+        const long: [considered_large_string + 1]u8 = @splat('_');
+        const string = try objects.String.new(&long);
+        defer string.asHead().dropReference();
+        try expectPatch(string.asHead(), .{ .start = long.len, .end = long.len, .bytes = "grown" }, &long ++ "grown");
+        try expectPatch(string.asHead(), .{ .start = 0, .end = long.len + "grown".len, .bytes = &ref }, &ref);
+    }
+
+    // A copied special string that ends up small without references becomes
+    // a normal string again.
+    {
+        const long: [considered_large_string + 1]u8 = @splat('_');
+        const original = try objects.String.new(&long);
+        defer original.asHead().dropReference();
+        const copy = try original.asHead().duplicate();
+        defer copy.dropReference();
+        try expectPatch(copy, .{ .start = 1, .end = long.len, .bytes = "" }, "_");
+        try testing.expect(copy.getStringDetails() == .normal);
+        try testing.expectEqualStrings(&long, testCurrentBytes(original.asHead()));
+    }
+}
+
+test "strpatch edge cases" {
+    try testing.checkAllAllocationFailures(testing.allocator, testStrpatchEdgeCases, .{});
+}
+
+const StrpatchFuzzContext = struct {
+    refs: [3][hashutil.hash_token_len]u8,
+};
+
+/// Edit bytes biased toward forming and breaking hash references.
+fn fuzzEditBytes(ctx: *const StrpatchFuzzContext, smith: *std.testing.Smith, out: []u8) []const u8 {
+    const ref = &ctx.refs[smith.index(ctx.refs.len)];
+    switch (smith.index(7)) {
+        0 => return ref,
+        1 => return ref[0 .. smith.index(ref.len) + 1],
+        2 => return ref[smith.index(ref.len)..],
+        3 => return hashutil.hash_prepend,
+        4 => return hashutil.hash_postpend,
+        5 => return "",
+        else => {
+            const len = smith.index(out.len) + 1;
+            smith.bytes(out[0..len]);
+            return out[0..len];
+        },
+    }
+}
+
+/// Applies an edit chosen by the fuzzer, then checks the result the same way
+/// `expectPatch` does, against a straightforward model.
+fn fuzzOnePatch(ctx: *const StrpatchFuzzContext, smith: *std.testing.Smith, obj: *Object) !void {
+    const old = try global_gpa.dupe(u8, testCurrentBytes(obj));
+    defer global_gpa.free(old);
+
+    const a = smith.index(old.len + 1);
+    const b = smith.index(old.len + 1);
+    var buf: [24]u8 = undefined;
+    const edit: strpatch.Edit = .{
+        .start = @min(a, b),
+        .end = @max(a, b),
+        .bytes = fuzzEditBytes(ctx, smith, &buf),
+    };
+
+    const expected = try mem.concat(global_gpa, u8, &.{ old[0..edit.start], edit.bytes, old[edit.end..] });
+    defer global_gpa.free(expected);
+
+    try expectPatch(obj, edit, expected);
+}
+
+fn testStrpatchFuzzOne(ctx: *StrpatchFuzzContext, smith: *std.testing.Smith) !void {
+    // Starting long makes the first patches go in place rather than copy.
+    const long: [considered_large_string + 1]u8 = @splat('_');
+    const string = try objects.String.new(if (smith.value(bool)) &long else "");
+    defer string.asHead().dropReference();
+
+    const op_count = smith.valueRangeAtMost(u8, 1, 8);
+    for (0..op_count) |_| try fuzzOnePatch(ctx, smith, string.asHead());
+}
+
+test "strpatch fuzz" {
+    const backing_gpa = if (@import("builtin").fuzz) std.heap.c_allocator else testing.allocator;
+    try testStart(backing_gpa, null);
+    defer testFinish();
+
+    var ctx: StrpatchFuzzContext = undefined;
+    var targets: [3]*objects.String = undefined;
+    for (&targets, &ctx.refs, 0..) |*target, *ref, i| {
+        var name_buf: [24]u8 = undefined;
+        target.* = try objects.String.new(try std.fmt.bufPrint(&name_buf, "fuzz payload {d}", .{i}));
+        ref.* = objects.HashReference.render(try target.*.asHead().getHashRegistering());
+    }
+    defer for (targets) |target| target.asHead().dropReference();
+
+    try std.testing.fuzz(&ctx, testStrpatchFuzzOne, .{});
 }

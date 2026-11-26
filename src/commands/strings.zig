@@ -39,16 +39,22 @@ pub fn appendCmd(interp: *Interp, args: []Shimmerable) !void {
 
     const maybe_var = try interp.getVariableForMutation(var_name);
     if (maybe_var) |var_value| {
-        if (try var_value.asMutableStringInPlace()) |special| {
-            const old_len = special.getString().len;
-            const total_len = std.math.add(usize, old_len, extra_len) catch return error.OutOfMemory;
-            try special.ensureTotalCapacity(total_len);
+        if (try var_value.asMutableInPlace(String, null)) |string| {
+            const old_len = (try string.asHead().getString()).len;
 
+            // One edit for all arguments, since each argument's bytes may only
+            // live in a stack buffer for the duration of its loop iteration.
+            const appended = try heap.global_gpa.alloc(u8, extra_len);
+            defer heap.global_gpa.free(appended);
+            var pos: usize = 0;
             for (args[2..]) |arg| {
                 var buf: [350]u8 = undefined;
                 const item_bytes = arg.current().getStringWithBuffer(&buf) catch unreachable;
-                try special.appendInPlace(item_bytes);
+                @memcpy(appended[pos..][0..item_bytes.len], item_bytes);
+                pos += item_bytes.len;
             }
+
+            try heap.strpatch.patch(string, .{ .start = old_len, .end = old_len, .bytes = appended });
             interp.setResult(var_value);
             return;
         }

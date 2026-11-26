@@ -12,6 +12,7 @@ const heap = @import("heap.zig");
 const Value = heap.Value;
 const OptionalValue = heap.OptionalValue;
 const Object = heap.Object;
+const hashutil = @import("hashutil.zig");
 const objects = @import("objects.zig");
 const IterHelper = objects.IterHelper;
 const allocPrintZ = objects.allocPrintZ;
@@ -1528,7 +1529,7 @@ pub const Closure = struct {
         result.appendAssumeCapacity("impl");
         result.appendAssumeCapacity(try strutil.quoteStrings(heap.local_arena, &args_and_body));
 
-        var scope_hash_ref: ?[heap.hashutil.hash_and_prepend_len]u8 = null;
+        var scope_hash_ref: ?[hashutil.hash_token_len]u8 = null;
         if (closure.scope) |scope| {
             result.appendAssumeCapacity("scope");
             // Use `getHashRegistering`, as the hash has escaped.

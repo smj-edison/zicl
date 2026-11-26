@@ -8,6 +8,8 @@ pub const Value = heap.Value;
 pub const memutil = @import("../memutil.zig");
 pub const expectErrorOrOom = memutil.expectErrorOrOom;
 
+pub const hashutil = @import("../hashutil.zig");
+
 pub const objects = @import("../objects.zig");
 pub const ErrorDetails = objects.ErrorDetails;
 pub const Shimmerable = objects.Shimmerable;
