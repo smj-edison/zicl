@@ -148,22 +148,21 @@ pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { forea
 
     // Track per-list iteration state.
     var iter_state: std.ArrayList(struct {
-        stride: usize,
-        length: usize,
+        var_list: *const List,
+        value_list: *const List,
         current_index: usize,
     }) = try .initCapacity(heap.local_arena, list_count);
 
     for (0..list_count) |i| {
-        const list_variable_names = try interp.getList(&args[i * 2 + 1]);
-        const list_values = try interp.getList(&args[i * 2 + 2]);
-        const stride = list_variable_names.items.len;
-        if (stride == 0) {
+        const var_list = try interp.getList(&args[i * 2 + 1]);
+        const value_list = try interp.getList(&args[i * 2 + 2]);
+        if (var_list.items.len == 0) {
             try interp.setResultString("foreach varlist is empty");
             return error.EvalError;
         }
         iter_state.appendAssumeCapacity(.{
-            .stride = stride,
-            .length = list_values.items.len,
+            .var_list = var_list,
+            .value_list = value_list,
             .current_index = 0,
         });
     }
@@ -174,26 +173,21 @@ pub fn foreachMapHelper(interp: *Interp, args: []Shimmerable, mode: enum { forea
     outer: while (true) {
         // Continue only if any list still has unconsumed elements.
         inner: for (0..list_count) |i| {
-            if (iter_state.items[i].current_index < iter_state.items[i].length) break :inner;
+            if (iter_state.items[i].current_index < iter_state.items[i].value_list.items.len) break :inner;
         } else {
             // All lists have consumed their elements, so we're done.
             break :outer;
         }
 
         // Go through all the lists and assign their variables.
-        for (0..list_count) |list_index| {
-            const var_list = try interp.getList(&args[list_index * 2 + 1]);
-            const value_list = try interp.getList(&args[list_index * 2 + 2]);
-
-            const state = &iter_state.items[list_index];
-
+        for (iter_state.items) |*state| {
             // Assign variables for this specific list.
-            for (0..state.stride) |var_name_index| {
-                var var_name: Shimmerable = .{ .original = var_list.items[var_name_index] };
+            for (state.var_list.items) |var_name_value| {
+                var var_name: Shimmerable = .{ .original = var_name_value };
                 defer var_name.discardChanges();
 
-                const value = if (state.current_index < state.length) blk: {
-                    const item = value_list.items[state.current_index];
+                const value = if (state.current_index < state.value_list.items.len) blk: {
+                    const item = state.value_list.items[state.current_index];
                     state.current_index += 1;
                     break :blk item;
                 } else heap.interned_empty_string;
@@ -302,6 +296,15 @@ fn testLoopCommands(ta: std.mem.Allocator) !void {
     // [foreach] empty varlist error.
     try interp.testExpectScriptError(error.EvalError, "foreach varlist is empty",
         \\ foreach {} {1 2} { puts hi }
+    );
+
+    // The body shimmers the list being iterated to a dict, which mustn't
+    // replace the list [foreach] is reading.
+    try interp.testExpectScriptResult("a b c d",
+        \\ set l {a b c d}
+        \\ set seen {}
+        \\ foreach x $l { dict size $l; lappend seen $x }
+        \\ set seen
     );
 }
 

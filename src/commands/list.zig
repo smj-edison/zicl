@@ -393,7 +393,7 @@ const LsortContext = struct {
         };
         defer for (&call_args) |*shim| shim.discardChanges();
 
-        try interp.invokeCommand(command, &call_args);
+        try interp.invokeCommand(command, &call_args, null);
 
         const num = try interp.getIntOrFloatInPlace(&interp.result);
         return std.math.order(num.asFloat(), 0.0);

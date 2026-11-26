@@ -235,13 +235,14 @@ pub fn registerCommand(interp: *Interp, name: []const u8, command: evaltypes.Nat
     _ = interp.nextProcedureEpoch();
 }
 
-/// If called with a method, this will _modify_ `args[1]`, not just shimmer it.
+/// If called with a method, this will write back the result to `updated_self`.
 pub fn callClosure(
     interp: *Interp,
     closure: *Closure.Content,
     letrec_scope: ?*Dictionary,
     cache_key: u256,
-    args: []Shimmerable,
+    args: []const Shimmerable,
+    updated_self: ?*OptionalValue,
 ) InternalEvalError!void {
     const arg_count = args.len - 1; // - 1 to skip command name as first argument.
 
@@ -310,17 +311,6 @@ pub fn callClosure(
         }
     }
 
-    // Note that once we evaluate `closure`, we can no longer guarantee that it's still shimmered
-    // as a Closure. This is because the closure and variable namespaces are the same, so something
-    // like
-    // ```
-    // fn foo {} {
-    //   upvar foo foo
-    //   puts [dict get $foo name]
-    // }
-    // ```
-    // will shimmer `foo` halfway through evaluation.
-
     // `[return -level N]` counts closure calls, so this is where a level is
     // consumed. Counting script evaluations instead would let a body such as an
     // [if] eat the level before the closure ever sees it:
@@ -340,13 +330,14 @@ pub fn callClosure(
         else => return err,
     };
 
-    // When called as a method, we write back `self` to `args[1]`, so that the
-    // caller can update the new method.
+    // When called as a method, hand back `self` so the caller can write it
+    // back. A caller that ignores it, like [apply], still gets the error if
+    // `self` was removed.
     if (is_method) {
         var self_var_name: Shimmerable = .{ .original = arg_names[0] };
         defer self_var_name.discardChanges(); // TODO PERF don't discard, write back.
-        if (vartypes.getVariableTakingRefOrError(interp, null, call_frame_idx, &self_var_name)) |updated_self| {
-            args[1].shimmered.swap(updated_self);
+        if (vartypes.getVariableTakingRefOrError(interp, null, call_frame_idx, &self_var_name)) |new_self| {
+            if (updated_self) |out| out.swap(new_self) else new_self.dropReference();
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadVariableName => {
@@ -561,8 +552,9 @@ const CallFrame = struct {
     /// The frame's variables. Held by pointer, not inline, so that the
     /// `*VarTable` a `CachedLocalVar` caches survives `call_frames` reallocating.
     variables: *vartypes.VarTable,
-    /// Arguments of this procedure call. Lifetime managed by creator.
-    args: []Shimmerable,
+    /// Arguments of this procedure call. Lifetime managed by creator. Const, so
+    /// nothing can shimmer the caller's arguments through the frame.
+    args: []const Shimmerable,
     /// Signature of the closure that is being called. Note this is more than
     /// a normal closure signature, since this also includes `letrec_scope`.
     signature: struct {
@@ -709,7 +701,8 @@ pub const EvalFrame = struct {
     /// Pointer to the corrisponding call frame.
     call_frame: u32,
     /// Arguments of the command currently being dispatched in this eval frame.
-    args: []Shimmerable,
+    /// Const, so nothing can shimmer the caller's arguments through the frame.
+    args: []const Shimmerable,
     /// The line number of the command currently being dispatched, within
     /// the script being evaluated (note that this is relative, since that's
     /// how parsed scripts are stored). Combine with `source_info.line_no`
@@ -731,7 +724,7 @@ pub fn evalFrame(interp: *Interp) *EvalFrame {
 /// needed from `signature` when creating the call frame.
 fn pushCallFrame(
     interp: *Interp,
-    args: []Shimmerable,
+    args: []const Shimmerable,
     signature: *const Closure.Content,
     letrec_scope: ?*objects.Dictionary,
 ) !u32 {
@@ -1076,10 +1069,17 @@ fn invokeUnknown(interp: *Interp, args: []Shimmerable) !void {
     new_args[0] = .{ .original = interned_unknown };
     @memcpy(new_args[1..], args);
 
-    try interp.invokeCommand(&unknown_cmd, new_args);
+    try interp.invokeCommand(&unknown_cmd, new_args, null);
 }
 
-pub fn invokeCommand(interp: *Interp, command_variant: *const CommandVariant, args: []Shimmerable) InternalEvalError!void {
+/// Pass `updated_self` only when the command is a method, and it receives the
+/// method's `self` once the method returns.
+pub fn invokeCommand(
+    interp: *Interp,
+    command_variant: *const CommandVariant,
+    args: []Shimmerable,
+    updated_self: ?*OptionalValue,
+) InternalEvalError!void {
     if (interp.eval_depth >= interp.max_eval_depth) {
         try interp.setResultString("Infinite eval recursion");
         return error.EvalError;
@@ -1101,6 +1101,9 @@ pub fn invokeCommand(interp: *Interp, command_variant: *const CommandVariant, ar
         interp.setEmptyResult();
 
         const to_call: *const CommandVariant = if (owned_tailcall) |*tailcall| &tailcall.command else command_variant;
+        // Callers only pass `updated_self` for a method, and [tailcall] is
+        // rejected inside methods.
+        assert(owned_tailcall == null or updated_self == null);
 
         const result = blk: {
             switch (to_call.*) {
@@ -1108,10 +1111,10 @@ pub fn invokeCommand(interp: *Interp, command_variant: *const CommandVariant, ar
                     break :blk interp.callNative(command, current_args);
                 },
                 .closure => |*closure| {
-                    break :blk interp.callClosure(closure.closure.content, null, closure.cache_key, current_args);
+                    break :blk interp.callClosure(closure.closure.content, null, closure.cache_key, current_args, updated_self);
                 },
                 .letrec => |letrec| {
-                    break :blk interp.callClosure(letrec.closure.closure.content, letrec.scope, letrec.closure.cache_key, current_args);
+                    break :blk interp.callClosure(letrec.closure.closure.content, letrec.scope, letrec.closure.cache_key, current_args, updated_self);
                 },
             }
         };
@@ -1377,70 +1380,39 @@ pub fn invokeCommandMaybeMethod(
     if (maybe_self.asValue()) |self| {
         args_raw[0] = args_raw[1]; // Move command name to the left.
         args_raw[1] = .{ .original = self };
-        sources_raw[0] = sources_raw[1];
-        // `self` gets modified back through `args_raw`, never through
-        // `sources_raw`.
-        sources_raw[1] = .none;
         args = args_raw[0..]; // Include all the allocated args now.
+        sources_raw[0] = sources_raw[1];
+        // `self` isn't read from any word. Its new value is written back to
+        // the command name's dict path below.
+        sources_raw[1] = .none;
     }
 
     // Now that we've populated the arguments for this command, we'll go ahead and run it.
-    try interp.invokeCommand(&command, args);
+    var updated_self: OptionalValue = .none;
+    defer updated_self.dropReference();
+    try interp.invokeCommand(&command, args, if (maybe_self.isSome()) &updated_self else null);
 
     if (maybe_self.isSome()) {
-        // Be sure to write back `self`.
-
+        // Write `self` back to where it came from, so for example
+        // `outer::inner::method` updates `outer::inner`.
         const call_frame = interp.callFrameIdx();
-        const method_dict_path = &args[0];
-        // `self` is returned back through `args[1]`.
-        const new_self = &args[1];
-        assert(new_self.shimmered.isSome());
-
-        // Make sure `method_dict_path` is still .dict_sugar, as it technically could have shimmered.
-        var det: ErrorDetails = undefined;
-        try method_dict_path.ensureShimmerable();
-
-        const ensure_result = try interp.wrapError(&det, vartypes.ensureValidVariableType(interp, &det, call_frame, method_dict_path));
-        const as_dict_sugar = blk: switch (ensure_result) {
-            .not_found => unreachable, // .dict_sugar will always be returned.
-            .normal => unreachable,
-            .dict_sugar => {
-                // What we want.
-                break :blk method_dict_path.current().asType(vartypes.DictSugar).?;
-            },
-        };
+        // `getCommandAndSelfParam` left the command name as a `DictSugar`. While
+        // the method runs, `callClosure` and the frames only hold `args` as
+        // const, so it's still one.
+        const as_dict_sugar = args[0].current().asType(vartypes.DictSugar).?;
 
         var dict_name: Shimmerable = .{ .original = as_dict_sugar.dict_name };
         defer dict_name.discardChanges();
-        const dict_resolved = try interp.getVariableForMutationInFrame(call_frame, &dict_name) orelse {
+        if (try interp.getVariableForMutationInFrame(call_frame, &dict_name) == null) {
             const args_list = command.closure.closure.content.arg_names;
             const self_name = try args_list.items[0].getString();
             try interp.setResultFormatted("Could not update \"{s}\" as it was unset when calling method", .{self_name});
             return error.EvalError;
-        };
-
-        if (as_dict_sugar.dict_path.items.len == 1) {
-            try interp.wrapError(&det, vartypes.setVariable(interp, &det, call_frame, &dict_name, new_self.current()));
-        } else {
-            const all_but_last = as_dict_sugar.dict_path.items[0..(as_dict_sugar.dict_path.items.len - 1)];
-            const put_ctx = objects.ValueSliceContext{ .items = all_but_last };
-
-            var dict_resolved_shim: Shimmerable = .{ .original = dict_resolved };
-            defer dict_resolved_shim.discardChanges();
-            _ = try interp.wrapError(&det, Dictionary.shimmerFrom(&det, &dict_resolved_shim));
-
-            if (dict_resolved_shim.shimmered.isNone() and dict_resolved.canMutate()) {
-                const as_mutable = dict_resolved.asType(Dictionary).?;
-                try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
-                return; // End transaction.
-            } else {
-                const duped = try dict_resolved_shim.current().duplicate();
-                defer duped.dropReference();
-                const as_mutable = duped.asType(Dictionary).?;
-                try interp.wrapError(&det, as_mutable.putRecursively(&det, put_ctx, new_self.current()));
-                try interp.setVariableInFrame(call_frame, &dict_name, duped);
-            }
         }
+
+        const path = as_dict_sugar.dict_path.items;
+        var det: ErrorDetails = undefined;
+        try interp.wrapError(&det, vartypes.writeDictPath(interp, &det, call_frame, &dict_name, path[0 .. path.len - 1], updated_self.asValue().?));
     }
 }
 

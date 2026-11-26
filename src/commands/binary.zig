@@ -1237,14 +1237,15 @@ fn invokeCustomCodec(
         .{ .original = arg1 },
         .{ .original = arg2 },
     };
-    defer invoke_args[1].discardChanges();
+    var new_self: heap.OptionalValue = .none;
+    defer new_self.dropReference();
 
-    try interp.invokeCommand(&command, &invoke_args);
+    try interp.invokeCommand(&command, &invoke_args, if (is_method) &new_self else null);
     const result_val = interp.result.takeReference();
     errdefer result_val.dropReference();
 
     if (is_method) {
-        if (invoke_args[1].shimmered.asValue()) |updated_self| {
+        if (new_self.asValue()) |updated_self| {
             var self_shim: Shimmerable = .{ .original = updated_self };
             defer self_shim.discardChanges();
             var det: ErrorDetails = undefined;

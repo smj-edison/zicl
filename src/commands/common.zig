@@ -166,7 +166,7 @@ pub const FuzzSandbox = struct {
         interp.call_frame_fence = interp.callFrame().level + 1;
         defer interp.call_frame_fence = previous_fence;
 
-        try interp.callClosure(&content, null, cache_key, &args);
+        try interp.callClosure(&content, null, cache_key, &args, null);
     }
 
     pub fn reset(sandbox: *const FuzzSandbox, interp: *Interp) !void {

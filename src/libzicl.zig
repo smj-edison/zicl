@@ -814,7 +814,7 @@ export fn Zicl_CallClosure(
     interp.stack_trace.swapWithNone();
     // Use the higher level `invokeCommand` so tailcalls are handled.
     const command_variant: Interp.CommandVariant = .{ .closure = closure.* };
-    return ReturnCode.fromErrorUnion(interp.invokeCommand(&command_variant, args));
+    return ReturnCode.fromErrorUnion(interp.invokeCommand(&command_variant, args, null));
 }
 
 /// The closure's body, as a value borrowed from `closure` (valid only while

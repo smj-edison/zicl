@@ -532,19 +532,21 @@ fn dictSugarRead(
     };
 }
 
-fn dictSugarWriteInner(
+/// Puts `value` at `path` inside the dict held by the variable `dict_name`,
+/// or sets the variable itself when `path` is empty. A missing variable
+/// becomes a new dict.
+pub fn writeDictPath(
     interp: *Interp,
     det: ?*ErrorDetails,
     call_frame_idx: u32,
-    dict_sugar: *DictSugar,
+    dict_name: *Shimmerable,
+    path: []const Value,
     value: Value,
 ) !void {
-    const put_ctx = objects.ValueSliceContext{ .items = dict_sugar.dict_path.items };
+    if (path.len == 0) return setVariable(interp, det, call_frame_idx, dict_name, value);
+    const put_ctx = objects.ValueSliceContext{ .items = path };
 
-    var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
-    defer dict_name.discardChanges();
-
-    const resolved_dict = try getVariableInner(interp, det, call_frame_idx, &dict_name, false) orelse {
+    const resolved_dict = try getVariableInner(interp, det, call_frame_idx, dict_name, false) orelse {
         // Create a new dictionary, since this variable doesn't exist.
         const new_dict = try Dictionary.new(&.{});
         defer new_dict.asHead().dropReference();
@@ -554,7 +556,7 @@ fn dictSugarWriteInner(
             error.BadDict => unreachable, // Freshly built, so it is a dict.
         };
 
-        try setVariable(interp, det, call_frame_idx, &dict_name, new_dict.asHead().asValue());
+        try setVariable(interp, det, call_frame_idx, dict_name, new_dict.asHead().asValue());
         return;
     };
 
@@ -565,7 +567,7 @@ fn dictSugarWriteInner(
         const dict_mut = try resolved_dict.duplicateAsType(Dictionary, det);
         defer dict_mut.asHead().dropReference();
         try dict_mut.putRecursively(det, put_ctx, value);
-        try setVariable(interp, det, call_frame_idx, &dict_name, dict_mut.asHead().asValue());
+        try setVariable(interp, det, call_frame_idx, dict_name, dict_mut.asHead().asValue());
     }
 }
 
@@ -576,7 +578,10 @@ fn dictSugarWrite(
     dict_sugar: *DictSugar,
     value: Value,
 ) error{ OutOfMemory, LookupFailed, BadVariableName }!void {
-    dictSugarWriteInner(interp, det, call_frame_idx, dict_sugar, value) catch |err| switch (err) {
+    var dict_name: Shimmerable = .{ .original = dict_sugar.dict_name };
+    defer dict_name.discardChanges();
+
+    writeDictPath(interp, det, call_frame_idx, &dict_name, dict_sugar.dict_path.items, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BadDict => {
             if (det) |details| heap.global_gpa.free(details.message);

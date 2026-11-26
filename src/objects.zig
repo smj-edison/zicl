@@ -25,6 +25,9 @@ pub const ErrorDetails = struct {
     index: ?u32 = null,
 };
 
+/// If something is shimmered from `Shimmerable`, it's guaranteed not to
+/// alias any other instances of `Shimmerable`, as it will duplicate
+/// `original` if it's not mutable.
 pub const Shimmerable = extern struct {
     original: Value,
     shimmered: OptionalValue = .none,

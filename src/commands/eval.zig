@@ -110,7 +110,7 @@ pub fn applyCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
 
     // args[1..] puts the lambda in the name slot (index 0) that callClosure
     // expects, with the actual arguments starting at index 1.
-    try interp.invokeCommand(&command, args[1..]);
+    try interp.invokeCommand(&command, args[1..], null);
 }
 
 pub fn applymethodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -130,13 +130,12 @@ pub fn applymethodCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
         return error.EvalError;
     }
 
-    defer args[2].discardChanges(); // Make sure the mutated self value never escapes.
-    try interp.invokeCommand(&command, args[1..]);
-
-    const new_self = args[2].shimmered.asValue().?;
+    var new_self: heap.OptionalValue = .none;
+    defer new_self.dropReference();
+    try interp.invokeCommand(&command, args[1..], &new_self);
     const method_result = interp.result;
 
-    interp.setResultOwning((try objects.List.new(&.{ new_self, method_result })).asHead().asValue());
+    interp.setResultOwning((try objects.List.new(&.{ new_self.asValue().?, method_result })).asHead().asValue());
 }
 
 pub fn letrecCmd(interp: *Interp, args: []Shimmerable) Interp.Error!void {
@@ -651,6 +650,24 @@ fn testLetrecSelfDictSugar(ta: std.mem.Allocator) !void {
 
 test "letrec self dict sugar" {
     try memutil.checkAllocationFailures(.exhaustive, testLetrecSelfDictSugar, .{});
+}
+
+fn testApplyMethodLeavesArgument(ta: std.mem.Allocator) !void {
+    var interp = try common.testStart(ta);
+    defer common.testFinish(&interp);
+
+    // Called through [apply], a method's changes to `self` are dropped rather
+    // than written back to the variable that was passed in.
+    try interp.testExpectScriptResult("a 0",
+        \\ method m {self} { set self::a 1 }
+        \\ set o {a 0}
+        \\ apply $m $o
+        \\ set o
+    );
+}
+
+test "apply on a method leaves its argument alone" {
+    try memutil.checkAllocationFailures(.exhaustive, testApplyMethodLeavesArgument, .{});
 }
 
 fn testTailcallBasicFactorial(ta: std.mem.Allocator) !void {
