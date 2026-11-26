@@ -1,11 +1,6 @@
 //! Computes the hash references a string made by joining pieces would track,
 //! without building the string itself.
 //!
-//! Callers assemble the bytes however suits them (patching in place, growing
-//! a buffer, gathering into a fresh one), and use this for the tracked hashes.
-//! Since it only reads the pieces, they may alias each other or the string
-//! being written, as long as the caller doesn't write until this returns.
-//!
 //! Glossary:
 //! - _Token_: a hash reference, `blake3.<hash>~`.
 //! - _Piece_: a byte slice, which is joined in order with the other pieces to
@@ -22,6 +17,12 @@
 //!   token cut by where one scan ends is still found whole by the next.
 //! - _Run_: the tracked hashes of the tokens fully inside one piece, which are
 //!   merged into the result without being rescanned.
+//!
+//! This module only computes the tracked hashes. Callers assemble the joined
+//! bytes however suits them, whether by patching in place, growing a buffer,
+//! or gathering into a fresh one. Since the pieces are only read, they may
+//! alias each other or the string being written, as long as the caller
+//! doesn't write until `trackedHashes` returns.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -32,7 +33,7 @@ const heap = @import("heap.zig");
 const hashutil = @import("hashutil.zig");
 const objects = @import("objects.zig");
 const Object = heap.Object;
-const HashAndInfo = heap.SpecialString.HashAndInfo;
+const ResolvedHash = heap.SpecialString.ResolvedHash;
 
 const token_len = hashutil.hash_token_len;
 
@@ -40,64 +41,85 @@ const token_len = hashutil.hash_token_len;
 /// Scans split at a boundary overlap by this much, so no token is missed.
 const max_overlap = token_len - 1;
 
-/// What a tracked piece carries: its source's tracked hashes, and where in
-/// the source it starts.
+/// What a tracked piece carries: the tracked hashes of the tokens inside it,
+/// and where in its source it starts.
 pub const PieceMetadata = struct {
-    /// Every token in the source string, sorted by `str_index`. Tokens not
-    /// fully inside the piece are ignored.
-    hashes: []const HashAndInfo,
-    /// Where the piece starts in its source. `hashes` index into the source,
-    /// not the piece, so this is needed to tell which tokens are inside the
-    /// piece, and where they land in the joined string. For example, the
-    /// tail of a patch, `old[old_edit_end..]`, has a `source_start` of
-    /// `old_edit_end`.
+    /// The source's tracked hashes for exactly the tokens fully inside the
+    /// piece, sorted by `str_index`. `Piece.fromSource` picks these out.
+    hashes: []const ResolvedHash,
+    /// Where the piece starts in its source. The source indexes its tracked
+    /// hashes from its own start, not the piece's, so this offset tells where
+    /// `hashes` land in the joined string. For example, the tail of a patch,
+    /// `old[old_edit_end..]`, has a `source_start` of `old_edit_end`.
     source_start: usize,
+};
 
-    /// Borrows `obj`'s string `[start, end)` along with its tracked hashes.
-    /// `obj` must have a string rep.
-    pub fn fromObject(obj: *const Object, start: usize, end: usize) struct { []const u8, ?PieceMetadata } {
+pub const Piece = struct {
+    bytes: []const u8,
+    /// Null for a raw piece.
+    metadata: ?PieceMetadata = null,
+
+    /// Returns `source[start..end]` as a tracked piece. `source_hashes` must
+    /// be every token in `source`, sorted by `str_index`, as a string's
+    /// tracked hashes are. The piece borrows from both.
+    pub fn fromSource(source: []const u8, source_hashes: []const ResolvedHash, start: usize, end: usize) Piece {
+        // Tokens cut by either end of the piece are left out. If the joined
+        // string recreates one, the window around that boundary finds it.
+        const Search = struct {
+            fn startsBefore(limit: usize, hash: ResolvedHash) bool {
+                return hash.str_index < limit;
+            }
+            fn endsBy(limit: usize, hash: ResolvedHash) bool {
+                return hash.str_index + token_len <= limit;
+            }
+        };
+        const first = std.sort.partitionPoint(ResolvedHash, source_hashes, start, Search.startsBefore);
+        const count = std.sort.partitionPoint(ResolvedHash, source_hashes[first..], end, Search.endsBy);
+        return .{
+            .bytes = source[start..end],
+            .metadata = .{ .hashes = source_hashes[first..][0..count], .source_start = start },
+        };
+    }
+
+    /// Returns `obj`'s string `[start, end)` as a tracked piece. It borrows
+    /// from `obj`, which must have a string rep.
+    pub fn fromObject(obj: *const Object, start: usize, end: usize) Piece {
         // A normal string never contains a token, so it tracks nothing.
-        const bytes: []const u8, const hashes: []const HashAndInfo = switch (obj.getStringDetails()) {
+        const bytes: []const u8, const hashes: []const ResolvedHash = switch (obj.getStringDetails()) {
             .normal => |bytes| .{ bytes, &.{} },
             .special => |special| .{ special.getString(), special.tracked_hashes },
             .none => unreachable,
         };
-        return .{ bytes[start..end], .{ .hashes = hashes, .source_start = start } };
+        return .fromSource(bytes, hashes, start, end);
     }
 };
 
-/// Returns the hash references that the pieces `bytes`, joined in order,
-/// would track, sorted by their index in the joined string. `metadata` is
-/// parallel to `bytes`, and is null for bytes that were never scanned. Each
-/// non-null `value` carries a reference owned by the caller. Free the result
-/// with `release`.
+/// Returns the hash references that `pieces`, joined in order, would track,
+/// sorted by their index in the joined string. Each returned entry whose
+/// `value` is non-null carries a reference owned by the caller, so free the
+/// result with `release`.
 ///
-/// `scan_buffer` is scratch space for scanning the bytes around each boundary, and
-/// must hold at least `hashutil.hash_token_len` bytes. A larger buffer means
-/// fewer scans, and 256 bytes is plenty.
-pub fn trackedHashes(
-    gpa: Allocator,
-    scan_buffer: []u8,
-    bytes: []const []const u8,
-    metadata: []const ?PieceMetadata,
-) error{OutOfMemory}![]HashAndInfo {
-    assert(bytes.len == metadata.len);
-
-    // Every token in the joined string is either fully inside one piece, or
-    // crosses at least one boundary between pieces. Tokens inside a long
-    // piece come from its tracked hashes (or an in-place scan, for raw
-    // bytes). Crossing tokens are found by streaming the `max_overlap` bytes
-    // on each side of every boundary through `scanner`.
+/// `scan_buffer` is scratch space for scanning windows, and must hold at
+/// least `hashutil.hash_token_len` bytes. A larger buffer means fewer scans,
+/// and 256 bytes is plenty.
+pub fn trackedHashes(gpa: Allocator, scan_buffer: []u8, pieces: []const Piece) error{OutOfMemory}![]ResolvedHash {
+    // Every token in the joined string either lies fully inside one piece, or
+    // crosses at least one boundary. Crossing tokens are found by streaming
+    // the windows around each boundary through `scanner`.
     //
-    // A piece of at most `2 * max_overlap` bytes is streamed whole, which
-    // merges the windows on either side of it. That window also finds the
-    // tokens inside the piece, so they aren't taken from the piece itself.
-    // A longer piece has a gap between its two windows, so the window is
-    // flushed there, and only finds tokens crossing a boundary.
+    // A short piece, of at most `2 * max_overlap` bytes, is streamed whole,
+    // which merges the windows on either side of it into one. That merged
+    // window also finds the tokens inside the short piece.
     //
-    // This first pass is the fallible one, and takes no references. A run's
-    // values stay alive through the source strings, and found tokens are
-    // only resolved once nothing else can fail.
+    // A long piece only streams its first and last `max_overlap` bytes, with
+    // the window ended between them, so its two windows can only find
+    // tokens crossing a boundary. The tokens inside a long piece come from
+    // its run instead. A raw long piece has no run, so it's scanned in place.
+    //
+    // This first pass is the fallible one, and takes no references. Scanned
+    // tokens collect in `found` as bare hashes, and are only resolved once
+    // nothing else can fail. Meanwhile, a run's values stay alive through its
+    // piece's source.
     var found: std.ArrayList(hashutil.HashInstance) = .empty;
     defer found.deinit(gpa);
     var runs: std.ArrayList(Run) = .empty;
@@ -106,37 +128,40 @@ pub fn trackedHashes(
 
     var scanner: BoundaryScanner = .init(scan_buffer);
     var joined_start: usize = 0;
-    for (bytes, metadata) |piece, piece_metadata| {
-        defer joined_start += piece.len;
-        if (piece.len <= 2 * max_overlap) {
-            try scanner.feed(gpa, &found, piece, joined_start);
+    for (pieces) |piece| {
+        const bytes = piece.bytes;
+        defer joined_start += bytes.len;
+        if (bytes.len <= 2 * max_overlap) {
+            try scanner.feed(gpa, &found, bytes, joined_start);
             continue;
         }
-        try scanner.feed(gpa, &found, piece[0..max_overlap], joined_start);
-        try scanner.flush(gpa, &found);
-        if (piece_metadata) |source| {
-            const contained = containedHashes(source, piece.len);
-            if (contained.len > 0) {
-                try runs.append(gpa, .{ .hashes = contained, .source_start = source.source_start, .joined_start = joined_start });
-                runs_len += contained.len;
+        try scanner.feed(gpa, &found, bytes[0..max_overlap], joined_start);
+        try scanner.endWindow(gpa, &found);
+        if (piece.metadata) |metadata| {
+            if (metadata.hashes.len > 0) {
+                // Catches metadata built by hand rather than by `fromSource`.
+                assert(metadata.hashes[0].str_index >= metadata.source_start);
+                assert(metadata.hashes[metadata.hashes.len - 1].str_index + token_len <= metadata.source_start + bytes.len);
+                try runs.append(gpa, .{ .metadata = metadata, .joined_start = joined_start });
+                runs_len += metadata.hashes.len;
             }
         } else {
-            try hashutil.scanStringForHashRefs(gpa, piece, joined_start, &found);
+            try hashutil.scanStringForHashRefs(gpa, bytes, joined_start, &found);
         }
-        try scanner.feed(gpa, &found, piece[piece.len - max_overlap ..], joined_start + piece.len - max_overlap);
+        try scanner.feed(gpa, &found, bytes[bytes.len - max_overlap ..], joined_start + bytes.len - max_overlap);
     }
-    try scanner.flush(gpa, &found);
+    try scanner.endWindow(gpa, &found);
 
-    const out = try gpa.alloc(HashAndInfo, runs_len + found.items.len);
+    const out = try gpa.alloc(ResolvedHash, runs_len + found.items.len);
     errdefer comptime unreachable;
 
-    // `found` is sorted, and so is each run. A run's tokens all come after
-    // every found token that starts before its piece, and before every other
-    // found token, so merging is a matter of where each run splits `found`.
+    // `found` is sorted, and so is each run. A run belongs between the found
+    // tokens starting before its piece and the ones starting after, so
+    // merging only needs to know where each run splits `found`.
     heap.registered_hashes.rw_lock.lockSharedUncancelable(heap.global_io);
     defer heap.registered_hashes.rw_lock.unlockShared(heap.global_io);
 
-    var filled: std.ArrayList(HashAndInfo) = .initBuffer(out);
+    var filled: std.ArrayList(ResolvedHash) = .initBuffer(out);
     var remaining = found.items;
     for (runs.items) |run| {
         var before: usize = 0;
@@ -144,8 +169,8 @@ pub fn trackedHashes(
         hashutil.resolveHashRefsInner(remaining[0..before], filled.addManyAsSliceAssumeCapacity(before));
         remaining = remaining[before..];
 
-        for (run.hashes) |hash| filled.appendAssumeCapacity(.{
-            .str_index = hash.str_index - run.source_start + run.joined_start,
+        for (run.metadata.hashes) |hash| filled.appendAssumeCapacity(.{
+            .str_index = hash.str_index - run.metadata.source_start + run.joined_start,
             .value = if (hash.value) |value| value.takeReference() else null,
         });
     }
@@ -156,37 +181,20 @@ pub fn trackedHashes(
 }
 
 /// Drops every reference in `hashes`, and frees it.
-pub fn release(gpa: Allocator, hashes: []const HashAndInfo) void {
+pub fn release(gpa: Allocator, hashes: []const ResolvedHash) void {
     for (hashes) |hash| if (hash.value) |value| value.dropReference();
     gpa.free(hashes);
 }
 
 /// The tokens fully inside one tracked piece.
 const Run = struct {
-    hashes: []const HashAndInfo,
-    source_start: usize,
+    metadata: PieceMetadata,
     /// Where the piece starts in the joined string.
     joined_start: usize,
 };
 
-/// The hashes in `source` for tokens fully inside its piece of `piece_len` bytes.
-fn containedHashes(source: PieceMetadata, piece_len: usize) []const HashAndInfo {
-    const Search = struct {
-        fn startsBefore(limit: usize, hash: HashAndInfo) bool {
-            return hash.str_index < limit;
-        }
-        fn endsBy(limit: usize, hash: HashAndInfo) bool {
-            return hash.str_index + token_len <= limit;
-        }
-    };
-    const source_end = source.source_start + piece_len;
-    const first = std.sort.partitionPoint(HashAndInfo, source.hashes, source.source_start, Search.startsBefore);
-    const count = std.sort.partitionPoint(HashAndInfo, source.hashes[first..], source_end, Search.endsBy);
-    return source.hashes[first..][0..count];
-}
-
-/// Scans a window of the joined string that arrives in pieces, through a
-/// fixed buffer. Each window must be contiguous, and `flush` ends it.
+/// Scans windows of the joined string through a fixed buffer. A window is fed
+/// in contiguous parts, and `endWindow` ends it.
 const BoundaryScanner = struct {
     buffer: []u8,
     len: usize = 0,
@@ -214,43 +222,35 @@ const BoundaryScanner = struct {
                 // last `max_overlap` bytes, so those overlap with the next
                 // scan. They're too short to hold a whole token, so nothing
                 // already found is found twice.
-                std.mem.copyForwards(u8, scanner.buffer[0..max_overlap], scanner.buffer[scanner.buffer.len - max_overlap ..]);
+                @memmove(scanner.buffer[0..max_overlap], scanner.buffer[scanner.buffer.len - max_overlap ..]);
                 scanner.start += scanner.buffer.len - max_overlap;
                 scanner.len = max_overlap;
             }
         }
     }
 
-    fn flush(scanner: *BoundaryScanner, gpa: Allocator, found: *std.ArrayList(hashutil.HashInstance)) error{OutOfMemory}!void {
+    fn endWindow(scanner: *BoundaryScanner, gpa: Allocator, found: *std.ArrayList(hashutil.HashInstance)) error{OutOfMemory}!void {
         try hashutil.scanStringForHashRefs(gpa, scanner.buffer[0..scanner.len], scanner.start, found);
         scanner.len = 0;
     }
 };
 
-const TestPiece = struct { []const u8, ?PieceMetadata };
-
-/// Fails unless both buffer sizes give exactly what a full rescan of the
-/// joined bytes finds.
-fn expectMatchesRescan(pieces: []const TestPiece) !void {
+/// Fails unless `trackedHashes` gives exactly what a full rescan of the joined
+/// bytes finds. It's checked with a full-size scan buffer, and again with the
+/// smallest allowed one, which overlaps on nearly every byte.
+fn expectMatchesRescan(pieces: []const Piece) !void {
     const gpa = heap.global_gpa;
 
-    const bytes = try gpa.alloc([]const u8, pieces.len);
-    defer gpa.free(bytes);
-    const metadata = try gpa.alloc(?PieceMetadata, pieces.len);
-    defer gpa.free(metadata);
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(gpa);
-    for (pieces, bytes, metadata) |piece, *piece_bytes, *piece_metadata| {
-        piece_bytes.*, piece_metadata.* = piece;
-        try joined.appendSlice(gpa, piece_bytes.*);
-    }
+    for (pieces) |piece| try joined.appendSlice(gpa, piece.bytes);
 
     const expected = try hashutil.scanAndResolveHashRefs(gpa, joined.items);
     defer release(gpa, expected);
 
     var scan_buffer: [256]u8 = undefined;
     for ([_]usize{ scan_buffer.len, token_len }) |buffer_len| {
-        const actual = try trackedHashes(gpa, scan_buffer[0..buffer_len], bytes, metadata);
+        const actual = try trackedHashes(gpa, scan_buffer[0..buffer_len], pieces);
         defer release(gpa, actual);
 
         try testing.expectEqual(expected.len, actual.len);
@@ -299,13 +299,15 @@ fn testSplitsFrom(ta: Allocator, first_cut: usize) !void {
     defer source.asHead().dropReference();
     const obj = source.asHead();
     const len = (try obj.getString()).len;
+    // Runs only come from a source that tracks its tokens.
+    try testing.expect(obj.getStringDetails() == .special);
 
     for (first_cut..len + 1) |second_cut| for (0..8) |raw_mask| {
         const bounds = [_]usize{ 0, first_cut, second_cut, len };
-        var pieces: [3]TestPiece = undefined;
+        var pieces: [3]Piece = undefined;
         for (&pieces, 0..) |*piece, i| {
-            piece.* = PieceMetadata.fromObject(obj, bounds[i], bounds[i + 1]);
-            if (raw_mask & (@as(usize, 1) << @intCast(i)) != 0) piece[1] = null;
+            piece.* = .fromObject(obj, bounds[i], bounds[i + 1]);
+            if (raw_mask & (@as(usize, 1) << @intCast(i)) != 0) piece.metadata = null;
         }
         try expectMatchesRescan(&pieces);
     };
@@ -340,17 +342,17 @@ fn testBoundaries(ta: Allocator) !void {
         const tail = try objects.String.new(ref[10..] ++ " right");
         defer tail.asHead().dropReference();
         try expectMatchesRescan(&.{
-            PieceMetadata.fromObject(head.asHead(), 0, 15),
-            PieceMetadata.fromObject(tail.asHead(), 0, token_len - 10 + 6),
+            Piece.fromObject(head.asHead(), 0, 15),
+            Piece.fromObject(tail.asHead(), 0, token_len - 10 + 6),
         });
     }
 
     // One token crossing many boundaries, with empty pieces between some of them.
     {
-        var pieces: [2 * token_len]TestPiece = undefined;
+        var pieces: [2 * token_len]Piece = undefined;
         for (0..token_len) |i| {
-            pieces[2 * i] = .{ ref[i..][0..1], null };
-            pieces[2 * i + 1] = .{ "", null };
+            pieces[2 * i] = .{ .bytes = ref[i..][0..1] };
+            pieces[2 * i + 1] = .{ .bytes = "" };
         }
         try expectMatchesRescan(&pieces);
     }
@@ -362,21 +364,82 @@ fn testBoundaries(ta: Allocator) !void {
         defer doubled.asHead().dropReference();
         const obj = doubled.asHead();
         const len = (try obj.getString()).len;
+        try testing.expect(obj.getStringDetails() == .special);
         for (0..len + 1) |at| try expectMatchesRescan(&.{
-            PieceMetadata.fromObject(obj, 0, at),
-            .{ ref, null },
-            PieceMetadata.fromObject(obj, at, len),
-            PieceMetadata.fromObject(obj, 0, len),
+            Piece.fromObject(obj, 0, at),
+            .{ .bytes = ref },
+            Piece.fromObject(obj, at, len),
+            Piece.fromObject(obj, 0, len),
         });
     }
 
     // Long raw pieces, scanned in place.
     try expectMatchesRescan(&.{
-        .{ "a fairly long raw prefix " ++ ref.* ++ " and " ++ refs.unregistered, null },
-        .{ &(ref.* ++ ref.*), null },
+        .{ .bytes = "a fairly long raw prefix " ++ ref.* ++ " and " ++ refs.unregistered },
+        .{ .bytes = &(ref.* ++ ref.*) },
     });
 }
 
 test "hashjoin boundaries" {
     try testing.checkAllAllocationFailures(testing.allocator, testBoundaries, .{});
+}
+
+/// Fails unless `trackedHashes` gives exactly `expected`, with both a
+/// full-size and the smallest allowed scan buffer.
+fn expectTrackedHashes(pieces: []const Piece, expected: []const ResolvedHash) !void {
+    const gpa = heap.global_gpa;
+    var scan_buffer: [256]u8 = undefined;
+    for ([_]usize{ scan_buffer.len, token_len }) |buffer_len| {
+        const actual = try trackedHashes(gpa, scan_buffer[0..buffer_len], pieces);
+        defer release(gpa, actual);
+
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |exp, act| {
+            try testing.expectEqual(exp.str_index, act.str_index);
+            try testing.expectEqual(exp.value, act.value);
+        }
+    }
+}
+
+fn testRunsSkipRescan(ta: Allocator) !void {
+    try heap.testStart(ta, null);
+    defer heap.testFinish();
+    const refs = try TestRefs.init();
+    defer refs.deinit();
+
+    // A rescan can't tell a run from a scan of the same bytes, so these
+    // pieces carry metadata that disagrees with their bytes. `bytes` holds
+    // a real token for `targets[0]`, padded so that neither window around
+    // the piece holds all of it.
+    const padding: [token_len]u8 = @splat(' ');
+    const bytes = padding ++ refs.registered[0] ++ padding;
+    const claimed = [_]ResolvedHash{
+        .{ .str_index = token_len, .value = refs.targets[1].asHead() },
+        .{ .str_index = 2 * token_len, .value = null },
+    };
+
+    // A tracked piece that tracks nothing is never scanned inside.
+    try expectTrackedHashes(&.{.fromSource(&bytes, &.{}, 0, bytes.len)}, &.{});
+
+    // A run's values come from its metadata, not the registry.
+    try expectTrackedHashes(&.{.fromSource(&bytes, &claimed, 0, bytes.len)}, &claimed);
+
+    // A run starting partway into its source, between scanned tokens.
+    const head = "<" ++ refs.registered[0];
+    const source_start = 10;
+    const tail_start = head.len + bytes.len - source_start;
+    try expectTrackedHashes(&.{
+        .{ .bytes = head },
+        .fromSource(&bytes, &claimed, source_start, bytes.len),
+        .{ .bytes = refs.unregistered ++ ">" },
+    }, &.{
+        .{ .str_index = 1, .value = refs.targets[0].asHead() },
+        .{ .str_index = head.len + token_len - source_start, .value = refs.targets[1].asHead() },
+        .{ .str_index = head.len + 2 * token_len - source_start, .value = null },
+        .{ .str_index = tail_start, .value = null },
+    });
+}
+
+test "hashjoin passes runs through without rescanning" {
+    try testing.checkAllAllocationFailures(testing.allocator, testRunsSkipRescan, .{});
 }
